@@ -445,6 +445,55 @@ void test_model_failure_paths(llama_model * model) {
     GGML_ASSERT(stats.cancellations == 1);
     GGML_ASSERT(stats.handles_acquired == stats.handles_released);
     llama_free(context);
+
+    model->replace_expert_weight_provider_for_testing(llm_create_resident_expert_weight_provider());
+    context = integration_context(model);
+    llama_set_abort_callback(context, [](void *) { return true; }, nullptr);
+    GGML_ASSERT(llama_decode(context, llama_batch_get_one(const_cast<llama_token *>(prompt.data()), prompt.size())) == 2);
+    stats = model->expert_weight_provider_stats();
+    GGML_ASSERT(stats.handles_acquired > 0);
+    GGML_ASSERT(stats.handles_acquired == stats.handles_released);
+    llama_free(context);
+}
+
+void test_two_models(const char * disabled_path, const char * resident_path, int n_gpu_layers) {
+    llama_model_params disabled_params = llama_model_default_params();
+    disabled_params.n_gpu_layers = n_gpu_layers;
+    llama_model * disabled_model = llama_model_load_from_file(disabled_path, disabled_params);
+    GGML_ASSERT(disabled_model != nullptr);
+
+    llama_model_params resident_params = disabled_params;
+    resident_params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT;
+    llama_model * resident_model = llama_model_load_from_file(resident_path, resident_params);
+    GGML_ASSERT(resident_model != nullptr);
+
+    const auto disabled_prompt = integration_prompt(disabled_model);
+    const auto resident_prompt = integration_prompt(resident_model);
+    llama_context * disabled_context = integration_context(disabled_model);
+    llama_context * resident_context = integration_context(resident_model);
+    GGML_ASSERT(llama_decode(disabled_context, llama_batch_get_one(
+        const_cast<llama_token *>(disabled_prompt.data()), disabled_prompt.size())) == 0);
+    GGML_ASSERT(llama_decode(resident_context, llama_batch_get_one(
+        const_cast<llama_token *>(resident_prompt.data()), resident_prompt.size())) == 0);
+
+    const float * disabled_logits = llama_get_logits_ith(disabled_context, -1);
+    const float * resident_logits = llama_get_logits_ith(resident_context, -1);
+    GGML_ASSERT(disabled_logits != nullptr && resident_logits != nullptr);
+    GGML_ASSERT(std::all_of(disabled_logits,
+        disabled_logits + llama_vocab_n_tokens(llama_model_get_vocab(disabled_model)),
+        [](float value) { return std::isfinite(value); }));
+    GGML_ASSERT(std::all_of(resident_logits,
+        resident_logits + llama_vocab_n_tokens(llama_model_get_vocab(resident_model)),
+        [](float value) { return std::isfinite(value); }));
+    GGML_ASSERT(disabled_model->expert_weight_provider_stats().objects_created == 0);
+    GGML_ASSERT(resident_model->expert_weight_provider_stats().handles_acquired > 0);
+
+    llama_free(disabled_context);
+    llama_free(resident_context);
+    const auto resident_stats = resident_model->expert_weight_provider_stats();
+    GGML_ASSERT(resident_stats.handles_acquired == resident_stats.handles_released);
+    llama_model_free(disabled_model);
+    llama_model_free(resident_model);
 }
 
 void test_model_integration(const char * model_path, int n_gpu_layers) {
@@ -459,8 +508,6 @@ void test_model_integration(const char * model_path, int n_gpu_layers) {
     GGML_ASSERT(disabled_stats.prepare_calls == 0);
     GGML_ASSERT(disabled_stats.handles_acquired == 0);
     GGML_ASSERT(disabled_stats.handles_released == 0);
-    llama_model_free(disabled_model);
-
     llama_model_params resident_params = disabled_params;
     resident_params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT;
     llama_model * resident_model = llama_model_load_from_file(model_path, resident_params);
@@ -487,6 +534,7 @@ void test_model_integration(const char * model_path, int n_gpu_layers) {
     if (n_gpu_layers == 0) {
         test_model_failure_paths(resident_model);
     }
+    llama_model_free(disabled_model);
     llama_model_free(resident_model);
 }
 
@@ -499,11 +547,15 @@ int main(int argc, char ** argv) {
     test_failed_graph_binding_is_never_reusable();
     test_resident_provider_and_plan_retention();
     test_resident_provider_failures_cleanup_partially_acquired_handles();
-    if (argc == 3) {
+    if (argc == 3 || argc == 4) {
         ggml_backend_load_all();
         test_model_integration(argv[1], std::stoi(argv[2]));
+        if (argc == 4) {
+            test_two_models(argv[1], argv[3], std::stoi(argv[2]));
+        }
+        llama_backend_free();
     } else if (argc != 1) {
-        std::cerr << "usage: test-expert-weight-provider [MODEL GPU_LAYERS]\n";
+        std::cerr << "usage: test-expert-weight-provider [MODEL GPU_LAYERS [SECOND_MODEL]]\n";
         return 2;
     }
     return 0;
