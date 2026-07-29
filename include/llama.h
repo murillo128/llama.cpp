@@ -236,6 +236,52 @@ extern "C" {
 
     typedef bool (*llama_progress_callback)(float progress, void * user_data);
 
+    enum llama_route_phase {
+        LLAMA_ROUTE_PHASE_UNSPECIFIED = 0,
+        LLAMA_ROUTE_PHASE_PREFILL     = 1,
+        LLAMA_ROUTE_PHASE_DECODE      = 2,
+        LLAMA_ROUTE_PHASE_MIXED       = 3,
+    };
+
+    enum llama_route_observer_status {
+        LLAMA_ROUTE_OBSERVER_STATUS_OK                =  0,
+        LLAMA_ROUTE_OBSERVER_ERROR_STATE              = -1,
+        LLAMA_ROUTE_OBSERVER_ERROR_UNSUPPORTED_PHASE  = -2,
+        LLAMA_ROUTE_OBSERVER_ERROR_REQUEST_ORDER      = -3,
+        LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION         = -4,
+    };
+
+    struct llama_route_observation {
+        uint64_t request_ordinal;
+        uint64_t ubatch_ordinal;
+        enum llama_route_phase phase;
+
+        int32_t layer;
+        uint32_t n_tokens;
+        uint32_t n_expert_used;
+        uint32_t n_pos;
+
+        const llama_pos * positions;
+        const int32_t * n_seq_ids;
+        const llama_seq_id * const * seq_ids;
+
+        // Arrays are laid out as [n_tokens][n_expert_used], with top-k rank as the inner dimension.
+        const int32_t * selected_experts;
+        const float * weights;
+    };
+
+    typedef bool (*llama_route_observer_callback)(
+            const struct llama_route_observation * observation,
+                                               void * user_data);
+
+    struct llama_route_observer_stats {
+        uint64_t ubatches;
+        uint64_t layers;
+        uint64_t copy_bytes;
+        uint64_t explicit_synchronizations;
+        uint64_t failures;
+    };
+
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
@@ -971,6 +1017,7 @@ extern "C" {
     //    1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
     //    2 - aborted     (processed ubatches will remain in the context's memory)
     //   -1 - invalid input batch
+    //   -4 - route observer metadata or sink failure
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
@@ -1005,6 +1052,24 @@ extern "C" {
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // Install a per-context route observer. Passing NULL disables observation and releases its staging buffers.
+    // Observation pointers are valid only for the duration of the callback.
+    LLAMA_API int32_t llama_set_route_observer(
+                            struct llama_context * ctx,
+                    llama_route_observer_callback   callback,
+                                               void * user_data);
+
+    // Annotate the next traced llama_decode() submission. PREFILL and DECODE are supported.
+    // Reusing a request ordinal across submissions continues its ubatch ordinal sequence.
+    // Returns LLAMA_ROUTE_OBSERVER_ERROR_UNSUPPORTED_PHASE for UNSPECIFIED or MIXED.
+    LLAMA_API int32_t llama_route_observer_begin(
+                          struct llama_context * ctx,
+                                       uint64_t   request_ordinal,
+                         enum llama_route_phase   phase);
+
+    LLAMA_API struct llama_route_observer_stats llama_route_observer_get_stats(const struct llama_context * ctx);
+    LLAMA_API void llama_route_observer_reset_stats(struct llama_context * ctx);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

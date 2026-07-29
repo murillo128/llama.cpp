@@ -708,6 +708,8 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    bool observe_routes;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -778,6 +780,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            observe_routes                  == other.observe_routes                  &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -790,6 +793,12 @@ struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
     int il;
+};
+
+struct llm_graph_route_output {
+    int32_t il;
+    ggml_tensor * selected_experts;
+    ggml_tensor * weights;
 };
 
 class llm_graph_result {
@@ -827,7 +836,10 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    void add_route_output(llm_graph_route_output output);
+
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+    const std::vector<llm_graph_route_output> & get_route_outputs() const { return route_outputs; }
 
     void set_params(const llm_graph_params & params);
 
@@ -848,6 +860,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_route_output> route_outputs;
 
     ggml_context_ptr ctx_compute;
 
@@ -916,6 +929,7 @@ struct llm_graph_context {
     const int64_t n_tokens;
     const int64_t n_outputs;
     const int32_t n_ctx_orig; // yarn
+    const bool observe_routes;
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;

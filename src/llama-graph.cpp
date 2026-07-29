@@ -1207,6 +1207,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    route_outputs.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1269,6 +1270,10 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(t);
         }
     }
+    for (const auto & output : route_outputs) {
+        ggml_set_output(output.selected_experts);
+        ggml_set_output(output.weights);
+    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1312,6 +1317,11 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
 }
 
+void llm_graph_result::add_route_output(llm_graph_route_output output) {
+    GGML_ASSERT(route_outputs.empty() || route_outputs.back().il <= output.il);
+    route_outputs.push_back(output);
+}
+
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
@@ -1349,6 +1359,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
+    observe_routes   (params.observe_routes),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
     sched            (params.sched),
@@ -1966,6 +1977,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    if (observe_routes) {
+        ggml_tensor * selected_experts_out = ggml_dup(ctx0, selected_experts);
+        ggml_tensor * weights_out = ggml_dup(ctx0, weights);
+
+        cb(selected_experts_out, "ffn_moe_topk_observed", il);
+        cb(weights_out, "ffn_moe_weights_observed", il);
+
+        ggml_build_forward_expand(gf, selected_experts_out);
+        ggml_build_forward_expand(gf, weights_out);
+
+        res->add_route_output({ il, selected_experts_out, weights_out });
     }
 
     //call early so that topk-moe can be used

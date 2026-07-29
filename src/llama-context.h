@@ -112,6 +112,11 @@ struct llama_context {
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
+    int32_t set_route_observer(llama_route_observer_callback callback, void * user_data);
+    int32_t route_observer_begin(uint64_t request_ordinal, llama_route_phase phase);
+    llama_route_observer_stats route_observer_get_stats() const;
+    void route_observer_reset_stats();
+
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
@@ -139,6 +144,10 @@ struct llama_context {
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
                        ggml_status & ret);
+
+    bool route_observer_start_submission();
+    void route_observer_end_submission();
+    bool route_observer_extract(const llm_graph_result * res, const llama_ubatch & ubatch);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -366,6 +375,22 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    llama_route_observer_callback route_observer_callback = nullptr;
+    void * route_observer_user_data = nullptr;
+    std::vector<int32_t> route_observer_ids;
+    std::vector<float> route_observer_weights;
+    llama_route_observer_stats route_observer_stats = {};
+
+    bool route_observer_annotation_pending = false;
+    bool route_observer_submission_active = false;
+    bool route_observer_latched_failure = false;
+    bool route_observer_has_request = false;
+    uint64_t route_observer_pending_request = 0;
+    uint64_t route_observer_request = 0;
+    uint64_t route_observer_next_ubatch = 0;
+    llama_route_phase route_observer_pending_phase = LLAMA_ROUTE_PHASE_UNSPECIFIED;
+    llama_route_phase route_observer_phase = LLAMA_ROUTE_PHASE_UNSPECIFIED;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

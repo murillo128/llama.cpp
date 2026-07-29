@@ -1142,6 +1142,206 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+int32_t llama_context::set_route_observer(llama_route_observer_callback callback, void * user_data) {
+    synchronize();
+
+    route_observer_callback = callback;
+    route_observer_user_data = user_data;
+    route_observer_annotation_pending = false;
+    route_observer_submission_active = false;
+    route_observer_latched_failure = false;
+    route_observer_has_request = false;
+    route_observer_pending_request = 0;
+    route_observer_request = 0;
+    route_observer_next_ubatch = 0;
+    route_observer_pending_phase = LLAMA_ROUTE_PHASE_UNSPECIFIED;
+    route_observer_phase = LLAMA_ROUTE_PHASE_UNSPECIFIED;
+    route_observer_stats = {};
+
+    route_observer_ids.clear();
+    route_observer_weights.clear();
+
+    if (callback == nullptr) {
+        route_observer_ids.shrink_to_fit();
+        route_observer_weights.shrink_to_fit();
+        sched_need_reserve = true;
+        return LLAMA_ROUTE_OBSERVER_STATUS_OK;
+    }
+
+    const size_t n_layer = model.hparams.n_layer();
+    const size_t n_ubatch = cparams.n_ubatch;
+    const size_t n_expert_used = model.hparams.n_expert_used;
+
+    if (n_layer != 0 && n_ubatch > SIZE_MAX/n_layer) {
+        route_observer_callback = nullptr;
+        route_observer_user_data = nullptr;
+        return LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION;
+    }
+    const size_t n_rows = n_layer*n_ubatch;
+    if (n_expert_used != 0 && n_rows > SIZE_MAX/n_expert_used) {
+        route_observer_callback = nullptr;
+        route_observer_user_data = nullptr;
+        return LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION;
+    }
+
+    const size_t capacity = n_rows*n_expert_used;
+    try {
+        route_observer_ids.resize(capacity);
+        route_observer_weights.resize(capacity);
+    } catch (const std::bad_alloc &) {
+        route_observer_callback = nullptr;
+        route_observer_user_data = nullptr;
+        route_observer_ids.clear();
+        route_observer_weights.clear();
+        return LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION;
+    }
+
+    sched_need_reserve = true;
+    return LLAMA_ROUTE_OBSERVER_STATUS_OK;
+}
+
+int32_t llama_context::route_observer_begin(uint64_t request_ordinal, llama_route_phase phase) {
+    if (route_observer_callback == nullptr || route_observer_latched_failure ||
+        route_observer_annotation_pending || route_observer_submission_active) {
+        return LLAMA_ROUTE_OBSERVER_ERROR_STATE;
+    }
+    if (phase != LLAMA_ROUTE_PHASE_PREFILL && phase != LLAMA_ROUTE_PHASE_DECODE) {
+        return LLAMA_ROUTE_OBSERVER_ERROR_UNSUPPORTED_PHASE;
+    }
+    if (route_observer_has_request && request_ordinal < route_observer_request) {
+        return LLAMA_ROUTE_OBSERVER_ERROR_REQUEST_ORDER;
+    }
+
+    route_observer_pending_request = request_ordinal;
+    route_observer_pending_phase = phase;
+    route_observer_annotation_pending = true;
+    return LLAMA_ROUTE_OBSERVER_STATUS_OK;
+}
+
+llama_route_observer_stats llama_context::route_observer_get_stats() const {
+    return route_observer_stats;
+}
+
+void llama_context::route_observer_reset_stats() {
+    route_observer_stats = {};
+}
+
+bool llama_context::route_observer_start_submission() {
+    if (route_observer_callback == nullptr) {
+        return true;
+    }
+    if (!route_observer_annotation_pending || route_observer_latched_failure) {
+        return false;
+    }
+
+    if (!route_observer_has_request || route_observer_pending_request != route_observer_request) {
+        route_observer_request = route_observer_pending_request;
+        route_observer_next_ubatch = 0;
+        route_observer_has_request = true;
+    }
+
+    route_observer_phase = route_observer_pending_phase;
+    route_observer_pending_phase = LLAMA_ROUTE_PHASE_UNSPECIFIED;
+    route_observer_annotation_pending = false;
+    route_observer_submission_active = true;
+    return true;
+}
+
+void llama_context::route_observer_end_submission() {
+    route_observer_submission_active = false;
+    route_observer_phase = LLAMA_ROUTE_PHASE_UNSPECIFIED;
+}
+
+bool llama_context::route_observer_extract(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    if (route_observer_callback == nullptr || !route_observer_submission_active) {
+        return true;
+    }
+
+    const auto & outputs = res->get_route_outputs();
+    size_t value_count = 0;
+
+    for (const auto & output : outputs) {
+        ggml_tensor * ids = output.selected_experts;
+        ggml_tensor * weights = output.weights;
+        if (ids == nullptr || weights == nullptr || ids->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+        if (ids->ne[1] != (int64_t) ubatch.n_tokens || weights->ne[0] != 1 ||
+            weights->ne[1] != ids->ne[0] || weights->ne[2] != ids->ne[1]) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+
+        const size_t count = (size_t) ggml_nelements(ids);
+        if (count != (size_t) ggml_nelements(weights) || value_count > route_observer_ids.size() ||
+            count > route_observer_ids.size() - value_count) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+        if (ggml_backend_sched_get_tensor_backend(sched.get(), ids) == nullptr ||
+            ggml_backend_sched_get_tensor_backend(sched.get(), weights) == nullptr) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+        value_count += count;
+    }
+
+    size_t offset = 0;
+    for (const auto & output : outputs) {
+        const size_t count = (size_t) ggml_nelements(output.selected_experts);
+        ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched.get(), output.selected_experts);
+        ggml_backend_t weights_backend = ggml_backend_sched_get_tensor_backend(sched.get(), output.weights);
+        GGML_ASSERT(ids_backend != nullptr && weights_backend != nullptr);
+
+        ggml_backend_tensor_get_async(ids_backend, output.selected_experts, route_observer_ids.data() + offset, 0, count*sizeof(int32_t));
+        ggml_backend_tensor_get_async(weights_backend, output.weights, route_observer_weights.data() + offset, 0, count*sizeof(float));
+        offset += count;
+    }
+
+    if (!outputs.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        route_observer_stats.explicit_synchronizations++;
+    }
+
+    offset = 0;
+    for (const auto & output : outputs) {
+        const size_t count = (size_t) ggml_nelements(output.selected_experts);
+        const llama_route_observation observation = {
+            /*.request_ordinal  =*/ route_observer_request,
+            /*.ubatch_ordinal   =*/ route_observer_next_ubatch,
+            /*.phase            =*/ route_observer_phase,
+            /*.layer            =*/ output.il,
+            /*.n_tokens         =*/ ubatch.n_tokens,
+            /*.n_expert_used    =*/ (uint32_t) output.selected_experts->ne[0],
+            /*.n_pos            =*/ ubatch.n_pos,
+            /*.positions        =*/ ubatch.pos,
+            /*.n_seq_ids        =*/ ubatch.n_seq_id,
+            /*.seq_ids          =*/ ubatch.seq_id,
+            /*.selected_experts =*/ route_observer_ids.data() + offset,
+            /*.weights          =*/ route_observer_weights.data() + offset,
+        };
+
+        if (!route_observer_callback(&observation, route_observer_user_data)) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+
+        route_observer_stats.layers++;
+        route_observer_stats.copy_bytes += count*(sizeof(int32_t) + sizeof(float));
+        offset += count;
+    }
+
+    route_observer_stats.ubatches++;
+    route_observer_next_ubatch++;
+    return true;
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1379,6 +1579,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (!route_observer_extract(res, ubatch)) {
+        LLAMA_LOG_ERROR("%s: route observer failed\n", __func__);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1771,6 +1975,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
+    const bool route_observer_enabled = route_observer_callback != nullptr;
+    if (!route_observer_start_submission()) {
+        LLAMA_LOG_ERROR("%s: missing or invalid route observer annotation\n", __func__);
+        return -4;
+    }
+    struct route_observer_submission_guard {
+        llama_context * ctx;
+        bool active;
+
+        ~route_observer_submission_guard() {
+            if (active) {
+                ctx->route_observer_end_submission();
+            }
+        }
+    } route_observer_guard = { this, route_observer_enabled };
+
     sched_reserve();
 
     bool did_optimize = false;
@@ -1884,6 +2104,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        if (route_observer_latched_failure) {
+            return -4;
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -2436,6 +2660,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.observe_routes =*/ route_observer_submission_active,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3663,6 +3888,28 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+int32_t llama_set_route_observer(
+                    llama_context * ctx,
+    llama_route_observer_callback   callback,
+                               void * user_data) {
+    return ctx->set_route_observer(callback, user_data);
+}
+
+int32_t llama_route_observer_begin(
+           llama_context * ctx,
+                uint64_t   request_ordinal,
+      llama_route_phase   phase) {
+    return ctx->route_observer_begin(request_ordinal, phase);
+}
+
+llama_route_observer_stats llama_route_observer_get_stats(const llama_context * ctx) {
+    return ctx->route_observer_get_stats();
+}
+
+void llama_route_observer_reset_stats(llama_context * ctx) {
+    ctx->route_observer_reset_stats();
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
