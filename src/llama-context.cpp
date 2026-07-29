@@ -761,6 +761,37 @@ const llama_cparams & llama_context::get_cparams() const {
     return cparams;
 }
 
+llm_expert_graph_diagnostics llama_context::expert_graph_diagnostics() const {
+    llm_expert_graph_diagnostics result;
+    result.graphs_reused = n_reused;
+    if (expert_plans) {
+        result.inflight_handles = expert_plans->inflight.handle_count();
+    }
+    if (!gf_res_prev) {
+        return result;
+    }
+
+    ggml_cgraph * graph = gf_res_prev->get_gf();
+    result.node_count = graph ? ggml_graph_n_nodes(graph) : 0;
+    result.binding_count = int32_t(gf_res_prev->get_expert_bindings().size());
+
+    uint64_t hash = 1469598103934665603ULL;
+    constexpr uint64_t prime = 1099511628211ULL;
+    for (int32_t index = 0; graph && index < ggml_graph_n_nodes(graph); ++index) {
+        const ggml_tensor * node = ggml_graph_node(graph, index);
+        const uint32_t op = uint32_t(node->op);
+        for (size_t byte = 0; byte < sizeof(op); ++byte) {
+            hash = (hash ^ ((op >> (byte*8)) & 0xffU))*prime;
+        }
+        for (const char * name = node->name; *name; ++name) {
+            hash = (hash ^ uint8_t(*name))*prime;
+        }
+        hash = (hash ^ 0xffU)*prime;
+    }
+    result.operation_hash = hash;
+    return result;
+}
+
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }

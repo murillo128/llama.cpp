@@ -398,6 +398,55 @@ void test_shared_contexts_and_async_destruction(llama_model * model, const std::
     GGML_ASSERT(after_destroy.handles_acquired == after_destroy.handles_released);
 }
 
+void test_model_failure_paths(llama_model * model) {
+    const auto prompt = integration_prompt(model);
+
+    llm_expert_provider_faults binding_fault;
+    binding_fault.binding = llm_expert_provider_error::preparation_failed;
+    model->replace_expert_weight_provider_for_testing(llm_create_resident_expert_weight_provider(binding_fault));
+    llama_context * context = integration_context(model);
+    GGML_ASSERT(llama_decode(context, llama_batch_get_one(const_cast<llama_token *>(prompt.data()), prompt.size())) == -3);
+    GGML_ASSERT(llama_decode(context, llama_batch_get_one(const_cast<llama_token *>(prompt.data()), prompt.size())) == -3);
+    auto stats = model->expert_weight_provider_stats();
+    GGML_ASSERT(stats.bind_calls >= 2);
+    GGML_ASSERT(stats.prepare_calls == 0);
+    GGML_ASSERT(stats.handles_acquired == 0);
+    llama_free(context);
+
+    llm_expert_provider_faults allocation_fault;
+    allocation_fault.preparation = llm_expert_provider_error::allocation_failed;
+    allocation_fault.fail_preparation_after_handles = 1;
+    model->replace_expert_weight_provider_for_testing(llm_create_resident_expert_weight_provider(allocation_fault));
+    context = integration_context(model);
+    GGML_ASSERT(llama_decode(context, llama_batch_get_one(const_cast<llama_token *>(prompt.data()), prompt.size())) == -2);
+    stats = model->expert_weight_provider_stats();
+    GGML_ASSERT(stats.prepare_calls == 1);
+    GGML_ASSERT(stats.handles_acquired == 1);
+    GGML_ASSERT(stats.handles_released == 1);
+    llama_free(context);
+
+    llm_expert_provider_faults preparation_fault;
+    preparation_fault.preparation = llm_expert_provider_error::preparation_failed;
+    preparation_fault.fail_preparation_after_handles = 1;
+    model->replace_expert_weight_provider_for_testing(llm_create_resident_expert_weight_provider(preparation_fault));
+    context = integration_context(model);
+    GGML_ASSERT(llama_decode(context, llama_batch_get_one(const_cast<llama_token *>(prompt.data()), prompt.size())) == -3);
+    stats = model->expert_weight_provider_stats();
+    GGML_ASSERT(stats.handles_acquired == stats.handles_released);
+    llama_free(context);
+
+    llm_expert_provider_faults cancellation;
+    cancellation.preparation = llm_expert_provider_error::cancelled;
+    cancellation.fail_preparation_after_handles = 0;
+    model->replace_expert_weight_provider_for_testing(llm_create_resident_expert_weight_provider(cancellation));
+    context = integration_context(model);
+    GGML_ASSERT(llama_decode(context, llama_batch_get_one(const_cast<llama_token *>(prompt.data()), prompt.size())) == -3);
+    stats = model->expert_weight_provider_stats();
+    GGML_ASSERT(stats.cancellations == 1);
+    GGML_ASSERT(stats.handles_acquired == stats.handles_released);
+    llama_free(context);
+}
+
 void test_model_integration(const char * model_path, int n_gpu_layers) {
     llama_model_params disabled_params = llama_model_default_params();
     disabled_params.n_gpu_layers = n_gpu_layers;
@@ -435,6 +484,9 @@ void test_model_integration(const char * model_path, int n_gpu_layers) {
     GGML_ASSERT(resident_a.logits == disabled.logits);
     GGML_ASSERT(resident_b.generated == disabled.generated);
     GGML_ASSERT(resident_b.logits == disabled.logits);
+    if (n_gpu_layers == 0) {
+        test_model_failure_paths(resident_model);
+    }
     llama_model_free(resident_model);
 }
 

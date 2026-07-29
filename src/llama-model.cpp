@@ -1105,6 +1105,10 @@ llm_expert_provider_stats llama_model::expert_weight_provider_stats() const {
     return pimpl->expert_weight_provider ? pimpl->expert_weight_provider->get_stats() : llm_expert_provider_stats {};
 }
 
+void llama_model::replace_expert_weight_provider_for_testing(std::unique_ptr<llm_expert_weight_provider> provider) {
+    pimpl->expert_weight_provider = std::move(provider);
+}
+
 llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;

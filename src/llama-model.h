@@ -690,6 +690,7 @@ struct llama_model {
     void init_expert_weight_provider();
     llm_expert_weight_provider * expert_weight_provider() const;
     llm_expert_provider_stats expert_weight_provider_stats() const;
+    void replace_expert_weight_provider_for_testing(std::unique_ptr<llm_expert_weight_provider> provider);
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

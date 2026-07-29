@@ -108,6 +108,14 @@ struct llm_expert_provider_stats {
     uint64_t cancellations = 0;
 };
 
+struct llm_expert_graph_diagnostics {
+    uint64_t operation_hash = 0;
+    int32_t node_count = 0;
+    int32_t binding_count = 0;
+    uint64_t inflight_handles = 0;
+    int32_t graphs_reused = 0;
+};
+
 class llm_expert_weight_provider;
 
 class llm_expert_handle {

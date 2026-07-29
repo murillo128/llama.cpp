@@ -61,6 +61,7 @@ struct llama_context {
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
+    llm_expert_graph_diagnostics expert_graph_diagnostics() const;
 
     ggml_backend_sched_t get_sched() const;
 
