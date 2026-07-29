@@ -348,6 +348,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->print_info();
 
         if (params.vocab_only) {
+            model->capture_storage_metadata(ml);
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
             return {0, model_ptr.release()};
         }
@@ -603,4 +604,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
@@ -1039,6 +1040,32 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    struct source_file_storage {
+        std::string identity;
+        uint64_t size;
+        uint32_t alignment;
+    };
+
+    struct tensor_storage {
+        std::string name;
+        std::string runtime_buffer_type;
+        uint32_t source_file_index;
+        uint32_t alignment;
+        uint64_t file_offset;
+        uint64_t byte_size;
+        ggml_type type;
+        uint32_t n_dims;
+        std::array<int64_t, GGML_MAX_DIMS> ne;
+        std::array<uint64_t, GGML_MAX_DIMS> nb;
+        bool runtime_layout_transform;
+        bool runtime_backend_transform;
+        bool runtime_repack;
+    };
+
+    bool has_authoritative_file_backing = false;
+    std::vector<source_file_storage> source_files;
+    std::map<std::string, tensor_storage, llama_model_loader::weight_name_comparer> tensor_storage_by_name;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1055,6 +1082,144 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+}
+
+void llama_model::capture_storage_metadata(llama_model_loader & ml) {
+    pimpl->has_authoritative_file_backing = !ml.source_files.empty() &&
+        std::all_of(ml.source_files.begin(), ml.source_files.end(), [](const llama_model_loader::llama_source_file & source) {
+            return source.has_authoritative_identity;
+        });
+
+    pimpl->source_files.clear();
+    pimpl->tensor_storage_by_name.clear();
+    if (!pimpl->has_authoritative_file_backing) {
+        return;
+    }
+
+    pimpl->source_files.reserve(ml.source_files.size());
+    for (const auto & source : ml.source_files) {
+        pimpl->source_files.push_back({source.identity, source.size, uint32_t(source.alignment)});
+    }
+
+    struct runtime_tensor_info {
+        const ggml_tensor * tensor;
+        ggml_backend_buffer_type_t buft;
+    };
+    std::unordered_map<std::string, runtime_tensor_info> runtime_tensors;
+    for (const auto & [buft, ctx] : ml.ctx_map) {
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+            runtime_tensors.emplace(ggml_get_name(tensor), runtime_tensor_info{tensor, buft});
+        }
+    }
+
+    for (const auto & [name, weight] : ml.weights_map) {
+        const ggml_tensor * source = weight.tensor;
+        const auto runtime_it = runtime_tensors.find(name);
+        const ggml_tensor * runtime = runtime_it == runtime_tensors.end() ? nullptr : runtime_it->second.tensor;
+        ggml_backend_buffer_type_t buft = runtime_it == runtime_tensors.end() ? nullptr : runtime_it->second.buft;
+
+        bool runtime_layout_transform = false;
+        if (runtime) {
+            runtime_layout_transform = source->type != runtime->type || ggml_n_dims(source) != ggml_n_dims(runtime);
+            for (int i = 0; i < GGML_MAX_DIMS && !runtime_layout_transform; ++i) {
+                runtime_layout_transform = source->ne[i] != runtime->ne[i] || source->nb[i] != runtime->nb[i];
+            }
+        }
+
+        bool runtime_backend_transform = false;
+        std::string runtime_buffer_type;
+        if (buft) {
+            runtime_buffer_type = ggml_backend_buft_name(buft);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (!dev) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            }
+            runtime_backend_transform = dev && buft != ggml_backend_dev_buffer_type(dev);
+        }
+
+        std::string folded_buffer_type = runtime_buffer_type;
+        std::transform(folded_buffer_type.begin(), folded_buffer_type.end(), folded_buffer_type.begin(),
+                [](unsigned char c) { return char(std::tolower(c)); });
+        const bool runtime_repack = folded_buffer_type.find("repack") != std::string::npos;
+
+        impl::tensor_storage storage = {
+            name,
+            runtime_buffer_type,
+            weight.idx,
+            uint32_t(weight.alignment),
+            uint64_t(weight.offs),
+            uint64_t(ggml_nbytes(source)),
+            source->type,
+            uint32_t(ggml_n_dims(source)),
+            {},
+            {},
+            runtime_layout_transform,
+            runtime_backend_transform,
+            runtime_repack,
+        };
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            storage.ne[i] = source->ne[i];
+            storage.nb[i] = source->nb[i];
+        }
+        pimpl->tensor_storage_by_name.emplace(name, std::move(storage));
+    }
+}
+
+int32_t llama_model::source_file_count(uint32_t * count) const {
+    if (!count) {
+        return LLAMA_MODEL_STORAGE_ERROR_INVALID_ARGUMENT;
+    }
+    if (!pimpl->has_authoritative_file_backing) {
+        *count = 0;
+        return LLAMA_MODEL_STORAGE_ERROR_NO_FILE_BACKING_METADATA;
+    }
+    *count = uint32_t(pimpl->source_files.size());
+    return LLAMA_MODEL_STORAGE_STATUS_OK;
+}
+
+int32_t llama_model::source_file_metadata(uint32_t index, struct llama_model_source_file_metadata * metadata) const {
+    if (!metadata) {
+        return LLAMA_MODEL_STORAGE_ERROR_INVALID_ARGUMENT;
+    }
+    if (!pimpl->has_authoritative_file_backing) {
+        return LLAMA_MODEL_STORAGE_ERROR_NO_FILE_BACKING_METADATA;
+    }
+    if (index >= pimpl->source_files.size()) {
+        return LLAMA_MODEL_STORAGE_ERROR_NOT_FOUND;
+    }
+    const auto & source = pimpl->source_files[index];
+    *metadata = {index, source.alignment, source.size, source.identity.c_str()};
+    return LLAMA_MODEL_STORAGE_STATUS_OK;
+}
+
+int32_t llama_model::tensor_storage_metadata(const char * name, struct llama_model_tensor_storage_metadata * metadata) const {
+    if (!name || !metadata) {
+        return LLAMA_MODEL_STORAGE_ERROR_INVALID_ARGUMENT;
+    }
+    if (!pimpl->has_authoritative_file_backing) {
+        return LLAMA_MODEL_STORAGE_ERROR_NO_FILE_BACKING_METADATA;
+    }
+    const auto it = pimpl->tensor_storage_by_name.find(name);
+    if (it == pimpl->tensor_storage_by_name.end()) {
+        return LLAMA_MODEL_STORAGE_ERROR_NOT_FOUND;
+    }
+    const auto & storage = it->second;
+    metadata->tensor_name = storage.name.c_str();
+    metadata->runtime_buffer_type = storage.runtime_buffer_type.c_str();
+    metadata->source_file_index = storage.source_file_index;
+    metadata->gguf_alignment = storage.alignment;
+    metadata->file_offset = storage.file_offset;
+    metadata->byte_size = storage.byte_size;
+    metadata->type = storage.type;
+    metadata->n_dims = storage.n_dims;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        metadata->logical_shape[i] = storage.ne[i];
+        metadata->physical_strides[i] = storage.nb[i];
+    }
+    metadata->runtime_layout_transform = storage.runtime_layout_transform;
+    metadata->runtime_backend_transform = storage.runtime_backend_transform;
+    metadata->runtime_repack = storage.runtime_repack;
+    return LLAMA_MODEL_STORAGE_STATUS_OK;
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -1527,6 +1692,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+
+    capture_storage_metadata(ml);
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
@@ -2356,6 +2523,20 @@ void llama_free_model(llama_model * model) {
 
 void llama_model_free(llama_model * model) {
     delete model;
+}
+
+int32_t llama_model_source_file_count(const llama_model * model, uint32_t * count) {
+    return model ? model->source_file_count(count) : LLAMA_MODEL_STORAGE_ERROR_INVALID_ARGUMENT;
+}
+
+int32_t llama_model_get_source_file_metadata(
+        const llama_model * model, uint32_t index, struct llama_model_source_file_metadata * metadata) {
+    return model ? model->source_file_metadata(index, metadata) : LLAMA_MODEL_STORAGE_ERROR_INVALID_ARGUMENT;
+}
+
+int32_t llama_model_get_tensor_storage_metadata(
+        const llama_model * model, const char * tensor_name, struct llama_model_tensor_storage_metadata * metadata) {
+    return model ? model->tensor_storage_metadata(tensor_name, metadata) : LLAMA_MODEL_STORAGE_ERROR_INVALID_ARGUMENT;
 }
 
 int32_t llama_model_n_ctx_train(const llama_model * model) {

@@ -33,10 +33,11 @@ struct llama_model_loader {
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
+        size_t   alignment;
 
         ggml_tensor * tensor;
 
-        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), alignment(gguf_get_alignment(gguf_ctx)), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
@@ -47,6 +48,13 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+    };
+
+    struct llama_source_file {
+        std::string identity;
+        size_t size;
+        size_t alignment;
+        bool has_authoritative_identity;
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -81,6 +89,7 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    std::vector<llama_source_file> source_files;
     llama_ftype ftype;
     llama_fver  fver;
 

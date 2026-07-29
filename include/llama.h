@@ -570,6 +570,60 @@ extern "C" {
 
     LLAMA_API void llama_model_free(struct llama_model * model);
 
+    enum llama_model_storage_status {
+        LLAMA_MODEL_STORAGE_STATUS_OK                       =  0,
+        LLAMA_MODEL_STORAGE_ERROR_INVALID_ARGUMENT          = -1,
+        LLAMA_MODEL_STORAGE_ERROR_NOT_FOUND                 = -2,
+        LLAMA_MODEL_STORAGE_ERROR_NO_FILE_BACKING_METADATA  = -3,
+    };
+
+    struct llama_model_source_file_metadata {
+        uint32_t index;
+        uint32_t gguf_alignment;
+        uint64_t size;
+
+        // Exact identity supplied to llama_model_load_from_file[_splits]().
+        // The pointer remains valid for the lifetime of the model.
+        const char * identity;
+    };
+
+    struct llama_model_tensor_storage_metadata {
+        const char * tensor_name;
+        const char * runtime_buffer_type;
+
+        uint32_t source_file_index;
+        uint32_t gguf_alignment;
+        uint64_t file_offset;
+        uint64_t byte_size;
+
+        enum ggml_type type;
+        uint32_t n_dims;
+        int64_t  logical_shape[GGML_MAX_DIMS];
+        uint64_t physical_strides[GGML_MAX_DIMS];
+
+        // These describe the loaded tensor independently from its immutable GGUF layout.
+        bool runtime_layout_transform;
+        bool runtime_backend_transform;
+        bool runtime_repack;
+    };
+
+    // Source-file metadata is available only when the caller supplied file paths.
+    // FILE * and llama_model_init_from_user() inputs intentionally return
+    // LLAMA_MODEL_STORAGE_ERROR_NO_FILE_BACKING_METADATA.
+    LLAMA_API int32_t llama_model_source_file_count(
+            const struct llama_model * model,
+                             uint32_t * count);
+
+    LLAMA_API int32_t llama_model_get_source_file_metadata(
+                     const struct llama_model * model,
+                                      uint32_t   index,
+            struct llama_model_source_file_metadata * metadata);
+
+    LLAMA_API int32_t llama_model_get_tensor_storage_metadata(
+                     const struct llama_model * model,
+                                        const char * tensor_name,
+            struct llama_model_tensor_storage_metadata * metadata);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);
