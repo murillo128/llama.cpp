@@ -128,7 +128,7 @@ void test_default_and_model_ownership() {
     GGML_ASSERT(model->expert_weight_provider_stats().objects_created == 1);
     delete model;
 
-    params.expert_weights_mode = static_cast<llama_expert_weights_mode>(99);
+    params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COUNT;
     bool invalid = false;
     try {
         model = llama_model_create(LLM_ARCH_KIMI_K3, params);

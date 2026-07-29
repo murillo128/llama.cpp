@@ -352,6 +352,7 @@ extern "C" {
     enum llama_expert_weights_mode {
         LLAMA_EXPERT_WEIGHTS_MODE_DISABLED = 0,
         LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT = 1,
+        LLAMA_EXPERT_WEIGHTS_MODE_COUNT = 2,
     };
 
     struct llama_model_params {

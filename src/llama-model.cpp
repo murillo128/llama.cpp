@@ -1093,6 +1093,8 @@ void llama_model::init_expert_weight_provider() {
         case LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT:
             pimpl->expert_weight_provider = llm_create_resident_expert_weight_provider();
             return;
+        case LLAMA_EXPERT_WEIGHTS_MODE_COUNT:
+            break;
     }
     throw std::runtime_error("invalid expert weights mode");
 }
