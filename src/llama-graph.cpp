@@ -1280,6 +1280,14 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    if (!expert_provider_result.is_ready()) {
+        if (debug > 1) {
+            LLAMA_LOG_DEBUG("%s: cannot reuse graph after expert-weight provider failure\n", __func__);
+        }
+
+        return false;
+    }
+
     if (!this->params.allow_reuse(params)) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);

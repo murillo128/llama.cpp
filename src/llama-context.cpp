@@ -1602,6 +1602,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const auto & graph_provider_result = res->get_expert_provider_result();
+    if (!graph_provider_result.is_ready()) {
+        LLAMA_LOG_ERROR("%s: expert-weight provider graph binding failed\n", __func__);
+        ret = graph_provider_result.status == llm_expert_provider_status::allocation_failed ? GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();

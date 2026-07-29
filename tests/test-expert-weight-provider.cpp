@@ -199,6 +199,22 @@ void test_selection_binding_and_handles() {
     GGML_ASSERT(provider.get_stats().handles_released == 3);
 }
 
+void test_failed_graph_binding_is_never_reusable() {
+    llm_graph_result graph_result(16);
+    llm_graph_params params = {};
+    graph_result.set_params(params);
+    GGML_ASSERT(graph_result.can_reuse(params));
+
+    graph_result.set_expert_provider_result(
+        llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
+    GGML_ASSERT(!graph_result.can_reuse(params));
+    GGML_ASSERT(!graph_result.can_reuse(params));
+
+    graph_result.reset();
+    graph_result.set_params(params);
+    GGML_ASSERT(graph_result.can_reuse(params));
+}
+
 void test_resident_provider_and_plan_retention() {
     test_tensors tensors;
     auto bundle = separate_bundle(tensors);
@@ -428,6 +444,7 @@ int main(int argc, char ** argv) {
     test_default_and_model_ownership();
     test_keys_and_descriptors();
     test_selection_binding_and_handles();
+    test_failed_graph_binding_is_never_reusable();
     test_resident_provider_and_plan_retention();
     test_resident_provider_failures_cleanup_partially_acquired_handles();
     if (argc == 3) {
