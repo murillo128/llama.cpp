@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
+#include "llama-expert-weight-provider.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -1025,6 +1026,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // Declared after model buffers so provider leases and borrowed tensor references are destroyed first.
+    std::unique_ptr<llm_expert_weight_provider> expert_weight_provider;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1069,6 +1073,10 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_DISABLED &&
+        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT) {
+        throw std::invalid_argument("invalid expert weights mode");
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1076,6 +1084,24 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+}
+
+void llama_model::init_expert_weight_provider() {
+    switch (params.expert_weights_mode) {
+        case LLAMA_EXPERT_WEIGHTS_MODE_DISABLED:
+            return;
+        case LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT:
+            throw std::runtime_error("resident expert-weight provider is not available");
+    }
+    throw std::runtime_error("invalid expert weights mode");
+}
+
+llm_expert_weight_provider * llama_model::expert_weight_provider() const {
+    return pimpl->expert_weight_provider.get();
+}
+
+llm_expert_provider_stats llama_model::expert_weight_provider_stats() const {
+    return pimpl->expert_weight_provider ? pimpl->expert_weight_provider->get_stats() : llm_expert_provider_stats {};
 }
 
 llama_model::~llama_model() {
@@ -2498,6 +2524,7 @@ llama_model_params llama_model_default_params() {
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
+        /*.expert_weights_mode         =*/ LLAMA_EXPERT_WEIGHTS_MODE_DISABLED,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

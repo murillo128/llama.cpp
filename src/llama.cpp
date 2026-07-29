@@ -348,6 +348,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->print_info();
 
         if (params.vocab_only) {
+            if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_DISABLED) {
+                throw std::runtime_error("expert-weight providers require model tensors");
+            }
             model->capture_storage_metadata(ml);
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
             return {0, model_ptr.release()};
@@ -356,6 +359,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+
+        model->init_expert_weight_provider();
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {

@@ -349,6 +349,11 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    enum llama_expert_weights_mode {
+        LLAMA_EXPERT_WEIGHTS_MODE_DISABLED = 0,
+        LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT = 1,
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -359,6 +364,7 @@ extern "C" {
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
+        enum llama_expert_weights_mode expert_weights_mode; // routed-expert provider mode [EXPERIMENTAL]
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

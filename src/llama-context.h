@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+class llm_expert_weight_provider;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -287,6 +288,7 @@ private:
     //
 
     const llama_model & model;
+    llm_expert_weight_provider * expert_weight_provider;
 
     llama_cparams cparams;
 

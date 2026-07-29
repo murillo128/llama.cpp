@@ -83,6 +83,7 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    expert_weight_provider(model.expert_weight_provider()),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -1557,6 +1558,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const auto & provider_result = res->get_expert_provider_result();
+        if (!provider_result.is_ready()) {
+            LLAMA_LOG_ERROR("%s: expert-weight provider graph binding failed\n", __func__);
+            ret = provider_result.status == llm_expert_provider_status::allocation_failed ? GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2658,6 +2666,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.expert_weight_provider =*/ expert_weight_provider,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.observe_routes =*/ route_observer_submission_active,

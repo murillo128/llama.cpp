@@ -17,6 +17,8 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+class llm_expert_weight_provider;
+struct llm_expert_provider_stats;
 
 // available models
 enum llm_type {
@@ -684,6 +686,10 @@ struct llama_model {
     int32_t source_file_count(uint32_t * count) const;
     int32_t source_file_metadata(uint32_t index, struct llama_model_source_file_metadata * metadata) const;
     int32_t tensor_storage_metadata(const char * name, struct llama_model_tensor_storage_metadata * metadata) const;
+
+    void init_expert_weight_provider();
+    llm_expert_weight_provider * expert_weight_provider() const;
+    llm_expert_provider_stats expert_weight_provider_stats() const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

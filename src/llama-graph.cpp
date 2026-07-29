@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 // dedup helpers
 
@@ -1208,6 +1209,8 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
     route_outputs.clear();
+    expert_bindings.clear();
+    expert_provider_result = {};
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1322,6 +1325,17 @@ void llm_graph_result::add_route_output(llm_graph_route_output output) {
     route_outputs.push_back(output);
 }
 
+void llm_graph_result::add_expert_binding(llm_expert_graph_binding binding) {
+    GGML_ASSERT(expert_bindings.empty() || expert_bindings.back().layer <= binding.layer);
+    expert_bindings.push_back(std::move(binding));
+}
+
+void llm_graph_result::set_expert_provider_result(llm_expert_provider_result result) {
+    if (expert_provider_result.is_ready()) {
+        expert_provider_result = result;
+    }
+}
+
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
@@ -1368,6 +1382,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    expert_weight_provider(params.expert_weight_provider),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1992,6 +2007,65 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         res->add_route_output({ il, selected_experts_out, weights_out });
     }
 
+    ggml_tensor * execution_up_exps = up_exps;
+    ggml_tensor * execution_up_exps_b = up_exps_b;
+    ggml_tensor * execution_gate_exps = gate_exps;
+    ggml_tensor * execution_gate_exps_b = gate_exps_b;
+    ggml_tensor * execution_gate_up_exps = gate_up_exps;
+    ggml_tensor * execution_gate_up_exps_b = gate_up_exps_b;
+    ggml_tensor * execution_down_exps = down_exps;
+    ggml_tensor * execution_down_exps_b = down_exps_b;
+    ggml_tensor * execution_up_exps_s = up_exps_s;
+    ggml_tensor * execution_gate_exps_s = gate_exps_s;
+    ggml_tensor * execution_down_exps_s = down_exps_s;
+    ggml_tensor * execution_ids = selected_experts;
+
+    if (expert_weight_provider && res->get_expert_provider_result().is_ready()) {
+        const llm_expert_bundle_descriptor bundle = {
+            il,
+            int32_t(n_expert),
+            gate_up_exps ? llm_expert_projection_descriptor {} : llm_expert_projection_descriptor::from(up_exps, up_exps_b, up_exps_s),
+            gate_up_exps ? llm_expert_projection_descriptor {} : llm_expert_projection_descriptor::from(gate_exps, gate_exps_b, gate_exps_s),
+            gate_up_exps ? llm_expert_projection_descriptor::from(gate_up_exps, gate_up_exps_b, up_exps_s) : llm_expert_projection_descriptor {},
+            llm_expert_projection_descriptor::from(down_exps, down_exps_b, down_exps_s),
+        };
+        const llm_expert_selection selection = {
+            il,
+            int32_t(n_expert),
+            int32_t(n_expert_used),
+            n_tokens,
+            selected_experts,
+        };
+        llm_expert_graph_binding binding;
+        auto provider_result = bundle.validate();
+        if (provider_result.is_ready()) {
+            provider_result = selection.validate();
+        }
+        if (provider_result.is_ready()) {
+            provider_result = expert_weight_provider->bind(bundle, selection, binding);
+        }
+        if (provider_result.is_ready()) {
+            provider_result = binding.validate(selection);
+        }
+        if (provider_result.is_ready()) {
+            execution_up_exps = binding.up.weight;
+            execution_up_exps_b = binding.up.bias;
+            execution_gate_exps = binding.gate.weight;
+            execution_gate_exps_b = binding.gate.bias;
+            execution_gate_up_exps = binding.gate_up.weight;
+            execution_gate_up_exps_b = binding.gate_up.bias;
+            execution_down_exps = binding.down.weight;
+            execution_down_exps_b = binding.down.bias;
+            execution_up_exps_s = binding.uses_merged_gate_up() ? binding.gate_up.scale : binding.up.scale;
+            execution_gate_exps_s = binding.gate.scale;
+            execution_down_exps_s = binding.down.scale;
+            execution_ids = binding.execution_ids;
+            res->add_expert_binding(std::move(binding));
+        } else {
+            res->set_expert_provider_result(provider_result);
+        }
+    }
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
@@ -2007,17 +2081,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
+    if (execution_gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(execution_gate_up_exps, cur, execution_ids, execution_up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
-        if (up_exps_s) {
+        if (execution_up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
         }
 
-        if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+        if (execution_gate_up_exps_b) {
+            gate_up = ggml_add_id(ctx0, gate_up, execution_gate_up_exps_b, execution_ids);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
@@ -2028,40 +2102,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(execution_up_exps, cur, execution_ids, execution_up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
-        if (up_exps_s) {
+        if (execution_up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
 
-        if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+        if (execution_up_exps_b) {
+            up = ggml_add_id(ctx0, up, execution_up_exps_b, execution_ids);
             cb(up, "ffn_moe_up_biased", il);
         }
 
-        if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+        if (execution_gate_exps) {
+            cur = build_lora_mm_id(execution_gate_exps, cur, execution_ids, execution_gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
         }
 
-        if (gate_exps_s) {
+        if (execution_gate_exps_s) {
             cb(cur, "ffn_moe_gate_scaled", il);
         }
 
-        if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+        if (execution_gate_exps_b) {
+            cur = ggml_add_id(ctx0, cur, execution_gate_exps_b, execution_ids);
             cb(cur, "ffn_moe_gate_biased", il);
         }
     }
 
-    const bool has_gate = gate_exps || gate_up_exps;
+    const bool has_gate = execution_gate_exps || execution_gate_up_exps;
 
     switch (type_op) {
         case LLM_FFN_SILU:
-            if (gate_exps) {
+            if (execution_gate_exps) {
                 if (il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
@@ -2145,15 +2219,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(execution_down_exps, cur, execution_ids, execution_down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
-    if (down_exps_s) {
+    if (execution_down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
     }
 
-    if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+    if (execution_down_exps_b) {
+        experts = ggml_add_id(ctx0, experts, execution_down_exps_b, execution_ids);
         cb(experts, "ffn_moe_down_biased", il);
     }
 

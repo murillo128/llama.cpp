@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-expert-weight-provider.h"
 
 #include <cstdint>
 #include <vector>
@@ -688,6 +689,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    llm_expert_weight_provider   * expert_weight_provider;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -785,7 +787,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            expert_weight_provider == other.expert_weight_provider;
     }
 };
 
@@ -837,9 +840,13 @@ public:
     void add_fused_node(llm_graph_fused_node result);
 
     void add_route_output(llm_graph_route_output output);
+    void add_expert_binding(llm_expert_graph_binding binding);
+    void set_expert_provider_result(llm_expert_provider_result result);
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
     const std::vector<llm_graph_route_output> & get_route_outputs() const { return route_outputs; }
+    const std::vector<llm_expert_graph_binding> & get_expert_bindings() const { return expert_bindings; }
+    const llm_expert_provider_result & get_expert_provider_result() const { return expert_provider_result; }
 
     void set_params(const llm_graph_params & params);
 
@@ -861,6 +868,8 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::vector<llm_graph_route_output> route_outputs;
+    std::vector<llm_expert_graph_binding> expert_bindings;
+    llm_expert_provider_result expert_provider_result;
 
     ggml_context_ptr ctx_compute;
 
@@ -942,6 +951,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    llm_expert_weight_provider   * expert_weight_provider;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
