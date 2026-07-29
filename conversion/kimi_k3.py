@@ -45,13 +45,21 @@ class KimiK3Model(TextModel):
         "output_attn_res":    (gguf.MODEL_TENSOR.OUTPUT_RES_SCORE, False),
     }
 
-    # compressed-tensors MXFP4. The `language_model.` prefix is still present here:
-    # self.model_tensors is keyed by the raw checkpoint names, get_tensors() strips
-    # the prefix only on the way out.
+    # compressed-tensors MXFP4. The `language_model.` prefix may still be present
+    # here: self.model_tensors is keyed before get_tensors() strips it on output.
+    # Routed experts stay in MXFP4 and are repacked losslessly. Some tiny K3
+    # fixtures also quantize five resident MoE projections per sparse layer;
+    # those explicitly recognized tensors are dequantized lazily to F16.
     _MXFP4_FORMAT = "mxfp4-pack-quantized"
     _MXFP4_EXPERT_RE = re.compile(
         r"^(?:language_model\.)?model\.layers\.(\d+)"
         r"\.block_sparse_moe\.experts\.(\d+)\.(w[123])\.weight_packed$"
+    )
+    _MXFP4_RESIDENT_RE = re.compile(
+        r"^(?:language_model\.)?model\.layers\.(\d+)"
+        r"\.block_sparse_moe\."
+        r"(?:routed_expert_(?:up|down)_proj"
+        r"|shared_experts\.(?:gate|up|down)_proj)\.weight_packed$"
     )
     _MXFP4_PROJ = {
         "w1": gguf.MODEL_TENSOR.FFN_GATE_EXP,
@@ -83,15 +91,13 @@ class KimiK3Model(TextModel):
             self.gguf_writer.add_eos_token_id(eos)
 
     #
-    # compressed-tensors MXFP4 -> ggml MXFP4
+    # compressed-tensors MXFP4 -> ggml MXFP4 / resident F16
     #
-    # The real checkpoint stores only the routed experts quantized (everything
-    # else is excluded by quantization_config["ignore"]), as a
-    # weight_packed/weight_scale pair per expert. Both sides are 4-bit E2M1 with
-    # a per-32 E8M0 scale, so this is a pure repack - see repack_mxfp4_blocks.
-    #
-    # Dequantizing instead would be catastrophic here: the routed experts are
-    # ~1.38 TB at 4 bits, so a bf16 round-trip would need ~5.5 TB of output.
+    # Both source paths use 4-bit E2M1 values with a per-32 E8M0 scale. Routed
+    # experts use a pure bit repack into ggml MXFP4. Dequantizing those experts
+    # would be catastrophic for the full checkpoint: ~1.38 TB at 4 bits would
+    # require roughly 5.5 TB of bf16 output. Only the explicitly matched resident
+    # projections from the tiny fixture take the F16 dequantization path.
     #
 
     def _is_mxfp4_packed(self) -> bool:
@@ -99,19 +105,87 @@ class KimiK3Model(TextModel):
         return (quant_config.get("quant_method") == "compressed-tensors"
                 and quant_config.get("format") == self._MXFP4_FORMAT)
 
+    @staticmethod
+    def _dequant_mxfp4_tensor(packed: Tensor, scale: Tensor) -> Tensor:
+        """Dequantize compressed-tensors MXFP4 blocks to an F16 matrix."""
+        p = packed.contiguous().view(torch.uint8)
+        s = scale.contiguous().view(torch.uint8)
+
+        if p.ndim != 2:
+            raise ValueError(f"MXFP4 packed tensor must have rank 2, got shape {tuple(p.shape)}")
+
+        rows, packed_cols = p.shape
+        cols = packed_cols * 2
+        if cols % 32 != 0:
+            raise ValueError(f"MXFP4 source row has {cols} values, expected a multiple of 32")
+
+        n_blocks = cols // 32
+        if tuple(s.shape) != (rows, n_blocks):
+            raise ValueError(f"MXFP4 scale shape {tuple(s.shape)} does not match {(rows, n_blocks)}")
+
+        n_bad = int((s == 0xFF).sum())
+        if n_bad:
+            raise ValueError(f"invalid E8M0 scale byte 0xff in {n_bad} MXFP4 block(s)")
+
+        # Source byte i stores element 2i in the low nibble and 2i+1 in the high.
+        codes = torch.stack((p & 0x0F, (p >> 4) & 0x0F), dim=-1).reshape(rows, n_blocks, 32)
+        magnitudes = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            dtype=torch.float32,
+            device=codes.device,
+        )
+        values = magnitudes[(codes & 0x07).long()]
+        values = torch.where((codes & 0x08) != 0, -values, values)
+
+        block_scales = torch.ldexp(
+            torch.ones_like(s, dtype=torch.float32),
+            s.to(torch.int32) - 127,
+        )
+        values = values * block_scales.unsqueeze(-1)
+        return values.reshape(rows, cols).to(torch.float16)
+
     def dequant_model(self):
         if not self._is_mxfp4_packed():
             return super().dequant_model()
 
-        # Skipping base.py's dequant is only safe because the experts are the
-        # *only* quantized tensors. Verify that rather than assume it.
-        stray = [n for n in self.model_tensors
-                 if n.endswith(".weight_packed") and not self._MXFP4_EXPERT_RE.match(n)]
+        packed_names = [
+            name for name in self.model_tensors
+            if name.endswith(".weight_packed")
+        ]
+        resident_names = [
+            name for name in packed_names
+            if self._MXFP4_RESIDENT_RE.match(name)
+        ]
+        stray = [
+            name for name in packed_names
+            if not self._MXFP4_EXPERT_RE.match(name)
+            and not self._MXFP4_RESIDENT_RE.match(name)
+        ]
         if stray:
             raise NotImplementedError(
-                f"{len(stray)} MXFP4 tensor(s) outside the routed experts, e.g. {stray[0]!r}; "
-                "only the routed experts have a repack path"
+                f"{len(stray)} unrecognized MXFP4 tensor(s), e.g. {stray[0]!r}; "
+                "no reviewed conversion path exists"
             )
+
+        for packed_name in resident_names:
+            scale_name = packed_name.removesuffix("_packed") + "_scale"
+            weight_name = packed_name.removesuffix("_packed")
+            if scale_name not in self.model_tensors:
+                raise KeyError(f"missing {scale_name} for {packed_name}")
+
+            packed_fn = self.model_tensors[packed_name]
+            scale_fn = self.model_tensors[scale_name]
+
+            def dequantize(packed_fn=packed_fn, scale_fn=scale_fn):
+                return self._dequant_mxfp4_tensor(
+                    LazyTorchTensor.to_eager(packed_fn()),
+                    LazyTorchTensor.to_eager(scale_fn()),
+                )
+
+            self.model_tensors[weight_name] = dequantize
+            del self.model_tensors[packed_name]
+            del self.model_tensors[scale_name]
+            logger.info(f"{weight_name}: resident tensor will be dequantized to F16")
 
     def _mxfp4_expert_tensor(self, loaders: list[tuple[Callable[[], Tensor], Callable[[], Tensor]]]):
         """
