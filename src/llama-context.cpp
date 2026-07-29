@@ -19,6 +19,16 @@
 #include <stdexcept>
 #include <string>
 
+struct llm_expert_context_plans {
+    explicit llm_expert_context_plans(size_t layer_capacity) {
+        pending.reserve(layer_capacity);
+        inflight.reserve(1);
+    }
+
+    llm_expert_execution_plan pending;
+    llm_expert_execution_plan inflight;
+};
+
 //
 // llama_context
 //
@@ -472,9 +482,15 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    if (expert_weight_provider) {
+        expert_plans = std::make_unique<llm_expert_context_plans>(model.hparams.n_layer());
+    }
 }
 
 llama_context::~llama_context() {
+    synchronize();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -697,10 +713,18 @@ void llama_context::sched_reserve() {
 
 void llama_context::synchronize() {
     if (!sched) {
+        if (expert_plans) {
+            expert_plans->pending.reset();
+            expert_plans->inflight.reset();
+        }
         return;
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (expert_plans) {
+        expert_plans->pending.reset();
+        expert_plans->inflight.reset();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -801,6 +825,9 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
+        if (expert_plans && expert_plans->inflight.handle_count() != 0) {
+            synchronize();
+        }
         gf_res_prev->reset();
 
         if (!mctx->apply()) {
@@ -1541,6 +1568,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        if (expert_plans && expert_plans->inflight.handle_count() != 0) {
+            synchronize();
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1582,9 +1612,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (expert_weight_provider) {
+        GGML_ASSERT(expert_plans);
+        auto provider_result = expert_weight_provider->prepare(res->get_expert_bindings(), expert_plans->pending);
+        if (!provider_result.is_ready()) {
+            LLAMA_LOG_ERROR("%s: expert-weight provider request preparation failed\n", __func__);
+            expert_plans->pending.reset();
+            ret = provider_result.status == llm_expert_provider_status::allocation_failed ? GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        try {
+            expert_plans->inflight.absorb(std::move(expert_plans->pending));
+        } catch (const std::bad_alloc &) {
+            LLAMA_LOG_ERROR("%s: expert-weight provider plan retention failed\n", __func__);
+            ggml_backend_sched_synchronize(sched.get());
+            expert_plans->pending.reset();
+            expert_plans->inflight.reset();
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        if (expert_weight_provider) {
+            ggml_backend_sched_synchronize(sched.get());
+            expert_plans->pending.reset();
+            expert_plans->inflight.reset();
+        }
         ret = status;
         return nullptr;
     }
@@ -2600,6 +2656,9 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
+    if (expert_plans && expert_plans->inflight.handle_count() != 0) {
+        synchronize();
+    }
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that

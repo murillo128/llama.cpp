@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 enum class llm_expert_provider_status {
@@ -112,7 +113,7 @@ class llm_expert_weight_provider;
 class llm_expert_handle {
 public:
     llm_expert_handle() = default;
-    llm_expert_handle(llm_expert_weight_provider * provider, uint64_t lease_id);
+    llm_expert_handle(llm_expert_weight_provider * provider, uint64_t lease_id, uint64_t repetitions = 1);
     ~llm_expert_handle();
 
     llm_expert_handle(const llm_expert_handle &) = delete;
@@ -125,8 +126,11 @@ public:
     void reset();
 
 private:
+    friend class llm_expert_execution_plan;
+
     llm_expert_weight_provider * provider = nullptr;
     uint64_t lease_id = 0;
+    uint64_t repetitions = 0;
 };
 
 class llm_expert_execution_plan {
@@ -142,6 +146,7 @@ public:
 
     void reserve(size_t capacity);
     void add_handle(llm_expert_handle handle);
+    void absorb(llm_expert_execution_plan && other);
     void set_result(llm_expert_provider_result result);
     void reset();
 
@@ -173,4 +178,12 @@ protected:
     virtual void release_handle(uint64_t lease_id) noexcept = 0;
 };
 
-class llm_resident_expert_weight_provider;
+struct llm_expert_provider_faults {
+    llm_expert_provider_error initialization = llm_expert_provider_error::none;
+    llm_expert_provider_error binding = llm_expert_provider_error::none;
+    llm_expert_provider_error preparation = llm_expert_provider_error::none;
+    size_t fail_preparation_after_handles = SIZE_MAX;
+};
+
+std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(
+        llm_expert_provider_faults faults = {});

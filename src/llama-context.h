@@ -16,6 +16,7 @@
 
 struct llama_model;
 class llm_expert_weight_provider;
+struct llm_expert_context_plans;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -377,6 +378,9 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // Absent in the disabled mode so the legacy path constructs no request-plan object.
+    std::unique_ptr<llm_expert_context_plans> expert_plans;
 
     llama_route_observer_callback route_observer_callback = nullptr;
     void * route_observer_user_data = nullptr;
