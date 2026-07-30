@@ -26,6 +26,7 @@ struct llm_transfer_ring_config {
     ggml_backend_dev_t target_device = nullptr;
     bool allow_non_cuda_target_for_testing = false;
     bool force_pageable_fallback_for_testing = false;
+    bool force_no_events_for_testing = false;
     uint64_t initial_lane_generation_for_testing = 0;
 };
 
@@ -63,6 +64,14 @@ struct llm_transfer_ring_diagnostics {
     uint64_t waves = 0;
     uint64_t peak_in_flight_lanes = 0;
     uint64_t wave_synchronizations = 0;
+    bool dedicated_transfer_backend = false;
+    bool event_capable = false;
+    uint32_t event_capacity = 0;
+    uint32_t live_events = 0;
+    uint32_t peak_live_events = 0;
+    uint64_t event_records = 0;
+    uint64_t compute_waits = 0;
+    uint64_t event_synchronizations = 0;
     uint64_t h2d_bytes = 0;
     uint64_t h2d_time_us = 0;
     uint64_t failed_cleanups = 0;
@@ -100,6 +109,11 @@ public:
     llm_expert_provider_result transfer_wave(
         ggml_backend_t backend,
         const std::vector<llm_transfer_binding> & bindings) noexcept;
+    llm_expert_provider_result wait_for_hot(
+        ggml_backend_t compute_backend,
+        uint32_t hot_slot,
+        uint64_t hot_generation) noexcept;
+    llm_expert_provider_result retire_hot(uint32_t hot_slot, uint64_t hot_generation) noexcept;
     llm_expert_provider_result cleanup_failed_lanes() noexcept;
     llm_expert_provider_result surrender() noexcept;
     llm_expert_provider_result validate_invariants() noexcept;

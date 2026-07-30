@@ -248,6 +248,14 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_waves = 0;
     uint64_t ring_peak_in_flight_lanes = 0;
     uint64_t ring_wave_synchronizations = 0;
+    bool ring_dedicated_transfer_backend = false;
+    bool ring_event_capable = false;
+    uint32_t ring_event_capacity = 0;
+    uint32_t ring_live_events = 0;
+    uint32_t ring_peak_live_events = 0;
+    uint64_t ring_event_records = 0;
+    uint64_t ring_compute_waits = 0;
+    uint64_t ring_event_synchronizations = 0;
     uint64_t ring_h2d_bytes = 0;
     uint64_t ring_h2d_time_us = 0;
     uint64_t ring_failed_cleanup = 0;

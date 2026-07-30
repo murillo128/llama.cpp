@@ -303,6 +303,7 @@ struct llm_expert_async_transport::impl {
         uint64_t ordinal = 0;
         read_state state = read_state::free;
         bool cancel_requested = false;
+        uint32_t operations_remaining = 0;
         llm_expert_async_read_completion completion;
     };
 
@@ -315,12 +316,14 @@ struct llm_expert_async_transport::impl {
     std::vector<read_request_record> read_requests;
     std::vector<trace_record> traces;
     std::vector<uint32_t> batch_slots;
+    std::vector<llm_expert_request_handle> group_handles;
     mutable std::mutex mutex;
     std::condition_variable condition;
     std::thread worker;
     llm_expert_async_diagnostics counters;
     uint64_t next_read_ordinal = 1;
     bool worker_stop = false;
+    bool deferred_batch_open = false;
     std::vector<int> registered_files;
     uint32_t registered_file_count = 0;
     void * staging = nullptr;
@@ -428,6 +431,240 @@ struct llm_expert_async_transport::impl {
             }
         }
         sqe.user_data = llm_expert_async_transport::encode_user_data(operation_slot, operation.generation);
+        return true;
+    }
+
+    void finalize_group_request_locked(read_request_record & request, bool used_ring) {
+        if (request.cancel_requested) request.completion.result = llm_expert_async_result::closed;
+        if (request.completion.result == llm_expert_async_result::ready) {
+            std::array<const llm_expert_storage_read_segment *, 12> completed_segments{};
+            size_t completed_segment_count = 0;
+            for (const auto & operation : operations) {
+                if (!operation.active || !operation.read_operation ||
+                    operation.identity.request.slot != request.handle.slot ||
+                    operation.identity.request.generation != request.handle.generation) continue;
+                for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
+                    if (completed_segment_count < completed_segments.size()) {
+                        completed_segments[completed_segment_count++] = &operation.read.segments[index];
+                    }
+                }
+            }
+            std::sort(completed_segments.begin(), completed_segments.begin() + completed_segment_count,
+                [](const auto * lhs, const auto * rhs) {
+                    const uint8_t lhs_identity = uint8_t(lhs->projection)*3 + uint8_t(lhs->sidecar);
+                    const uint8_t rhs_identity = uint8_t(rhs->projection)*3 + uint8_t(rhs->sidecar);
+                    return lhs_identity < rhs_identity;
+                });
+            request.completion.digest = 1469598103934665603ULL;
+            for (size_t segment_index = 0; segment_index < completed_segment_count; ++segment_index) {
+                const auto & segment = *completed_segments[segment_index];
+                const auto * bytes = static_cast<const uint8_t *>(segment.data);
+                for (uint64_t byte_index = 0; byte_index < segment.byte_count; ++byte_index) {
+                    request.completion.digest ^= bytes[byte_index];
+                    request.completion.digest *= 1099511628211ULL;
+                }
+            }
+        }
+        request.state = read_state::complete;
+        request.operations_remaining = 0;
+        counters.read_requests_completed++;
+        if (request.completion.result == llm_expert_async_result::closed) counters.read_requests_cancelled++;
+        for (auto & operation : operations) {
+            if (operation.active && operation.read_operation &&
+                operation.identity.request.slot == request.handle.slot &&
+                operation.identity.request.generation == request.handle.generation) {
+                operation.active = false;
+                operation.read_operation = false;
+                operation.ring_completed = false;
+                operation.cancel_submitted = false;
+                counters.active_operations--;
+                counters.read_operations_completed++;
+                if (!used_ring) counters.synchronous_fallback_operations++;
+            }
+        }
+        counters.read_bytes_completed += request.completion.bytes_completed;
+        condition.notify_all();
+    }
+
+    void run_buffered_group_fallback(size_t handle_count) {
+        for (size_t handle_index = 0; handle_index < handle_count; ++handle_index) {
+            const auto handle = group_handles[handle_index];
+            for (auto & operation : operations) {
+                if (!operation.active || !operation.read_operation ||
+                    operation.identity.request.slot != handle.slot ||
+                    operation.identity.request.generation != handle.generation) continue;
+                for (uint8_t segment_index = 0; segment_index < operation.read.segment_count; ++segment_index) {
+                    const auto & segment = operation.read.segments[segment_index];
+                    uint64_t completed = 0;
+                    while (completed < segment.byte_count) {
+                        {
+                            std::lock_guard<std::mutex> guard(mutex);
+                            auto * request = find_read(handle);
+                            if (request == nullptr || request->cancel_requested) break;
+                        }
+                        const ssize_t result = pread(int(operation.read.native_handle),
+                            static_cast<uint8_t *>(segment.data) + completed,
+                            size_t(segment.byte_count - completed), off_t(segment.file_offset + completed));
+                        if (result < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+                        std::lock_guard<std::mutex> guard(mutex);
+                        auto * request = find_read(handle);
+                        if (request == nullptr) break;
+                        if (result <= 0) {
+                            request->completion.result = llm_expert_async_result::invalid;
+                            request->completion.native_error = result < 0 ? errno : 0;
+                            break;
+                        }
+                        completed += uint64_t(result);
+                        request->completion.bytes_completed += uint64_t(result);
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> guard(mutex);
+            auto * request = find_read(handle);
+            if (request != nullptr) finalize_group_request_locked(*request, false);
+        }
+    }
+
+    bool run_buffered_group(size_t handle_count) {
+        size_t next_operation = 0;
+        while (next_operation < operations.size()) {
+            uint32_t batch = 0;
+            {
+                std::lock_guard<std::mutex> guard(mutex);
+                for (; next_operation < operations.size() && batch < batch_slots.size(); ++next_operation) {
+                    auto & operation = operations[next_operation];
+                    if (!operation.active || !operation.read_operation) continue;
+                    auto * request = find_read(operation.identity.request);
+                    if (request == nullptr || request->state != read_state::running) continue;
+                    io_uring_sqe * sqe = ring.acquire_sqe();
+                    if (sqe == nullptr) break;
+                    operation.ring_completed = false;
+                    operation.cancel_submitted = false;
+                    batch_slots[batch++] = uint32_t(next_operation);
+                    (void) fill_read_sqe(uint32_t(next_operation), *sqe);
+                }
+            }
+            if (batch == 0) break;
+            int native_error = 0;
+            uint32_t submitted = 0;
+            while (submitted < batch) {
+                const int count = ring.submit(native_error);
+                if (count <= 0) {
+                    ring.close_ring();
+                    {
+                        std::lock_guard<std::mutex> guard(mutex);
+                        counters.io_uring_enabled = false;
+                        counters.io_uring_runtime_error = count == 0 ? EAGAIN : native_error;
+                        record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                            counters.io_uring_runtime_error, "ring-runtime");
+                    }
+                    run_buffered_group_fallback(handle_count);
+                    return false;
+                }
+                submitted += uint32_t(count);
+            }
+            {
+                std::lock_guard<std::mutex> guard(mutex);
+                counters.ring_submissions += submitted;
+                counters.peak_sq_occupancy = std::max(counters.peak_sq_occupancy, submitted);
+            }
+            uint32_t reads_left = submitted;
+            uint32_t cancels_left = 0;
+            while (reads_left != 0 || cancels_left != 0) {
+                uint32_t cancels_prepared = 0;
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    for (uint32_t index = 0; index < batch; ++index) {
+                        auto & operation = operations[batch_slots[index]];
+                        auto * request = find_read(operation.identity.request);
+                        if (request == nullptr || !request->cancel_requested ||
+                            operation.ring_completed || operation.cancel_submitted) continue;
+                        io_uring_sqe * cancel = ring.acquire_sqe();
+                        if (cancel == nullptr) break;
+                        cancel->opcode = IORING_OP_ASYNC_CANCEL;
+                        cancel->addr = llm_expert_async_transport::encode_user_data(
+                            batch_slots[index], operation.generation);
+                        cancel->cancel_flags = IORING_ASYNC_CANCEL_USERDATA;
+                        cancel->user_data = llm_expert_async_transport::encode_user_data(
+                            batch_slots[index] | 0x80000000U, operation.generation);
+                        operation.cancel_submitted = true;
+                        cancels_prepared++;
+                    }
+                }
+                if (cancels_prepared != 0) {
+                    const int count = ring.submit(native_error);
+                    if (count > 0) {
+                        cancels_left += uint32_t(count);
+                        std::lock_guard<std::mutex> guard(mutex);
+                        counters.ring_cancel_submissions += uint32_t(count);
+                    }
+                }
+                io_uring_cqe cqe{};
+                if (!ring.try_cqe(cqe)) {
+                    std::unique_lock<std::mutex> guard(mutex);
+                    counters.cq_empty_waits++;
+                    condition.wait_for(guard, std::chrono::milliseconds(1));
+                    continue;
+                }
+                uint32_t operation_slot = 0;
+                uint32_t generation = 0;
+                const bool decoded = llm_expert_async_transport::decode_user_data(
+                    cqe.user_data, operation_slot, generation);
+                const bool cancel_completion = (operation_slot & 0x80000000U) != 0;
+                operation_slot &= 0x7fffffffU;
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!decoded || operation_slot >= operations.size()) {
+                    counters.stale_completions++;
+                    if (cancel_completion) cancels_left--;
+                    else reads_left--;
+                    continue;
+                }
+                auto & operation = operations[operation_slot];
+                auto * request = find_read(operation.identity.request);
+                if (request == nullptr || operation.generation != generation) {
+                    counters.stale_completions++;
+                    if (cancel_completion) cancels_left--;
+                    else reads_left--;
+                    continue;
+                }
+                if (cancel_completion) {
+                    cancels_left--;
+                    counters.ring_cancel_completions++;
+                    if (cqe.res < 0 && cqe.res != -ENOENT && cqe.res != -EALREADY &&
+                        request->completion.result == llm_expert_async_result::ready) {
+                        request->completion.result = llm_expert_async_result::invalid;
+                        request->completion.native_error = -cqe.res;
+                    }
+                    continue;
+                }
+                if (cqe.res == -EINTR || cqe.res == -EAGAIN) {
+                    io_uring_sqe * retry = ring.acquire_sqe();
+                    int retry_error = 0;
+                    if (retry != nullptr && fill_read_sqe(operation_slot, *retry) && ring.submit(retry_error) == 1) {
+                        counters.ring_submissions++;
+                        counters.ring_completions++;
+                        if (cqe.res == -EINTR) counters.interrupted_reads_retried++;
+                        else counters.would_block_reads_retried++;
+                        continue;
+                    }
+                }
+                operation.ring_completed = true;
+                reads_left--;
+                request->operations_remaining--;
+                if (cqe.res < 0) {
+                    if (cqe.res != -ECANCELED || !request->cancel_requested) {
+                        request->completion.result = llm_expert_async_result::invalid;
+                        request->completion.native_error = -cqe.res;
+                    }
+                } else if (uint64_t(cqe.res) != operation.read.byte_count) {
+                    request->completion.result = llm_expert_async_result::invalid;
+                } else {
+                    request->completion.bytes_completed += uint64_t(cqe.res);
+                }
+                counters.ring_completions++;
+                if (request->operations_remaining == 0) finalize_group_request_locked(*request, true);
+            }
+        }
         return true;
     }
 
@@ -717,9 +954,32 @@ struct llm_expert_async_transport::impl {
         for (;;) {
             condition.wait(lock, [&] {
                 if (worker_stop) return true;
+                if (deferred_batch_open) return false;
                 for (const auto & request : read_requests) if (request.state == read_state::queued) return true;
                 return false;
             });
+#if defined(__linux__)
+            if (counters.io_uring_enabled && config.read_override_for_testing == nullptr &&
+                !config.direct_io_requested && config.submit_error_for_testing == 0 &&
+                !config.pause_after_ring_submit_for_testing && !config.inject_first_read_cqe_for_testing &&
+                config.hide_cqes_after_cancel_polls_for_testing == 0) {
+                size_t handle_count = 0;
+                for (auto & queued : read_requests) {
+                    if (queued.state != read_state::queued) continue;
+                    queued.state = read_state::running;
+                    group_handles[handle_count++] = queued.handle;
+                }
+                if (handle_count != 0) {
+                    counters.ring_request_batches++;
+                    counters.peak_ring_batch_requests = std::max(
+                        counters.peak_ring_batch_requests, uint32_t(handle_count));
+                    lock.unlock();
+                    (void) run_buffered_group(handle_count);
+                    lock.lock();
+                    continue;
+                }
+            }
+#endif
             uint32_t selected = UINT32_MAX;
             for (uint32_t slot = 0; slot < read_requests.size(); ++slot) {
                 if (read_requests[slot].state == read_state::queued &&
@@ -943,6 +1203,7 @@ struct llm_expert_async_transport::impl {
                 }
                 current->completion = completion;
                 current->state = read_state::complete;
+                current->operations_remaining = 0;
                 counters.read_requests_completed++;
                 if (completion.result == llm_expert_async_result::closed) counters.read_requests_cancelled++;
                 for (auto & operation : operations) {
@@ -994,6 +1255,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     pimpl->read_requests.resize(config.request_capacity);
     pimpl->traces.resize(config.trace_capacity);
     pimpl->batch_slots.resize(sq_entries);
+    pimpl->group_handles.resize(config.request_capacity);
     pimpl->registered_files.resize(config.source_file_capacity == 0 ? 256 : config.source_file_capacity);
     pimpl->direct_disabled_handles.resize(pimpl->registered_files.size());
     for (auto & operation : pimpl->operations) {
@@ -1012,6 +1274,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
         pimpl->read_requests.capacity()*sizeof(impl::read_request_record) +
         pimpl->traces.capacity()*sizeof(impl::trace_record) +
         pimpl->batch_slots.capacity()*sizeof(uint32_t) +
+        pimpl->group_handles.capacity()*sizeof(llm_expert_request_handle) +
         pimpl->registered_files.capacity()*sizeof(int) +
         pimpl->direct_disabled_handles.capacity()*sizeof(intptr_t);
 #if defined(__linux__)
@@ -1283,7 +1546,8 @@ void llm_expert_async_transport::record_trace_for_testing() noexcept {
 llm_expert_async_result llm_expert_async_transport::submit_read_plan(
         const llm_expert_async_operation_identity & identity,
         const llm_expert_storage_read_operation * reads,
-        size_t read_count) noexcept {
+        size_t read_count,
+        bool defer_worker) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->counters.admission_closed) return llm_expert_async_result::closed;
     if (!identity.request.valid() || identity.request.slot >= pimpl->read_requests.size() ||
@@ -1321,13 +1585,21 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
     request.ordinal = pimpl->next_read_ordinal++;
     request.state = impl::read_state::queued;
     request.cancel_requested = false;
-    request.completion = {};
+    request.operations_remaining = uint32_t(read_count);
+    request.completion = { llm_expert_async_result::ready, 0, 0 };
     pimpl->counters.read_requests_submitted++;
     pimpl->counters.active_read_requests++;
     pimpl->counters.peak_active_read_requests = std::max(
         pimpl->counters.peak_active_read_requests, pimpl->counters.active_read_requests);
-    pimpl->condition.notify_one();
+    pimpl->deferred_batch_open = defer_worker;
+    if (!defer_worker) pimpl->condition.notify_one();
     return llm_expert_async_result::ready;
+}
+
+void llm_expert_async_transport::start_deferred_reads() noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    pimpl->deferred_batch_open = false;
+    pimpl->condition.notify_one();
 }
 
 llm_expert_async_result llm_expert_async_transport::register_files(
@@ -1394,6 +1666,45 @@ llm_expert_async_result llm_expert_async_transport::wait_read(
     return completion.result;
 }
 
+llm_expert_async_result llm_expert_async_transport::wait_any_read(
+        const llm_expert_request_handle * handles,
+        size_t handle_count,
+        llm_expert_request_handle & completed_handle,
+        llm_expert_async_read_completion & completion,
+        bool (*abort_callback)(void *),
+        void * abort_callback_data) noexcept {
+    if (handles == nullptr || handle_count == 0) return llm_expert_async_result::invalid;
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    while (true) {
+        if (abort_callback != nullptr) {
+            lock.unlock();
+            const bool cancelled = abort_callback(abort_callback_data);
+            lock.lock();
+            if (cancelled) {
+                for (size_t index = 0; index < handle_count; ++index) {
+                    auto * request = pimpl->find_read(handles[index]);
+                    if (request != nullptr) request->cancel_requested = true;
+                }
+                pimpl->condition.notify_all();
+                return llm_expert_async_result::closed;
+            }
+        }
+        bool live = false;
+        for (size_t index = 0; index < handle_count; ++index) {
+            const auto * request = pimpl->find_read(handles[index]);
+            if (request == nullptr) continue;
+            live = true;
+            if (request->state == impl::read_state::complete) {
+                completed_handle = handles[index];
+                completion = request->completion;
+                return completion.result;
+            }
+        }
+        if (!live) return llm_expert_async_result::stale_generation;
+        pimpl->condition.wait_for(lock, std::chrono::milliseconds(1));
+    }
+}
+
 llm_expert_async_result llm_expert_async_transport::cancel_read(llm_expert_request_handle handle) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     auto * request = pimpl->find_read(handle);
@@ -1412,6 +1723,7 @@ llm_expert_async_result llm_expert_async_transport::release_read(llm_expert_requ
     request->handle = {};
     request->ordinal = 0;
     request->cancel_requested = false;
+    request->operations_remaining = 0;
     pimpl->counters.active_read_requests--;
     return llm_expert_async_result::ready;
 }
@@ -1437,6 +1749,7 @@ bool llm_expert_async_transport::shutdown() noexcept {
             }
         }
         pimpl->worker_stop = true;
+        pimpl->deferred_batch_open = false;
         pimpl->condition.notify_all();
     }
     if (pimpl->worker.joinable() && pimpl->worker.get_id() != std::this_thread::get_id()) {
@@ -1452,6 +1765,7 @@ bool llm_expert_async_transport::shutdown() noexcept {
     for (auto & request : pimpl->read_requests) {
         if (request.state == impl::read_state::complete) {
             request.state = impl::read_state::free;
+            request.operations_remaining = 0;
             if (pimpl->counters.active_read_requests > 0) pimpl->counters.active_read_requests--;
         } else if (request.state != impl::read_state::free) {
             drained = false;

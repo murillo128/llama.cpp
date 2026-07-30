@@ -147,6 +147,8 @@ struct llm_expert_async_diagnostics {
     uint32_t peak_cq_occupancy = 0;
     uint64_t ring_cancel_submissions = 0;
     uint64_t ring_cancel_completions = 0;
+    uint64_t ring_request_batches = 0;
+    uint32_t peak_ring_batch_requests = 0;
     uint64_t cq_empty_waits = 0;
     uint64_t cq_empty_waits_after_cancel = 0;
     uint32_t registered_file_count = 0;
@@ -203,10 +205,19 @@ public:
     llm_expert_async_result submit_read_plan(
             const llm_expert_async_operation_identity & identity,
             const llm_expert_storage_read_operation * operations,
-            size_t operation_count) noexcept;
+            size_t operation_count,
+            bool defer_worker = false) noexcept;
+    void start_deferred_reads() noexcept;
     llm_expert_async_result register_files(const intptr_t * handles, size_t handle_count) noexcept;
     llm_expert_async_result wait_read(
             llm_expert_request_handle request,
+            llm_expert_async_read_completion & completion,
+            bool (*abort_callback)(void *) = nullptr,
+            void * abort_callback_data = nullptr) noexcept;
+    llm_expert_async_result wait_any_read(
+            const llm_expert_request_handle * requests,
+            size_t request_count,
+            llm_expert_request_handle & completed_request,
             llm_expert_async_read_completion & completion,
             bool (*abort_callback)(void *) = nullptr,
             void * abort_callback_data = nullptr) noexcept;

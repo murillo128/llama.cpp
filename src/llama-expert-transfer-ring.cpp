@@ -104,6 +104,7 @@ bool derive_layout(
 struct llm_expert_transfer_ring::impl {
     struct lane_state : llm_transfer_ring_diagnostics::lane {
         llm_cold_expert_cache * cold_cache = nullptr;
+        ggml_backend_event_t event = nullptr;
     };
 
     impl(llm_transfer_ring_config config, llm_transfer_ring_faults faults) : config(config), faults(faults) {
@@ -131,10 +132,18 @@ struct llm_expert_transfer_ring::impl {
         lane.state = llm_transfer_lane_state::free;
     }
 
+    void synchronize_lane(lane_state & lane) {
+        if (lane.state != llm_transfer_lane_state::in_flight || lane.event == nullptr) return;
+        ggml_backend_event_synchronize(lane.event);
+        counters.event_synchronizations++;
+        if (counters.live_events > 0) counters.live_events--;
+    }
+
     llm_transfer_ring_config config;
     llm_transfer_ring_faults faults;
     mutable std::mutex mutex;
     ggml_backend_buffer_ptr arena;
+    ggml_backend_ptr transfer_backend;
     uint8_t * base = nullptr;
     std::vector<span_layout> spans;
     std::vector<lane_state> lanes;
@@ -148,7 +157,12 @@ llm_expert_transfer_ring::llm_expert_transfer_ring(
 llm_expert_transfer_ring::~llm_expert_transfer_ring() {
     if (!pimpl) return;
     std::lock_guard<std::mutex> lock(pimpl->mutex);
-    for (auto & lane : pimpl->lanes) pimpl->release_lane(lane);
+    for (auto & lane : pimpl->lanes) {
+        pimpl->synchronize_lane(lane);
+        pimpl->release_lane(lane);
+        if (lane.event != nullptr) ggml_backend_event_free(lane.event);
+        lane.event = nullptr;
+    }
 }
 
 llm_expert_provider_result llm_expert_transfer_ring::initialize(
@@ -209,11 +223,44 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
         pimpl->counters.lane_footprint = footprint;
         pimpl->counters.alignment = native_alignment;
         pimpl->counters.effective_lanes = lane_count;
-        pimpl->counters.acquisition_method = pinned ? "device-native-host" : "pageable-cpu";
-        pimpl->counters.fallback_reason = pinned ? "" : fallback_reason;
+        bool event_capable = false;
+        if (pinned && !pimpl->config.force_no_events_for_testing) {
+            ggml_backend_dev_props properties{};
+            ggml_backend_dev_get_props(pimpl->config.target_device, &properties);
+            if (properties.caps.async && properties.caps.events) {
+                pimpl->transfer_backend.reset(ggml_backend_dev_init(pimpl->config.target_device, nullptr));
+                event_capable = bool(pimpl->transfer_backend);
+                if (event_capable) {
+                    for (auto & lane : pimpl->lanes) {
+                        lane.event = ggml_backend_event_new(pimpl->config.target_device);
+                        if (lane.event == nullptr) {
+                            event_capable = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!event_capable) fallback_reason = "transfer-events-unavailable";
+        } else if (pinned) {
+            fallback_reason = "forced-no-events-for-testing";
+        }
+        if (!event_capable) {
+            for (auto & lane : pimpl->lanes) {
+                if (lane.event != nullptr) ggml_backend_event_free(lane.event);
+                lane.event = nullptr;
+            }
+            pimpl->transfer_backend.reset();
+        }
+        pimpl->counters.acquisition_method = pinned ?
+            (event_capable ? "device-native-host-events" : "device-native-host-synchronous") : "pageable-cpu";
+        pimpl->counters.fallback_reason = event_capable ? "" : fallback_reason;
         pimpl->counters.pageable_fallback = !pinned;
         pimpl->counters.pinned_or_registered_bytes = pinned ? actual : 0;
         pimpl->counters.fallback_count = pinned ? 0 : 1;
+        if (pinned && !event_capable) pimpl->counters.fallback_count = 1;
+        pimpl->counters.dedicated_transfer_backend = event_capable;
+        pimpl->counters.event_capable = event_capable;
+        pimpl->counters.event_capacity = event_capable ? lane_count : 0;
         pimpl->arena = std::move(candidate);
         return llm_expert_provider_result::success();
     } catch (const std::bad_alloc &) {
@@ -235,6 +282,15 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
     if (!pimpl->arena) return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
     uint32_t index = 0;
     while (index < pimpl->lanes.size() && pimpl->lanes[index].state != llm_transfer_lane_state::free) index++;
+    if (index == pimpl->lanes.size()) {
+        for (index = 0; index < pimpl->lanes.size(); ++index) {
+            if (pimpl->lanes[index].state == llm_transfer_lane_state::in_flight) {
+                pimpl->synchronize_lane(pimpl->lanes[index]);
+                pimpl->release_lane(pimpl->lanes[index]);
+                break;
+            }
+        }
+    }
     if (index == pimpl->lanes.size()) return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
     auto & lane = pimpl->lanes[index];
     if (lane.generation == std::numeric_limits<uint64_t>::max()) {
@@ -324,7 +380,12 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
         fail_bindings();
         return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
     }
-    const bool async = pimpl->counters.pinned_or_registered_bytes > 0;
+    const bool async = pimpl->counters.event_capable;
+    if (async && (backend == nullptr || ggml_backend_get_device(backend) != pimpl->config.target_device)) {
+        std::fprintf(stderr, "error: expert transfer backend/device mismatch during enqueue\n");
+        fail_bindings();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    }
     const int64_t start = ggml_time_us();
     uint64_t bytes = 0;
     for (const auto & binding : bindings) {
@@ -336,7 +397,7 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
             const auto * data = pimpl->base + size_t(binding.lane.lane)*pimpl->counters.lane_footprint + span.offset;
             const size_t offset = size_t(binding.hot_slot)*span.bytes;
             if (async) {
-                ggml_backend_tensor_set_async(backend, target, data, offset, span.bytes);
+                ggml_backend_tensor_set_async(pimpl->transfer_backend.get(), target, data, offset, span.bytes);
                 pimpl->counters.async_enqueues++;
             } else {
                 ggml_backend_tensor_set(target, data, offset, span.bytes);
@@ -344,17 +405,57 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
             }
             bytes += span.bytes;
         }
+        if (async) {
+            ggml_backend_event_record(lane.event, pimpl->transfer_backend.get());
+            pimpl->counters.event_records++;
+            pimpl->counters.live_events++;
+            pimpl->counters.peak_live_events = std::max(
+                pimpl->counters.peak_live_events, pimpl->counters.live_events);
+        }
     }
     if (async) {
         pimpl->counters.peak_in_flight_lanes = std::max<uint64_t>(
             pimpl->counters.peak_in_flight_lanes, bindings.size());
-        ggml_backend_synchronize(backend);
-        pimpl->counters.wave_synchronizations++;
     }
     pimpl->counters.waves++;
     pimpl->counters.h2d_bytes += bytes;
     pimpl->counters.h2d_time_us += ggml_time_us() - start;
-    for (const auto & binding : bindings) pimpl->release_lane(pimpl->lanes[binding.lane.lane]);
+    if (!async) {
+        for (const auto & binding : bindings) pimpl->release_lane(pimpl->lanes[binding.lane.lane]);
+    }
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
+        ggml_backend_t compute_backend,
+        uint32_t hot_slot,
+        uint64_t hot_generation) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    for (auto & lane : pimpl->lanes) {
+        if (lane.hot_slot != hot_slot || lane.hot_generation != hot_generation ||
+            lane.state != llm_transfer_lane_state::in_flight) continue;
+        if (compute_backend == nullptr || ggml_backend_get_device(compute_backend) != pimpl->config.target_device ||
+            lane.event == nullptr) {
+            std::fprintf(stderr, "error: expert transfer backend/device mismatch during compute wait\n");
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+        }
+        ggml_backend_event_wait(compute_backend, lane.event);
+        pimpl->counters.compute_waits++;
+        return llm_expert_provider_result::success();
+    }
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::retire_hot(
+        uint32_t hot_slot,
+        uint64_t hot_generation) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    for (auto & lane : pimpl->lanes) {
+        if (lane.hot_slot != hot_slot || lane.hot_generation != hot_generation ||
+            lane.state != llm_transfer_lane_state::in_flight) continue;
+        pimpl->synchronize_lane(lane);
+        pimpl->release_lane(lane);
+    }
     return llm_expert_provider_result::success();
 }
 
@@ -365,6 +466,11 @@ llm_expert_provider_result llm_expert_transfer_ring::cleanup_failed_lanes() noex
         return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
     }
     for (auto & lane : pimpl->lanes) {
+        if (lane.state == llm_transfer_lane_state::in_flight) {
+            pimpl->synchronize_lane(lane);
+            pimpl->release_lane(lane);
+            continue;
+        }
         if (lane.state == llm_transfer_lane_state::failed || lane.state == llm_transfer_lane_state::staging) {
             pimpl->release_lane(lane);
         }
@@ -374,15 +480,26 @@ llm_expert_provider_result llm_expert_transfer_ring::cleanup_failed_lanes() noex
 
 llm_expert_provider_result llm_expert_transfer_ring::surrender() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
-    for (const auto & lane : pimpl->lanes) {
-        if (lane.state != llm_transfer_lane_state::free) {
+    for (auto & lane : pimpl->lanes) {
+        if (lane.state == llm_transfer_lane_state::in_flight) {
+            pimpl->synchronize_lane(lane);
+            pimpl->release_lane(lane);
+        } else if (lane.state != llm_transfer_lane_state::free) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         }
     }
+    for (auto & lane : pimpl->lanes) {
+        if (lane.event != nullptr) ggml_backend_event_free(lane.event);
+        lane.event = nullptr;
+    }
+    pimpl->transfer_backend.reset();
     pimpl->arena.reset(); pimpl->base = nullptr; pimpl->spans.clear(); pimpl->lanes.clear();
     pimpl->counters.actual_bytes = 0;
     pimpl->counters.pinned_or_registered_bytes = 0;
     pimpl->counters.effective_lanes = 0;
+    pimpl->counters.event_capacity = 0;
+    pimpl->counters.event_capable = false;
+    pimpl->counters.dedicated_transfer_backend = false;
     pimpl->counters.unused_budget_bytes = pimpl->config.byte_budget;
     return llm_expert_provider_result::success();
 }
@@ -401,6 +518,10 @@ llm_expert_provider_result llm_expert_transfer_ring::validate_invariants() noexc
     }
     if (pimpl->counters.pageable_fallback &&
         (pimpl->counters.pinned_or_registered_bytes != 0 || pimpl->counters.async_enqueues != 0 || inflight != 0)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    if (inflight != pimpl->counters.live_events ||
+        (pimpl->counters.event_capable && pimpl->counters.event_capacity != pimpl->lanes.size())) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
     return llm_expert_provider_result::success();

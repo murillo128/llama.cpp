@@ -67,7 +67,7 @@ llm_cold_expert_cache make_cold(const fixture & source) {
 }
 
 llm_transfer_ring_config ring_config(uint64_t bytes, uint32_t minimum = 2, uint64_t generation = 0) {
-    return { bytes, minimum, cpu_device(), true, true, generation };
+    return { bytes, minimum, cpu_device(), true, true, false, generation };
 }
 
 void assert_slot_matches(const fixture & source, const fixture & hot, int32_t expert, uint32_t slot) {

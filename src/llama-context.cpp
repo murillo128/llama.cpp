@@ -1668,7 +1668,10 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
     }
 
     if (checkpoint != nullptr) {
-        ggml_backend_t execution_backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
+        ggml_tensor * expert_weight = checkpoint->up.weight != nullptr ? checkpoint->up.weight :
+            (checkpoint->gate_up.weight != nullptr ? checkpoint->gate_up.weight : checkpoint->down.weight);
+        ggml_backend_t execution_backend = expert_weight == nullptr ? nullptr :
+            ggml_backend_sched_get_tensor_backend(ctx->sched.get(), expert_weight);
         if (execution_backend == nullptr) {
             ctx->expert_eval_result = llm_expert_provider_result::failure(
                 llm_expert_provider_error::invalid_binding);

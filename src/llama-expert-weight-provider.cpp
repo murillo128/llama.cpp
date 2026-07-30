@@ -185,6 +185,23 @@ struct storage_load_context {
     void * abort_callback_data = nullptr;
 };
 
+struct storage_async_flight {
+    llm_expert_key key = { -1, -1 };
+    llm_cold_reference cold;
+    llm_expert_request_handle handle;
+    std::array<llm_expert_storage_destination, 12> destinations;
+    std::array<llm_expert_storage_read_operation, 12> operations;
+    size_t destination_count = 0;
+    size_t operation_count = 0;
+    bool cold_hit = false;
+    bool reserved = false;
+    bool submitted = false;
+    bool read_active = false;
+    bool scheduler_active = false;
+    bool processed = false;
+    llm_expert_request_state scheduler_state = llm_expert_request_state::free;
+};
+
 bool append_storage_destination(
         std::array<llm_expert_storage_destination, 12> & destinations,
         size_t & count,
@@ -228,6 +245,21 @@ bool append_storage_projection(
                identity, llm_expert_storage_sidecar::bias) &&
         append_storage_destination(destinations, count, projection.scale, n_expert, slot, false,
                identity, llm_expert_storage_sidecar::scale);
+}
+
+bool build_storage_destinations(
+        storage_async_flight & flight,
+        const llm_expert_bundle_descriptor & destination,
+        uint32_t slot) {
+    flight.destination_count = 0;
+    return append_storage_projection(flight.destinations, flight.destination_count,
+               destination.up, destination.n_expert, slot, llm_expert_storage_projection::up) &&
+        append_storage_projection(flight.destinations, flight.destination_count,
+               destination.gate, destination.n_expert, slot, llm_expert_storage_projection::gate) &&
+        append_storage_projection(flight.destinations, flight.destination_count,
+               destination.gate_up, destination.n_expert, slot, llm_expert_storage_projection::gate_up) &&
+        append_storage_projection(flight.destinations, flight.destination_count,
+               destination.down, destination.n_expert, slot, llm_expert_storage_projection::down);
 }
 
 llm_expert_provider_result load_storage_bundle(
@@ -1368,6 +1400,9 @@ public:
                     auto touched = cold_cache->acquire(backing, llm_cold_reference_kind::request);
                     if (touched.is_ready()) touched = cold_cache->release(backing, llm_cold_reference_kind::request);
                     if (!touched.is_ready()) return fail(touched);
+                    touched = transfer_ring->wait_for_hot(execution_backend, uint32_t(unique_slots[index]),
+                        entry.generation);
+                    if (!touched.is_ready()) return fail(touched);
                 }
                 pin_slot_locked(uint32_t(unique_slots[index]));
                 hit_count++;
@@ -1380,6 +1415,8 @@ public:
             auto & entry = directory_slots[slot];
             if (entry.state != hot_slot_state::free) {
                 if (config.cold_mode) {
+                    auto retired = transfer_ring->retire_hot(slot, entry.generation);
+                    if (!retired.is_ready()) return fail(retired);
                     if (!entry.has_cold_backing) {
                         metadata_mismatches++;
                         return fail(llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch));
@@ -1414,77 +1451,309 @@ public:
             copy_result = llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
         if (config.cold_mode) {
-            storage_load_context storage_context = {
-                config.storage,
-                config.async_transport,
-                config.scheduler,
-                provider_lock,
-                {},
-                false,
-                abort_callback,
-                abort_callback_data,
-            };
-            for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
-                const uint32_t unique_index = miss_unique_indices[index];
-                const uint32_t slot = candidate_slots[index];
-                auto & entry = directory_slots[slot];
-                copy_result = config.storage ? cold_cache->find_or_admit_with_loader(
-                    unique_keys[unique_index], cold_references[index], load_storage_bundle, &storage_context) :
-                    cold_cache->find_or_admit(
-                        unique_keys[unique_index], registration->second, cold_references[index],
-                        faults.fail_copy_after_tensors);
-                if (storage_context.completed_io_pending_publication) {
-                    const auto handle = storage_context.completed_io_handle;
-                    if (copy_result.is_ready()) {
-                        const auto host_ready = config.scheduler->transition(
-                            handle, llm_expert_request_state::io_in_flight,
-                            llm_expert_request_state::host_ready);
-                        if (host_ready == llm_expert_schedule_disposition::admitted) {
-                            (void) config.scheduler->finish(handle, llm_expert_request_state::complete);
-                        } else {
+            if (config.storage && config.async_transport && config.scheduler) {
+                size_t submitted_count = 0;
+                for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
+                    auto & flight = async_flights[index];
+                    flight = {};
+                    const uint32_t unique_index = miss_unique_indices[index];
+                    flight.key = unique_keys[unique_index];
+                    bool cold_hit = false;
+                    copy_result = cold_cache->reserve_or_find(flight.key, flight.cold, cold_hit);
+                    flight.cold_hit = cold_hit;
+                    flight.reserved = copy_result.is_ready() && !cold_hit;
+                    cold_references[index] = flight.cold;
+                    if (!copy_result.is_ready() || cold_hit) continue;
+                    if (!build_storage_destinations(flight, cold_cache->bundle(), flight.cold.slot)) {
+                        copy_result = llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch);
+                        break;
+                    }
+                    const auto planned = config.storage->make_read_plan(
+                        flight.key, flight.destinations.data(), flight.destination_count,
+                        flight.operations.data(), flight.operations.size(), flight.operation_count);
+                    if (!planned.is_ready()) {
+                        copy_result = llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch);
+                        break;
+                    }
+                    const auto scheduled = config.scheduler->enqueue(
+                        flight.key, llm_expert_priority::demand_current_layer,
+                        llm_expert_readiness::device_ready);
+                    if (scheduled.disposition != llm_expert_schedule_disposition::admitted) {
+                        copy_result = llm_expert_provider_result::failure(
+                            scheduled.disposition == llm_expert_schedule_disposition::generation_exhausted ?
+                                llm_expert_provider_error::generation_exhausted : llm_expert_provider_error::busy);
+                        break;
+                    }
+                    flight.handle = scheduled.handle;
+                    flight.scheduler_active = true;
+                    flight.scheduler_state = llm_expert_request_state::queued;
+                    llm_expert_request_snapshot selected;
+                    const auto taken = config.scheduler->take_next(selected);
+                    if (taken.disposition != llm_expert_schedule_disposition::admitted ||
+                        selected.handle.slot != scheduled.handle.slot ||
+                        selected.handle.generation != scheduled.handle.generation) {
+                        if (taken.disposition == llm_expert_schedule_disposition::admitted) {
+                            (void) config.scheduler->transition(selected.handle,
+                                llm_expert_request_state::submitting,
+                                llm_expert_request_state::draining);
+                            (void) config.scheduler->finish(
+                                selected.handle, llm_expert_request_state::failed);
+                            (void) config.scheduler->release_terminal(selected.handle);
+                        }
+                        copy_result = llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch);
+                        break;
+                    }
+                    flight.scheduler_state = llm_expert_request_state::submitting;
+                    const llm_expert_async_operation_identity identity = {
+                        config.async_transport->diagnostics().transport_epoch,
+                        flight.handle, 0, flight.key, llm_expert_readiness::device_ready,
+                        llm_expert_priority::demand_current_layer,
+                    };
+                    const auto submitted = config.async_transport->submit_read_plan(
+                        identity, flight.operations.data(), flight.operation_count, true);
+                    if (submitted != llm_expert_async_result::ready) {
+                        copy_result = llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+                        break;
+                    }
+                    flight.submitted = true;
+                    flight.read_active = true;
+                    async_handles[submitted_count] = flight.handle;
+                    submitted_count++;
+                    if (config.scheduler->transition(flight.handle, llm_expert_request_state::submitting,
+                            llm_expert_request_state::io_in_flight) != llm_expert_schedule_disposition::admitted) {
+                        copy_result = llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+                        break;
+                    }
+                    flight.scheduler_state = llm_expert_request_state::io_in_flight;
+                }
+                if (submitted_count != 0) config.async_transport->start_deferred_reads();
+
+                for (size_t completed_count = 0;
+                        completed_count < miss_count && copy_result.is_ready(); ++completed_count) {
+                    size_t index = miss_count;
+                    for (size_t candidate = 0; candidate < miss_count; ++candidate) {
+                        if (async_flights[candidate].cold_hit && !async_flights[candidate].processed) {
+                            index = candidate;
+                            break;
+                        }
+                    }
+                    llm_expert_async_read_completion completion;
+                    llm_expert_async_result waited = llm_expert_async_result::ready;
+                    if (index == miss_count) {
+                        llm_expert_request_handle completed_handle;
+                        if (provider_lock != nullptr) provider_lock->unlock();
+                        waited = config.async_transport->wait_any_read(
+                            async_handles.data(), submitted_count, completed_handle, completion,
+                            abort_callback, abort_callback_data);
+                        if (provider_lock != nullptr) provider_lock->lock();
+                        for (size_t candidate = 0; candidate < miss_count; ++candidate) {
+                            const auto & candidate_flight = async_flights[candidate];
+                            if (!candidate_flight.processed && candidate_flight.handle.slot == completed_handle.slot &&
+                                candidate_flight.handle.generation == completed_handle.generation) {
+                                index = candidate;
+                                break;
+                            }
+                        }
+                        if (index == miss_count) {
+                            copy_result = llm_expert_provider_result::failure(
+                                waited == llm_expert_async_result::closed ?
+                                    llm_expert_provider_error::cancelled :
+                                    llm_expert_provider_error::stale_generation);
+                            break;
+                        }
+                    }
+                    auto & flight = async_flights[index];
+                    flight.processed = true;
+                    if (flight.submitted) {
+                        const auto released = config.async_transport->release_read(flight.handle);
+                        if (released == llm_expert_async_result::ready) flight.read_active = false;
+                        const auto storage_error = waited == llm_expert_async_result::ready ?
+                            llm_expert_storage_error::none :
+                            (waited == llm_expert_async_result::closed ? llm_expert_storage_error::cancelled :
+                             (completion.native_error == 0 ? llm_expert_storage_error::short_read :
+                              llm_expert_storage_error::io_error));
+                        config.storage->record_async_read(
+                            flight.destination_count, completion.bytes_completed, storage_error,
+                            completion.native_error);
+                        uint64_t digest = 1469598103934665603ULL;
+                        if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready) {
+                            for (size_t destination = 0; destination < flight.destination_count; ++destination) {
+                                const auto * bytes = static_cast<const uint8_t *>(flight.destinations[destination].data);
+                                for (uint64_t offset = 0; offset < flight.destinations[destination].extent; ++offset) {
+                                    digest ^= bytes[offset];
+                                    digest *= 1099511628211ULL;
+                                }
+                            }
+                        }
+                        const bool integrity_matches = waited == llm_expert_async_result::ready &&
+                            released == llm_expert_async_result::ready && digest == completion.digest;
+                        config.storage->record_integrity_check(integrity_matches);
+                        if (!integrity_matches) {
+                            copy_result = llm_expert_provider_result::failure(
+                                waited == llm_expert_async_result::closed ? llm_expert_provider_error::cancelled :
+                                llm_expert_provider_error::copy_failed);
+                            break;
+                        }
+                        copy_result = cold_cache->publish_ready(flight.key, flight.cold);
+                        if (copy_result.is_ready()) flight.reserved = false;
+                        if (copy_result.is_ready() && config.scheduler->transition(flight.handle,
+                                llm_expert_request_state::io_in_flight,
+                                llm_expert_request_state::host_ready) != llm_expert_schedule_disposition::admitted) {
                             copy_result = llm_expert_provider_result::failure(
                                 llm_expert_provider_error::metadata_mismatch);
-                            (void) config.scheduler->transition(handle,
-                                llm_expert_request_state::io_in_flight,
-                                llm_expert_request_state::draining);
-                            (void) config.scheduler->finish(handle, llm_expert_request_state::failed);
                         }
-                    } else {
-                        (void) config.scheduler->transition(handle,
-                            llm_expert_request_state::io_in_flight,
-                            llm_expert_request_state::draining);
-                        (void) config.scheduler->finish(handle, llm_expert_request_state::failed);
+                        if (copy_result.is_ready()) flight.scheduler_state = llm_expert_request_state::host_ready;
                     }
-                    (void) config.scheduler->release_terminal(handle);
-                    storage_context.completed_io_handle = {};
-                    storage_context.completed_io_pending_publication = false;
-                }
-                if (copy_result.is_ready()) {
-                    copy_result = cold_cache->acquire(cold_references[index], llm_cold_reference_kind::hot);
-                }
-                if (copy_result.is_ready()) {
-                    entry.cold_slot = cold_references[index].slot;
-                    entry.cold_generation = cold_references[index].generation;
-                    entry.has_cold_backing = true;
-                }
-            }
-            for (size_t wave_begin = 0; wave_begin < miss_count && copy_result.is_ready();
-                    wave_begin += transfer_lane_capacity) {
-                const size_t wave_end = std::min(miss_count, wave_begin + transfer_lane_capacity);
-                transfer_bindings.clear();
-                for (size_t index = wave_begin; index < wave_end && copy_result.is_ready(); ++index) {
+                    if (!copy_result.is_ready()) break;
+
                     const uint32_t slot = candidate_slots[index];
-                    copy_result = transfer_ring->reserve(*cold_cache, cold_references[index], slot,
-                        directory_slots[slot].generation, transfer_lanes[index]);
+                    auto & entry = directory_slots[slot];
+                    copy_result = cold_cache->acquire(flight.cold, llm_cold_reference_kind::hot);
+                    if (copy_result.is_ready()) {
+                        entry.cold_slot = flight.cold.slot;
+                        entry.cold_generation = flight.cold.generation;
+                        entry.has_cold_backing = true;
+                    }
+                    if (copy_result.is_ready() && flight.submitted &&
+                        config.scheduler->transition(flight.handle, llm_expert_request_state::host_ready,
+                            llm_expert_request_state::h2d_in_flight) != llm_expert_schedule_disposition::admitted) {
+                        copy_result = llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch);
+                    }
+                    if (copy_result.is_ready() && flight.submitted) {
+                        flight.scheduler_state = llm_expert_request_state::h2d_in_flight;
+                    }
+                    if (copy_result.is_ready()) {
+                        copy_result = transfer_ring->reserve(*cold_cache, flight.cold, slot,
+                            entry.generation, transfer_lanes[index]);
+                    }
                     if (copy_result.is_ready()) {
                         copy_result = transfer_ring->stage(transfer_lanes[index], cold_cache->bundle());
                     }
                     if (copy_result.is_ready()) {
+                        transfer_bindings.clear();
                         transfer_bindings.push_back({ transfer_lanes[index], pool->bundle, slot });
+                        copy_result = transfer_ring->transfer_wave(execution_backend, transfer_bindings);
+                    }
+                    if (copy_result.is_ready()) {
+                        copy_result = transfer_ring->wait_for_hot(
+                            execution_backend, slot, entry.generation);
+                    }
+                    if (flight.submitted) {
+                        if (copy_result.is_ready()) {
+                            const auto device_ready = config.scheduler->transition(flight.handle,
+                                llm_expert_request_state::h2d_in_flight,
+                                llm_expert_request_state::device_ready);
+                            if (device_ready == llm_expert_schedule_disposition::admitted) {
+                                flight.scheduler_state = llm_expert_request_state::device_ready;
+                                (void) config.scheduler->finish(
+                                    flight.handle, llm_expert_request_state::complete);
+                                flight.scheduler_state = llm_expert_request_state::complete;
+                            } else {
+                                copy_result = llm_expert_provider_result::failure(
+                                    llm_expert_provider_error::metadata_mismatch);
+                            }
+                        }
+                        if (copy_result.is_ready()) {
+                            (void) config.scheduler->release_terminal(flight.handle);
+                            flight.scheduler_active = false;
+                            flight.scheduler_state = llm_expert_request_state::free;
+                        }
                     }
                 }
-                if (copy_result.is_ready()) {
-                    copy_result = transfer_ring->transfer_wave(execution_backend, transfer_bindings);
+
+                if (!copy_result.is_ready()) {
+                    for (size_t index = 0; index < miss_count; ++index) {
+                        auto & flight = async_flights[index];
+                        if (flight.read_active) {
+                            (void) config.async_transport->cancel_read(flight.handle);
+                            llm_expert_async_read_completion discarded;
+                            if (provider_lock != nullptr) provider_lock->unlock();
+                            const auto drained = config.async_transport->wait_read(flight.handle, discarded);
+                            if (provider_lock != nullptr) provider_lock->lock();
+                            (void) config.async_transport->release_read(flight.handle);
+                            const auto storage_error = copy_result.error == llm_expert_provider_error::cancelled ?
+                                llm_expert_storage_error::cancelled :
+                                (drained == llm_expert_async_result::ready ? llm_expert_storage_error::none :
+                                 (discarded.native_error == 0 ? llm_expert_storage_error::short_read :
+                                  llm_expert_storage_error::io_error));
+                            config.storage->record_async_read(
+                                flight.destination_count, discarded.bytes_completed,
+                                storage_error, discarded.native_error);
+                            flight.read_active = false;
+                        }
+                        if (flight.scheduler_active) {
+                            if (flight.scheduler_state >= llm_expert_request_state::queued &&
+                                flight.scheduler_state <= llm_expert_request_state::h2d_in_flight) {
+                                (void) config.scheduler->transition(flight.handle, flight.scheduler_state,
+                                    llm_expert_request_state::draining);
+                                flight.scheduler_state = llm_expert_request_state::draining;
+                                (void) config.scheduler->finish(
+                                    flight.handle, llm_expert_request_state::failed);
+                                flight.scheduler_state = llm_expert_request_state::failed;
+                            } else if (flight.scheduler_state == llm_expert_request_state::device_ready) {
+                                (void) config.scheduler->finish(
+                                    flight.handle, llm_expert_request_state::complete);
+                                flight.scheduler_state = llm_expert_request_state::complete;
+                            }
+                            (void) config.scheduler->release_terminal(flight.handle);
+                            flight.scheduler_active = false;
+                            flight.scheduler_state = llm_expert_request_state::free;
+                        }
+                        if (flight.reserved) (void) cold_cache->fail_reservation(flight.key, flight.cold);
+                    }
+                }
+            } else {
+                storage_load_context storage_context = {
+                    config.storage, nullptr, nullptr, provider_lock, {}, false,
+                    abort_callback, abort_callback_data,
+                };
+                for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
+                    const uint32_t unique_index = miss_unique_indices[index];
+                    const uint32_t slot = candidate_slots[index];
+                    copy_result = config.storage ? cold_cache->find_or_admit_with_loader(
+                        unique_keys[unique_index], cold_references[index], load_storage_bundle, &storage_context) :
+                        cold_cache->find_or_admit(
+                            unique_keys[unique_index], registration->second, cold_references[index],
+                            faults.fail_copy_after_tensors);
+                    if (copy_result.is_ready()) {
+                        copy_result = cold_cache->acquire(cold_references[index], llm_cold_reference_kind::hot);
+                    }
+                    if (copy_result.is_ready()) {
+                        auto & entry = directory_slots[slot];
+                        entry.cold_slot = cold_references[index].slot;
+                        entry.cold_generation = cold_references[index].generation;
+                        entry.has_cold_backing = true;
+                    }
+                }
+                for (size_t wave_begin = 0; wave_begin < miss_count && copy_result.is_ready();
+                        wave_begin += transfer_lane_capacity) {
+                    const size_t wave_end = std::min(miss_count, wave_begin + transfer_lane_capacity);
+                    transfer_bindings.clear();
+                    for (size_t index = wave_begin; index < wave_end && copy_result.is_ready(); ++index) {
+                        const uint32_t slot = candidate_slots[index];
+                        copy_result = transfer_ring->reserve(*cold_cache, cold_references[index], slot,
+                            directory_slots[slot].generation, transfer_lanes[index]);
+                        if (copy_result.is_ready()) {
+                            copy_result = transfer_ring->stage(transfer_lanes[index], cold_cache->bundle());
+                        }
+                        if (copy_result.is_ready()) {
+                            transfer_bindings.push_back({ transfer_lanes[index], pool->bundle, slot });
+                        }
+                    }
+                    if (copy_result.is_ready()) {
+                        copy_result = transfer_ring->transfer_wave(execution_backend, transfer_bindings);
+                    }
+                    if (copy_result.is_ready()) {
+                        for (const auto & transfer : transfer_bindings) {
+                            copy_result = transfer_ring->wait_for_hot(execution_backend,
+                                transfer.hot_slot, directory_slots[transfer.hot_slot].generation);
+                            if (!copy_result.is_ready()) break;
+                        }
+                    }
                 }
             }
             if (copy_result.is_ready()) {
@@ -1685,6 +1954,7 @@ public:
                     config.target_device,
                     config.allow_non_cuda_target_for_testing,
                     config.force_pageable_transfer_for_testing,
+                    false,
                     0,
                 });
                 initialized = ring_candidate->initialize(source);
@@ -1714,6 +1984,8 @@ public:
             slot_releasable.resize(config.capacity);
             cold_references.resize(config.capacity);
             transfer_lanes.resize(config.capacity);
+            async_flights.resize(config.capacity);
+            async_handles.resize(config.capacity);
             transfer_bindings.clear();
             transfer_bindings.reserve(config.capacity);
             hot_backing_scratch.clear();
@@ -1761,6 +2033,8 @@ public:
             auto & entry = directory_slots[slot];
             if (entry.state == hot_slot_state::ready && entry.refcount == 0) {
                 if (config.cold_mode && entry.has_cold_backing) {
+                    auto retired = transfer_ring->retire_hot(slot, entry.generation);
+                    if (!retired.is_ready()) return fail(retired);
                     auto released = cold_cache->release(
                         { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
                     if (!released.is_ready()) return fail(released);
@@ -1823,6 +2097,8 @@ public:
         slot_releasable.clear();
         cold_references.clear();
         transfer_lanes.clear();
+        async_flights.clear();
+        async_handles.clear();
         transfer_bindings.clear();
         hot_backing_scratch.clear();
         element_unique.clear();
@@ -1956,6 +2232,14 @@ public:
             result.ring_waves = ring.waves;
             result.ring_peak_in_flight_lanes = ring.peak_in_flight_lanes;
             result.ring_wave_synchronizations = ring.wave_synchronizations;
+            result.ring_dedicated_transfer_backend = ring.dedicated_transfer_backend;
+            result.ring_event_capable = ring.event_capable;
+            result.ring_event_capacity = ring.event_capacity;
+            result.ring_live_events = ring.live_events;
+            result.ring_peak_live_events = ring.peak_live_events;
+            result.ring_event_records = ring.event_records;
+            result.ring_compute_waits = ring.compute_waits;
+            result.ring_event_synchronizations = ring.event_synchronizations;
             result.ring_h2d_bytes = ring.h2d_bytes;
             result.ring_h2d_time_us = ring.h2d_time_us;
             result.ring_failed_cleanup = ring.failed_cleanups;
@@ -2247,6 +2531,8 @@ private:
     std::vector<uint32_t> slot_releasable;
     std::vector<llm_cold_reference> cold_references;
     std::vector<llm_transfer_lane_reference> transfer_lanes;
+    std::vector<storage_async_flight> async_flights;
+    std::vector<llm_expert_request_handle> async_handles;
     std::vector<llm_transfer_binding> transfer_bindings;
     std::vector<llm_cold_hot_backing> hot_backing_scratch;
     std::vector<int32_t> element_unique;

@@ -96,12 +96,12 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
 }
 
 struct storage_cancel_state {
-    const llm_expert_storage * storage = nullptr;
+    const llama_model * model = nullptr;
 };
 
 bool cancel_after_first_storage_read(void * user_data) {
     const auto * state = static_cast<const storage_cancel_state *>(user_data);
-    return state && state->storage && state->storage->diagnostics().read_bytes > 0;
+    return state && state->model && state->model->expert_async_diagnostics().read_bytes_completed > 0;
 }
 
 int run_live(int argc, char ** argv) {
@@ -134,7 +134,7 @@ int run_live(int argc, char ** argv) {
 
     if (args.cancel_on_storage) {
         if (args.mode != "cold" || model->expert_storage() == nullptr) return 27;
-        storage_cancel_state cancel_state = { model->expert_storage() };
+        storage_cancel_state cancel_state = { model };
         llama_set_abort_callback(context, cancel_after_first_storage_read, &cancel_state);
         llama_token token = 1;
         const int cancelled = llama_decode(context, llama_batch_get_one(&token, 1));
@@ -163,8 +163,9 @@ int run_live(int argc, char ** argv) {
                   << "\tretry_hot_admissions=" << retry_cache.admissions
                   << "\tretry_cold_admissions=" << retry_cache.cold_admissions
                   << '\n';
-        const bool valid = cancelled == 2 && cancelled_storage.read_requests == 1 &&
-            cancelled_storage.read_bytes > 0 && cancelled_storage.cancelled_reads == 1 &&
+        const bool valid = cancelled == 2 && cancelled_storage.read_requests > 0 &&
+            cancelled_storage.read_bytes > 0 &&
+            cancelled_storage.cancelled_reads == cancelled_storage.read_requests &&
             cancelled_cache.admissions == 0 && cancelled_cache.cold_admissions == 0 &&
             cancelled_cache.cold_current_hot_refs == 0 && cancelled_cache.cold_current_transfer_refs == 0 &&
             cancelled_cache.cold_current_request_refs == 0 && cancelled_cache.failed_cleanups > 0 &&
@@ -316,6 +317,8 @@ int run_live(int argc, char ** argv) {
               << "\tio_file_registration_error=" << async_diagnostics.file_registration_error
               << "\tio_requests=" << async_diagnostics.read_requests_submitted
               << "\tio_operations=" << async_diagnostics.read_operations_completed
+              << "\tio_request_batches=" << async_diagnostics.ring_request_batches
+              << "\tio_peak_batch_requests=" << async_diagnostics.peak_ring_batch_requests
               << "\tio_peak_sq_occupancy=" << async_diagnostics.peak_sq_occupancy
               << "\tio_peak_cq_occupancy=" << async_diagnostics.peak_cq_occupancy
               << "\tio_bytes=" << async_diagnostics.read_bytes_completed
@@ -360,6 +363,14 @@ int run_live(int argc, char ** argv) {
               << "\tring_h2d_time_us=" << diagnostics.ring_h2d_time_us
               << "\tring_waves=" << diagnostics.ring_waves
               << "\tring_wave_syncs=" << diagnostics.ring_wave_synchronizations
+              << "\tring_dedicated_backend=" << diagnostics.ring_dedicated_transfer_backend
+              << "\tring_event_capable=" << diagnostics.ring_event_capable
+              << "\tring_event_capacity=" << diagnostics.ring_event_capacity
+              << "\tring_live_events=" << diagnostics.ring_live_events
+              << "\tring_peak_live_events=" << diagnostics.ring_peak_live_events
+              << "\tring_event_records=" << diagnostics.ring_event_records
+              << "\tring_compute_waits=" << diagnostics.ring_compute_waits
+              << "\tring_event_syncs=" << diagnostics.ring_event_synchronizations
               << '\n';
     llama_free(context);
     llama_model_free(model);
