@@ -389,6 +389,14 @@ public:
     }
     virtual uint64_t graph_epoch() const noexcept { return 0; }
     virtual llm_hot_cache_diagnostics hot_cache_diagnostics() const { return {}; }
+    // Read-only standing-evidence seam. Production execution never calls this.
+    virtual llm_expert_provider_result debug_copy_cold_bundle(
+            llm_expert_key key,
+            std::vector<uint8_t> & bytes) const noexcept {
+        (void) key;
+        bytes.clear();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
 
 protected:
     friend class llm_expert_handle;

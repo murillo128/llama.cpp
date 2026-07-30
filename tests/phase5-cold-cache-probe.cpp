@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -50,6 +51,7 @@ struct live_arguments {
     int steps = 5;
     llama_load_mode load_mode = LLAMA_LOAD_MODE_MMAP;
     bool cancel_on_storage = false;
+    std::string dump_cold_bundle;
 };
 
 bool parse_u64(const char * text, uint64_t & result) {
@@ -76,6 +78,7 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
         else if (option == "--cold-bytes" && parse_u64(value, result.cold_bytes)) {}
         else if (option == "--ring-bytes" && parse_u64(value, result.ring_bytes)) {}
         else if (option == "--steps" && parse_u64(value, parsed) && parsed > 0 && parsed <= 64) result.steps = parsed;
+        else if (option == "--dump-cold-bundle") result.dump_cold_bundle = value;
         else if (option == "--load-mode") {
             try {
                 result.load_mode = llama_load_mode_from_str(value);
@@ -203,6 +206,39 @@ int run_live(int argc, char ** argv) {
         model->expert_weight_provider()->hot_cache_diagnostics() : llm_hot_cache_diagnostics {};
     const auto storage_diagnostics = model->expert_storage() ?
         model->expert_storage()->diagnostics() : llm_expert_storage_diagnostics {};
+    if (!args.dump_cold_bundle.empty()) {
+        if (args.mode != "cold" || !model->expert_storage() || !model->expert_weight_provider()) return 29;
+        llm_expert_key key = { -1, -1 };
+        for (const auto & slot : diagnostics.slots) {
+            if (slot.state == llm_hot_cache_diagnostics::slot::ready && slot.has_cold_backing) {
+                key = { slot.layer, slot.expert };
+                break;
+            }
+        }
+        std::vector<uint8_t> bytes;
+        if (!key.is_valid(LLAMA_MAX_LAYERS, diagnostics.n_expert) ||
+            !model->expert_weight_provider()->debug_copy_cold_bundle(key, bytes).is_ready()) return 30;
+        const auto * spans = model->expert_storage()->find(key);
+        if (!spans || spans->empty()) return 31;
+        std::ofstream output(args.dump_cold_bundle, std::ios::binary | std::ios::trunc);
+        if (!output || !output.write(reinterpret_cast<const char *>(bytes.data()), bytes.size())) return 32;
+        std::ostringstream span_records;
+        uint64_t source_bytes = 0;
+        for (size_t index = 0; index < spans->size(); ++index) {
+            if (index) span_records << ',';
+            span_records << (*spans)[index].split_index << ':' << (*spans)[index].file_offset << ':'
+                         << (*spans)[index].byte_count;
+            source_bytes += (*spans)[index].byte_count;
+        }
+        if (source_bytes != bytes.size()) return 33;
+        std::cout << "PHASE6_BUNDLE"
+                  << "\tlayer=" << key.layer
+                  << "\texpert=" << key.expert
+                  << "\tbytes=" << bytes.size()
+                  << "\tspans=" << span_records.str()
+                  << "\tdump=" << args.dump_cold_bundle
+                  << '\n';
+    }
     std::ostringstream tokens;
     for (size_t index = 0; index < generated.size(); ++index) {
         if (index) tokens << ',';

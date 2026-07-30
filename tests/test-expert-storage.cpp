@@ -22,6 +22,15 @@
 
 namespace {
 
+struct storage_lifetime_evidence {
+    size_t baseline = 0;
+    size_t peak = 0;
+    size_t final = 0;
+    bool supported = false;
+};
+
+storage_lifetime_evidence lifetime_evidence;
+
 struct temporary_file {
     std::string path;
     std::vector<uint8_t> bytes;
@@ -272,6 +281,8 @@ void test_duplicate_lifetime_and_transactional_close() {
         return count;
     };
     const size_t baseline = descriptor_count();
+    lifetime_evidence.baseline = baseline;
+    lifetime_evidence.supported = true;
 #endif
     {
         auto first_loader = std::make_unique<llama_file>(first.path.c_str(), "rb");
@@ -300,11 +311,13 @@ void test_duplicate_lifetime_and_transactional_close() {
         GGML_ASSERT(storage->read_bundle({ 0, 0 }, destination.data(), destination.size()).is_ready());
 #if !defined(_WIN32)
         GGML_ASSERT(descriptor_count() == baseline + 2);
+        lifetime_evidence.peak = descriptor_count();
 #endif
         storage.reset();
     }
 #if !defined(_WIN32)
     GGML_ASSERT(descriptor_count() == baseline);
+    lifetime_evidence.final = descriptor_count();
 #endif
 }
 
@@ -333,6 +346,14 @@ int main() {
     test_retry_short_error_cancel_and_poison();
     test_duplicate_lifetime_and_transactional_close();
     test_cold_mode_rejects_non_mmap_before_loading();
+    std::cout << "PHASE6_STORAGE_LIFETIME"
+              << "\tsupported=" << lifetime_evidence.supported
+              << "\tbaseline=" << lifetime_evidence.baseline
+              << "\tpeak=" << lifetime_evidence.peak
+              << "\tfinal=" << lifetime_evidence.final
+              << "\tbalanced=" << (lifetime_evidence.supported &&
+                    lifetime_evidence.final == lifetime_evidence.baseline)
+              << '\n';
     std::cout << "expert storage tests passed\n";
     return 0;
 }

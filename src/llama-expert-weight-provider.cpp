@@ -1800,6 +1800,65 @@ public:
         return result;
     }
 
+    llm_expert_provider_result debug_copy_cold_bundle(
+            llm_expert_key key,
+            std::vector<uint8_t> & bytes) const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        bytes.clear();
+        if (!config.cold_mode || !cold_cache || active_request ||
+            !key.is_valid(LLAMA_MAX_LAYERS, n_expert)) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
+        const auto & forward = directory_forward[forward_index(key)];
+        if (!forward_entry_matches(key, forward)) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+        }
+        const auto & entry = directory_slots[forward.slot];
+        if (!entry.has_cold_backing) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        const auto cold_diagnostics = cold_cache->diagnostics();
+        if (entry.cold_slot >= cold_diagnostics.slots.size()) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        const auto & cold_slot = cold_diagnostics.slots[entry.cold_slot];
+        if (cold_slot.state != llm_cold_slot_state::ready || cold_slot.generation != entry.cold_generation ||
+            cold_slot.key.layer != key.layer || cold_slot.key.expert != key.expert) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        std::array<llm_expert_storage_destination, 12> destinations;
+        size_t count = 0;
+        const auto & bundle = cold_cache->bundle();
+        if (!append_storage_projection(destinations, count, bundle.up, bundle.n_expert, entry.cold_slot,
+                llm_expert_storage_projection::up) ||
+            !append_storage_projection(destinations, count, bundle.gate, bundle.n_expert, entry.cold_slot,
+                llm_expert_storage_projection::gate) ||
+            !append_storage_projection(destinations, count, bundle.gate_up, bundle.n_expert, entry.cold_slot,
+                llm_expert_storage_projection::gate_up) ||
+            !append_storage_projection(destinations, count, bundle.down, bundle.n_expert, entry.cold_slot,
+                llm_expert_storage_projection::down)) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        try {
+            uint64_t total = 0;
+            for (size_t index = 0; index < count; ++index) {
+                if (destinations[index].extent > SIZE_MAX - total) {
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+                }
+                total += destinations[index].extent;
+            }
+            bytes.reserve(size_t(total));
+            for (size_t index = 0; index < count; ++index) {
+                const auto * begin = static_cast<const uint8_t *>(destinations[index].data);
+                bytes.insert(bytes.end(), begin, begin + destinations[index].extent);
+            }
+        } catch (const std::bad_alloc &) {
+            bytes.clear();
+            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+        }
+        return llm_expert_provider_result::success();
+    }
+
 protected:
     void release_handle(uint64_t lease_id) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
