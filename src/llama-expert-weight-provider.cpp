@@ -4,9 +4,11 @@
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <new>
@@ -545,6 +547,58 @@ struct hot_pool_generation {
     std::vector<uintptr_t> addresses;
 };
 
+using hot_slot_state = llm_hot_cache_diagnostics::slot::state_type;
+
+struct hot_forward_entry {
+    int32_t slot = -1;
+    uint64_t generation = 0;
+};
+
+struct hot_slot_entry {
+    llm_expert_key key = { -1, -1 };
+    uint64_t generation = 0;
+    uint64_t last_use = 0;
+    uint32_t refcount = 0;
+    hot_slot_state state = hot_slot_state::free;
+};
+
+struct hot_request_pin {
+    uint32_t slot = 0;
+    uint64_t generation = 0;
+};
+
+struct deterministic_lru_policy {
+    int32_t select_victim(
+            const std::vector<hot_slot_entry> & slots,
+            const std::vector<uint8_t> & selected,
+            const std::vector<uint32_t> & candidates,
+            size_t candidate_count,
+            const std::vector<uint32_t> & releasable) const noexcept {
+        int32_t victim = -1;
+        for (uint32_t slot = 0; slot < slots.size(); ++slot) {
+            const auto & entry = slots[slot];
+            bool already_candidate = false;
+            for (size_t index = 0; index < candidate_count; ++index) {
+                already_candidate = already_candidate || candidates[index] == slot;
+            }
+            if (selected[slot] || already_candidate ||
+                (entry.state != hot_slot_state::ready && entry.state != hot_slot_state::pinned) ||
+                entry.refcount != releasable[slot]) {
+                continue;
+            }
+            if (victim < 0 || entry.last_use < slots[victim].last_use ||
+                (entry.last_use == slots[victim].last_use && slot < uint32_t(victim))) {
+                victim = int32_t(slot);
+            }
+        }
+        return victim;
+    }
+};
+
+bool expert_key_matches(const llm_expert_key & lhs, const llm_expert_key & rhs) {
+    return lhs.layer == rhs.layer && lhs.expert == rhs.expert;
+}
+
 ggml_tensor * make_slot_tensor(
         ggml_context * ctx,
         const ggml_tensor * source,
@@ -594,6 +648,73 @@ void collect_projection_addresses(
             addresses.push_back(reinterpret_cast<uintptr_t>(tensor->data));
         }
     }
+}
+
+bool copy_expert_tensor(
+        ggml_tensor * target,
+        const ggml_tensor * source,
+        int32_t n_expert,
+        uint32_t capacity,
+        int32_t expert,
+        uint32_t slot,
+        bool weight,
+        size_t & bytes) {
+    if (target == nullptr || source == nullptr) {
+        return target == source;
+    }
+    const int source_axis = expert_axis(source, n_expert, weight);
+    if (source_axis < 0 || target->ne[source_axis] != capacity ||
+        source->data == nullptr || target->data == nullptr) {
+        return false;
+    }
+    for (int axis = source_axis + 1; axis < ggml_n_dims(source); ++axis) {
+        if (source->ne[axis] != 1 || target->ne[axis] != 1) {
+            return false;
+        }
+    }
+    const size_t span = source->nb[source_axis];
+    if (span != target->nb[source_axis]) {
+        return false;
+    }
+    const auto * source_data = static_cast<const uint8_t *>(source->data) + size_t(expert)*span;
+    ggml_backend_tensor_set(target, source_data, size_t(slot)*span, span);
+    bytes += span;
+    return true;
+}
+
+bool copy_expert_projection(
+        const llm_expert_projection_descriptor & target,
+        const llm_expert_projection_descriptor & source,
+        int32_t n_expert,
+        uint32_t capacity,
+        int32_t expert,
+        uint32_t slot,
+        size_t & bytes,
+        size_t & copies,
+        size_t fail_after) {
+    const std::array<std::pair<ggml_tensor *, const ggml_tensor *>, 3> tensors = {{
+        { target.weight, source.weight },
+        { target.bias, source.bias },
+        { target.scale, source.scale },
+    }};
+    for (size_t index = 0; index < tensors.size(); ++index) {
+        if (tensors[index].first == nullptr && tensors[index].second == nullptr) {
+            continue;
+        }
+        if (copies >= fail_after || !copy_expert_tensor(
+                tensors[index].first,
+                tensors[index].second,
+                n_expert,
+                capacity,
+                expert,
+                slot,
+                index == 0,
+                bytes)) {
+            return false;
+        }
+        copies++;
+    }
+    return true;
 }
 
 class llm_hot_cache_expert_weight_provider final : public llm_expert_weight_provider {
@@ -695,6 +816,13 @@ public:
             const std::vector<llm_expert_graph_binding> & bindings,
             llm_expert_execution_plan & plan) noexcept override {
         plan.reset();
+        try {
+            plan.reserve(1);
+        } catch (...) {
+            auto result = llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+            plan.set_result(result);
+            return result;
+        }
         std::lock_guard<std::mutex> lock(mutex);
         counters.prepare_calls++;
         if (bindings.empty()) {
@@ -702,9 +830,17 @@ public:
             return llm_expert_provider_result::success();
         }
 
+        if (!pool) {
+            auto result = llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
+            plan.set_result(result);
+            return fail(result);
+        }
+
+        size_t max_elements = 0;
         for (const auto & binding : bindings) {
             if (binding.provider_identity != this || binding.execution_ids == nullptr ||
-                binding.execution_ids->ne[0] != int64_t(config.n_expert_used) || binding.execution_ids->ne[1] < 0) {
+                binding.execution_ids->ne[0] != int64_t(config.n_expert_used) || binding.execution_ids->ne[1] < 0 ||
+                registrations.find(binding.layer) == registrations.end()) {
                 auto result = llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
                 plan.set_result(result);
                 return fail(result);
@@ -714,13 +850,47 @@ public:
                 plan.set_result(result);
                 return fail(result);
             }
+            if (binding.bootstrap || binding.graph_epoch != epoch || binding.generation_lease.get() != pool.get() ||
+                !binding_uses_current_pool(binding)) {
+                auto result = llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+                plan.set_result(result);
+                return fail(result);
+            }
+            const uint64_t elements = uint64_t(binding.execution_ids->ne[0])*uint64_t(binding.execution_ids->ne[1]);
+            if (elements > SIZE_MAX) {
+                auto result = llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+                plan.set_result(result);
+                return fail(result);
+            }
+            max_elements = std::max(max_elements, size_t(elements));
         }
 
-        // Runtime remapping is introduced by issue Phase 3. Reject submission
-        // until then so bootstrap or unpopulated pool tensors cannot execute.
-        auto result = llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
-        plan.set_result(result);
-        return fail(result);
+        if (active_request) {
+            exclusive_busy_failures++;
+            auto result = llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+            plan.set_result(result);
+            return fail(result);
+        }
+
+        try {
+            if (element_unique.size() < max_elements) {
+                element_unique.resize(max_elements);
+                scratch_reservations++;
+            }
+        } catch (const std::bad_alloc &) {
+            auto result = llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+            plan.set_result(result);
+            return fail(result);
+        }
+
+        active_request = true;
+        active_request_id = ++next_request_id;
+        request_pin_count = 0;
+        requests++;
+        counters.handles_acquired++;
+        plan.add_handle({ this, active_request_id });
+        plan.set_result(llm_expert_provider_result::success());
+        return llm_expert_provider_result::success();
     }
 
     llm_expert_provider_stats get_stats() const noexcept override {
@@ -747,6 +917,210 @@ public:
         if (n_ctx == 0 || n_ubatch == 0 || !extent_is_safe(extent)) {
             context_rejections++;
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration));
+        }
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result remap_checkpoint(
+            const llm_expert_graph_binding & binding,
+            const int32_t * logical_ids,
+            size_t logical_id_count,
+            int32_t * execution_ids) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!active_request || !pool || logical_ids == nullptr || execution_ids == nullptr ||
+            binding.provider_identity != this || binding.bootstrap || binding.graph_epoch != epoch ||
+            binding.generation_lease.get() != pool.get() || !binding_uses_current_pool(binding) ||
+            binding.execution_ids == nullptr || binding.execution_ids->ne[0] != int64_t(config.n_expert_used) ||
+            binding.execution_ids->ne[1] < 0) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
+        }
+
+        const uint64_t expected_count = uint64_t(binding.execution_ids->ne[0])*uint64_t(binding.execution_ids->ne[1]);
+        if (expected_count != logical_id_count || logical_id_count > element_unique.size() ||
+            !extent_is_safe(uint64_t(binding.execution_ids->ne[1]))) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration));
+        }
+
+        auto registration = registrations.find(binding.layer);
+        if (registration == registrations.end()) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
+        }
+
+        if (!validate_request_pins_locked()) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation));
+        }
+
+        size_t unique_count = 0;
+        for (size_t index = 0; index < logical_id_count; ++index) {
+            const int32_t expert = logical_ids[index];
+            if (expert < 0 || expert >= int32_t(n_expert)) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key));
+            }
+            const llm_expert_key key = { binding.layer, expert };
+            size_t unique_index = 0;
+            while (unique_index < unique_count && !expert_key_matches(unique_keys[unique_index], key)) {
+                unique_index++;
+            }
+            if (unique_index == unique_count) {
+                if (unique_count >= config.capacity) {
+                    return fail(llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration));
+                }
+                unique_keys[unique_count] = key;
+                unique_slots[unique_count] = -1;
+                unique_index = unique_count++;
+            }
+            element_unique[index] = int32_t(unique_index);
+        }
+
+        std::fill(slot_selected.begin(), slot_selected.end(), uint8_t(0));
+        std::fill(slot_releasable.begin(), slot_releasable.end(), uint32_t(0));
+        for (size_t index = 0; index < request_pin_count; ++index) {
+            slot_releasable[request_pins[index].slot]++;
+        }
+
+        size_t miss_count = 0;
+        for (size_t index = 0; index < unique_count; ++index) {
+            const auto & key = unique_keys[index];
+            const auto & forward = directory_forward[forward_index(key)];
+            if (forward.slot < 0) {
+                miss_unique_indices[miss_count++] = uint32_t(index);
+                continue;
+            }
+            if (!forward_entry_matches(key, forward)) {
+                metadata_mismatches++;
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch));
+            }
+            unique_slots[index] = forward.slot;
+            slot_selected[forward.slot] = 1;
+        }
+
+        size_t candidate_count = 0;
+        for (uint32_t slot = 0; slot < config.capacity && candidate_count < miss_count; ++slot) {
+            if (directory_slots[slot].state == hot_slot_state::free) {
+                candidate_slots[candidate_count++] = slot;
+            }
+        }
+        while (candidate_count < miss_count) {
+            const int32_t victim = lru_policy.select_victim(
+                directory_slots, slot_selected, candidate_slots, candidate_count, slot_releasable);
+            if (victim < 0) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::busy));
+            }
+            candidate_slots[candidate_count++] = uint32_t(victim);
+        }
+
+        for (size_t index = 0; index < candidate_count; ++index) {
+            if (directory_slots[candidate_slots[index]].generation == std::numeric_limits<uint64_t>::max()) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted));
+            }
+        }
+
+        release_request_pins_locked();
+
+        size_t hit_count = 0;
+        for (size_t index = 0; index < unique_count; ++index) {
+            if (unique_slots[index] >= 0) {
+                pin_slot_locked(uint32_t(unique_slots[index]));
+                hit_count++;
+            }
+        }
+
+        for (size_t index = 0; index < miss_count; ++index) {
+            const uint32_t unique_index = miss_unique_indices[index];
+            const uint32_t slot = candidate_slots[index];
+            auto & entry = directory_slots[slot];
+            if (entry.state != hot_slot_state::free) {
+                entry.state = hot_slot_state::evicting;
+                clear_forward_locked(entry.key, slot, entry.generation);
+                evictions++;
+            }
+            entry.state = hot_slot_state::reserved;
+            entry.key = unique_keys[unique_index];
+            entry.generation++;
+            entry.refcount = 0;
+            generation_changes++;
+            entry.state = hot_slot_state::loading;
+            unique_slots[unique_index] = int32_t(slot);
+        }
+
+        size_t transaction_copies = 0;
+        size_t transaction_bytes = 0;
+        bool copied = true;
+        for (size_t index = 0; index < miss_count && copied; ++index) {
+            const uint32_t unique_index = miss_unique_indices[index];
+            const uint32_t slot = candidate_slots[index];
+            const auto & key = unique_keys[unique_index];
+            const auto & source = registration->second;
+            copied = copy_expert_projection(pool->bundle.up, source.up, source.n_expert, config.capacity,
+                         key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
+                copy_expert_projection(pool->bundle.gate, source.gate, source.n_expert, config.capacity,
+                         key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
+                copy_expert_projection(pool->bundle.gate_up, source.gate_up, source.n_expert, config.capacity,
+                         key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
+                copy_expert_projection(pool->bundle.down, source.down, source.n_expert, config.capacity,
+                         key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors);
+        }
+        counters.tensor_copies += transaction_copies;
+        h2d_bytes += transaction_bytes;
+
+        if (!copied) {
+            for (size_t index = 0; index < miss_count; ++index) {
+                auto & entry = directory_slots[candidate_slots[index]];
+                entry.state = hot_slot_state::failed;
+                entry.refcount = 0;
+            }
+            release_request_pins_locked();
+            faults.fail_copy_after_tensors = SIZE_MAX;
+            copy_failures++;
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed));
+        }
+
+        for (size_t index = 0; index < miss_count; ++index) {
+            const uint32_t slot = candidate_slots[index];
+            auto & entry = directory_slots[slot];
+            entry.state = hot_slot_state::ready;
+            directory_forward[forward_index(entry.key)] = { int32_t(slot), entry.generation };
+            admissions++;
+            pin_slot_locked(slot);
+        }
+
+        for (size_t index = 0; index < logical_id_count; ++index) {
+            execution_ids[index] = unique_slots[element_unique[index]];
+        }
+
+        remap_checkpoints++;
+        logical_id_total += logical_id_count;
+        unique_id_total += unique_count;
+        hits += hit_count;
+        misses += miss_count;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result cleanup_failed_slots() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (active_request) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+        }
+        for (auto & entry : directory_slots) {
+            if (entry.state == hot_slot_state::failed) {
+                entry.key = { -1, -1 };
+                entry.refcount = 0;
+                entry.state = hot_slot_state::free;
+                failed_cleanups++;
+            }
+        }
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result validate_slot_generation(
+            uint32_t slot,
+            uint64_t generation) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (slot >= directory_slots.size() || directory_slots[slot].generation != generation ||
+            (directory_slots[slot].state != hot_slot_state::ready &&
+             directory_slots[slot].state != hot_slot_state::pinned)) {
+            stale_generation_failures++;
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation));
         }
         return llm_expert_provider_result::success();
     }
@@ -807,6 +1181,23 @@ public:
             collect_projection_addresses(candidate->bundle.gate, candidate->addresses);
             collect_projection_addresses(candidate->bundle.gate_up, candidate->addresses);
             collect_projection_addresses(candidate->bundle.down, candidate->addresses);
+
+            directory_forward.assign(size_t(LLAMA_MAX_LAYERS)*n_expert, {});
+            directory_slots.assign(config.capacity, {});
+            for (auto & entry : directory_slots) {
+                entry.generation = config.initial_slot_generation_for_testing;
+            }
+            unique_keys.resize(config.capacity);
+            unique_slots.resize(config.capacity);
+            miss_unique_indices.resize(config.capacity);
+            candidate_slots.resize(config.capacity);
+            slot_selected.resize(config.capacity);
+            slot_releasable.resize(config.capacity);
+            request_pins.resize(config.capacity);
+            element_unique.clear();
+            request_pin_count = 0;
+            active_request = false;
+
             candidate->id = ++generation;
             pool = std::move(candidate);
             epoch++;
@@ -822,6 +1213,14 @@ public:
 
     llm_expert_provider_result trim() noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
+        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+            auto & entry = directory_slots[slot];
+            if (entry.state == hot_slot_state::ready && entry.refcount == 0) {
+                clear_forward_locked(entry.key, slot, entry.generation);
+                entry.key = { -1, -1 };
+                entry.state = hot_slot_state::free;
+            }
+        }
         counters.trims++;
         return llm_expert_provider_result::success();
     }
@@ -831,11 +1230,22 @@ public:
         if (!pool) {
             return llm_expert_provider_result::success();
         }
-        if (pool.use_count() != 1) {
+        if (active_request || pool.use_count() != 1) {
             counters.surrender_busy++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         }
         pool.reset();
+        directory_forward.clear();
+        directory_slots.clear();
+        unique_keys.clear();
+        unique_slots.clear();
+        miss_unique_indices.clear();
+        candidate_slots.clear();
+        slot_selected.clear();
+        slot_releasable.clear();
+        element_unique.clear();
+        request_pins.clear();
+        request_pin_count = 0;
         epoch++;
         counters.surrender_successes++;
         return llm_expert_provider_result::success();
@@ -862,19 +1272,130 @@ public:
         result.conservative_required_capacity = last_required_capacity;
         result.context_validations = context_validations;
         result.context_rejections = context_rejections;
+        result.requests = requests;
+        result.exclusive_busy_failures = exclusive_busy_failures;
+        result.remap_checkpoints = remap_checkpoints;
+        result.logical_ids = logical_id_total;
+        result.unique_ids = unique_id_total;
+        result.hits = hits;
+        result.misses = misses;
+        result.admissions = admissions;
+        result.evictions = evictions;
+        result.generation_changes = generation_changes;
+        result.stale_generation_failures = stale_generation_failures;
+        result.copy_failures = copy_failures;
+        result.failed_cleanups = failed_cleanups;
+        result.pin_acquires = pin_acquires;
+        result.pin_releases = pin_releases;
+        result.current_pins = current_pins;
+        result.peak_pins = peak_pins;
+        result.h2d_bytes = h2d_bytes;
+        result.remap_dynamic_allocations = 0;
         result.slot_tensor_addresses = pool ? pool->addresses : std::vector<uintptr_t> {};
+        result.slots.reserve(directory_slots.size());
+        for (const auto & entry : directory_slots) {
+            result.slots.push_back({
+                entry.key.layer,
+                entry.key.expert,
+                entry.generation,
+                entry.last_use,
+                entry.refcount,
+                entry.state,
+            });
+        }
         result.source_buffer_type = prototype.has_value() ? prototype->down.buffer_type : nullptr;
         result.target_buffer_type = config.target_buffer_type;
         return result;
     }
 
 protected:
-    void release_handle(uint64_t) noexcept override {
+    void release_handle(uint64_t lease_id) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
+        if (!active_request || lease_id != active_request_id || !validate_request_pins_locked()) {
+            stale_generation_failures++;
+        } else {
+            release_request_pins_locked();
+            active_request = false;
+            active_request_id = 0;
+        }
         counters.handles_released++;
     }
 
 private:
+    size_t forward_index(const llm_expert_key & key) const noexcept {
+        return size_t(key.layer)*n_expert + uint32_t(key.expert);
+    }
+
+    bool binding_uses_current_pool(const llm_expert_graph_binding & binding) const noexcept {
+        return projection_identity_matches(binding.up, pool->bundle.up) &&
+            projection_identity_matches(binding.gate, pool->bundle.gate) &&
+            projection_identity_matches(binding.gate_up, pool->bundle.gate_up) &&
+            projection_identity_matches(binding.down, pool->bundle.down);
+    }
+
+    bool forward_entry_matches(
+            const llm_expert_key & key,
+            const hot_forward_entry & forward) const noexcept {
+        if (forward.slot < 0 || uint32_t(forward.slot) >= directory_slots.size()) {
+            return false;
+        }
+        const auto & entry = directory_slots[forward.slot];
+        return expert_key_matches(entry.key, key) && entry.generation == forward.generation &&
+            (entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned);
+    }
+
+    void clear_forward_locked(
+            const llm_expert_key & key,
+            uint32_t slot,
+            uint64_t generation) noexcept {
+        if (!key.is_valid(LLAMA_MAX_LAYERS, n_expert)) {
+            return;
+        }
+        auto & forward = directory_forward[forward_index(key)];
+        if (forward.slot == int32_t(slot) && forward.generation == generation) {
+            forward = {};
+        }
+    }
+
+    bool validate_request_pins_locked() noexcept {
+        for (size_t index = 0; index < request_pin_count; ++index) {
+            const auto & pin = request_pins[index];
+            if (pin.slot >= directory_slots.size() || directory_slots[pin.slot].generation != pin.generation ||
+                directory_slots[pin.slot].refcount == 0 || directory_slots[pin.slot].state != hot_slot_state::pinned) {
+                stale_generation_failures++;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void release_request_pins_locked() noexcept {
+        for (size_t index = 0; index < request_pin_count; ++index) {
+            auto & entry = directory_slots[request_pins[index].slot];
+            GGML_ASSERT(entry.generation == request_pins[index].generation && entry.refcount > 0);
+            entry.refcount--;
+            if (entry.refcount == 0) {
+                entry.state = hot_slot_state::ready;
+            }
+            pin_releases++;
+            current_pins--;
+        }
+        request_pin_count = 0;
+    }
+
+    void pin_slot_locked(uint32_t slot) noexcept {
+        auto & entry = directory_slots[slot];
+        GGML_ASSERT(request_pin_count < request_pins.size());
+        GGML_ASSERT(entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned);
+        entry.refcount++;
+        entry.state = hot_slot_state::pinned;
+        entry.last_use = ++use_clock;
+        request_pins[request_pin_count++] = { slot, entry.generation };
+        pin_acquires++;
+        current_pins++;
+        peak_pins = std::max(peak_pins, current_pins);
+    }
+
     uint32_t required_capacity(uint64_t extent) const noexcept {
         if (extent >= (uint64_t(n_expert) + config.n_expert_used - 1)/config.n_expert_used) {
             return n_expert;
@@ -915,8 +1436,7 @@ private:
             return target == source;
         }
         const int source_axis = expert_axis(source, n_expert, weight);
-        const int target_axis = expert_axis(target, capacity, weight);
-        if (source_axis < 0 || target_axis != source_axis || source->type != target->type) {
+        if (source_axis < 0 || target->ne[source_axis] != capacity || source->type != target->type) {
             return false;
         }
         for (int axis = 0; axis < source_axis; ++axis) {
@@ -924,7 +1444,7 @@ private:
                 return false;
             }
         }
-        return source->nb[source_axis] == target->nb[target_axis];
+        return source->nb[source_axis] == target->nb[source_axis];
     }
 
     static bool pool_projection_matches_source(
@@ -956,6 +1476,7 @@ private:
 
     llm_hot_cache_config config;
     llm_expert_provider_faults faults;
+    deterministic_lru_policy lru_policy;
     uint32_t n_expert = 0;
     mutable std::mutex mutex;
     mutable llm_expert_provider_stats counters;
@@ -971,6 +1492,41 @@ private:
     uint32_t last_required_capacity = 0;
     uint64_t context_validations = 0;
     uint64_t context_rejections = 0;
+    std::vector<hot_forward_entry> directory_forward;
+    std::vector<hot_slot_entry> directory_slots;
+    std::vector<llm_expert_key> unique_keys;
+    std::vector<int32_t> unique_slots;
+    std::vector<uint32_t> miss_unique_indices;
+    std::vector<uint32_t> candidate_slots;
+    std::vector<uint8_t> slot_selected;
+    std::vector<uint32_t> slot_releasable;
+    std::vector<int32_t> element_unique;
+    std::vector<hot_request_pin> request_pins;
+    size_t request_pin_count = 0;
+    bool active_request = false;
+    uint64_t active_request_id = 0;
+    uint64_t next_request_id = 0;
+    uint64_t use_clock = 0;
+    uint64_t requests = 0;
+    uint64_t exclusive_busy_failures = 0;
+    uint64_t remap_checkpoints = 0;
+    uint64_t logical_id_total = 0;
+    uint64_t unique_id_total = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t admissions = 0;
+    uint64_t evictions = 0;
+    uint64_t generation_changes = 0;
+    uint64_t stale_generation_failures = 0;
+    uint64_t metadata_mismatches = 0;
+    uint64_t copy_failures = 0;
+    uint64_t failed_cleanups = 0;
+    uint64_t pin_acquires = 0;
+    uint64_t pin_releases = 0;
+    uint64_t current_pins = 0;
+    uint64_t peak_pins = 0;
+    uint64_t h2d_bytes = 0;
+    uint64_t scratch_reservations = 0;
 };
 
 } // namespace

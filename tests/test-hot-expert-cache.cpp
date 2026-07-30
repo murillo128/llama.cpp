@@ -5,11 +5,45 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+std::atomic<uint64_t> allocation_count { 0 };
+
+void * operator new(std::size_t size) {
+    allocation_count.fetch_add(1, std::memory_order_relaxed);
+    if (void * memory = std::malloc(size)) {
+        return memory;
+    }
+    throw std::bad_alloc();
+}
+
+void * operator new[](std::size_t size) {
+    return ::operator new(size);
+}
+
+void operator delete(void * memory) noexcept {
+    std::free(memory);
+}
+
+void operator delete[](void * memory) noexcept {
+    std::free(memory);
+}
+
+void operator delete(void * memory, std::size_t) noexcept {
+    std::free(memory);
+}
+
+void operator delete[](void * memory, std::size_t) noexcept {
+    std::free(memory);
+}
 
 namespace {
 
@@ -17,58 +51,86 @@ struct tensor_fixture {
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr buffer;
     ggml_tensor * up = nullptr;
+    ggml_tensor * up_bias = nullptr;
+    ggml_tensor * up_scale = nullptr;
     ggml_tensor * gate = nullptr;
+    ggml_tensor * gate_bias = nullptr;
+    ggml_tensor * gate_scale = nullptr;
     ggml_tensor * down = nullptr;
+    ggml_tensor * down_bias = nullptr;
+    ggml_tensor * down_scale = nullptr;
     ggml_tensor * ids = nullptr;
+    int64_t n_expert = 4;
+    int64_t n_expert_used = 2;
     int64_t n_tokens = 1;
 
     tensor_fixture(
             int64_t n_in = 8,
             int64_t n_hidden = 16,
             int64_t n_expert = 4,
-            int64_t n_tokens = 1) : n_tokens(n_tokens) {
+            int64_t n_tokens = 1,
+            int64_t n_expert_used = 2) :
+        n_expert(n_expert), n_expert_used(n_expert_used), n_tokens(n_tokens) {
         ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead()*8,
+            /*.mem_size   =*/ ggml_tensor_overhead()*16,
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
         ctx.reset(ggml_init(params));
         GGML_ASSERT(ctx);
         up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_in, n_hidden, n_expert);
+        up_bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_hidden, n_expert);
+        up_scale = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_expert);
         gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_in, n_hidden, n_expert);
+        gate_bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_hidden, n_expert);
+        gate_scale = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_expert);
         down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_hidden, n_in, n_expert);
-        ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, n_tokens);
+        down_bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_in, n_expert);
+        down_scale = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_expert);
+        ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, n_tokens);
         buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
         GGML_ASSERT(buffer);
+        uint8_t pattern = 0x10;
+        for (auto * tensor : { up, up_bias, up_scale, gate, gate_bias, gate_scale, down, down_bias, down_scale }) {
+            const int axis = tensor->ne[2] == n_expert ? 2 : 1;
+            for (int64_t expert = 0; expert < n_expert; ++expert) {
+                std::memset(static_cast<uint8_t *>(tensor->data) + expert*tensor->nb[axis],
+                    pattern + expert, tensor->nb[axis]);
+            }
+            pattern += 0x10;
+        }
     }
 
     llm_expert_bundle_descriptor bundle(int32_t layer) const {
         return {
             layer,
-            4,
-            llm_expert_projection_descriptor::from(up, nullptr, nullptr),
-            llm_expert_projection_descriptor::from(gate, nullptr, nullptr),
+            int32_t(n_expert),
+            llm_expert_projection_descriptor::from(up, up_bias, up_scale),
+            llm_expert_projection_descriptor::from(gate, gate_bias, gate_scale),
             {},
-            llm_expert_projection_descriptor::from(down, nullptr, nullptr),
+            llm_expert_projection_descriptor::from(down, down_bias, down_scale),
         };
     }
 
     llm_expert_selection selection(int32_t layer) const {
-        return { layer, 4, 2, n_tokens, ids };
+        return { layer, int32_t(n_expert), int32_t(n_expert_used), n_tokens, ids };
     }
 };
 
 llm_hot_cache_config test_config(
         uint32_t capacity = 2,
         uint32_t routed_layers = 1,
-        uint32_t total_keys = 4) {
+        uint32_t total_keys = 4,
+        uint32_t n_expert_used = 2,
+        uint64_t initial_generation = 0) {
     return {
         capacity,
-        2,
+        n_expert_used,
         routed_layers,
         total_keys,
         ggml_backend_cpu_buffer_type(),
         true,
+        initial_generation,
     };
 }
 
@@ -81,6 +143,86 @@ void expect_invalid(F && fn) {
         rejected = true;
     }
     GGML_ASSERT(rejected);
+}
+
+llm_expert_graph_binding initialize_hot_binding(
+        llm_expert_weight_provider & provider,
+        const tensor_fixture & tensors,
+        int32_t layer = 0) {
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(provider.bind(tensors.bundle(layer), tensors.selection(layer), binding).is_ready());
+    GGML_ASSERT(binding.bootstrap);
+    GGML_ASSERT(provider.initialize_after_reserve().is_ready());
+    GGML_ASSERT(provider.bind(tensors.bundle(layer), tensors.selection(layer), binding).is_ready());
+    GGML_ASSERT(!binding.bootstrap);
+    return binding;
+}
+
+int source_expert_axis(const ggml_tensor * tensor, int64_t n_expert, bool weight) {
+    if (weight) {
+        GGML_ASSERT(tensor->ne[2] == n_expert);
+        return 2;
+    }
+    int result = -1;
+    for (int axis = 0; axis < ggml_n_dims(tensor); ++axis) {
+        if (tensor->ne[axis] == n_expert) {
+            GGML_ASSERT(result == -1);
+            result = axis;
+        }
+    }
+    GGML_ASSERT(result >= 0);
+    return result;
+}
+
+void assert_tensor_slot_matches(
+        const ggml_tensor * source,
+        const ggml_tensor * target,
+        int64_t n_expert,
+        int32_t expert,
+        int32_t slot,
+        bool weight) {
+    GGML_ASSERT((source == nullptr) == (target == nullptr));
+    if (source == nullptr) {
+        return;
+    }
+    const int axis = source_expert_axis(source, n_expert, weight);
+    const size_t span = source->nb[axis];
+    GGML_ASSERT(target->nb[axis] == span);
+    const auto * source_bytes = static_cast<const uint8_t *>(source->data) + size_t(expert)*span;
+    const auto * target_bytes = static_cast<const uint8_t *>(target->data) + size_t(slot)*span;
+    GGML_ASSERT(std::memcmp(source_bytes, target_bytes, span) == 0);
+}
+
+void assert_projection_slot_matches(
+        const llm_expert_projection_descriptor & source,
+        const llm_expert_projection_descriptor & target,
+        int64_t n_expert,
+        int32_t expert,
+        int32_t slot) {
+    assert_tensor_slot_matches(source.weight, target.weight, n_expert, expert, slot, true);
+    assert_tensor_slot_matches(source.bias, target.bias, n_expert, expert, slot, false);
+    assert_tensor_slot_matches(source.scale, target.scale, n_expert, expert, slot, false);
+}
+
+void assert_bundle_slot_matches(
+        const tensor_fixture & source,
+        const llm_expert_graph_binding & target,
+        int32_t expert,
+        int32_t slot) {
+    const auto bundle = source.bundle(target.layer);
+    assert_projection_slot_matches(bundle.up, target.up, source.n_expert, expert, slot);
+    assert_projection_slot_matches(bundle.gate, target.gate, source.n_expert, expert, slot);
+    assert_projection_slot_matches(bundle.gate_up, target.gate_up, source.n_expert, expert, slot);
+    assert_projection_slot_matches(bundle.down, target.down, source.n_expert, expert, slot);
+}
+
+int32_t find_slot(const llm_hot_cache_diagnostics & diagnostics, int32_t expert) {
+    for (size_t slot = 0; slot < diagnostics.slots.size(); ++slot) {
+        if (diagnostics.slots[slot].expert == expert) {
+            return int32_t(slot);
+        }
+    }
+    return -1;
 }
 
 void test_configuration_matrix() {
@@ -135,11 +277,20 @@ void test_context_extent_matrix_and_prepare_revalidation() {
         llm_expert_provider_error::unsupported_configuration);
     GGML_ASSERT(unsafe_plan.handle_count() == 0);
 
+    GGML_ASSERT(capacity_three->bind(two_tokens.bundle(0), two_tokens.selection(0), binding).is_ready());
+    GGML_ASSERT(capacity_three->initialize_after_reserve().is_ready());
+    GGML_ASSERT(capacity_three->bind(two_tokens.bundle(0), two_tokens.selection(0), binding).is_ready());
+    llm_expert_execution_plan capacity_three_plan;
+    GGML_ASSERT(capacity_three->prepare({ binding }, capacity_three_plan).error ==
+        llm_expert_provider_error::unsupported_configuration);
+    GGML_ASSERT(capacity_three_plan.handle_count() == 0);
+
     GGML_ASSERT(all_experts->bind(two_tokens.bundle(0), two_tokens.selection(0), binding).is_ready());
     GGML_ASSERT(all_experts->initialize_after_reserve().is_ready());
+    GGML_ASSERT(all_experts->bind(two_tokens.bundle(0), two_tokens.selection(0), binding).is_ready());
     llm_expert_execution_plan safe_extent_plan;
-    GGML_ASSERT(all_experts->prepare({ binding }, safe_extent_plan).error ==
-        llm_expert_provider_error::preparation_failed);
+    GGML_ASSERT(all_experts->prepare({ binding }, safe_extent_plan).is_ready());
+    safe_extent_plan.reset();
 }
 
 void test_pool_lifetime_trim_surrender_and_epoch() {
@@ -260,6 +411,222 @@ void test_allocation_failure_is_recoverable_and_empty_prepare_is_safe() {
     GGML_ASSERT(empty.handle_count() == 0);
 }
 
+void test_directory_hit_eviction_generation_and_copy() {
+    tensor_fixture tensors(8, 16, 4, 1, 1);
+    auto provider = llm_create_hot_cache_expert_weight_provider(test_config(1, 1, 4, 1));
+    const auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+
+    const int32_t first_ids[] = { 0 };
+    int32_t execution_ids[] = { -1 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, first_ids, 1, execution_ids).is_ready());
+    GGML_ASSERT(execution_ids[0] == 0);
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.slots[0].expert == 0);
+    GGML_ASSERT(diagnostics.slots[0].generation == 1);
+    GGML_ASSERT(diagnostics.slots[0].state == llm_hot_cache_diagnostics::slot::pinned);
+    assert_bundle_slot_matches(tensors, binding, 0, 0);
+
+    GGML_ASSERT(provider->remap_checkpoint(binding, first_ids, 1, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.slots[0].generation == 1);
+    GGML_ASSERT(diagnostics.hits == 1);
+    GGML_ASSERT(diagnostics.misses == 1);
+    plan.reset();
+
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t second_ids[] = { 1 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, second_ids, 1, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.slots[0].expert == 1);
+    GGML_ASSERT(diagnostics.slots[0].generation == 2);
+    GGML_ASSERT(diagnostics.evictions == 1);
+    GGML_ASSERT(provider->validate_slot_generation(0, 1).error ==
+        llm_expert_provider_error::stale_generation);
+    GGML_ASSERT(provider->validate_slot_generation(0, 2).is_ready());
+    assert_bundle_slot_matches(tensors, binding, 1, 0);
+    plan.reset();
+}
+
+void test_directory_multi_token_atomic_dedup_and_no_allocation() {
+    tensor_fixture tensors(8, 16, 4, 2, 2);
+    auto provider = llm_create_hot_cache_expert_weight_provider(test_config(4, 1, 4, 2));
+    const auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+
+    const int32_t logical_ids[] = { 0, 1, 2, 3 };
+    int32_t execution_ids[] = { -1, -1, -1, -1 };
+    const uint64_t allocations_before = allocation_count.load(std::memory_order_relaxed);
+    GGML_ASSERT(provider->remap_checkpoint(binding, logical_ids, 4, execution_ids).is_ready());
+    const uint64_t allocations_after = allocation_count.load(std::memory_order_relaxed);
+    GGML_ASSERT(allocations_after == allocations_before);
+    for (int32_t index = 0; index < 4; ++index) {
+        GGML_ASSERT(execution_ids[index] == index);
+        assert_bundle_slot_matches(tensors, binding, index, index);
+    }
+
+    const int32_t duplicate_ids[] = { 0, 0, 1, 1 };
+    const int32_t expected_slots[] = { 0, 0, 1, 1 };
+    const uint64_t duplicate_allocations_before = allocation_count.load(std::memory_order_relaxed);
+    GGML_ASSERT(provider->remap_checkpoint(binding, duplicate_ids, 4, execution_ids).is_ready());
+    GGML_ASSERT(allocation_count.load(std::memory_order_relaxed) == duplicate_allocations_before);
+    GGML_ASSERT(std::memcmp(execution_ids, expected_slots, sizeof(expected_slots)) == 0);
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.remap_checkpoints == 2);
+    GGML_ASSERT(diagnostics.logical_ids == 8);
+    GGML_ASSERT(diagnostics.unique_ids == 6);
+    GGML_ASSERT(diagnostics.hits == 2);
+    GGML_ASSERT(diagnostics.misses == 4);
+    GGML_ASSERT(diagnostics.current_pins == 2);
+    GGML_ASSERT(diagnostics.remap_dynamic_allocations == 0);
+    plan.reset();
+}
+
+void test_directory_composite_layer_expert_keys() {
+    tensor_fixture first(8, 16, 4, 1, 1);
+    tensor_fixture second(8, 16, 4, 1, 1);
+    auto provider = llm_create_hot_cache_expert_weight_provider(test_config(2, 2, 8, 1));
+    llm_expert_graph_binding first_binding;
+    llm_expert_graph_binding second_binding;
+    GGML_ASSERT(provider->bind(first.bundle(0), first.selection(0), first_binding).is_ready());
+    GGML_ASSERT(provider->bind(second.bundle(1), second.selection(1), second_binding).is_ready());
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+    GGML_ASSERT(provider->bind(first.bundle(0), first.selection(0), first_binding).is_ready());
+    GGML_ASSERT(provider->bind(second.bundle(1), second.selection(1), second_binding).is_ready());
+
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ first_binding, second_binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0 };
+    int32_t first_execution[] = { -1 };
+    int32_t second_execution[] = { -1 };
+    GGML_ASSERT(provider->remap_checkpoint(first_binding, logical_ids, 1, first_execution).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint(second_binding, logical_ids, 1, second_execution).is_ready());
+    GGML_ASSERT(first_execution[0] != second_execution[0]);
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.slots[first_execution[0]].layer == 0);
+    GGML_ASSERT(diagnostics.slots[second_execution[0]].layer == 1);
+    assert_bundle_slot_matches(first, first_binding, 0, first_execution[0]);
+    assert_bundle_slot_matches(second, second_binding, 0, second_execution[0]);
+    plan.reset();
+}
+
+void test_directory_lru_pin_exclusion_and_request_exclusivity() {
+    tensor_fixture tensors;
+    auto provider = llm_create_hot_cache_expert_weight_provider(test_config());
+    const auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    llm_expert_execution_plan competing;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->prepare({ binding }, competing).error == llm_expert_provider_error::busy);
+
+    const int32_t first_ids[] = { 0, 1 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, first_ids, 2, execution_ids).is_ready());
+    const auto first = provider->hot_cache_diagnostics();
+    const int32_t slot_zero = find_slot(first, 0);
+    const int32_t slot_one = find_slot(first, 1);
+    GGML_ASSERT(slot_zero >= 0 && slot_one >= 0 && slot_zero != slot_one);
+
+    const int32_t second_ids[] = { 0, 2 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, second_ids, 2, execution_ids).is_ready());
+    const auto second = provider->hot_cache_diagnostics();
+    GGML_ASSERT(find_slot(second, 0) == slot_zero);
+    GGML_ASSERT(find_slot(second, 2) == slot_one);
+    GGML_ASSERT(second.slots[slot_zero].generation == first.slots[slot_zero].generation);
+    plan.reset();
+
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t third_ids[] = { 2, 3 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, third_ids, 2, execution_ids).is_ready());
+    const auto third = provider->hot_cache_diagnostics();
+    GGML_ASSERT(find_slot(third, 2) == slot_one);
+    GGML_ASSERT(find_slot(third, 3) == slot_zero);
+    GGML_ASSERT(third.evictions == 2);
+    GGML_ASSERT(third.exclusive_busy_failures == 1);
+    plan.reset();
+}
+
+void test_directory_copy_failure_cleanup_and_reuse() {
+    tensor_fixture tensors;
+    llm_expert_provider_faults faults;
+    faults.fail_copy_after_tensors = 4;
+    auto provider = llm_create_hot_cache_expert_weight_provider(test_config(), faults);
+    const auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, logical_ids, 2, execution_ids).error ==
+        llm_expert_provider_error::copy_failed);
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.copy_failures == 1);
+    GGML_ASSERT(diagnostics.current_pins == 0);
+    GGML_ASSERT(std::all_of(diagnostics.slots.begin(), diagnostics.slots.end(), [](const auto & slot) {
+        return slot.state == llm_hot_cache_diagnostics::slot::failed;
+    }));
+    GGML_ASSERT(provider->cleanup_failed_slots().error == llm_expert_provider_error::busy);
+    plan.reset();
+    GGML_ASSERT(provider->cleanup_failed_slots().is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.failed_cleanups == 2);
+    GGML_ASSERT(std::all_of(diagnostics.slots.begin(), diagnostics.slots.end(), [](const auto & slot) {
+        return slot.state == llm_hot_cache_diagnostics::slot::free && slot.expert == -1;
+    }));
+
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint(binding, logical_ids, 2, execution_ids).is_ready());
+    GGML_ASSERT(execution_ids[0] != execution_ids[1]);
+    plan.reset();
+}
+
+void test_directory_generation_exhaustion_trim_and_invalid_id() {
+    tensor_fixture tensors(8, 16, 4, 1, 1);
+    auto provider = llm_create_hot_cache_expert_weight_provider(
+        test_config(1, 1, 4, 1, UINT64_MAX - 1));
+    const auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    int32_t execution_ids[] = { -1 };
+    const int32_t first_ids[] = { 0 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, first_ids, 1, execution_ids).is_ready());
+    const auto before = provider->hot_cache_diagnostics();
+    GGML_ASSERT(before.slots[0].generation == UINT64_MAX);
+    plan.reset();
+
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t second_ids[] = { 1 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, second_ids, 1, execution_ids).error ==
+        llm_expert_provider_error::generation_exhausted);
+    auto after = provider->hot_cache_diagnostics();
+    GGML_ASSERT(after.slots[0].expert == before.slots[0].expert);
+    GGML_ASSERT(after.slots[0].generation == before.slots[0].generation);
+    GGML_ASSERT(after.slots[0].state == llm_hot_cache_diagnostics::slot::ready);
+    plan.reset();
+
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t invalid_ids[] = { 4 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, invalid_ids, 1, execution_ids).error ==
+        llm_expert_provider_error::invalid_key);
+    after = provider->hot_cache_diagnostics();
+    GGML_ASSERT(after.slots[0].expert == 0 && after.slots[0].generation == UINT64_MAX);
+    plan.reset();
+
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint(binding, first_ids, 1, execution_ids).is_ready());
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->hot_cache_diagnostics().slots[0].state ==
+        llm_hot_cache_diagnostics::slot::pinned);
+    plan.reset();
+    GGML_ASSERT(provider->trim().is_ready());
+    after = provider->hot_cache_diagnostics();
+    GGML_ASSERT(after.slots[0].state == llm_hot_cache_diagnostics::slot::free);
+    GGML_ASSERT(after.slots[0].expert == -1);
+    GGML_ASSERT(provider->validate_slot_generation(0, UINT64_MAX).error ==
+        llm_expert_provider_error::stale_generation);
+}
+
 void test_cuda_model_pool_smoke(const char * model_path) {
     const llama_model_tensor_buft_override overrides[] = {
         { "ffn_(gate|up|down)_exps\\.weight", ggml_backend_cpu_buffer_type() },
@@ -315,6 +682,53 @@ void test_cuda_model_pool_smoke(const char * model_path) {
     llama_model_free(model);
 }
 
+void test_cuda_directory_copy() {
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    GGML_ASSERT(gpu != nullptr);
+    tensor_fixture tensors;
+    auto config = test_config();
+    config.target_buffer_type = ggml_backend_dev_buffer_type(gpu);
+    config.allow_non_cuda_target_for_testing = false;
+    auto provider = llm_create_hot_cache_expert_weight_provider(config);
+    const auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 1, 3 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, logical_ids, 2, execution_ids).is_ready());
+
+    const auto assert_cuda_tensor = [&](const ggml_tensor * source, const ggml_tensor * target,
+                                        int32_t expert, int32_t slot, bool weight) {
+        GGML_ASSERT((source == nullptr) == (target == nullptr));
+        if (source == nullptr) {
+            return;
+        }
+        const int axis = source_expert_axis(source, tensors.n_expert, weight);
+        const size_t span = source->nb[axis];
+        std::vector<uint8_t> actual(span);
+        ggml_backend_tensor_get(target, actual.data(), size_t(slot)*span, span);
+        const auto * expected = static_cast<const uint8_t *>(source->data) + size_t(expert)*span;
+        GGML_ASSERT(std::memcmp(actual.data(), expected, span) == 0);
+    };
+    const auto assert_cuda_projection = [&](const auto & source, const auto & target,
+                                             int32_t expert, int32_t slot) {
+        assert_cuda_tensor(source.weight, target.weight, expert, slot, true);
+        assert_cuda_tensor(source.bias, target.bias, expert, slot, false);
+        assert_cuda_tensor(source.scale, target.scale, expert, slot, false);
+    };
+    const auto source = tensors.bundle(0);
+    for (int32_t index = 0; index < 2; ++index) {
+        assert_cuda_projection(source.up, binding.up, logical_ids[index], execution_ids[index]);
+        assert_cuda_projection(source.gate, binding.gate, logical_ids[index], execution_ids[index]);
+        assert_cuda_projection(source.down, binding.down, logical_ids[index], execution_ids[index]);
+    }
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.misses == 2);
+    GGML_ASSERT(diagnostics.admissions == 2);
+    GGML_ASSERT(diagnostics.h2d_bytes > 0);
+    plan.reset();
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -323,8 +737,15 @@ int main(int argc, char ** argv) {
     test_pool_lifetime_trim_surrender_and_epoch();
     test_layout_host_and_partial_initialization_rejection();
     test_allocation_failure_is_recoverable_and_empty_prepare_is_safe();
+    test_directory_hit_eviction_generation_and_copy();
+    test_directory_multi_token_atomic_dedup_and_no_allocation();
+    test_directory_composite_layer_expert_keys();
+    test_directory_lru_pin_exclusion_and_request_exclusivity();
+    test_directory_copy_failure_cleanup_and_reuse();
+    test_directory_generation_exhaustion_trim_and_invalid_id();
     if (argc == 2) {
         ggml_backend_load_all();
+        test_cuda_directory_copy();
         test_cuda_model_pool_smoke(argv[1]);
         llama_backend_free();
     } else if (argc != 1) {
