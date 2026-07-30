@@ -1,4 +1,6 @@
 #include "llama-expert-weight-provider.h"
+#include "llama-cold-expert-cache.h"
+#include "llama-expert-transfer-ring.h"
 #include "llama-hparams.h"
 
 #include "ggml-alloc.h"
@@ -741,6 +743,14 @@ public:
         if (!config.allow_non_cuda_target_for_testing && !buffer_type_is_cuda(config.target_buffer_type)) {
             throw std::invalid_argument("hot-cache target must be one CUDA device");
         }
+        if (config.cold_mode && (config.cold_cache_bytes == 0 || config.transfer_ring_bytes == 0 ||
+            config.target_device == nullptr)) {
+            throw std::invalid_argument("cold-cache mode requires byte budgets and a target device");
+        }
+        if (!config.cold_mode && (config.cold_cache_bytes != 0 || config.transfer_ring_bytes != 0 ||
+            config.force_pageable_transfer_for_testing)) {
+            throw std::invalid_argument("cold-cache configuration outside cold mode");
+        }
     }
 
     llm_expert_provider_result bind(
@@ -960,7 +970,7 @@ public:
             size_t logical_id_count,
             int32_t * execution_ids) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
-        return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids);
+        return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr);
     }
 
     llm_expert_provider_result remap_checkpoint_tensor(
@@ -982,7 +992,7 @@ public:
         ggml_backend_tensor_get(binding.execution_ids, logical_id_scratch.data(), 0, bytes);
         execution_id_read_bytes += bytes;
         auto result = remap_checkpoint_locked(
-            binding, logical_id_scratch.data(), count, execution_id_scratch.data());
+            binding, logical_id_scratch.data(), count, execution_id_scratch.data(), execution_backend);
         if (!result.is_ready()) {
             return result;
         }
@@ -998,7 +1008,8 @@ public:
             const llm_expert_graph_binding & binding,
             const int32_t * logical_ids,
             size_t logical_id_count,
-            int32_t * execution_ids) noexcept {
+            int32_t * execution_ids,
+            ggml_backend_t execution_backend) noexcept {
         if (!active_request || !pool || logical_ids == nullptr || execution_ids == nullptr ||
             binding.provider_identity != this || binding.bootstrap || binding.graph_epoch != epoch ||
             binding.generation_lease.get() != pool.get() || !binding_uses_current_pool(binding) ||
@@ -1092,6 +1103,17 @@ public:
         size_t hit_count = 0;
         for (size_t index = 0; index < unique_count; ++index) {
             if (unique_slots[index] >= 0) {
+                auto & entry = directory_slots[unique_slots[index]];
+                if (config.cold_mode) {
+                    if (!entry.has_cold_backing) {
+                        metadata_mismatches++;
+                        return fail(llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch));
+                    }
+                    const llm_cold_reference backing = { entry.cold_slot, entry.cold_generation };
+                    auto touched = cold_cache->acquire(backing, llm_cold_reference_kind::request);
+                    if (touched.is_ready()) touched = cold_cache->release(backing, llm_cold_reference_kind::request);
+                    if (!touched.is_ready()) return fail(touched);
+                }
                 pin_slot_locked(uint32_t(unique_slots[index]));
                 hit_count++;
             }
@@ -1102,6 +1124,18 @@ public:
             const uint32_t slot = candidate_slots[index];
             auto & entry = directory_slots[slot];
             if (entry.state != hot_slot_state::free) {
+                if (config.cold_mode) {
+                    if (!entry.has_cold_backing) {
+                        metadata_mismatches++;
+                        return fail(llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch));
+                    }
+                    auto released = cold_cache->release(
+                        { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                    if (!released.is_ready()) return fail(released);
+                    entry.has_cold_backing = false;
+                    entry.cold_slot = 0;
+                    entry.cold_generation = 0;
+                }
                 entry.state = hot_slot_state::evicting;
                 clear_forward_locked(entry.key, slot, entry.generation);
                 evictions++;
@@ -1110,6 +1144,7 @@ public:
             entry.key = unique_keys[unique_index];
             entry.generation++;
             entry.refcount = 0;
+            entry.has_cold_backing = false;
             generation_changes++;
             entry.state = hot_slot_state::loading;
             unique_slots[unique_index] = int32_t(slot);
@@ -1118,28 +1153,85 @@ public:
         size_t transaction_copies = 0;
         size_t transaction_bytes = 0;
         const int64_t copy_start_us = miss_count > 0 ? ggml_time_us() : 0;
-        bool copied = true;
-        for (size_t index = 0; index < miss_count && copied; ++index) {
-            const uint32_t unique_index = miss_unique_indices[index];
-            const uint32_t slot = candidate_slots[index];
-            const auto & key = unique_keys[unique_index];
-            const auto & source = registration->second;
-            copied = copy_expert_projection(pool->bundle.up, source.up, source.n_expert, config.capacity,
-                         key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
-                copy_expert_projection(pool->bundle.gate, source.gate, source.n_expert, config.capacity,
-                         key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
-                copy_expert_projection(pool->bundle.gate_up, source.gate_up, source.n_expert, config.capacity,
-                         key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
-                copy_expert_projection(pool->bundle.down, source.down, source.n_expert, config.capacity,
-                         key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors);
+        auto copy_result = llm_expert_provider_result::success();
+        if (config.cold_mode && miss_count != 0 && cold_bundle_payload > SIZE_MAX/miss_count) {
+            copy_result = llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
-        counters.tensor_copies += transaction_copies;
+        if (config.cold_mode) {
+            for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
+                const uint32_t unique_index = miss_unique_indices[index];
+                const uint32_t slot = candidate_slots[index];
+                auto & entry = directory_slots[slot];
+                copy_result = cold_cache->find_or_admit(
+                    unique_keys[unique_index], registration->second, cold_references[index],
+                    faults.fail_copy_after_tensors);
+                if (copy_result.is_ready()) {
+                    copy_result = cold_cache->acquire(cold_references[index], llm_cold_reference_kind::hot);
+                }
+                if (copy_result.is_ready()) {
+                    entry.cold_slot = cold_references[index].slot;
+                    entry.cold_generation = cold_references[index].generation;
+                    entry.has_cold_backing = true;
+                }
+            }
+            for (size_t wave_begin = 0; wave_begin < miss_count && copy_result.is_ready();
+                    wave_begin += transfer_lane_capacity) {
+                const size_t wave_end = std::min(miss_count, wave_begin + transfer_lane_capacity);
+                transfer_bindings.clear();
+                for (size_t index = wave_begin; index < wave_end && copy_result.is_ready(); ++index) {
+                    const uint32_t slot = candidate_slots[index];
+                    copy_result = transfer_ring->reserve(*cold_cache, cold_references[index], slot,
+                        directory_slots[slot].generation, transfer_lanes[index]);
+                    if (copy_result.is_ready()) {
+                        copy_result = transfer_ring->stage(transfer_lanes[index], cold_cache->bundle());
+                    }
+                    if (copy_result.is_ready()) {
+                        transfer_bindings.push_back({ transfer_lanes[index], pool->bundle, slot });
+                    }
+                }
+                if (copy_result.is_ready()) {
+                    copy_result = transfer_ring->transfer_wave(execution_backend, transfer_bindings);
+                }
+            }
+            if (copy_result.is_ready()) {
+                transaction_bytes = size_t(cold_bundle_payload)*miss_count;
+            }
+        } else {
+            bool copied = true;
+            for (size_t index = 0; index < miss_count && copied; ++index) {
+                const uint32_t unique_index = miss_unique_indices[index];
+                const uint32_t slot = candidate_slots[index];
+                const auto & key = unique_keys[unique_index];
+                const auto & source = registration->second;
+                copied = copy_expert_projection(pool->bundle.up, source.up, source.n_expert, config.capacity,
+                             key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
+                    copy_expert_projection(pool->bundle.gate, source.gate, source.n_expert, config.capacity,
+                             key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
+                    copy_expert_projection(pool->bundle.gate_up, source.gate_up, source.n_expert, config.capacity,
+                             key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors) &&
+                    copy_expert_projection(pool->bundle.down, source.down, source.n_expert, config.capacity,
+                             key.expert, slot, transaction_bytes, transaction_copies, faults.fail_copy_after_tensors);
+            }
+            if (!copied) copy_result = llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+            counters.tensor_copies += transaction_copies;
+        }
         h2d_bytes += transaction_bytes;
-        if (miss_count > 0) {
-            h2d_time_us += ggml_time_us() - copy_start_us;
-        }
+        if (miss_count > 0) h2d_time_us += ggml_time_us() - copy_start_us;
 
-        if (!copied) {
+        if (!copy_result.is_ready()) {
+            if (config.cold_mode) {
+                (void) transfer_ring->cleanup_failed_lanes();
+                for (size_t index = 0; index < miss_count; ++index) {
+                    auto & entry = directory_slots[candidate_slots[index]];
+                    if (entry.has_cold_backing) {
+                        (void) cold_cache->release(
+                            { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                        entry.has_cold_backing = false;
+                        entry.cold_slot = 0;
+                        entry.cold_generation = 0;
+                    }
+                }
+            }
             for (size_t index = 0; index < miss_count; ++index) {
                 auto & entry = directory_slots[candidate_slots[index]];
                 entry.state = hot_slot_state::failed;
@@ -1148,7 +1240,7 @@ public:
             release_request_pins_locked();
             faults.fail_copy_after_tensors = SIZE_MAX;
             copy_failures++;
-            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed));
+            return fail(copy_result);
         }
 
         for (size_t index = 0; index < miss_count; ++index) {
@@ -1158,6 +1250,11 @@ public:
             directory_forward[forward_index(entry.key)] = { int32_t(slot), entry.generation };
             admissions++;
             pin_slot_locked(slot);
+        }
+
+        if (config.cold_mode) {
+            auto invariant = validate_inclusive_locked();
+            if (!invariant.is_ready()) return fail(invariant);
         }
 
         for (size_t index = 0; index < logical_id_count; ++index) {
@@ -1183,11 +1280,23 @@ public:
         }
         for (auto & entry : directory_slots) {
             if (entry.state == hot_slot_state::failed) {
+                if (config.cold_mode && entry.has_cold_backing) {
+                    auto released = cold_cache->release(
+                        { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                    if (!released.is_ready()) return fail(released);
+                    entry.has_cold_backing = false;
+                }
                 entry.key = { -1, -1 };
                 entry.refcount = 0;
                 entry.state = hot_slot_state::free;
                 failed_cleanups++;
             }
+        }
+        if (config.cold_mode) {
+            auto result = transfer_ring->cleanup_failed_lanes();
+            if (result.is_ready()) result = cold_cache->cleanup_failed_slots();
+            if (result.is_ready()) result = validate_inclusive_locked();
+            if (!result.is_ready()) return fail(result);
         }
         return llm_expert_provider_result::success();
     }
@@ -1262,6 +1371,42 @@ public:
             collect_projection_addresses(candidate->bundle.gate_up, candidate->addresses);
             collect_projection_addresses(candidate->bundle.down, candidate->addresses);
 
+            std::unique_ptr<llm_cold_expert_cache> cold_candidate;
+            std::unique_ptr<llm_expert_transfer_ring> ring_candidate;
+            if (config.cold_mode) {
+                cold_candidate = std::make_unique<llm_cold_expert_cache>(llm_cold_cache_config {
+                    config.cold_cache_bytes,
+                    config.capacity,
+                    config.routed_layer_count,
+                    config.total_expert_keys,
+                    0,
+                });
+                auto initialized = cold_candidate->initialize(source);
+                if (!initialized.is_ready()) {
+                    return fail(initialized);
+                }
+                ring_candidate = std::make_unique<llm_expert_transfer_ring>(llm_transfer_ring_config {
+                    config.transfer_ring_bytes,
+                    config.n_expert_used,
+                    config.target_device,
+                    config.allow_non_cuda_target_for_testing,
+                    config.force_pageable_transfer_for_testing,
+                    0,
+                });
+                initialized = ring_candidate->initialize(source);
+                if (!initialized.is_ready()) {
+                    return fail(initialized);
+                }
+                const auto cold_diagnostics = cold_candidate->diagnostics();
+                const auto ring_diagnostics = ring_candidate->diagnostics();
+                cold_bundle_payload = cold_diagnostics.bundle_payload_bytes;
+                transfer_lane_capacity = ring_diagnostics.effective_lanes;
+                if (cold_bundle_payload == 0 || transfer_lane_capacity < config.n_expert_used) {
+                    return fail(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::unsupported_configuration));
+                }
+            }
+
             directory_forward.assign(size_t(LLAMA_MAX_LAYERS)*n_expert, {});
             directory_slots.assign(config.capacity, {});
             for (auto & entry : directory_slots) {
@@ -1273,6 +1418,12 @@ public:
             candidate_slots.resize(config.capacity);
             slot_selected.resize(config.capacity);
             slot_releasable.resize(config.capacity);
+            cold_references.resize(config.capacity);
+            transfer_lanes.resize(config.capacity);
+            transfer_bindings.clear();
+            transfer_bindings.reserve(config.capacity);
+            hot_backing_scratch.clear();
+            hot_backing_scratch.reserve(config.capacity);
             request_pins.resize(config.capacity);
             element_unique.clear();
             logical_id_scratch.clear();
@@ -1286,6 +1437,8 @@ public:
 
             candidate->id = ++generation;
             pool = std::move(candidate);
+            cold_cache = std::move(cold_candidate);
+            transfer_ring = std::move(ring_candidate);
             epoch++;
             counters.allocations++;
             counters.pool_generations++;
@@ -1299,13 +1452,33 @@ public:
 
     llm_expert_provider_result trim() noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
+        if (config.cold_mode && active_request) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+        }
+        if (config.cold_mode) {
+            auto invariant = validate_inclusive_locked();
+            if (!invariant.is_ready()) return fail(invariant);
+        }
         for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
             auto & entry = directory_slots[slot];
             if (entry.state == hot_slot_state::ready && entry.refcount == 0) {
+                if (config.cold_mode && entry.has_cold_backing) {
+                    auto released = cold_cache->release(
+                        { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                    if (!released.is_ready()) return fail(released);
+                    entry.has_cold_backing = false;
+                    entry.cold_slot = 0;
+                    entry.cold_generation = 0;
+                }
                 clear_forward_locked(entry.key, slot, entry.generation);
                 entry.key = { -1, -1 };
                 entry.state = hot_slot_state::free;
             }
+        }
+        if (config.cold_mode) {
+            auto result = cold_cache->trim();
+            if (result.is_ready()) result = validate_inclusive_locked();
+            if (!result.is_ready()) return fail(result);
         }
         counters.trims++;
         return llm_expert_provider_result::success();
@@ -1320,7 +1493,28 @@ public:
             counters.surrender_busy++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         }
+        if (config.cold_mode) {
+            auto result = validate_inclusive_locked();
+            if (!result.is_ready()) return fail(result);
+            result = transfer_ring->surrender();
+            if (!result.is_ready()) {
+                counters.surrender_busy++;
+                return result;
+            }
+            for (auto & entry : directory_slots) {
+                if (entry.has_cold_backing) {
+                    result = cold_cache->release(
+                        { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                    if (!result.is_ready()) return fail(result);
+                    entry.has_cold_backing = false;
+                }
+            }
+            result = cold_cache->surrender();
+            if (!result.is_ready()) return fail(result);
+        }
         pool.reset();
+        cold_cache.reset();
+        transfer_ring.reset();
         directory_forward.clear();
         directory_slots.clear();
         unique_keys.clear();
@@ -1329,6 +1523,10 @@ public:
         candidate_slots.clear();
         slot_selected.clear();
         slot_releasable.clear();
+        cold_references.clear();
+        transfer_lanes.clear();
+        transfer_bindings.clear();
+        hot_backing_scratch.clear();
         element_unique.clear();
         logical_id_scratch.clear();
         execution_id_scratch.clear();
@@ -1338,6 +1536,8 @@ public:
         last_remap_layer = -1;
         request_pins.clear();
         request_pin_count = 0;
+        cold_bundle_payload = 0;
+        transfer_lane_capacity = 0;
         epoch++;
         counters.surrender_successes++;
         return llm_expert_provider_result::success();
@@ -1407,6 +1607,52 @@ public:
         }
         result.source_buffer_type = prototype.has_value() ? prototype->down.buffer_type : nullptr;
         result.target_buffer_type = config.target_buffer_type;
+        if (cold_cache) {
+            const auto cold = cold_cache->diagnostics();
+            result.cold_requested_bytes = cold.requested_bytes;
+            result.cold_actual_bytes = cold.actual_bytes;
+            result.cold_unused_budget_bytes = cold.unused_budget_bytes;
+            result.cold_bundle_payload_bytes = cold.bundle_payload_bytes;
+            result.cold_slot_footprint = cold.aligned_slot_footprint;
+            result.cold_alignment = cold.alignment;
+            result.cold_effective_slots = cold.effective_slots;
+            result.cold_pageable = cold.pageable;
+            result.cold_requests = cold.requests;
+            result.cold_hits = cold.hits;
+            result.cold_misses = cold.misses;
+            result.cold_admissions = cold.admissions;
+            result.cold_evictions = cold.evictions;
+            result.cold_source_copy_bundles = cold.source_copy_bundles;
+            result.cold_source_copy_bytes = cold.source_copy_bytes;
+            result.cold_source_copy_time_us = cold.source_copy_time_us;
+            result.cold_failed_copies = cold.failed_copies;
+            result.cold_invariant_failures = cold.invariant_failures;
+            result.cold_current_hot_refs = cold.current_hot_refs;
+            result.cold_peak_hot_refs = cold.peak_hot_refs;
+            result.cold_current_transfer_refs = cold.current_transfer_refs;
+            result.cold_peak_transfer_refs = cold.peak_transfer_refs;
+            result.cold_current_request_refs = cold.current_request_refs;
+            result.cold_peak_request_refs = cold.peak_request_refs;
+        }
+        if (transfer_ring) {
+            const auto ring = transfer_ring->diagnostics();
+            result.ring_requested_bytes = ring.requested_bytes;
+            result.ring_actual_bytes = ring.actual_bytes;
+            result.ring_lane_footprint = ring.lane_footprint;
+            result.ring_effective_lanes = ring.effective_lanes;
+            result.ring_pinned_or_registered_bytes = ring.pinned_or_registered_bytes;
+            result.ring_pageable_fallback = ring.pageable_fallback;
+            result.ring_fallback_count = ring.fallback_count;
+            result.ring_lane_reservations = ring.lane_reservations;
+            result.ring_stage_bytes = ring.stage_bytes;
+            result.ring_async_enqueues = ring.async_enqueues;
+            result.ring_synchronous_copies = ring.synchronous_copies;
+            result.ring_waves = ring.waves;
+            result.ring_peak_in_flight_lanes = ring.peak_in_flight_lanes;
+            result.ring_wave_synchronizations = ring.wave_synchronizations;
+            result.ring_h2d_bytes = ring.h2d_bytes;
+            result.ring_failed_cleanup = ring.failed_cleanups;
+        }
         return result;
     }
 
@@ -1419,6 +1665,9 @@ protected:
             release_request_pins_locked();
             active_request = false;
             active_request_id = 0;
+            if (config.cold_mode && !validate_inclusive_locked().is_ready()) {
+                metadata_mismatches++;
+            }
         }
         counters.handles_released++;
     }
@@ -1509,6 +1758,28 @@ private:
         return config.capacity >= n_expert || extent <= config.capacity/config.n_expert_used;
     }
 
+    llm_expert_provider_result validate_inclusive_locked() noexcept {
+        if (!config.cold_mode || !cold_cache || !transfer_ring) {
+            return config.cold_mode ?
+                llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed) :
+                llm_expert_provider_result::success();
+        }
+        hot_backing_scratch.clear();
+        for (const auto & entry : directory_slots) {
+            if (entry.state != hot_slot_state::loading && entry.state != hot_slot_state::ready &&
+                entry.state != hot_slot_state::pinned) {
+                continue;
+            }
+            if (!entry.has_cold_backing) {
+                metadata_mismatches++;
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+            hot_backing_scratch.push_back({ entry.key, entry.cold_slot, entry.cold_generation });
+        }
+        auto result = cold_cache->validate_invariants(hot_backing_scratch);
+        return result.is_ready() ? transfer_ring->validate_invariants() : result;
+    }
+
     llm_expert_provider_result validate_source_bundle(const llm_expert_bundle_descriptor & bundle) const {
         auto result = bundle.validate();
         if (!result.is_ready()) {
@@ -1585,6 +1856,8 @@ private:
     std::map<int32_t, llm_expert_bundle_descriptor> registrations;
     std::optional<llm_expert_bundle_descriptor> prototype;
     std::shared_ptr<hot_pool_generation> pool;
+    std::unique_ptr<llm_cold_expert_cache> cold_cache;
+    std::unique_ptr<llm_expert_transfer_ring> transfer_ring;
     uint64_t successful_bindings = 0;
     uint64_t epoch = 0;
     uint64_t generation = 0;
@@ -1602,6 +1875,10 @@ private:
     std::vector<uint32_t> candidate_slots;
     std::vector<uint8_t> slot_selected;
     std::vector<uint32_t> slot_releasable;
+    std::vector<llm_cold_reference> cold_references;
+    std::vector<llm_transfer_lane_reference> transfer_lanes;
+    std::vector<llm_transfer_binding> transfer_bindings;
+    std::vector<llm_cold_hot_backing> hot_backing_scratch;
     std::vector<int32_t> element_unique;
     std::vector<int32_t> logical_id_scratch;
     std::vector<int32_t> execution_id_scratch;
@@ -1639,6 +1916,8 @@ private:
     uint64_t execution_id_write_bytes = 0;
     uint64_t scratch_reservations = 0;
     uint64_t synchronization_checkpoints = 0;
+    uint64_t cold_bundle_payload = 0;
+    uint32_t transfer_lane_capacity = 0;
 };
 
 } // namespace
@@ -1651,5 +1930,12 @@ std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_pr
 std::unique_ptr<llm_expert_weight_provider> llm_create_hot_cache_expert_weight_provider(
         llm_hot_cache_config config,
         llm_expert_provider_faults faults) {
+    return std::make_unique<llm_hot_cache_expert_weight_provider>(config, faults);
+}
+
+std::unique_ptr<llm_expert_weight_provider> llm_create_cold_cache_expert_weight_provider(
+        llm_hot_cache_config config,
+        llm_expert_provider_faults faults) {
+    config.cold_mode = true;
     return std::make_unique<llm_hot_cache_expert_weight_provider>(config, faults);
 }

@@ -197,6 +197,46 @@ struct llm_hot_cache_diagnostics {
     std::vector<slot> slots;
     ggml_backend_buffer_type_t source_buffer_type = nullptr;
     ggml_backend_buffer_type_t target_buffer_type = nullptr;
+    uint64_t cold_requested_bytes = 0;
+    uint64_t cold_actual_bytes = 0;
+    uint64_t cold_unused_budget_bytes = 0;
+    uint64_t cold_bundle_payload_bytes = 0;
+    uint64_t cold_slot_footprint = 0;
+    uint64_t cold_alignment = 0;
+    uint32_t cold_effective_slots = 0;
+    bool cold_pageable = false;
+    uint64_t cold_requests = 0;
+    uint64_t cold_hits = 0;
+    uint64_t cold_misses = 0;
+    uint64_t cold_admissions = 0;
+    uint64_t cold_evictions = 0;
+    uint64_t cold_source_copy_bundles = 0;
+    uint64_t cold_source_copy_bytes = 0;
+    uint64_t cold_source_copy_time_us = 0;
+    uint64_t cold_failed_copies = 0;
+    uint64_t cold_invariant_failures = 0;
+    uint64_t cold_current_hot_refs = 0;
+    uint64_t cold_peak_hot_refs = 0;
+    uint64_t cold_current_transfer_refs = 0;
+    uint64_t cold_peak_transfer_refs = 0;
+    uint64_t cold_current_request_refs = 0;
+    uint64_t cold_peak_request_refs = 0;
+    uint64_t ring_requested_bytes = 0;
+    uint64_t ring_actual_bytes = 0;
+    uint64_t ring_lane_footprint = 0;
+    uint32_t ring_effective_lanes = 0;
+    uint64_t ring_pinned_or_registered_bytes = 0;
+    bool ring_pageable_fallback = false;
+    uint64_t ring_fallback_count = 0;
+    uint64_t ring_lane_reservations = 0;
+    uint64_t ring_stage_bytes = 0;
+    uint64_t ring_async_enqueues = 0;
+    uint64_t ring_synchronous_copies = 0;
+    uint64_t ring_waves = 0;
+    uint64_t ring_peak_in_flight_lanes = 0;
+    uint64_t ring_wave_synchronizations = 0;
+    uint64_t ring_h2d_bytes = 0;
+    uint64_t ring_failed_cleanup = 0;
 };
 
 struct llm_expert_graph_diagnostics {
@@ -355,11 +395,20 @@ struct llm_hot_cache_config {
     // Internal test seam. The model-facing path always leaves this false.
     bool allow_non_cuda_target_for_testing = false;
     uint64_t initial_slot_generation_for_testing = 0;
+    bool cold_mode = false;
+    uint64_t cold_cache_bytes = 0;
+    uint64_t transfer_ring_bytes = 0;
+    ggml_backend_dev_t target_device = nullptr;
+    bool force_pageable_transfer_for_testing = false;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(
         llm_expert_provider_faults faults = {});
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_hot_cache_expert_weight_provider(
+        llm_hot_cache_config config,
+        llm_expert_provider_faults faults = {});
+
+std::unique_ptr<llm_expert_weight_provider> llm_create_cold_cache_expert_weight_provider(
         llm_hot_cache_config config,
         llm_expert_provider_faults faults = {});

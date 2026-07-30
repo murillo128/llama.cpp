@@ -529,7 +529,6 @@ llm_expert_provider_result llm_cold_expert_cache::surrender() noexcept {
 llm_expert_provider_result llm_cold_expert_cache::validate_invariants(
         const std::vector<llm_cold_hot_backing> & hot_backings) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
-    std::vector<uint32_t> expected_hot(pimpl->slots.size(), 0);
     for (const auto & backing : hot_backings) {
         if (backing.cold_slot >= pimpl->slots.size()) {
             pimpl->counters.invariant_failures++;
@@ -541,11 +540,14 @@ llm_expert_provider_result llm_cold_expert_cache::validate_invariants(
             pimpl->counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
-        expected_hot[backing.cold_slot]++;
     }
     for (uint32_t index = 0; index < pimpl->slots.size(); ++index) {
         const auto & slot = pimpl->slots[index];
-        if (slot.hot_refs != expected_hot[index]) {
+        uint32_t expected_hot = 0;
+        for (const auto & backing : hot_backings) {
+            expected_hot += backing.cold_slot == index;
+        }
+        if (slot.hot_refs != expected_hot) {
             pimpl->counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }

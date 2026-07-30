@@ -1101,7 +1101,8 @@ void llama_model::init_expert_weight_provider() {
         case LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT:
             pimpl->expert_weight_provider = llm_create_resident_expert_weight_provider();
             return;
-        case LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE: {
+        case LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE:
+        case LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE: {
             ggml_backend_dev_t target = nullptr;
             uint32_t routed_layer_count = 0;
             for (uint32_t il = 0; il < layers.size(); ++il) {
@@ -1120,20 +1121,29 @@ void llama_model::init_expert_weight_provider() {
             if (target == nullptr || hparams.n_expert <= 0 || hparams.n_expert_used <= 0) {
                 throw std::invalid_argument("hot-cache mode requires routed experts and a CUDA target");
             }
-            pimpl->expert_weight_provider = llm_create_hot_cache_expert_weight_provider({
+            const uint64_t directory_entries = uint64_t(routed_layer_count)*uint32_t(hparams.n_expert);
+            if (directory_entries > UINT32_MAX) {
+                throw std::overflow_error("hot-cache expert directory exceeds uint32_t capacity");
+            }
+            llm_hot_cache_config config = {
                 params.expert_hot_cache_capacity,
                 uint32_t(hparams.n_expert_used),
                 routed_layer_count,
-                routed_layer_count*uint32_t(hparams.n_expert),
+                uint32_t(directory_entries),
                 ggml_backend_dev_buffer_type(target),
                 false,
-            });
+            };
+            if (params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
+                config.cold_mode = true;
+                config.cold_cache_bytes = params.expert_cold_cache_bytes;
+                config.transfer_ring_bytes = params.expert_transfer_ring_bytes;
+                config.target_device = target;
+                pimpl->expert_weight_provider = llm_create_cold_cache_expert_weight_provider(config);
+            } else {
+                pimpl->expert_weight_provider = llm_create_hot_cache_expert_weight_provider(config);
+            }
             return;
         }
-        case LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE:
-            // Phase 1 establishes the byte-budgeted CPU mechanism. Live provider
-            // construction is enabled only after the bounded transfer ring exists.
-            throw std::invalid_argument("cold-cache live integration is not initialized");
         case LLAMA_EXPERT_WEIGHTS_MODE_COUNT:
             break;
     }

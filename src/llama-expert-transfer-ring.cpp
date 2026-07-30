@@ -365,7 +365,9 @@ llm_expert_provider_result llm_expert_transfer_ring::cleanup_failed_lanes() noex
         return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
     }
     for (auto & lane : pimpl->lanes) {
-        if (lane.state == llm_transfer_lane_state::failed) pimpl->release_lane(lane);
+        if (lane.state == llm_transfer_lane_state::failed || lane.state == llm_transfer_lane_state::staging) {
+            pimpl->release_lane(lane);
+        }
     }
     return llm_expert_provider_result::success();
 }

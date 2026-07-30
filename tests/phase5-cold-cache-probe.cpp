@@ -1,14 +1,168 @@
 #include "llama-expert-transfer-ring.h"
+#include "llama-context.h"
+#include "llama-model.h"
+#include "llama.h"
 
 #include "ggml-cpp.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
 namespace {
+
+uint64_t hash_bytes(uint64_t hash, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+struct route_hash {
+    uint64_t value = 1469598103934665603ULL;
+    uint64_t records = 0;
+};
+
+bool capture_route(const llama_route_observation * observation, void * user_data) {
+    auto * state = static_cast<route_hash *>(user_data);
+    const size_t count = size_t(observation->n_tokens)*observation->n_expert_used;
+    state->value = hash_bytes(state->value, &observation->layer, sizeof(observation->layer));
+    state->value = hash_bytes(state->value, observation->selected_experts, count*sizeof(int32_t));
+    state->value = hash_bytes(state->value, observation->weights, count*sizeof(float));
+    state->records++;
+    return true;
+}
+
+struct live_arguments {
+    std::string model;
+    std::string mode;
+    uint32_t capacity = 0;
+    uint64_t cold_bytes = 0;
+    uint64_t ring_bytes = 0;
+    int steps = 5;
+};
+
+bool parse_u64(const char * text, uint64_t & result) {
+    char * end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0') return false;
+    result = value;
+    return true;
+}
+
+bool parse_live(int argc, char ** argv, live_arguments & result) {
+    for (int index = 1; index < argc; ++index) {
+        if (index + 1 >= argc) return false;
+        const std::string option = argv[index];
+        const char * value = argv[++index];
+        uint64_t parsed = 0;
+        if (option == "--model") result.model = value;
+        else if (option == "--mode") result.mode = value;
+        else if (option == "--capacity" && parse_u64(value, parsed) && parsed <= UINT32_MAX) result.capacity = parsed;
+        else if (option == "--cold-bytes" && parse_u64(value, result.cold_bytes)) {}
+        else if (option == "--ring-bytes" && parse_u64(value, result.ring_bytes)) {}
+        else if (option == "--steps" && parse_u64(value, parsed) && parsed > 0 && parsed <= 64) result.steps = parsed;
+        else return false;
+    }
+    return !result.model.empty() && (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold") &&
+        (result.mode == "disabled" || result.capacity > 0) &&
+        (result.mode != "cold" || (result.cold_bytes > 0 && result.ring_bytes > 0));
+}
+
+int run_live(int argc, char ** argv) {
+    live_arguments args;
+    if (!parse_live(argc, argv, args)) return 20;
+    ggml_backend_load_all();
+    const llama_model_tensor_buft_override overrides[] = {
+        { "ffn_(gate|up|down)_exps\\.weight", ggml_backend_cpu_buffer_type() },
+        { nullptr, nullptr },
+    };
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = -1;
+    if (args.mode != "disabled") {
+        model_params.tensor_buft_overrides = overrides;
+        model_params.expert_hot_cache_capacity = args.capacity;
+        model_params.expert_weights_mode = args.mode == "hot" ?
+            LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+        model_params.expert_cold_cache_bytes = args.cold_bytes;
+        model_params.expert_transfer_ring_bytes = args.ring_bytes;
+    }
+    llama_model * model = llama_model_load_from_file(args.model.c_str(), model_params);
+    if (!model) return 21;
+    llama_context_params context_params = llama_context_default_params();
+    context_params.n_ctx = 64;
+    context_params.n_batch = 64;
+    context_params.n_ubatch = 1;
+    llama_context * context = llama_init_from_model(model, context_params);
+    if (!context) return 22;
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const std::string prompt_text = "According to all known laws";
+    const int prompt_count = -llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), nullptr, 0, true, true);
+    std::vector<llama_token> prompt(prompt_count);
+    if (prompt_count <= 0 || llama_tokenize(vocab, prompt_text.data(), prompt_text.size(),
+            prompt.data(), prompt.size(), true, true) != prompt_count) return 23;
+    route_hash routes;
+    if (llama_set_route_observer(context, capture_route, &routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 24;
+    uint64_t logits_hash = 1469598103934665603ULL;
+    std::vector<llama_token> generated;
+    llama_batch batch = llama_batch_get_one(prompt.data(), prompt.size());
+    for (int step = 0; step < args.steps; ++step) {
+        const auto phase = step == 0 ? LLAMA_ROUTE_PHASE_PREFILL : LLAMA_ROUTE_PHASE_DECODE;
+        if (llama_route_observer_begin(context, step, phase) != LLAMA_ROUTE_OBSERVER_STATUS_OK ||
+            llama_decode(context, batch) != 0) return 25;
+        const float * logits = llama_get_logits_ith(context, -1);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        if (!logits) return 26;
+        logits_hash = hash_bytes(logits_hash, logits, size_t(n_vocab)*sizeof(float));
+        int32_t next = 0;
+        for (int32_t token = 1; token < n_vocab; ++token) if (logits[token] > logits[next]) next = token;
+        generated.push_back(next);
+        if (llama_vocab_is_eog(vocab, next)) break;
+        batch = llama_batch_get_one(&generated.back(), 1);
+    }
+    llama_synchronize(context);
+    const auto diagnostics = model->expert_weight_provider() ?
+        model->expert_weight_provider()->hot_cache_diagnostics() : llm_hot_cache_diagnostics {};
+    std::ostringstream tokens;
+    for (size_t index = 0; index < generated.size(); ++index) {
+        if (index) tokens << ',';
+        tokens << generated[index];
+    }
+    std::cout << "PHASE5_LIVE"
+              << "\tmode=" << args.mode
+              << "\ttokens=" << tokens.str()
+              << "\tlogits_hash=" << logits_hash
+              << "\troute_hash=" << routes.value
+              << "\troute_records=" << routes.records
+              << "\thot_hits=" << diagnostics.hits
+              << "\thot_misses=" << diagnostics.misses
+              << "\tcold_hits=" << diagnostics.cold_hits
+              << "\tcold_misses=" << diagnostics.cold_misses
+              << "\tcold_evictions=" << diagnostics.cold_evictions
+              << "\tcold_actual_bytes=" << diagnostics.cold_actual_bytes
+              << "\tcold_slot_footprint=" << diagnostics.cold_slot_footprint
+              << "\tcold_slots=" << diagnostics.cold_effective_slots
+              << "\tcold_source_bytes=" << diagnostics.cold_source_copy_bytes
+              << "\tcold_hot_refs=" << diagnostics.cold_current_hot_refs
+              << "\tcold_transfer_refs=" << diagnostics.cold_current_transfer_refs
+              << "\tring_lanes=" << diagnostics.ring_effective_lanes
+              << "\tring_pinned_bytes=" << diagnostics.ring_pinned_or_registered_bytes
+              << "\tring_fallback=" << diagnostics.ring_pageable_fallback
+              << "\tring_async_enqueues=" << diagnostics.ring_async_enqueues
+              << "\tring_sync_copies=" << diagnostics.ring_synchronous_copies
+              << "\tring_waves=" << diagnostics.ring_waves
+              << "\tring_wave_syncs=" << diagnostics.ring_wave_synchronizations
+              << '\n';
+    llama_free(context);
+    llama_model_free(model);
+    return 0;
+}
 
 struct fixture {
     ggml_context_ptr ctx;
@@ -69,6 +223,7 @@ bool slot_matches(const fixture & source, const fixture & hot, int32_t expert, u
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--model") return run_live(argc, argv);
     bool force_pageable = false;
     if (argc == 2 && std::string(argv[1]) == "--force-pageable") force_pageable = true;
     else if (argc != 1) return 2;
