@@ -46,6 +46,7 @@ struct live_arguments {
     uint64_t cold_bytes = 0;
     uint64_t ring_bytes = 0;
     int steps = 5;
+    llama_load_mode load_mode = LLAMA_LOAD_MODE_MMAP;
 };
 
 bool parse_u64(const char * text, uint64_t & result) {
@@ -68,6 +69,13 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
         else if (option == "--cold-bytes" && parse_u64(value, result.cold_bytes)) {}
         else if (option == "--ring-bytes" && parse_u64(value, result.ring_bytes)) {}
         else if (option == "--steps" && parse_u64(value, parsed) && parsed > 0 && parsed <= 64) result.steps = parsed;
+        else if (option == "--load-mode") {
+            try {
+                result.load_mode = llama_load_mode_from_str(value);
+            } catch (const std::invalid_argument &) {
+                return false;
+            }
+        }
         else return false;
     }
     return !result.model.empty() && (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold") &&
@@ -85,6 +93,7 @@ int run_live(int argc, char ** argv) {
     };
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = -1;
+    model_params.load_mode = args.load_mode;
     if (args.mode != "disabled") {
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_hot_cache_capacity = args.capacity;
@@ -136,6 +145,7 @@ int run_live(int argc, char ** argv) {
     }
     std::cout << "PHASE5_LIVE"
               << "\tmode=" << args.mode
+              << "\tload_mode=" << llama_load_mode_name(args.load_mode)
               << "\ttokens=" << tokens.str()
               << "\tlogits_hash=" << logits_hash
               << "\troute_hash=" << routes.value
@@ -149,10 +159,15 @@ int run_live(int argc, char ** argv) {
               << "\tcold_slot_footprint=" << diagnostics.cold_slot_footprint
               << "\tcold_slots=" << diagnostics.cold_effective_slots
               << "\tcold_source_bytes=" << diagnostics.cold_source_copy_bytes
+              << "\tsource_pageable=" << diagnostics.source_pageable
+              << "\tsource_pinned_bytes=" << diagnostics.source_pinned_bytes
+              << "\tno_writeback_evictions=" << diagnostics.no_writeback_evictions
               << "\tcold_hot_refs=" << diagnostics.cold_current_hot_refs
               << "\tcold_transfer_refs=" << diagnostics.cold_current_transfer_refs
               << "\tring_lanes=" << diagnostics.ring_effective_lanes
               << "\tring_pinned_bytes=" << diagnostics.ring_pinned_or_registered_bytes
+              << "\tring_acquisition=" << diagnostics.ring_acquisition_method
+              << "\tring_fallback_reason=" << diagnostics.ring_fallback_reason
               << "\tring_fallback=" << diagnostics.ring_pageable_fallback
               << "\tring_async_enqueues=" << diagnostics.ring_async_enqueues
               << "\tring_sync_copies=" << diagnostics.ring_synchronous_copies

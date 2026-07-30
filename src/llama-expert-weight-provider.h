@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 enum class llm_expert_provider_status {
@@ -157,6 +158,7 @@ struct llm_hot_cache_diagnostics {
     uint64_t misses = 0;
     uint64_t admissions = 0;
     uint64_t evictions = 0;
+    uint64_t no_writeback_evictions = 0;
     uint64_t generation_changes = 0;
     uint64_t stale_generation_failures = 0;
     uint64_t copy_failures = 0;
@@ -197,6 +199,8 @@ struct llm_hot_cache_diagnostics {
     std::vector<slot> slots;
     ggml_backend_buffer_type_t source_buffer_type = nullptr;
     ggml_backend_buffer_type_t target_buffer_type = nullptr;
+    bool source_pageable = false;
+    uint64_t source_pinned_bytes = 0;
     uint64_t cold_requested_bytes = 0;
     uint64_t cold_actual_bytes = 0;
     uint64_t cold_unused_budget_bytes = 0;
@@ -226,6 +230,8 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_lane_footprint = 0;
     uint32_t ring_effective_lanes = 0;
     uint64_t ring_pinned_or_registered_bytes = 0;
+    std::string ring_acquisition_method;
+    std::string ring_fallback_reason;
     bool ring_pageable_fallback = false;
     uint64_t ring_fallback_count = 0;
     uint64_t ring_lane_reservations = 0;

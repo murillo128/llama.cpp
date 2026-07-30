@@ -1085,6 +1085,9 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
                        params.expert_transfer_ring_bytes == 0))) {
         throw std::invalid_argument("invalid cold-cache byte budgets");
     }
+    if (cold_mode && params.load_mode != LLAMA_LOAD_MODE_MMAP) {
+        throw std::invalid_argument("cold-cache mode requires pageable mmap source tensors");
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.

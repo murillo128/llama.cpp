@@ -153,6 +153,24 @@ bool projection_is_host_accessible(const llm_expert_projection_descriptor & proj
     return true;
 }
 
+bool projection_is_pageable_cpu(const llm_expert_projection_descriptor & projection) {
+    const std::array<ggml_tensor *, 3> tensors = { projection.weight, projection.bias, projection.scale };
+    for (const auto * tensor : tensors) {
+        if (tensor == nullptr) {
+            continue;
+        }
+        if (tensor->buffer == nullptr || !ggml_backend_buffer_is_host(tensor->buffer)) {
+            return false;
+        }
+        const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
+        const auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool llm_expert_provider_result::is_ready() const {
@@ -1139,6 +1157,7 @@ public:
                 entry.state = hot_slot_state::evicting;
                 clear_forward_locked(entry.key, slot, entry.generation);
                 evictions++;
+                if (config.cold_mode) no_writeback_evictions++;
             }
             entry.state = hot_slot_state::reserved;
             entry.key = unique_keys[unique_index];
@@ -1573,6 +1592,7 @@ public:
         result.misses = misses;
         result.admissions = admissions;
         result.evictions = evictions;
+        result.no_writeback_evictions = no_writeback_evictions;
         result.generation_changes = generation_changes;
         result.stale_generation_failures = stale_generation_failures;
         result.copy_failures = copy_failures;
@@ -1607,6 +1627,8 @@ public:
         }
         result.source_buffer_type = prototype.has_value() ? prototype->down.buffer_type : nullptr;
         result.target_buffer_type = config.target_buffer_type;
+        result.source_pageable = config.cold_mode && prototype.has_value();
+        result.source_pinned_bytes = 0;
         if (cold_cache) {
             const auto cold = cold_cache->diagnostics();
             result.cold_requested_bytes = cold.requested_bytes;
@@ -1641,6 +1663,8 @@ public:
             result.ring_lane_footprint = ring.lane_footprint;
             result.ring_effective_lanes = ring.effective_lanes;
             result.ring_pinned_or_registered_bytes = ring.pinned_or_registered_bytes;
+            result.ring_acquisition_method = ring.acquisition_method;
+            result.ring_fallback_reason = ring.fallback_reason;
             result.ring_pageable_fallback = ring.pageable_fallback;
             result.ring_fallback_count = ring.fallback_count;
             result.ring_lane_reservations = ring.lane_reservations;
@@ -1786,7 +1810,8 @@ private:
             return result;
         }
         for (const auto * projection : { &bundle.up, &bundle.gate, &bundle.gate_up, &bundle.down }) {
-            if (!projection_is_host_accessible(*projection)) {
+            if (!projection_is_host_accessible(*projection) ||
+                (config.cold_mode && !projection_is_pageable_cpu(*projection))) {
                 return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
             }
         }
@@ -1901,6 +1926,7 @@ private:
     uint64_t misses = 0;
     uint64_t admissions = 0;
     uint64_t evictions = 0;
+    uint64_t no_writeback_evictions = 0;
     uint64_t generation_changes = 0;
     uint64_t stale_generation_failures = 0;
     uint64_t metadata_mismatches = 0;

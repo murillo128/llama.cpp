@@ -71,7 +71,8 @@ struct tensor_fixture {
             int64_t n_hidden = 16,
             int64_t n_expert = 4,
             int64_t n_tokens = 1,
-            int64_t n_expert_used = 2) :
+            int64_t n_expert_used = 2,
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type()) :
         n_expert(n_expert), n_expert_used(n_expert_used), n_tokens(n_tokens) {
         ggml_init_params params = {
             /*.mem_size   =*/ ggml_tensor_overhead()*16,
@@ -90,7 +91,7 @@ struct tensor_fixture {
         down_bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_in, n_expert);
         down_scale = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_expert);
         ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, n_tokens);
-        buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+        buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
         GGML_ASSERT(buffer);
         uint8_t pattern = 0x10;
         for (auto * tensor : { up, up_bias, up_scale, gate, gate_bias, gate_scale, down, down_bias, down_scale }) {
@@ -347,6 +348,19 @@ void test_context_extent_matrix_and_prepare_revalidation() {
     safe_extent_plan.reset();
 }
 
+void test_cold_provider_rejects_cuda_host_source() {
+    ggml_backend_load_all();
+    auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) return;
+    auto * host_buft = ggml_backend_dev_host_buffer_type(device);
+    if (!host_buft) return;
+    tensor_fixture tensors(8, 16, 4, 1, 2, host_buft);
+    auto provider = llm_create_cold_cache_expert_weight_provider(cold_test_config());
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(provider->bind(tensors.bundle(0), tensors.selection(0), binding).error ==
+        llm_expert_provider_error::unsupported_configuration);
+}
+
 void test_pool_lifetime_trim_surrender_and_epoch() {
     tensor_fixture tensors;
     auto provider = llm_create_hot_cache_expert_weight_provider(test_config());
@@ -557,6 +571,9 @@ void test_cold_provider_inclusive_promotion_and_hits() {
     GGML_ASSERT(diagnostics.ring_async_enqueues == 0 && diagnostics.ring_wave_synchronizations == 0);
     GGML_ASSERT(diagnostics.cold_current_hot_refs == 2);
     GGML_ASSERT(diagnostics.cold_current_transfer_refs == 0);
+    GGML_ASSERT(diagnostics.source_pageable && diagnostics.source_pinned_bytes == 0);
+    GGML_ASSERT(diagnostics.ring_acquisition_method == "pageable-cpu");
+    GGML_ASSERT(diagnostics.ring_fallback_reason == "forced-for-testing");
     for (int32_t index = 0; index < 2; ++index) {
         GGML_ASSERT(diagnostics.slots[execution_ids[index]].has_cold_backing);
         assert_bundle_slot_matches(tensors, binding, first_ids[index], execution_ids[index]);
@@ -567,6 +584,10 @@ void test_cold_provider_inclusive_promotion_and_hits() {
     diagnostics = provider->hot_cache_diagnostics();
     GGML_ASSERT(diagnostics.hits == 2 && diagnostics.cold_source_copy_bytes == source_bytes);
     GGML_ASSERT(diagnostics.cold_current_request_refs == 0);
+    const int32_t second_ids[] = { 2, 3 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, second_ids, 2, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.evictions == 2 && diagnostics.no_writeback_evictions == 2);
     plan.reset();
 
     GGML_ASSERT(provider->trim().is_ready());
@@ -1032,6 +1053,7 @@ void test_cuda_directory_copy() {
 int main(int argc, char ** argv) {
     test_configuration_matrix();
     test_context_extent_matrix_and_prepare_revalidation();
+    test_cold_provider_rejects_cuda_host_source();
     test_pool_lifetime_trim_surrender_and_epoch();
     test_layout_host_and_partial_initialization_rejection();
     test_allocation_failure_is_recoverable_and_empty_prepare_is_safe();
