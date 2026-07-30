@@ -85,6 +85,7 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    bool defer_routed_expert_payloads = false;
     bool check_tensors;
     bool no_alloc;
 
@@ -104,6 +105,10 @@ struct llama_model_loader {
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
     std::vector<ggml_context_ptr> contexts;
+    ggml_context_ptr deferred_expert_ctx;
+    std::unordered_map<std::string, ggml_tensor *> deferred_expert_tensors;
+    uint64_t deferred_expert_payload_bytes = 0;
+    bool full_file_prefetch_disabled = false;
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
@@ -136,6 +141,7 @@ struct llama_model_loader {
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
         llama_load_mode load_mode,
+        bool defer_routed_expert_payloads,
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
@@ -179,6 +185,8 @@ struct llama_model_loader {
     const llama_tensor_weight * get_weight(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
+
+    bool is_deferred_expert_tensor(const char * name) const;
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 

@@ -28,8 +28,9 @@ struct llm_expert_storage_source {
 };
 
 struct llm_expert_storage_config {
-    uint32_t routed_layer_count = 0;
+    uint32_t layer_count = 0;
     uint32_t experts_per_layer = 0;
+    uint32_t expected_bundle_count = 0;
     uint64_t maximum_read_chunk = 8U*1024U*1024U;
 };
 

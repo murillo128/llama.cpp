@@ -19,6 +19,18 @@ struct llama_ubatch;
 struct llama_model_loader;
 class llm_expert_weight_provider;
 struct llm_expert_provider_stats;
+class llm_expert_storage;
+struct llm_expert_storage_diagnostics;
+
+struct llm_deferred_expert_diagnostics {
+    uint64_t tensor_count = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t allocated_bytes = 0;
+    uint64_t mmap_bound_bytes = 0;
+    uint64_t prefetched_bytes = 0;
+    uint64_t resident_loaded_bytes = 0;
+    bool full_file_prefetch_disabled = false;
+};
 
 // available models
 enum llm_type {
@@ -688,6 +700,9 @@ struct llama_model {
     int32_t tensor_storage_metadata(const char * name, struct llama_model_tensor_storage_metadata * metadata) const;
 
     void init_expert_weight_provider();
+    void init_expert_storage(llama_model_loader & ml);
+    llm_expert_storage * expert_storage() const;
+    llm_deferred_expert_diagnostics deferred_expert_diagnostics() const;
     llm_expert_weight_provider * expert_weight_provider() const;
     llm_expert_provider_stats expert_weight_provider_stats() const;
     void replace_expert_weight_provider_for_testing(std::unique_ptr<llm_expert_weight_provider> provider);

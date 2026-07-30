@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-expert-weight-provider.h"
+#include "llama-expert-storage.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -1026,6 +1027,11 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // Deferred routed metadata and storage outlive the provider that borrows them.
+    ggml_context_ptr deferred_expert_ctx;
+    std::unique_ptr<llm_expert_storage> expert_storage;
+    llm_deferred_expert_diagnostics deferred_expert_diagnostics;
+
     // Declared after model buffers so provider leases and borrowed tensor references are destroyed first.
     std::unique_ptr<llm_expert_weight_provider> expert_weight_provider;
 
@@ -1141,6 +1147,7 @@ void llama_model::init_expert_weight_provider() {
                 config.cold_cache_bytes = params.expert_cold_cache_bytes;
                 config.transfer_ring_bytes = params.expert_transfer_ring_bytes;
                 config.target_device = target;
+                config.storage = pimpl->expert_storage.get();
                 pimpl->expert_weight_provider = llm_create_cold_cache_expert_weight_provider(config);
             } else {
                 pimpl->expert_weight_provider = llm_create_hot_cache_expert_weight_provider(config);
@@ -1151,6 +1158,110 @@ void llama_model::init_expert_weight_provider() {
             break;
     }
     throw std::runtime_error("invalid expert weights mode");
+}
+
+namespace {
+
+bool checked_storage_add(uint64_t lhs, uint64_t rhs, uint64_t & result) {
+    if (lhs > std::numeric_limits<uint64_t>::max() - rhs) return false;
+    result = lhs + rhs;
+    return true;
+}
+
+int routed_expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight) {
+    if (tensor == nullptr) return -1;
+    if (weight) {
+        if (ggml_n_dims(tensor) < 3 || tensor->ne[2] != n_expert) return -1;
+        for (int axis = 3; axis < ggml_n_dims(tensor); ++axis) if (tensor->ne[axis] != 1) return -1;
+        return 2;
+    }
+    for (int axis = ggml_n_dims(tensor) - 1; axis >= 0; --axis) {
+        if (tensor->ne[axis] != n_expert) continue;
+        for (int upper = axis + 1; upper < ggml_n_dims(tensor); ++upper) if (tensor->ne[upper] != 1) return -1;
+        return axis;
+    }
+    return -1;
+}
+
+} // namespace
+
+void llama_model::init_expert_storage(llama_model_loader & ml) {
+    if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
+        return;
+    }
+    if (!ml.defer_routed_expert_payloads || !ml.full_file_prefetch_disabled || ml.deferred_expert_tensors.empty() ||
+        !pimpl->deferred_expert_ctx || hparams.n_expert <= 0) {
+        throw std::runtime_error("cold-cache routed tensor deferral is incomplete");
+    }
+
+    std::vector<llm_expert_storage_source> sources;
+    sources.reserve(ml.files.size());
+    for (uint32_t index = 0; index < ml.files.size(); ++index) {
+        sources.push_back({ uint16_t(index), ml.files[index].get(), uint64_t(ml.source_files[index].alignment) });
+    }
+    uint32_t routed_layer_count = 0;
+    for (const auto & layer : layers) if (layer.ffn_down_exps != nullptr) routed_layer_count++;
+    const uint64_t expected = uint64_t(routed_layer_count)*uint32_t(hparams.n_expert);
+    if (routed_layer_count == 0 || expected > UINT32_MAX) {
+        throw std::runtime_error("invalid routed topology for expert storage");
+    }
+    auto storage = std::make_unique<llm_expert_storage>(llm_expert_storage_config{
+        uint32_t(layers.size()), uint32_t(hparams.n_expert), uint32_t(expected), 8U*1024U*1024U,
+    }, sources);
+
+    for (uint32_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+        const auto & layer = layers[layer_index];
+        if (layer.ffn_down_exps == nullptr) continue;
+        const std::array<std::pair<llm_expert_storage_projection, llm_expert_projection_descriptor>, 4> projections = {{
+            { llm_expert_storage_projection::up, llm_expert_projection_descriptor::from(layer.ffn_up_exps, layer.ffn_up_exps_b, layer.ffn_up_exps_s) },
+            { llm_expert_storage_projection::gate, llm_expert_projection_descriptor::from(layer.ffn_gate_exps, layer.ffn_gate_exps_b, layer.ffn_gate_exps_s) },
+            { llm_expert_storage_projection::gate_up, llm_expert_projection_descriptor::from(layer.ffn_gate_up_exps, layer.ffn_gate_up_exps_b, nullptr) },
+            { llm_expert_storage_projection::down, llm_expert_projection_descriptor::from(layer.ffn_down_exps, layer.ffn_down_exps_b, layer.ffn_down_exps_s) },
+        }};
+        for (int32_t expert = 0; expert < int32_t(hparams.n_expert); ++expert) {
+            std::vector<llm_expert_storage_span> spans;
+            uint64_t destination_offset = 0;
+            for (const auto & [projection_identity, projection] : projections) {
+                size_t sidecar_index = 0;
+                for (const ggml_tensor * tensor : { projection.weight, projection.bias, projection.scale }) {
+                    if (tensor == nullptr) { sidecar_index++; continue; }
+                    if (!ml.is_deferred_expert_tensor(ggml_get_name(tensor)) || tensor->data != nullptr || tensor->buffer != nullptr) {
+                        throw std::runtime_error(format("routed tensor '%s' was not metadata-only", ggml_get_name(tensor)));
+                    }
+                    const int axis = routed_expert_axis(tensor, hparams.n_expert, sidecar_index == 0);
+                    if (axis < 0) throw std::runtime_error(format("invalid routed expert axis for '%s'", ggml_get_name(tensor)));
+                    const uint64_t extent = tensor->nb[axis];
+                    uint64_t expert_offset = 0, tensor_end = 0, source_offset = 0, destination_end = 0;
+                    if (extent == 0 || uint64_t(expert) > std::numeric_limits<uint64_t>::max()/extent) {
+                        throw std::overflow_error("routed expert span overflow");
+                    }
+                    expert_offset = uint64_t(expert)*extent;
+                    if (!checked_storage_add(expert_offset, extent, tensor_end) || tensor_end > ggml_nbytes(tensor)) {
+                        throw std::runtime_error("routed expert span exceeds parent tensor");
+                    }
+                    const auto & weight = ml.require_weight(ggml_get_name(tensor));
+                    if (!checked_storage_add(weight.offs, expert_offset, source_offset) ||
+                        !checked_storage_add(destination_offset, extent, destination_end)) {
+                        throw std::overflow_error("routed expert file or destination span overflow");
+                    }
+                    spans.push_back({ weight.idx, source_offset, extent, projection_identity,
+                        static_cast<llm_expert_storage_sidecar>(sidecar_index), destination_offset, extent });
+                    destination_offset = destination_end;
+                    sidecar_index++;
+                }
+            }
+            const auto result = storage->add_bundle({ int32_t(layer_index), expert }, std::move(spans));
+            if (!result.is_ready()) throw std::runtime_error("invalid routed expert storage directory");
+        }
+    }
+    const auto result = storage->seal();
+    if (!result.is_ready()) throw std::runtime_error("incomplete routed expert storage directory");
+    pimpl->expert_storage = std::move(storage);
+}
+
+llm_expert_storage * llama_model::expert_storage() const { return pimpl->expert_storage.get(); }
+llm_deferred_expert_diagnostics llama_model::deferred_expert_diagnostics() const {
+    return pimpl->deferred_expert_diagnostics;
 }
 
 llm_expert_weight_provider * llama_model::expert_weight_provider() const {
@@ -1196,6 +1307,12 @@ void llama_model::capture_storage_metadata(llama_model_loader & ml) {
     for (const auto & [buft, ctx] : ml.ctx_map) {
         for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
             runtime_tensors.emplace(ggml_get_name(tensor), runtime_tensor_info{tensor, buft});
+        }
+    }
+    if (ml.deferred_expert_ctx) {
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ml.deferred_expert_ctx.get()); tensor;
+                tensor = ggml_get_next_tensor(ml.deferred_expert_ctx.get(), tensor)) {
+            runtime_tensors.emplace(ggml_get_name(tensor), runtime_tensor_info{tensor, nullptr});
         }
     }
 
@@ -1779,10 +1896,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+    if (ml.deferred_expert_ctx) {
+        for (auto * cur = ggml_get_first_tensor(ml.deferred_expert_ctx.get()); cur;
+                cur = ggml_get_next_tensor(ml.deferred_expert_ctx.get(), cur)) {
+            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+        }
+    }
 
     capture_storage_metadata(ml);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!ml.defer_routed_expert_payloads, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    pimpl->deferred_expert_diagnostics = {
+        ml.deferred_expert_tensors.size(),
+        ml.deferred_expert_payload_bytes,
+        0,
+        0,
+        0,
+        ml.size_data,
+        ml.full_file_prefetch_disabled,
+    };
+    pimpl->deferred_expert_ctx = std::move(ml.deferred_expert_ctx);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers

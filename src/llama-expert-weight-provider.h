@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+class llm_expert_storage;
+
 enum class llm_expert_provider_status {
     ready,
     allocation_failed,
@@ -410,6 +412,7 @@ struct llm_hot_cache_config {
     uint64_t transfer_ring_bytes = 0;
     ggml_backend_dev_t target_device = nullptr;
     bool force_pageable_transfer_for_testing = false;
+    llm_expert_storage * storage = nullptr;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(

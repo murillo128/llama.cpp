@@ -60,13 +60,14 @@ struct llm_expert_storage::impl {
 llm_expert_storage::llm_expert_storage(llm_expert_storage_config config,
         const std::vector<llm_expert_storage_source> & sources,
         llm_expert_storage_read_override * read_override) : pimpl(std::make_unique<impl>()) {
-    if (config.routed_layer_count == 0 || config.experts_per_layer == 0 || config.maximum_read_chunk == 0 ||
+    if (config.layer_count == 0 || config.experts_per_layer == 0 || config.expected_bundle_count == 0 ||
+        config.expected_bundle_count > uint64_t(config.layer_count)*config.experts_per_layer || config.maximum_read_chunk == 0 ||
         config.maximum_read_chunk > 8U*1024U*1024U || sources.empty()) {
         throw std::invalid_argument("invalid expert storage configuration");
     }
     pimpl->config = config;
     pimpl->read_override = read_override;
-    pimpl->directory.resize(size_t(config.routed_layer_count)*config.experts_per_layer);
+    pimpl->directory.resize(size_t(config.layer_count)*config.experts_per_layer);
     pimpl->sources.reserve(sources.size());
     for (const auto & item : sources) {
         if (item.file == nullptr || item.alignment == 0) {
@@ -100,7 +101,7 @@ llm_expert_storage & llm_expert_storage::operator=(llm_expert_storage &&) noexce
 llm_expert_storage_result llm_expert_storage::add_bundle(
         llm_expert_key key, std::vector<llm_expert_storage_span> spans) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->directory_mutex);
-    if (pimpl->sealed.load() || !key.is_valid(pimpl->config.routed_layer_count, pimpl->config.experts_per_layer) || spans.empty()) {
+    if (pimpl->sealed.load() || !key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer) || spans.empty()) {
         return { llm_expert_storage_error::invalid_key, 0 };
     }
     auto & entry = pimpl->directory[pimpl->index(key)];
@@ -163,13 +164,17 @@ llm_expert_storage_result llm_expert_storage::seal() noexcept {
         return {};
     }
     uint64_t span_count = 0;
+    uint32_t entry_count = 0;
     for (const auto & entry : pimpl->directory) {
-        if (!entry.present) {
-            return { llm_expert_storage_error::invalid_directory, 0 };
+        if (entry.present) {
+            entry_count++;
+            span_count += entry.spans.size();
         }
-        span_count += entry.spans.size();
     }
-    pimpl->counters.directory_entry_count = pimpl->directory.size();
+    if (entry_count != pimpl->config.expected_bundle_count) {
+        return { llm_expert_storage_error::invalid_directory, 0 };
+    }
+    pimpl->counters.directory_entry_count = entry_count;
     pimpl->counters.span_count = span_count;
     pimpl->counters.administration_bytes = sizeof(*pimpl) + pimpl->sources.capacity()*sizeof(impl::source) +
         pimpl->directory.capacity()*sizeof(impl::entry) + span_count*sizeof(llm_expert_storage_span);
@@ -178,10 +183,11 @@ llm_expert_storage_result llm_expert_storage::seal() noexcept {
 }
 
 const std::vector<llm_expert_storage_span> * llm_expert_storage::find(llm_expert_key key) const noexcept {
-    if (!pimpl->sealed.load() || !key.is_valid(pimpl->config.routed_layer_count, pimpl->config.experts_per_layer)) {
+    if (!pimpl->sealed.load() || !key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer)) {
         return nullptr;
     }
-    return &pimpl->directory[pimpl->index(key)].spans;
+    const auto & entry = pimpl->directory[pimpl->index(key)];
+    return entry.present ? &entry.spans : nullptr;
 }
 
 llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key, void * destination,
@@ -189,7 +195,8 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key, vo
     if (pimpl->poisoned.load()) {
         return { llm_expert_storage_error::poisoned, 0 };
     }
-    if (!pimpl->sealed.load() || !key.is_valid(pimpl->config.routed_layer_count, pimpl->config.experts_per_layer)) {
+    if (!pimpl->sealed.load() || !key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer) ||
+        !pimpl->directory[pimpl->index(key)].present) {
         return { llm_expert_storage_error::invalid_key, 0 };
     }
     if (destination == nullptr) {

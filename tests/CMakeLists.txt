@@ -283,6 +283,8 @@ llama_build_and_test(test-expert-storage.cpp LABEL "model")
 target_include_directories(test-expert-storage PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build(phase5-cold-cache-probe.cpp)
 target_include_directories(phase5-cold-cache-probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build(phase6-gguf-storage-probe.cpp)
+target_include_directories(phase6-gguf-storage-probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build(phase4-hot-cache-probe.cpp)
 target_include_directories(phase4-hot-cache-probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

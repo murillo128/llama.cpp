@@ -1,4 +1,5 @@
 #include "llama-expert-storage.h"
+#include "llama-model.h"
 
 #include "ggml.h"
 
@@ -87,16 +88,16 @@ void test_configuration_directory_and_real_reads() {
     const std::vector<llm_expert_storage_source> sources = {
         { 0, &first_loader, 32 }, { 1, &second_loader, 32 },
     };
-    expect_invalid([&] { llm_expert_storage storage({ 0, 2, 8 }, sources); });
-    expect_invalid([&] { llm_expert_storage storage({ 1, 2, 8U*1024U*1024U + 1 }, sources); });
+    expect_invalid([&] { llm_expert_storage storage({ 0, 2, 2, 8 }, sources); });
+    expect_invalid([&] { llm_expert_storage storage({ 1, 2, 2, 8U*1024U*1024U + 1 }, sources); });
     expect_invalid([&] {
-        llm_expert_storage storage({ 1, 2, 8 }, { sources[0], sources[0] });
+        llm_expert_storage storage({ 1, 2, 2, 8 }, { sources[0], sources[0] });
     });
     expect_invalid([&] {
-        llm_expert_storage storage({ 1, 2, 8 }, { sources[1] });
+        llm_expert_storage storage({ 1, 2, 2, 8 }, { sources[1] });
     });
 
-    llm_expert_storage storage({ 1, 2, 4 }, sources);
+    llm_expert_storage storage({ 1, 2, 2, 4 }, sources);
     auto malformed = separate_bundle();
     malformed[0].split_index = 7;
     GGML_ASSERT(storage.add_bundle({ 0, 0 }, malformed).error == llm_expert_storage_error::invalid_directory);
@@ -174,7 +175,7 @@ void test_retry_short_error_cancel_and_poison() {
     scripted_reader reader;
     reader.first = first.bytes;
     reader.second = second.bytes;
-    llm_expert_storage storage({ 1, 2, 4 }, {
+    llm_expert_storage storage({ 1, 2, 2, 4 }, {
         { 0, &first_loader, 32 }, { 1, &second_loader, 32 },
     }, &reader);
     populate_and_seal(storage);
@@ -228,7 +229,7 @@ void test_duplicate_lifetime_and_transactional_close() {
 #endif
         bool partial_rejected = false;
         try {
-            llm_expert_storage rejected({ 1, 2, 4 }, {
+            llm_expert_storage rejected({ 1, 2, 2, 4 }, {
                 { 0, first_loader.get(), 32 }, { 1, nullptr, 32 },
             });
         } catch (const std::invalid_argument &) {
@@ -238,7 +239,7 @@ void test_duplicate_lifetime_and_transactional_close() {
 #if !defined(_WIN32)
         GGML_ASSERT(descriptor_count() == loaders_open);
 #endif
-        auto storage = std::make_unique<llm_expert_storage>(llm_expert_storage_config{ 1, 2, 4 },
+        auto storage = std::make_unique<llm_expert_storage>(llm_expert_storage_config{ 1, 2, 2, 4 },
             std::vector<llm_expert_storage_source>{ { 0, first_loader.get(), 32 }, { 1, second_loader.get(), 32 } });
         populate_and_seal(*storage);
         first_loader.reset();
@@ -255,12 +256,31 @@ void test_duplicate_lifetime_and_transactional_close() {
 #endif
 }
 
+void test_cold_mode_rejects_non_mmap_before_loading() {
+    llama_model_params params = llama_model_default_params();
+    params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+    params.expert_hot_cache_capacity = 2;
+    params.expert_cold_cache_bytes = 1U << 20;
+    params.expert_transfer_ring_bytes = 1U << 20;
+    for (const auto mode : { LLAMA_LOAD_MODE_NONE, LLAMA_LOAD_MODE_MLOCK,
+            LLAMA_LOAD_MODE_MMAP_MLOCK, LLAMA_LOAD_MODE_DIRECT_IO }) {
+        params.load_mode = mode;
+        expect_invalid([&] {
+            std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, params));
+        });
+    }
+    params.load_mode = LLAMA_LOAD_MODE_MMAP;
+    std::unique_ptr<llama_model> valid(llama_model_create(LLM_ARCH_KIMI_K3, params));
+    GGML_ASSERT(valid != nullptr);
+}
+
 } // namespace
 
 int main() {
     test_configuration_directory_and_real_reads();
     test_retry_short_error_cancel_and_poison();
     test_duplicate_lifetime_and_transactional_close();
+    test_cold_mode_rejects_non_mmap_before_loading();
     std::cout << "expert storage tests passed\n";
     return 0;
 }

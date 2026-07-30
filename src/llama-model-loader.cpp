@@ -524,6 +524,7 @@ llama_model_loader::llama_model_loader(
         std::vector<std::string> & splits,
         FILE * file,
         llama_load_mode load_mode,
+        bool defer_routed_expert_payloads,
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
@@ -544,6 +545,7 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    this->defer_routed_expert_payloads = defer_routed_expert_payloads;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -840,6 +842,25 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name));
     }
     return *weight;
+}
+
+bool llama_model_loader::is_deferred_expert_tensor(const char * name) const {
+    return name != nullptr && deferred_expert_tensors.find(name) != deferred_expert_tensors.end();
+}
+
+static bool is_routed_expert_payload(llm_tensor tensor) {
+    switch (tensor) {
+        case LLM_TENSOR_FFN_DOWN_EXP:
+        case LLM_TENSOR_FFN_GATE_EXP:
+        case LLM_TENSOR_FFN_UP_EXP:
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            return true;
+        default:
+            return false;
+    }
 }
 
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
@@ -1271,6 +1292,35 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
+    if (defer_routed_expert_payloads && is_routed_expert_payload(tn.tensor)) {
+        if (duplicated) {
+            throw std::runtime_error(format("deferred routed tensor '%s' cannot be duplicated", tn.str().c_str()));
+        }
+        if (!deferred_expert_ctx) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead()*size_t(n_tensors + 1),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            deferred_expert_ctx.reset(ggml_init(params));
+            if (!deferred_expert_ctx) {
+                throw std::runtime_error("failed to create deferred routed tensor context");
+            }
+        }
+        ggml_tensor * tensor = ggml_dup_tensor(deferred_expert_ctx.get(), cur);
+        ggml_set_name(tensor, ggml_get_name(cur));
+        if (tensor->data != nullptr || tensor->buffer != nullptr ||
+            !deferred_expert_tensors.emplace(ggml_get_name(tensor), tensor).second) {
+            throw std::runtime_error(format("invalid deferred routed tensor '%s'", ggml_get_name(tensor)));
+        }
+        if (deferred_expert_payload_bytes > std::numeric_limits<uint64_t>::max() - ggml_nbytes(cur)) {
+            throw std::overflow_error("deferred routed tensor byte count overflow");
+        }
+        deferred_expert_payload_bytes += ggml_nbytes(cur);
+        n_created++;
+        return tensor;
+    }
+
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
 
@@ -1330,6 +1380,10 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    if (defer_routed_expert_payloads && prefetch) {
+        throw std::invalid_argument("whole-file prefetch is forbidden with deferred routed tensors");
+    }
+    full_file_prefetch_disabled = defer_routed_expert_payloads && !prefetch;
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
@@ -1358,7 +1412,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+        if (!is_deferred_expert_tensor(it.first.c_str())) {
+            size_data += ggml_nbytes(it.second.tensor);
+        }
     }
 }
 
@@ -1522,6 +1578,9 @@ bool llama_model_loader::load_all_data(
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
+        }
+        if (is_deferred_expert_tensor(ggml_get_name(cur))) {
+            throw std::runtime_error(format("deferred routed tensor '%s' reached eager load", ggml_get_name(cur)));
         }
 
         if (progress_callback) {

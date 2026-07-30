@@ -762,7 +762,7 @@ public:
             throw std::invalid_argument("hot-cache target must be one CUDA device");
         }
         if (config.cold_mode && (config.cold_cache_bytes == 0 || config.transfer_ring_bytes == 0 ||
-            config.target_device == nullptr)) {
+            config.target_device == nullptr || (!config.allow_non_cuda_target_for_testing && config.storage == nullptr))) {
             throw std::invalid_argument("cold-cache mode requires byte budgets and a target device");
         }
         if (!config.cold_mode && (config.cold_cache_bytes != 0 || config.transfer_ring_bytes != 0 ||
@@ -1471,6 +1471,10 @@ public:
 
     llm_expert_provider_result trim() noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
+        if (!pool) {
+            counters.trims++;
+            return llm_expert_provider_result::success();
+        }
         if (config.cold_mode && active_request) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         }
