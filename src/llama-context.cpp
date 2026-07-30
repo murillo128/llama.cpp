@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -682,6 +683,52 @@ void llama_context::sched_reserve() {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+    }
+
+    if (expert_weight_provider && expert_weight_provider->needs_post_reserve_initialization()) {
+        std::vector<size_t> bootstrap_sizes(backend_ptrs.size());
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            bootstrap_sizes[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+
+        // The final bootstrap graph owns source-tensor bindings. Release those
+        // before creating the persistent pool so bootstrap bindings can never be
+        // submitted and do not make a later surrender spuriously busy.
+        gf_res_prev->reset();
+        gf_res_reserve->reset();
+
+        const auto initialized = expert_weight_provider->initialize_after_reserve();
+        if (!initialized.is_ready()) {
+            throw std::runtime_error(initialized.status == llm_expert_provider_status::allocation_failed
+                ? "failed to allocate persistent expert hot cache"
+                : "failed to initialize persistent expert hot cache");
+        }
+
+        auto abandon_pool = [&] {
+            gf_res_prev->reset();
+            gf_res_reserve->reset();
+            const auto surrendered = expert_weight_provider->surrender();
+            GGML_ASSERT(surrendered.is_ready());
+        };
+        auto reserve_hot = [&](uint32_t tokens, uint32_t seqs, uint32_t outputs) {
+            auto * gf = graph_reserve(tokens, seqs, outputs, mctx.get(), model.hparams.no_alloc);
+            return gf != nullptr && gf_res_reserve->get_expert_provider_result().is_ready();
+        };
+
+        if (!reserve_hot(n_tokens, n_seqs, n_outputs_pp) ||
+            !reserve_hot(n_seqs, n_seqs, n_seqs) ||
+            !reserve_hot(n_tokens, n_seqs, n_outputs_pp)) {
+            abandon_pool();
+            throw std::runtime_error("failed to reserve graph against persistent expert hot cache");
+        }
+
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t final_size = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            if (final_size > bootstrap_sizes[i]) {
+                abandon_pool();
+                throw std::runtime_error("persistent expert hot cache increased reserved compute workspace");
+            }
         }
     }
 
@@ -1593,7 +1640,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool expert_graph_current = !expert_weight_provider || std::all_of(
+        res->get_expert_bindings().begin(), res->get_expert_bindings().end(),
+        [&](const llm_expert_graph_binding & binding) {
+            return binding.graph_epoch == expert_weight_provider->graph_epoch();
+        });
+
+    if (!graph_reuse_disable && expert_graph_current && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running

@@ -1,11 +1,18 @@
 #include "llama-expert-weight-provider.h"
 #include "llama-hparams.h"
 
+#include "ggml-alloc.h"
+#include "ggml-cpp.h"
+
 #include <array>
 #include <atomic>
+#include <cstring>
+#include <map>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace {
@@ -57,6 +64,89 @@ bool binding_identity_matches(
         binding.execution_ids != nullptr && binding.execution_ids->type == GGML_TYPE_I32 &&
         binding.execution_ids->ne[0] > 0 && binding.execution_ids->ne[0] <= bundle.n_expert &&
         binding.execution_ids->ne[1] >= 0;
+}
+
+bool buffer_type_is_cuda(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * name = reg ? ggml_backend_reg_name(reg) : nullptr;
+    return name != nullptr && std::strcmp(name, "CUDA") == 0;
+}
+
+int expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight) {
+    if (tensor == nullptr) {
+        return -1;
+    }
+    if (weight) {
+        return ggml_n_dims(tensor) >= 3 && tensor->ne[2] == n_expert ? 2 : -1;
+    }
+    int result = -1;
+    for (int axis = ggml_n_dims(tensor) - 1; axis >= 0; --axis) {
+        if (tensor->ne[axis] == n_expert) {
+            if (result >= 0) {
+                return -1;
+            }
+            result = axis;
+        }
+    }
+    return result;
+}
+
+bool tensor_layout_matches(
+        const ggml_tensor * lhs,
+        const ggml_tensor * rhs,
+        int32_t n_expert,
+        bool weight) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return lhs == rhs;
+    }
+    const int lhs_axis = expert_axis(lhs, n_expert, weight);
+    const int rhs_axis = expert_axis(rhs, n_expert, weight);
+    if (lhs_axis < 0 || lhs_axis != rhs_axis || lhs->type != rhs->type || ggml_n_dims(lhs) != ggml_n_dims(rhs)) {
+        return false;
+    }
+    for (int axis = 0; axis < GGML_MAX_DIMS; ++axis) {
+        if (axis != lhs_axis && (lhs->ne[axis] != rhs->ne[axis] || lhs->nb[axis] != rhs->nb[axis])) {
+            return false;
+        }
+    }
+    return lhs->nb[lhs_axis] == rhs->nb[rhs_axis];
+}
+
+bool projection_layout_matches(
+        const llm_expert_projection_descriptor & lhs,
+        const llm_expert_projection_descriptor & rhs,
+        int32_t n_expert) {
+    return tensor_layout_matches(lhs.weight, rhs.weight, n_expert, true) &&
+        tensor_layout_matches(lhs.bias, rhs.bias, n_expert, false) &&
+        tensor_layout_matches(lhs.scale, rhs.scale, n_expert, false) &&
+        lhs.buffer_type == rhs.buffer_type;
+}
+
+bool bundle_layout_matches(
+        const llm_expert_bundle_descriptor & lhs,
+        const llm_expert_bundle_descriptor & rhs) {
+    return lhs.n_expert == rhs.n_expert && lhs.uses_merged_gate_up() == rhs.uses_merged_gate_up() &&
+        projection_layout_matches(lhs.up, rhs.up, lhs.n_expert) &&
+        projection_layout_matches(lhs.gate, rhs.gate, lhs.n_expert) &&
+        projection_layout_matches(lhs.gate_up, rhs.gate_up, lhs.n_expert) &&
+        projection_layout_matches(lhs.down, rhs.down, lhs.n_expert);
+}
+
+bool projection_is_host_accessible(const llm_expert_projection_descriptor & projection) {
+    const std::array<ggml_tensor *, 3> tensors = { projection.weight, projection.bias, projection.scale };
+    for (const auto * tensor : tensors) {
+        if (tensor != nullptr && (tensor->buffer == nullptr || !ggml_backend_buffer_is_host(tensor->buffer))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -344,6 +434,9 @@ public:
             bundle.gate_up,
             bundle.down,
             selection.logical_ids,
+            {},
+            0,
+            false,
         };
         result = binding.validate(selection);
         if (result.is_ready()) {
@@ -444,9 +537,389 @@ private:
     std::array<resident_bundle_registration, LLAMA_MAX_LAYERS> registrations;
 };
 
+struct hot_pool_generation {
+    uint64_t id = 0;
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buffer;
+    llm_expert_bundle_descriptor bundle = {};
+    std::vector<uintptr_t> addresses;
+};
+
+ggml_tensor * make_slot_tensor(
+        ggml_context * ctx,
+        const ggml_tensor * source,
+        int32_t n_expert,
+        uint32_t capacity,
+        bool weight,
+        const char * name) {
+    if (source == nullptr) {
+        return nullptr;
+    }
+    const int axis = expert_axis(source, n_expert, weight);
+    if (axis < 0) {
+        throw std::invalid_argument("expert sidecar has no unambiguous expert axis");
+    }
+    int64_t ne[GGML_MAX_DIMS];
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        ne[i] = source->ne[i];
+    }
+    ne[axis] = capacity;
+    ggml_tensor * tensor = ggml_new_tensor(ctx, source->type, ggml_n_dims(source), ne);
+    ggml_set_name(tensor, name);
+    return tensor;
+}
+
+llm_expert_projection_descriptor make_slot_projection(
+        ggml_context * ctx,
+        const llm_expert_projection_descriptor & source,
+        int32_t n_expert,
+        uint32_t capacity,
+        const char * prefix) {
+    const std::string weight_name = std::string(prefix) + ".weight";
+    const std::string bias_name = std::string(prefix) + ".bias";
+    const std::string scale_name = std::string(prefix) + ".scale";
+    return {
+        make_slot_tensor(ctx, source.weight, n_expert, capacity, true, weight_name.c_str()),
+        make_slot_tensor(ctx, source.bias, n_expert, capacity, false, bias_name.c_str()),
+        make_slot_tensor(ctx, source.scale, n_expert, capacity, false, scale_name.c_str()),
+        nullptr,
+    };
+}
+
+void collect_projection_addresses(
+        const llm_expert_projection_descriptor & projection,
+        std::vector<uintptr_t> & addresses) {
+    for (const auto * tensor : { projection.weight, projection.bias, projection.scale }) {
+        if (tensor != nullptr) {
+            addresses.push_back(reinterpret_cast<uintptr_t>(tensor->data));
+        }
+    }
+}
+
+class llm_hot_cache_expert_weight_provider final : public llm_expert_weight_provider {
+public:
+    llm_hot_cache_expert_weight_provider(llm_hot_cache_config config, llm_expert_provider_faults faults) :
+        config(config), faults(faults) {
+        if (faults.initialization != llm_expert_provider_error::none) {
+            throw std::runtime_error("hot-cache expert-weight provider initialization failed");
+        }
+        if (config.capacity < config.n_expert_used || config.capacity > config.total_expert_keys ||
+            config.n_expert_used == 0 || config.routed_layer_count == 0 || config.target_buffer_type == nullptr) {
+            throw std::invalid_argument("invalid hot-cache capacity or topology");
+        }
+        if (!config.allow_non_cuda_target_for_testing && !buffer_type_is_cuda(config.target_buffer_type)) {
+            throw std::invalid_argument("hot-cache target must be one CUDA device");
+        }
+    }
+
+    llm_expert_provider_result bind(
+            const llm_expert_bundle_descriptor & bundle,
+            const llm_expert_selection & selection,
+            llm_expert_graph_binding & binding) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        counters.bind_calls++;
+        auto result = selection.validate();
+        if (!result.is_ready() || bundle.layer < 0 || bundle.layer >= LLAMA_MAX_LAYERS) {
+            return fail(result.is_ready()
+                ? llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor)
+                : result);
+        }
+
+        auto it = registrations.find(bundle.layer);
+        if (it == registrations.end()) {
+            result = validate_source_bundle(bundle);
+            if (!result.is_ready()) {
+                return fail(result);
+            }
+            if (prototype.has_value() && !bundle_layout_matches(*prototype, bundle)) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor));
+            }
+            if (!prototype.has_value()) {
+                prototype = bundle;
+            }
+            registrations.emplace(bundle.layer, bundle);
+            counters.bundle_registrations++;
+            counters.bundle_full_validations++;
+        } else {
+            counters.bundle_fast_path_hits++;
+            if (!bundle_identity_matches(it->second, bundle)) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor));
+            }
+        }
+
+        if (faults.binding != llm_expert_provider_error::none &&
+            successful_bindings >= faults.binding_successes_before_failure) {
+            return fail(llm_expert_provider_result::failure(faults.binding));
+        }
+
+        if (!pool) {
+            binding = {
+                this,
+                bundle.layer,
+                bundle.up,
+                bundle.gate,
+                bundle.gate_up,
+                bundle.down,
+                selection.logical_ids,
+                {},
+                epoch,
+                true,
+            };
+            counters.bootstrap_bindings++;
+        } else {
+            binding = {
+                this,
+                bundle.layer,
+                pool->bundle.up,
+                pool->bundle.gate,
+                pool->bundle.gate_up,
+                pool->bundle.down,
+                selection.logical_ids,
+                std::static_pointer_cast<void>(pool),
+                epoch,
+                false,
+            };
+            counters.hot_bindings++;
+        }
+        successful_bindings++;
+        result = binding.validate(selection);
+        return result.is_ready() ? result : fail(result);
+    }
+
+    llm_expert_provider_result prepare(
+            const std::vector<llm_expert_graph_binding> & bindings,
+            llm_expert_execution_plan & plan) noexcept override {
+        plan.reset();
+        std::lock_guard<std::mutex> lock(mutex);
+        counters.prepare_calls++;
+        if (bindings.empty()) {
+            plan.set_result(llm_expert_provider_result::success());
+            return llm_expert_provider_result::success();
+        }
+
+        // Runtime remapping is introduced by issue Phase 3. Reject submission
+        // until then so bootstrap or unpopulated pool tensors cannot execute.
+        auto result = llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
+        plan.set_result(result);
+        return fail(result);
+    }
+
+    llm_expert_provider_stats get_stats() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        llm_expert_provider_stats result = counters;
+        result.objects_created = 1;
+        result.requested_capacity = config.capacity;
+        result.effective_capacity = pool ? config.capacity : 0;
+        result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
+        result.graph_epoch = epoch;
+        return result;
+    }
+
+    bool needs_post_reserve_initialization() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return pool == nullptr;
+    }
+
+    llm_expert_provider_result initialize_after_reserve() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pool) {
+            return llm_expert_provider_result::success();
+        }
+        if (!prototype.has_value() || registrations.size() != config.routed_layer_count) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+        }
+        if (faults.fail_pool_allocation) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
+        }
+
+        try {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead()*32,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            auto candidate = std::make_shared<hot_pool_generation>();
+            candidate->ctx.reset(ggml_init(params));
+            if (!candidate->ctx) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
+            }
+
+            const auto & source = *prototype;
+            candidate->bundle.layer = -1;
+            candidate->bundle.n_expert = config.capacity;
+            candidate->bundle.up = make_slot_projection(candidate->ctx.get(), source.up, source.n_expert, config.capacity, "hot.up");
+            candidate->bundle.gate = make_slot_projection(candidate->ctx.get(), source.gate, source.n_expert, config.capacity, "hot.gate");
+            candidate->bundle.gate_up = make_slot_projection(candidate->ctx.get(), source.gate_up, source.n_expert, config.capacity, "hot.gate_up");
+            candidate->bundle.down = make_slot_projection(candidate->ctx.get(), source.down, source.n_expert, config.capacity, "hot.down");
+
+            candidate->buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(
+                candidate->ctx.get(), config.target_buffer_type));
+            if (!candidate->buffer ||
+                (!config.allow_non_cuda_target_for_testing && ggml_backend_buffer_is_host(candidate->buffer.get()))) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
+            }
+
+            set_projection_buffer_type(candidate->bundle.up);
+            set_projection_buffer_type(candidate->bundle.gate);
+            set_projection_buffer_type(candidate->bundle.gate_up);
+            set_projection_buffer_type(candidate->bundle.down);
+            if (!pool_layout_matches_source(candidate->bundle, source)) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor));
+            }
+
+            collect_projection_addresses(candidate->bundle.up, candidate->addresses);
+            collect_projection_addresses(candidate->bundle.gate, candidate->addresses);
+            collect_projection_addresses(candidate->bundle.gate_up, candidate->addresses);
+            collect_projection_addresses(candidate->bundle.down, candidate->addresses);
+            candidate->id = ++generation;
+            pool = std::move(candidate);
+            epoch++;
+            counters.allocations++;
+            counters.pool_generations++;
+            return llm_expert_provider_result::success();
+        } catch (const std::bad_alloc &) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
+        } catch (...) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+        }
+    }
+
+    llm_expert_provider_result trim() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        counters.trims++;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result surrender() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!pool) {
+            return llm_expert_provider_result::success();
+        }
+        if (pool.use_count() != 1) {
+            counters.surrender_busy++;
+            return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+        }
+        pool.reset();
+        epoch++;
+        counters.surrender_successes++;
+        return llm_expert_provider_result::success();
+    }
+
+    uint64_t graph_epoch() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return epoch;
+    }
+
+    llm_hot_cache_diagnostics hot_cache_diagnostics() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        llm_hot_cache_diagnostics result;
+        result.requested_capacity = config.capacity;
+        result.effective_capacity = pool ? config.capacity : 0;
+        result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
+        result.graph_epoch = epoch;
+        result.generation = pool ? pool->id : 0;
+        result.slot_tensor_addresses = pool ? pool->addresses : std::vector<uintptr_t> {};
+        result.source_buffer_type = prototype.has_value() ? prototype->down.buffer_type : nullptr;
+        result.target_buffer_type = config.target_buffer_type;
+        return result;
+    }
+
+protected:
+    void release_handle(uint64_t) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        counters.handles_released++;
+    }
+
+private:
+    llm_expert_provider_result validate_source_bundle(const llm_expert_bundle_descriptor & bundle) const {
+        auto result = bundle.validate();
+        if (!result.is_ready()) {
+            return result;
+        }
+        for (const auto * projection : { &bundle.up, &bundle.gate, &bundle.gate_up, &bundle.down }) {
+            if (!projection_is_host_accessible(*projection)) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+            }
+        }
+        return result;
+    }
+
+    static void set_projection_buffer_type(llm_expert_projection_descriptor & projection) {
+        if (projection.weight) {
+            projection.buffer_type = ggml_backend_buffer_get_type(projection.weight->buffer);
+        }
+    }
+
+    static bool pool_tensor_matches_source(
+            const ggml_tensor * target,
+            const ggml_tensor * source,
+            int32_t n_expert,
+            uint32_t capacity,
+            bool weight) {
+        if (target == nullptr || source == nullptr) {
+            return target == source;
+        }
+        const int source_axis = expert_axis(source, n_expert, weight);
+        const int target_axis = expert_axis(target, capacity, weight);
+        if (source_axis < 0 || target_axis != source_axis || source->type != target->type) {
+            return false;
+        }
+        for (int axis = 0; axis < source_axis; ++axis) {
+            if (source->ne[axis] != target->ne[axis] || source->nb[axis] != target->nb[axis]) {
+                return false;
+            }
+        }
+        return source->nb[source_axis] == target->nb[target_axis];
+    }
+
+    static bool pool_projection_matches_source(
+            const llm_expert_projection_descriptor & target,
+            const llm_expert_projection_descriptor & source,
+            int32_t n_expert,
+            uint32_t capacity) {
+        return pool_tensor_matches_source(target.weight, source.weight, n_expert, capacity, true) &&
+            pool_tensor_matches_source(target.bias, source.bias, n_expert, capacity, false) &&
+            pool_tensor_matches_source(target.scale, source.scale, n_expert, capacity, false);
+    }
+
+    static bool pool_layout_matches_source(
+            const llm_expert_bundle_descriptor & target,
+            const llm_expert_bundle_descriptor & source) {
+        return pool_projection_matches_source(target.up, source.up, source.n_expert, target.n_expert) &&
+            pool_projection_matches_source(target.gate, source.gate, source.n_expert, target.n_expert) &&
+            pool_projection_matches_source(target.gate_up, source.gate_up, source.n_expert, target.n_expert) &&
+            pool_projection_matches_source(target.down, source.down, source.n_expert, target.n_expert);
+    }
+
+    llm_expert_provider_result fail(llm_expert_provider_result result) const {
+        counters.failures++;
+        if (result.status == llm_expert_provider_status::cancelled) {
+            counters.cancellations++;
+        }
+        return result;
+    }
+
+    llm_hot_cache_config config;
+    llm_expert_provider_faults faults;
+    mutable std::mutex mutex;
+    mutable llm_expert_provider_stats counters;
+    std::map<int32_t, llm_expert_bundle_descriptor> registrations;
+    std::optional<llm_expert_bundle_descriptor> prototype;
+    std::shared_ptr<hot_pool_generation> pool;
+    uint64_t successful_bindings = 0;
+    uint64_t epoch = 0;
+    uint64_t generation = 0;
+};
+
 } // namespace
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(
         llm_expert_provider_faults faults) {
     return std::make_unique<llm_resident_expert_weight_provider>(faults);
+}
+
+std::unique_ptr<llm_expert_weight_provider> llm_create_hot_cache_expert_weight_provider(
+        llm_hot_cache_config config,
+        llm_expert_provider_faults faults) {
+    return std::make_unique<llm_hot_cache_expert_weight_provider>(config, faults);
 }

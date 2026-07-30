@@ -24,6 +24,8 @@ enum class llm_expert_provider_error {
     initialization_failed,
     allocation_failed,
     preparation_failed,
+    unsupported_configuration,
+    busy,
     cancelled,
 };
 
@@ -90,6 +92,12 @@ struct llm_expert_graph_binding {
 
     ggml_tensor * execution_ids = nullptr;
 
+    // Keeps cache-owned tensor storage alive for as long as the graph binding
+    // can be reused. Resident/bootstrap bindings leave this empty.
+    std::shared_ptr<void> generation_lease;
+    uint64_t graph_epoch = 0;
+    bool bootstrap = false;
+
     bool uses_merged_gate_up() const;
     llm_expert_provider_result validate(const llm_expert_selection & selection) const;
 };
@@ -109,6 +117,27 @@ struct llm_expert_provider_stats {
     uint64_t bundle_registrations = 0;
     uint64_t bundle_full_validations = 0;
     uint64_t bundle_fast_path_hits = 0;
+    uint64_t requested_capacity = 0;
+    uint64_t effective_capacity = 0;
+    uint64_t pool_bytes = 0;
+    uint64_t pool_generations = 0;
+    uint64_t graph_epoch = 0;
+    uint64_t bootstrap_bindings = 0;
+    uint64_t hot_bindings = 0;
+    uint64_t trims = 0;
+    uint64_t surrender_successes = 0;
+    uint64_t surrender_busy = 0;
+};
+
+struct llm_hot_cache_diagnostics {
+    uint32_t requested_capacity = 0;
+    uint32_t effective_capacity = 0;
+    uint64_t pool_bytes = 0;
+    uint64_t graph_epoch = 0;
+    uint64_t generation = 0;
+    std::vector<uintptr_t> slot_tensor_addresses;
+    ggml_backend_buffer_type_t source_buffer_type = nullptr;
+    ggml_backend_buffer_type_t target_buffer_type = nullptr;
 };
 
 struct llm_expert_graph_diagnostics {
@@ -185,6 +214,19 @@ public:
 
     virtual llm_expert_provider_stats get_stats() const noexcept = 0;
 
+    virtual bool needs_post_reserve_initialization() const noexcept { return false; }
+    virtual llm_expert_provider_result initialize_after_reserve() noexcept {
+        return llm_expert_provider_result::success();
+    }
+    virtual llm_expert_provider_result trim() noexcept {
+        return llm_expert_provider_result::success();
+    }
+    virtual llm_expert_provider_result surrender() noexcept {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual uint64_t graph_epoch() const noexcept { return 0; }
+    virtual llm_hot_cache_diagnostics hot_cache_diagnostics() const { return {}; }
+
 protected:
     friend class llm_expert_handle;
     virtual void release_handle(uint64_t lease_id) noexcept = 0;
@@ -196,7 +238,23 @@ struct llm_expert_provider_faults {
     llm_expert_provider_error preparation = llm_expert_provider_error::none;
     size_t binding_successes_before_failure = 0;
     size_t fail_preparation_after_handles = SIZE_MAX;
+    bool fail_pool_allocation = false;
+};
+
+struct llm_hot_cache_config {
+    uint32_t capacity = 0;
+    uint32_t n_expert_used = 0;
+    uint32_t routed_layer_count = 0;
+    uint32_t total_expert_keys = 0;
+    ggml_backend_buffer_type_t target_buffer_type = nullptr;
+
+    // Internal test seam. The model-facing path always leaves this false.
+    bool allow_non_cuda_target_for_testing = false;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(
+        llm_expert_provider_faults faults = {});
+
+std::unique_ptr<llm_expert_weight_provider> llm_create_hot_cache_expert_weight_provider(
+        llm_hot_cache_config config,
         llm_expert_provider_faults faults = {});

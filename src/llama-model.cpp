@@ -1074,7 +1074,8 @@ struct llama_model::impl {
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_DISABLED &&
-        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT) {
+        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT &&
+        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE) {
         throw std::invalid_argument("invalid expert weights mode");
     }
     if (params.tensor_split != nullptr) {
@@ -1093,6 +1094,35 @@ void llama_model::init_expert_weight_provider() {
         case LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT:
             pimpl->expert_weight_provider = llm_create_resident_expert_weight_provider();
             return;
+        case LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE: {
+            ggml_backend_dev_t target = nullptr;
+            uint32_t routed_layer_count = 0;
+            for (uint32_t il = 0; il < layers.size(); ++il) {
+                const auto & layer = layers[il];
+                if (layer.ffn_down_exps == nullptr) {
+                    continue;
+                }
+                ggml_backend_dev_t layer_target = dev_layer(il);
+                if (target == nullptr) {
+                    target = layer_target;
+                } else if (target != layer_target) {
+                    throw std::invalid_argument("hot-cache routed layers must target one device");
+                }
+                routed_layer_count++;
+            }
+            if (target == nullptr || hparams.n_expert <= 0 || hparams.n_expert_used <= 0) {
+                throw std::invalid_argument("hot-cache mode requires routed experts and a CUDA target");
+            }
+            pimpl->expert_weight_provider = llm_create_hot_cache_expert_weight_provider({
+                params.expert_hot_cache_capacity,
+                uint32_t(hparams.n_expert_used),
+                routed_layer_count,
+                routed_layer_count*uint32_t(hparams.n_expert),
+                ggml_backend_dev_buffer_type(target),
+                false,
+            });
+            return;
+        }
         case LLAMA_EXPERT_WEIGHTS_MODE_COUNT:
             break;
     }
@@ -2532,6 +2562,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
         /*.expert_weights_mode         =*/ LLAMA_EXPERT_WEIGHTS_MODE_DISABLED,
+        /*.expert_hot_cache_capacity   =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

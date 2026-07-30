@@ -352,7 +352,8 @@ extern "C" {
     enum llama_expert_weights_mode {
         LLAMA_EXPERT_WEIGHTS_MODE_DISABLED = 0,
         LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT = 1,
-        LLAMA_EXPERT_WEIGHTS_MODE_COUNT = 2,
+        LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE = 2,
+        LLAMA_EXPERT_WEIGHTS_MODE_COUNT = 3,
     };
 
     struct llama_model_params {
@@ -366,6 +367,7 @@ extern "C" {
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
         enum llama_expert_weights_mode expert_weights_mode; // routed-expert provider mode [EXPERIMENTAL]
+        uint32_t expert_hot_cache_capacity; // global routed-expert slot capacity [EXPERIMENTAL]
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

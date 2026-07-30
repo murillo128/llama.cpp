@@ -271,6 +271,9 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-expert-weight-provider.cpp LABEL "model")
 target_include_directories(test-expert-weight-provider PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-hot-expert-cache.cpp LABEL "model")
+target_include_directories(test-hot-expert-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
