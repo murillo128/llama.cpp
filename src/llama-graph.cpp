@@ -2049,7 +2049,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             selected_experts,
         };
         llm_expert_graph_binding binding;
-        auto provider_result = expert_weight_provider->bind(bundle, selection, binding);
+        auto provider_result = expert_weight_provider->bind_graph(ctx0, bundle, selection, binding);
         if (provider_result.is_ready()) {
             execution_up_exps = binding.up.weight;
             execution_up_exps_b = binding.up.bias;

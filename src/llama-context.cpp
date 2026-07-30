@@ -784,6 +784,9 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    expert_eval_bindings = nullptr;
+    expert_eval_pending_tensor = nullptr;
+    expert_eval_pending_user = false;
     if (expert_plans) {
         expert_plans->pending.reset();
         expert_plans->inflight.reset();
@@ -1637,6 +1640,44 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    const llm_expert_graph_binding * checkpoint = nullptr;
+    if (ctx->expert_eval_bindings != nullptr) {
+        for (const auto & binding : *ctx->expert_eval_bindings) {
+            if (!binding.bootstrap && binding.logical_ids != nullptr &&
+                binding.execution_ids != binding.logical_ids && binding.execution_ids == tensor) {
+                checkpoint = &binding;
+                break;
+            }
+        }
+    }
+
+    if (ask) {
+        const bool user_needs_tensor = ctx->cparams.cb_eval &&
+            ctx->cparams.cb_eval(tensor, true, ctx->cparams.cb_eval_user_data);
+        ctx->expert_eval_pending_tensor = tensor;
+        ctx->expert_eval_pending_user = user_needs_tensor;
+        return checkpoint != nullptr || user_needs_tensor;
+    }
+
+    if (tensor != ctx->expert_eval_pending_tensor) {
+        ctx->expert_eval_result = llm_expert_provider_result::failure(
+            llm_expert_provider_error::metadata_mismatch);
+        return false;
+    }
+
+    if (checkpoint != nullptr) {
+        ctx->expert_eval_result = ctx->expert_weight_provider->remap_checkpoint_tensor(*checkpoint);
+        if (!ctx->expert_eval_result.is_ready()) {
+            return false;
+        }
+    }
+
+    return !ctx->expert_eval_pending_user ||
+        ctx->cparams.cb_eval(tensor, false, ctx->cparams.cb_eval_user_data);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1710,6 +1751,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    const bool has_expert_checkpoints = expert_weight_provider && std::any_of(
+        res->get_expert_bindings().begin(), res->get_expert_bindings().end(),
+        [](const llm_expert_graph_binding & binding) {
+            return !binding.bootstrap && binding.logical_ids != nullptr &&
+                binding.execution_ids != binding.logical_ids;
+        });
+    if (has_expert_checkpoints && expert_plans->inflight.handle_count() != 0) {
+        synchronize();
+    }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1719,6 +1770,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+
+    expert_eval_bindings = has_expert_checkpoints ? &res->get_expert_bindings() : nullptr;
+    expert_eval_pending_tensor = nullptr;
+    expert_eval_pending_user = false;
+    expert_eval_result = llm_expert_provider_result::success();
+    ggml_backend_sched_set_eval_callback(
+        sched.get(),
+        has_expert_checkpoints ? expert_eval_callback : cparams.cb_eval,
+        has_expert_checkpoints ? this : cparams.cb_eval_user_data);
 
     if (expert_weight_provider) {
         GGML_ASSERT(expert_plans);
@@ -1742,6 +1802,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (!expert_eval_result.is_ready()) {
+        LLAMA_LOG_ERROR("%s: expert hot-cache remap checkpoint failed\n", __func__);
+        ggml_backend_sched_synchronize(sched.get());
+        expert_plans->pending.reset();
+        expert_plans->inflight.reset();
+        ret = expert_eval_result.status == llm_expert_provider_status::allocation_failed ?
+            GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
+        return nullptr;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         if (expert_weight_provider) {

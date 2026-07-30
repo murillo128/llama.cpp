@@ -1,4 +1,5 @@
 #include "llama-expert-weight-provider.h"
+#include "llama-context.h"
 #include "llama-model.h"
 
 #include "ggml-alloc.h"
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -223,6 +225,38 @@ int32_t find_slot(const llm_hot_cache_diagnostics & diagnostics, int32_t expert)
         }
     }
     return -1;
+}
+
+struct eval_callback_counts {
+    uint64_t asks = 0;
+    uint64_t observations = 0;
+};
+
+struct route_capture {
+    std::vector<int32_t> layers;
+    std::vector<int32_t> ids;
+    std::vector<float> weights;
+};
+
+bool capture_routes(const llama_route_observation * observation, void * user_data) {
+    auto * capture = static_cast<route_capture *>(user_data);
+    capture->layers.push_back(observation->layer);
+    const size_t count = size_t(observation->n_tokens)*observation->n_expert_used;
+    capture->ids.insert(capture->ids.end(), observation->selected_experts,
+        observation->selected_experts + count);
+    capture->weights.insert(capture->weights.end(), observation->weights,
+        observation->weights + count);
+    return true;
+}
+
+bool count_execution_id_callbacks(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * counts = static_cast<eval_callback_counts *>(user_data);
+    if (ask) {
+        counts->asks++;
+        return std::strncmp(tensor->name, "expert_execution_ids-", 21) == 0;
+    }
+    counts->observations++;
+    return true;
 }
 
 void test_configuration_matrix() {
@@ -641,9 +675,12 @@ void test_cuda_model_pool_smoke(const char * model_path) {
     GGML_ASSERT(model != nullptr);
 
     llama_context_params context_params = llama_context_default_params();
+    eval_callback_counts callback_counts;
     context_params.n_ctx = 64;
     context_params.n_batch = 64;
     context_params.n_ubatch = 2;
+    context_params.cb_eval = count_execution_id_callbacks;
+    context_params.cb_eval_user_data = &callback_counts;
     llama_context * rejected = llama_init_from_model(model, context_params);
     GGML_ASSERT(rejected == nullptr);
 
@@ -676,7 +713,184 @@ void test_cuda_model_pool_smoke(const char * model_path) {
     llama_context * second_context = llama_init_from_model(model, context_params);
     GGML_ASSERT(second_context != nullptr);
 
+    llama_token token = 1;
+    GGML_ASSERT(llama_decode(context, llama_batch_get_one(&token, 1)) == 0);
+    GGML_ASSERT(llama_decode(second_context, llama_batch_get_one(&token, 1)) == -3);
+    const float * first_logits = llama_get_logits_ith(context, -1);
+    GGML_ASSERT(first_logits != nullptr);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    GGML_ASSERT(std::all_of(first_logits, first_logits + n_vocab, [](float value) {
+        return std::isfinite(value);
+    }));
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.remap_checkpoints == 7);
+    GGML_ASSERT(diagnostics.synchronization_checkpoints == 7);
+    GGML_ASSERT(diagnostics.misses == 14);
+    GGML_ASSERT(diagnostics.current_pins == 0);
+    GGML_ASSERT(callback_counts.asks > 7);
+    GGML_ASSERT(callback_counts.observations == 7);
+
+    GGML_ASSERT(llama_decode(second_context, llama_batch_get_one(&token, 1)) == 0);
+    const float * second_logits = llama_get_logits_ith(second_context, -1);
+    GGML_ASSERT(second_logits != nullptr);
+    GGML_ASSERT(std::equal(first_logits, first_logits + n_vocab, second_logits));
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.remap_checkpoints == 14);
+    GGML_ASSERT(diagnostics.exclusive_busy_failures == 1);
+    GGML_ASSERT(diagnostics.current_pins == 0);
+    GGML_ASSERT(callback_counts.observations == 14);
+
+    llama_context * cancelled_context = llama_init_from_model(model, context_params);
+    GGML_ASSERT(cancelled_context != nullptr);
+    llama_set_abort_callback(cancelled_context, [](void *) { return true; }, nullptr);
+    GGML_ASSERT(llama_decode(cancelled_context, llama_batch_get_one(&token, 1)) == 2);
+    llama_synchronize(cancelled_context);
+    GGML_ASSERT(provider->hot_cache_diagnostics().current_pins == 0);
+    llama_free(cancelled_context);
+
     llama_free(second_context);
+    llama_free(context);
+    GGML_ASSERT(provider->surrender().is_ready());
+    llama_model_free(model);
+}
+
+void test_cuda_model_cross_epoch_hits(const char * model_path) {
+    llama_context_params context_params = llama_context_default_params();
+    context_params.n_ctx = 64;
+    context_params.n_batch = 64;
+    context_params.n_ubatch = 1;
+    llama_token token = 1;
+
+    llama_model_params disabled_params = llama_model_default_params();
+    disabled_params.n_gpu_layers = -1;
+    llama_model * disabled_model = llama_model_load_from_file(model_path, disabled_params);
+    GGML_ASSERT(disabled_model != nullptr);
+    llama_context * disabled_context = llama_init_from_model(disabled_model, context_params);
+    GGML_ASSERT(disabled_context != nullptr);
+    route_capture disabled_routes;
+    GGML_ASSERT(llama_set_route_observer(disabled_context, capture_routes, &disabled_routes) ==
+        LLAMA_ROUTE_OBSERVER_STATUS_OK);
+    GGML_ASSERT(llama_route_observer_begin(disabled_context, 1, LLAMA_ROUTE_PHASE_DECODE) ==
+        LLAMA_ROUTE_OBSERVER_STATUS_OK);
+    GGML_ASSERT(llama_decode(disabled_context, llama_batch_get_one(&token, 1)) == 0);
+    const float * disabled_logits = llama_get_logits_ith(disabled_context, -1);
+    GGML_ASSERT(disabled_logits != nullptr);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(disabled_model));
+    const std::vector<float> reference_logits(disabled_logits, disabled_logits + n_vocab);
+    const auto disabled_graph = disabled_context->expert_graph_diagnostics();
+    GGML_ASSERT(disabled_graph.binding_count == 0);
+    llama_free(disabled_context);
+    llama_model_free(disabled_model);
+
+    const llama_model_tensor_buft_override overrides[] = {
+        { "ffn_(gate|up|down)_exps\\.weight", ggml_backend_cpu_buffer_type() },
+        { nullptr, nullptr },
+    };
+    llama_model_params params = llama_model_default_params();
+    params.n_gpu_layers = -1;
+    params.tensor_buft_overrides = overrides;
+    params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
+    params.expert_hot_cache_capacity = 56;
+    llama_model * model = llama_model_load_from_file(model_path, params);
+    GGML_ASSERT(model != nullptr);
+
+    llama_context * first = llama_init_from_model(model, context_params);
+    llama_context * second = llama_init_from_model(model, context_params);
+    GGML_ASSERT(first != nullptr && second != nullptr);
+    route_capture hot_routes;
+    GGML_ASSERT(llama_set_route_observer(first, capture_routes, &hot_routes) ==
+        LLAMA_ROUTE_OBSERVER_STATUS_OK);
+    GGML_ASSERT(llama_route_observer_begin(first, 1, LLAMA_ROUTE_PHASE_DECODE) ==
+        LLAMA_ROUTE_OBSERVER_STATUS_OK);
+
+    GGML_ASSERT(llama_decode(first, llama_batch_get_one(&token, 1)) == 0);
+    const float * first_logits = llama_get_logits_ith(first, -1);
+    GGML_ASSERT(first_logits != nullptr);
+    GGML_ASSERT(std::equal(first_logits, first_logits + n_vocab, reference_logits.begin()));
+    GGML_ASSERT(hot_routes.layers == disabled_routes.layers);
+    GGML_ASSERT(hot_routes.ids == disabled_routes.ids);
+    GGML_ASSERT(hot_routes.weights == disabled_routes.weights);
+    const auto hot_graph = first->expert_graph_diagnostics();
+    GGML_ASSERT(hot_graph.binding_count == 7);
+    GGML_ASSERT(hot_graph.node_count == disabled_graph.node_count + 7);
+    GGML_ASSERT(hot_graph.operation_hash != disabled_graph.operation_hash);
+    auto * provider = model->expert_weight_provider();
+    const auto cold = provider->hot_cache_diagnostics();
+    GGML_ASSERT(cold.remap_checkpoints == 7);
+    GGML_ASSERT(cold.misses == 14 && cold.hits == 0);
+    GGML_ASSERT(cold.h2d_bytes > 0);
+    GGML_ASSERT(cold.last_remap_layer == hot_routes.layers.back());
+    GGML_ASSERT(cold.last_logical_ids.size() == 2 && cold.last_execution_ids.size() == 2);
+    GGML_ASSERT(std::equal(cold.last_logical_ids.begin(), cold.last_logical_ids.end(), hot_routes.ids.end() - 2));
+    GGML_ASSERT(std::all_of(cold.last_execution_ids.begin(), cold.last_execution_ids.end(), [](int32_t slot) {
+        return slot >= 12 && slot < 14;
+    }));
+
+    GGML_ASSERT(llama_decode(second, llama_batch_get_one(&token, 1)) == 0);
+    const float * second_logits = llama_get_logits_ith(second, -1);
+    GGML_ASSERT(second_logits != nullptr);
+    GGML_ASSERT(std::equal(first_logits, first_logits + n_vocab, second_logits));
+    const auto warm = provider->hot_cache_diagnostics();
+    GGML_ASSERT(warm.remap_checkpoints == 14);
+    GGML_ASSERT(warm.misses == cold.misses);
+    GGML_ASSERT(warm.hits == cold.hits + 14);
+    GGML_ASSERT(warm.h2d_bytes == cold.h2d_bytes);
+    GGML_ASSERT(warm.h2d_time_us == cold.h2d_time_us);
+    GGML_ASSERT(warm.slot_tensor_addresses == cold.slot_tensor_addresses);
+    GGML_ASSERT(warm.current_pins == 0);
+    for (size_t slot = 0; slot < cold.slots.size(); ++slot) {
+        GGML_ASSERT(warm.slots[slot].generation == cold.slots[slot].generation);
+    }
+
+    GGML_ASSERT(llama_decode(second, llama_batch_get_one(&token, 1)) == 0);
+    GGML_ASSERT(llama_decode(second, llama_batch_get_one(&token, 1)) == 0);
+    const float * reused_logits = llama_get_logits_ith(second, -1);
+    GGML_ASSERT(reused_logits != nullptr);
+    GGML_ASSERT(std::all_of(reused_logits, reused_logits + n_vocab, [](float value) {
+        return std::isfinite(value);
+    }));
+    GGML_ASSERT(second->expert_graph_diagnostics().graphs_reused > 0);
+    GGML_ASSERT(provider->hot_cache_diagnostics().current_pins == 0);
+
+    llama_free(second);
+    llama_free(first);
+    GGML_ASSERT(provider->surrender().is_ready());
+    llama_model_free(model);
+}
+
+void test_cuda_model_multi_token_all_expert_capacity(const char * model_path) {
+    const llama_model_tensor_buft_override overrides[] = {
+        { "ffn_(gate|up|down)_exps\\.weight", ggml_backend_cpu_buffer_type() },
+        { nullptr, nullptr },
+    };
+    llama_model_params params = llama_model_default_params();
+    params.n_gpu_layers = -1;
+    params.tensor_buft_overrides = overrides;
+    params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
+    params.expert_hot_cache_capacity = 8;
+    llama_model * model = llama_model_load_from_file(model_path, params);
+    GGML_ASSERT(model != nullptr);
+
+    llama_context_params context_params = llama_context_default_params();
+    context_params.n_ctx = 64;
+    context_params.n_batch = 64;
+    context_params.n_ubatch = 2;
+    llama_context * context = llama_init_from_model(model, context_params);
+    GGML_ASSERT(context != nullptr);
+    llama_token tokens[] = { 1, 1 };
+    GGML_ASSERT(llama_decode(context, llama_batch_get_one(tokens, 2)) == 0);
+    const float * logits = llama_get_logits_ith(context, -1);
+    GGML_ASSERT(logits != nullptr);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    GGML_ASSERT(std::all_of(logits, logits + n_vocab, [](float value) { return std::isfinite(value); }));
+    auto * provider = model->expert_weight_provider();
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.last_context_extent == 2);
+    GGML_ASSERT(diagnostics.conservative_required_capacity == 4);
+    GGML_ASSERT(diagnostics.remap_checkpoints == 7);
+    GGML_ASSERT(diagnostics.logical_ids == 28);
+    GGML_ASSERT(diagnostics.current_pins == 0);
+
     llama_free(context);
     GGML_ASSERT(provider->surrender().is_ready());
     llama_model_free(model);
@@ -747,6 +961,8 @@ int main(int argc, char ** argv) {
         ggml_backend_load_all();
         test_cuda_directory_copy();
         test_cuda_model_pool_smoke(argv[1]);
+        test_cuda_model_cross_epoch_hits(argv[1]);
+        test_cuda_model_multi_token_all_expert_capacity(argv[1]);
         llama_backend_free();
     } else if (argc != 1) {
         std::cerr << "usage: test-hot-expert-cache [MODEL]\n";

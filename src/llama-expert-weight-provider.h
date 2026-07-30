@@ -101,6 +101,7 @@ struct llm_expert_graph_binding {
     std::shared_ptr<void> generation_lease;
     uint64_t graph_epoch = 0;
     bool bootstrap = false;
+    ggml_tensor * logical_ids = nullptr;
 
     bool uses_merged_gate_up() const;
     llm_expert_provider_result validate(const llm_expert_selection & selection) const;
@@ -165,7 +166,14 @@ struct llm_hot_cache_diagnostics {
     uint64_t current_pins = 0;
     uint64_t peak_pins = 0;
     uint64_t h2d_bytes = 0;
+    uint64_t h2d_time_us = 0;
+    uint64_t execution_id_read_bytes = 0;
+    uint64_t execution_id_write_bytes = 0;
+    int32_t last_remap_layer = -1;
+    std::vector<int32_t> last_logical_ids;
+    std::vector<int32_t> last_execution_ids;
     uint64_t remap_dynamic_allocations = 0;
+    uint64_t synchronization_checkpoints = 0;
     std::vector<uintptr_t> slot_tensor_addresses;
     struct slot {
         int32_t layer = -1;
@@ -256,6 +264,15 @@ public:
             const llm_expert_selection & selection,
             llm_expert_graph_binding & binding) noexcept = 0;
 
+    virtual llm_expert_provider_result bind_graph(
+            ggml_context * graph_ctx,
+            const llm_expert_bundle_descriptor & bundle,
+            const llm_expert_selection & selection,
+            llm_expert_graph_binding & binding) noexcept {
+        (void) graph_ctx;
+        return bind(bundle, selection, binding);
+    }
+
     virtual llm_expert_provider_result prepare(
             const std::vector<llm_expert_graph_binding> & bindings,
             llm_expert_execution_plan & plan) noexcept = 0;
@@ -278,6 +295,11 @@ public:
         (void) logical_ids;
         (void) logical_id_count;
         (void) execution_ids;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual llm_expert_provider_result remap_checkpoint_tensor(
+            const llm_expert_graph_binding & binding) noexcept {
+        (void) binding;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     virtual llm_expert_provider_result cleanup_failed_slots() noexcept {

@@ -224,7 +224,8 @@ bool llm_expert_graph_binding::uses_merged_gate_up() const {
 }
 
 llm_expert_provider_result llm_expert_graph_binding::validate(const llm_expert_selection & selection) const {
-    if (provider_identity == nullptr || layer != selection.layer || execution_ids == nullptr) {
+    if (provider_identity == nullptr || layer != selection.layer || execution_ids == nullptr ||
+        (logical_ids != nullptr && logical_ids != selection.logical_ids)) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
     }
     if (execution_ids->type != GGML_TYPE_I32 || execution_ids->ne[0] != selection.n_expert_used || execution_ids->ne[1] != selection.n_tokens) {
@@ -440,6 +441,7 @@ public:
             0,
             false,
         };
+        binding.logical_ids = selection.logical_ids;
         result = binding.validate(selection);
         if (result.is_ready()) {
             successful_bindings.fetch_add(1, std::memory_order_relaxed);
@@ -742,6 +744,22 @@ public:
             const llm_expert_bundle_descriptor & bundle,
             const llm_expert_selection & selection,
             llm_expert_graph_binding & binding) noexcept override {
+        return bind_impl(nullptr, bundle, selection, binding);
+    }
+
+    llm_expert_provider_result bind_graph(
+            ggml_context * graph_ctx,
+            const llm_expert_bundle_descriptor & bundle,
+            const llm_expert_selection & selection,
+            llm_expert_graph_binding & binding) noexcept override {
+        return bind_impl(graph_ctx, bundle, selection, binding);
+    }
+
+    llm_expert_provider_result bind_impl(
+            ggml_context * graph_ctx,
+            const llm_expert_bundle_descriptor & bundle,
+            const llm_expert_selection & selection,
+            llm_expert_graph_binding & binding) noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         counters.bind_calls++;
         auto result = selection.validate();
@@ -793,6 +811,11 @@ public:
             };
             counters.bootstrap_bindings++;
         } else {
+            ggml_tensor * execution_ids = selection.logical_ids;
+            if (graph_ctx != nullptr) {
+                execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                ggml_format_name(execution_ids, "expert_execution_ids-%d", bundle.layer);
+            }
             binding = {
                 this,
                 bundle.layer,
@@ -800,13 +823,14 @@ public:
                 pool->bundle.gate,
                 pool->bundle.gate_up,
                 pool->bundle.down,
-                selection.logical_ids,
+                execution_ids,
                 std::static_pointer_cast<void>(pool),
                 epoch,
                 false,
             };
             counters.hot_bindings++;
         }
+        binding.logical_ids = selection.logical_ids;
         successful_bindings++;
         result = binding.validate(selection);
         return result.is_ready() ? result : fail(result);
@@ -873,8 +897,14 @@ public:
         }
 
         try {
-            if (element_unique.size() < max_elements) {
+            if (element_unique.size() < max_elements || logical_id_scratch.size() < max_elements ||
+                execution_id_scratch.size() < max_elements || last_logical_ids.size() < max_elements ||
+                last_execution_ids.size() < max_elements) {
                 element_unique.resize(max_elements);
+                logical_id_scratch.resize(max_elements);
+                execution_id_scratch.resize(max_elements);
+                last_logical_ids.resize(max_elements);
+                last_execution_ids.resize(max_elements);
                 scratch_reservations++;
             }
         } catch (const std::bad_alloc &) {
@@ -927,6 +957,43 @@ public:
             size_t logical_id_count,
             int32_t * execution_ids) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
+        return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids);
+    }
+
+    llm_expert_provider_result remap_checkpoint_tensor(
+            const llm_expert_graph_binding & binding) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (binding.execution_ids == nullptr || binding.execution_ids == binding.logical_ids ||
+            binding.execution_ids->type != GGML_TYPE_I32 || binding.execution_ids->ne[0] < 0 ||
+            binding.execution_ids->ne[1] < 0) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
+        }
+        const uint64_t count64 = uint64_t(binding.execution_ids->ne[0])*uint64_t(binding.execution_ids->ne[1]);
+        if (count64 > logical_id_scratch.size() || count64 > execution_id_scratch.size()) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration));
+        }
+        const size_t count = size_t(count64);
+        const size_t bytes = count*sizeof(int32_t);
+        ggml_backend_tensor_get(binding.execution_ids, logical_id_scratch.data(), 0, bytes);
+        execution_id_read_bytes += bytes;
+        auto result = remap_checkpoint_locked(
+            binding, logical_id_scratch.data(), count, execution_id_scratch.data());
+        if (!result.is_ready()) {
+            return result;
+        }
+        ggml_backend_tensor_set(binding.execution_ids, execution_id_scratch.data(), 0, bytes);
+        execution_id_write_bytes += bytes;
+        counters.callbacks++;
+        counters.synchronizations++;
+        synchronization_checkpoints++;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result remap_checkpoint_locked(
+            const llm_expert_graph_binding & binding,
+            const int32_t * logical_ids,
+            size_t logical_id_count,
+            int32_t * execution_ids) noexcept {
         if (!active_request || !pool || logical_ids == nullptr || execution_ids == nullptr ||
             binding.provider_identity != this || binding.bootstrap || binding.graph_epoch != epoch ||
             binding.generation_lease.get() != pool.get() || !binding_uses_current_pool(binding) ||
@@ -1045,6 +1112,7 @@ public:
 
         size_t transaction_copies = 0;
         size_t transaction_bytes = 0;
+        const int64_t copy_start_us = miss_count > 0 ? ggml_time_us() : 0;
         bool copied = true;
         for (size_t index = 0; index < miss_count && copied; ++index) {
             const uint32_t unique_index = miss_unique_indices[index];
@@ -1062,6 +1130,9 @@ public:
         }
         counters.tensor_copies += transaction_copies;
         h2d_bytes += transaction_bytes;
+        if (miss_count > 0) {
+            h2d_time_us += ggml_time_us() - copy_start_us;
+        }
 
         if (!copied) {
             for (size_t index = 0; index < miss_count; ++index) {
@@ -1086,7 +1157,11 @@ public:
 
         for (size_t index = 0; index < logical_id_count; ++index) {
             execution_ids[index] = unique_slots[element_unique[index]];
+            last_logical_ids[index] = logical_ids[index];
+            last_execution_ids[index] = execution_ids[index];
         }
+        last_id_count = logical_id_count;
+        last_remap_layer = binding.layer;
 
         remap_checkpoints++;
         logical_id_total += logical_id_count;
@@ -1195,6 +1270,12 @@ public:
             slot_releasable.resize(config.capacity);
             request_pins.resize(config.capacity);
             element_unique.clear();
+            logical_id_scratch.clear();
+            execution_id_scratch.clear();
+            last_logical_ids.clear();
+            last_execution_ids.clear();
+            last_id_count = 0;
+            last_remap_layer = -1;
             request_pin_count = 0;
             active_request = false;
 
@@ -1244,6 +1325,12 @@ public:
         slot_selected.clear();
         slot_releasable.clear();
         element_unique.clear();
+        logical_id_scratch.clear();
+        execution_id_scratch.clear();
+        last_logical_ids.clear();
+        last_execution_ids.clear();
+        last_id_count = 0;
+        last_remap_layer = -1;
         request_pins.clear();
         request_pin_count = 0;
         epoch++;
@@ -1290,7 +1377,14 @@ public:
         result.current_pins = current_pins;
         result.peak_pins = peak_pins;
         result.h2d_bytes = h2d_bytes;
+        result.h2d_time_us = h2d_time_us;
+        result.execution_id_read_bytes = execution_id_read_bytes;
+        result.execution_id_write_bytes = execution_id_write_bytes;
+        result.last_remap_layer = last_remap_layer;
+        result.last_logical_ids.assign(last_logical_ids.begin(), last_logical_ids.begin() + last_id_count);
+        result.last_execution_ids.assign(last_execution_ids.begin(), last_execution_ids.begin() + last_id_count);
         result.remap_dynamic_allocations = 0;
+        result.synchronization_checkpoints = synchronization_checkpoints;
         result.slot_tensor_addresses = pool ? pool->addresses : std::vector<uintptr_t> {};
         result.slots.reserve(directory_slots.size());
         for (const auto & entry : directory_slots) {
@@ -1501,6 +1595,12 @@ private:
     std::vector<uint8_t> slot_selected;
     std::vector<uint32_t> slot_releasable;
     std::vector<int32_t> element_unique;
+    std::vector<int32_t> logical_id_scratch;
+    std::vector<int32_t> execution_id_scratch;
+    std::vector<int32_t> last_logical_ids;
+    std::vector<int32_t> last_execution_ids;
+    size_t last_id_count = 0;
+    int32_t last_remap_layer = -1;
     std::vector<hot_request_pin> request_pins;
     size_t request_pin_count = 0;
     bool active_request = false;
@@ -1526,7 +1626,11 @@ private:
     uint64_t current_pins = 0;
     uint64_t peak_pins = 0;
     uint64_t h2d_bytes = 0;
+    uint64_t h2d_time_us = 0;
+    uint64_t execution_id_read_bytes = 0;
+    uint64_t execution_id_write_bytes = 0;
     uint64_t scratch_reservations = 0;
+    uint64_t synchronization_checkpoints = 0;
 };
 
 } // namespace

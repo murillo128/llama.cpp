@@ -146,7 +146,9 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+            ggml_status & ret);
+
+    static bool expert_eval_callback(ggml_tensor * tensor, bool ask, void * user_data);
 
     bool route_observer_start_submission();
     void route_observer_end_submission();
@@ -382,6 +384,10 @@ private:
 
     // Absent in the disabled mode so the legacy path constructs no request-plan object.
     std::unique_ptr<llm_expert_context_plans> expert_plans;
+    const std::vector<llm_expert_graph_binding> * expert_eval_bindings = nullptr;
+    ggml_tensor * expert_eval_pending_tensor = nullptr;
+    bool expert_eval_pending_user = false;
+    llm_expert_provider_result expert_eval_result;
 
     llama_route_observer_callback route_observer_callback = nullptr;
     void * route_observer_user_data = nullptr;
