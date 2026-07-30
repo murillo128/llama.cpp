@@ -149,6 +149,17 @@ void test_configuration_directory_and_real_reads() {
         { llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight, down.data(), down.size() },
     }};
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size()).is_ready());
+    const auto scattered_read = storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size());
+    uint64_t independent_digest = 1469598103934665603ULL;
+    for (const auto & destination : scattered) {
+        const auto * bytes = static_cast<const uint8_t *>(destination.data);
+        for (uint64_t index = 0; index < destination.extent; ++index) {
+            independent_digest ^= bytes[index]; independent_digest *= 1099511628211ULL;
+        }
+    }
+    GGML_ASSERT(scattered_read.digest == independent_digest);
+    storage.record_integrity_check(true);
+    GGML_ASSERT(storage.diagnostics().integrity_checks == 1);
     GGML_ASSERT(std::memcmp(up.data(), first.bytes.data() + 3, up.size()) == 0);
     GGML_ASSERT(std::memcmp(gate.data(), second.bytes.data() + 7, gate.size()) == 0);
     GGML_ASSERT(std::memcmp(down.data(), first.bytes.data() + 124, down.size()) == 0);
@@ -158,6 +169,19 @@ void test_configuration_directory_and_real_reads() {
         llm_expert_storage_error::invalid_destination);
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, destination.data(), 14).error ==
         llm_expert_storage_error::invalid_destination);
+    up[0] ^= 0xff;
+    uint64_t corrupted_digest = 1469598103934665603ULL;
+    for (const auto & item : scattered) {
+        const auto * bytes = static_cast<const uint8_t *>(item.data);
+        for (uint64_t index = 0; index < item.extent; ++index) {
+            corrupted_digest ^= bytes[index]; corrupted_digest *= 1099511628211ULL;
+        }
+    }
+    GGML_ASSERT(corrupted_digest != scattered_read.digest);
+    storage.record_integrity_check(false);
+    GGML_ASSERT(storage.diagnostics().integrity_mismatches == 1 && storage.diagnostics().poisoned);
+    GGML_ASSERT(storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size()).error ==
+        llm_expert_storage_error::poisoned);
 }
 
 struct scripted_reader : llm_expert_storage_read_override {

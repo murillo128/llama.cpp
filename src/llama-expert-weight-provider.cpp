@@ -246,7 +246,18 @@ llm_expert_provider_result load_storage_bundle(
     const auto result = context->storage->read_bundle(
         key, destinations.data(), count, context->abort_callback, context->abort_callback_data);
     if (result.is_ready()) {
-        return llm_expert_provider_result::success();
+        uint64_t destination_digest = 1469598103934665603ULL;
+        for (size_t index = 0; index < count; ++index) {
+            const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);
+            for (uint64_t offset = 0; offset < destinations[index].extent; ++offset) {
+                destination_digest ^= bytes[offset];
+                destination_digest *= 1099511628211ULL;
+            }
+        }
+        const bool matches = destination_digest == result.digest;
+        context->storage->record_integrity_check(matches);
+        return matches ? llm_expert_provider_result::success() :
+            llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
     if (result.error == llm_expert_storage_error::cancelled) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::cancelled);

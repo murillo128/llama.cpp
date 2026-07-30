@@ -56,6 +56,7 @@ enum class llm_expert_storage_error {
 struct llm_expert_storage_result {
     llm_expert_storage_error error = llm_expert_storage_error::none;
     int native_error = 0;
+    uint64_t digest = 1469598103934665603ULL;
     bool is_ready() const { return error == llm_expert_storage_error::none; }
 };
 
@@ -77,6 +78,8 @@ struct llm_expert_storage_diagnostics {
     uint64_t cancelled_reads = 0;
     uint64_t short_reads = 0;
     uint64_t io_errors = 0;
+    uint64_t integrity_checks = 0;
+    uint64_t integrity_mismatches = 0;
     int first_native_error = 0;
     bool sealed = false;
     bool poisoned = false;
@@ -103,6 +106,7 @@ public:
             const llm_expert_storage_destination * destinations, size_t destination_count,
             llm_expert_storage_abort abort = nullptr, void * abort_data = nullptr) noexcept;
     void poison() noexcept;
+    void record_integrity_check(bool matches) noexcept;
     llm_expert_storage_diagnostics diagnostics() const noexcept;
 
 private:

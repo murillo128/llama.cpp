@@ -260,6 +260,8 @@ int run_live(int argc, char ** argv) {
               << "\tstorage_cancelled_reads=" << storage_diagnostics.cancelled_reads
               << "\tstorage_short_reads=" << storage_diagnostics.short_reads
               << "\tstorage_io_errors=" << storage_diagnostics.io_errors
+              << "\tstorage_integrity_checks=" << storage_diagnostics.integrity_checks
+              << "\tstorage_integrity_mismatches=" << storage_diagnostics.integrity_mismatches
               << "\tstorage_poisoned=" << storage_diagnostics.poisoned
               << "\tsource_pageable=" << diagnostics.source_pageable
               << "\tsource_pinned_bytes=" << diagnostics.source_pinned_bytes

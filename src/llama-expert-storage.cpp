@@ -23,6 +23,15 @@ size_t identity_index(llm_expert_storage_projection projection, llm_expert_stora
     return size_t(projection)*3 + size_t(sidecar);
 }
 
+uint64_t digest_bytes(uint64_t digest, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t index = 0; index < size; ++index) {
+        digest ^= bytes[index];
+        digest *= 1099511628211ULL;
+    }
+    return digest;
+}
+
 } // namespace
 
 struct llm_expert_storage::impl {
@@ -293,6 +302,7 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
         std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
         pimpl->counters.read_requests++;
     }
+    uint64_t digest = 1469598103934665603ULL;
     const auto & spans = pimpl->directory[pimpl->index(key)].spans;
     for (const auto & span : spans) {
         const llm_expert_storage_destination * destination = nullptr;
@@ -343,6 +353,7 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
                     return { llm_expert_storage_error::short_read, 0 };
                 }
                 chunk_completed += size_t(result);
+                digest = digest_bytes(digest, target, size_t(result));
                 {
                     std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
                     pimpl->counters.read_bytes += uint64_t(result);
@@ -358,12 +369,21 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
             pimpl->counters.read_chunks++;
         }
     }
-    return {};
+    return { llm_expert_storage_error::none, 0, digest };
 }
 
 void llm_expert_storage::poison() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
     pimpl->poisoned.store(true);
+}
+
+void llm_expert_storage::record_integrity_check(bool matches) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+    pimpl->counters.integrity_checks++;
+    if (!matches) {
+        pimpl->counters.integrity_mismatches++;
+        pimpl->poisoned.store(true);
+    }
 }
 
 llm_expert_storage_diagnostics llm_expert_storage::diagnostics() const noexcept {
