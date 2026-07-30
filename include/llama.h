@@ -371,6 +371,8 @@ extern "C" {
         uint32_t expert_hot_cache_capacity; // global routed-expert slot capacity [EXPERIMENTAL]
         uint64_t expert_cold_cache_bytes; // pageable routed-expert cache budget [EXPERIMENTAL]
         uint64_t expert_transfer_ring_bytes; // bounded transfer staging budget [EXPERIMENTAL]
+        uint32_t expert_io_queue_depth; // bounded asynchronous I/O queue depth [EXPERIMENTAL]
+        uint64_t expert_io_staging_bytes; // bounded direct-I/O staging budget [EXPERIMENTAL]
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

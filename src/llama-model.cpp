@@ -2722,6 +2722,8 @@ llama_model_params llama_model_default_params() {
         /*.expert_hot_cache_capacity   =*/ 0,
         /*.expert_cold_cache_bytes     =*/ 0,
         /*.expert_transfer_ring_bytes  =*/ 0,
+        /*.expert_io_queue_depth       =*/ 0,
+        /*.expert_io_staging_bytes     =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
