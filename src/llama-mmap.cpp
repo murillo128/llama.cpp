@@ -16,6 +16,9 @@
         #include <unistd.h>
         #include <fcntl.h>
         #include <sys/stat.h>
+        #if defined(__linux__)
+            #include <linux/stat.h>
+        #endif
         #if defined(_POSIX_MAPPED_FILES)
             #include <sys/mman.h>
         #endif
@@ -175,6 +178,8 @@ struct llama_file::impl {
         return true;
     }
 
+    int direct_io_error() const { return 0; }
+
     ~impl() {
         if (fp && owns_fp) {
             std::fclose(fp);
@@ -189,7 +194,7 @@ struct llama_file::impl {
                 return;
             }
             LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
-                           fname, strerror(errno));
+                           fname, strerror(direct_error));
         }
 #endif
         init_fp(mode);
@@ -197,14 +202,50 @@ struct llama_file::impl {
 
 #ifdef __linux__
     bool init_fd() {
-        fd = open(fname.c_str(), O_RDONLY | O_DIRECT);
+        fd = open(fname.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
 
         if (fd != -1) {
             struct stat file_stats{};
-            fstat(fd, &file_stats);
+            if (fstat(fd, &file_stats) != 0) {
+                direct_error = errno;
+                close(fd);
+                fd = -1;
+                return false;
+            }
 
             size = file_stats.st_size;
-            alignment = file_stats.st_blksize;
+            struct statx direct_info{};
+            const int statx_result = statx(
+                fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT, STATX_DIOALIGN, &direct_info);
+            if (statx_result != 0 || (direct_info.stx_mask & STATX_DIOALIGN) == 0 ||
+                direct_info.stx_dio_mem_align == 0 || direct_info.stx_dio_offset_align == 0 ||
+                (direct_info.stx_dio_mem_align & (direct_info.stx_dio_mem_align - 1)) != 0 ||
+                (direct_info.stx_dio_offset_align & (direct_info.stx_dio_offset_align - 1)) != 0) {
+                direct_error = statx_result != 0 ? errno : EOPNOTSUPP;
+                close(fd);
+                fd = -1;
+                return false;
+            }
+            alignment = std::max<size_t>({ direct_info.stx_dio_mem_align,
+                direct_info.stx_dio_offset_align, sizeof(void *) });
+
+            void * probe = nullptr;
+            const int allocation_error = posix_memalign(&probe, alignment, alignment);
+            if (allocation_error != 0) {
+                direct_error = allocation_error;
+                close(fd);
+                fd = -1;
+                return false;
+            }
+            const ssize_t probe_result = pread(fd, probe, alignment, 0);
+            const int probe_error = errno;
+            free(probe);
+            if (probe_result < 0) {
+                direct_error = probe_error;
+                close(fd);
+                fd = -1;
+                return false;
+            }
 
             off_t ret = lseek(fd, 0, SEEK_SET);
             if (ret == -1) {
@@ -212,6 +253,7 @@ struct llama_file::impl {
             }
             return true;
         }
+        direct_error = errno;
         return false;
     }
 #endif
@@ -374,6 +416,8 @@ struct llama_file::impl {
         return fd != -1 && alignment > 1;
     }
 
+    int direct_io_error() const { return direct_error; }
+
     ~impl() {
         if (fd != -1) {
             close(fd);
@@ -390,6 +434,7 @@ struct llama_file::impl {
     }
 
     size_t alignment = 1;
+    int direct_error = 0;
 
     FILE * fp{};
     size_t size{};
@@ -408,6 +453,7 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+int llama_file::direct_io_error() const { return pimpl->direct_io_error(); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32
@@ -527,6 +573,14 @@ bool llama_file_read_handle::valid() const {
 
 uint64_t llama_file_read_handle::size() const { return pimpl ? pimpl->file_size : 0; }
 llama_file_identity llama_file_read_handle::identity() const { return pimpl ? pimpl->file_identity : llama_file_identity{}; }
+
+intptr_t llama_file_read_handle::native_handle() const {
+#ifdef _WIN32
+    return pimpl ? reinterpret_cast<intptr_t>(pimpl->handle) : intptr_t(-1);
+#else
+    return pimpl ? pimpl->fd : intptr_t(-1);
+#endif
+}
 
 int64_t llama_file_read_handle::read_at(void * data, size_t size, uint64_t offset, int & native_error) const noexcept {
     native_error = 0;

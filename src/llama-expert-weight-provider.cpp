@@ -1,6 +1,8 @@
 #include "llama-expert-weight-provider.h"
 #include "llama-cold-expert-cache.h"
 #include "llama-expert-storage.h"
+#include "llama-expert-async-io.h"
+#include "llama-expert-scheduler.h"
 #include "llama-expert-transfer-ring.h"
 #include "llama-hparams.h"
 
@@ -174,6 +176,11 @@ bool projection_is_pageable_cpu(const llm_expert_projection_descriptor & project
 
 struct storage_load_context {
     llm_expert_storage * storage = nullptr;
+    llm_expert_async_transport * transport = nullptr;
+    llm_expert_scheduler * scheduler = nullptr;
+    std::unique_lock<std::mutex> * provider_lock = nullptr;
+    llm_expert_request_handle completed_io_handle;
+    bool completed_io_pending_publication = false;
     bool (*abort_callback)(void *) = nullptr;
     void * abort_callback_data = nullptr;
 };
@@ -242,6 +249,122 @@ llm_expert_provider_result load_storage_bundle(
             llm_expert_storage_projection::down)) {
         if (context && context->storage) context->storage->poison();
         return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    if (context->transport != nullptr && context->scheduler != nullptr) {
+        std::array<llm_expert_storage_read_operation, 12> operations;
+        size_t operation_count = 0;
+        const auto planned = context->storage->make_read_plan(
+            key, destinations.data(), count, operations.data(), operations.size(), operation_count);
+        if (!planned.is_ready()) {
+            context->storage->poison();
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        const auto scheduled = context->scheduler->enqueue(
+            key, llm_expert_priority::demand_current_layer, llm_expert_readiness::host_ready);
+        if (scheduled.disposition != llm_expert_schedule_disposition::admitted) {
+            return llm_expert_provider_result::failure(
+                scheduled.disposition == llm_expert_schedule_disposition::generation_exhausted ?
+                    llm_expert_provider_error::generation_exhausted : llm_expert_provider_error::busy);
+        }
+        llm_expert_request_snapshot snapshot;
+        const auto selected = context->scheduler->take_next(snapshot);
+        if (selected.disposition != llm_expert_schedule_disposition::admitted ||
+            selected.handle.slot != scheduled.handle.slot || selected.handle.generation != scheduled.handle.generation) {
+            if (selected.disposition == llm_expert_schedule_disposition::admitted) {
+                (void) context->scheduler->transition(selected.handle, llm_expert_request_state::submitting,
+                    llm_expert_request_state::draining);
+                (void) context->scheduler->finish(selected.handle, llm_expert_request_state::failed);
+                (void) context->scheduler->release_terminal(selected.handle);
+            }
+            if (selected.handle.slot != scheduled.handle.slot || selected.handle.generation != scheduled.handle.generation) {
+                (void) context->scheduler->transition(scheduled.handle, llm_expert_request_state::queued,
+                    llm_expert_request_state::draining);
+                (void) context->scheduler->finish(scheduled.handle, llm_expert_request_state::failed);
+                (void) context->scheduler->release_terminal(scheduled.handle);
+            }
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        const llm_expert_async_operation_identity identity = {
+            context->transport->diagnostics().transport_epoch,
+            selected.handle,
+            0,
+            key,
+            llm_expert_readiness::host_ready,
+            llm_expert_priority::demand_current_layer,
+        };
+        const auto submitted = context->transport->submit_read_plan(identity, operations.data(), operation_count);
+        if (submitted != llm_expert_async_result::ready) {
+            (void) context->scheduler->transition(selected.handle, llm_expert_request_state::submitting,
+                llm_expert_request_state::draining);
+            (void) context->scheduler->finish(selected.handle, llm_expert_request_state::failed);
+            (void) context->scheduler->release_terminal(selected.handle);
+            return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+        }
+        if (context->scheduler->transition(selected.handle, llm_expert_request_state::submitting,
+                llm_expert_request_state::io_in_flight) != llm_expert_schedule_disposition::admitted) {
+            (void) context->transport->cancel_read(selected.handle);
+            llm_expert_async_read_completion discarded;
+            if (context->provider_lock != nullptr) context->provider_lock->unlock();
+            (void) context->transport->wait_read(selected.handle, discarded);
+            if (context->provider_lock != nullptr) context->provider_lock->lock();
+            (void) context->transport->release_read(selected.handle);
+            (void) context->scheduler->transition(selected.handle, llm_expert_request_state::submitting,
+                llm_expert_request_state::draining);
+            (void) context->scheduler->finish(selected.handle, llm_expert_request_state::failed);
+            (void) context->scheduler->release_terminal(selected.handle);
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        llm_expert_async_read_completion completion;
+        if (context->provider_lock != nullptr) context->provider_lock->unlock();
+        const auto waited = context->transport->wait_read(
+            selected.handle, completion, context->abort_callback, context->abort_callback_data);
+        if (context->provider_lock != nullptr) context->provider_lock->lock();
+        const auto released = context->transport->release_read(selected.handle);
+        const llm_expert_storage_error storage_error = waited == llm_expert_async_result::ready ?
+            llm_expert_storage_error::none :
+            (waited == llm_expert_async_result::closed ? llm_expert_storage_error::cancelled :
+             (completion.native_error == 0 ? llm_expert_storage_error::short_read :
+              llm_expert_storage_error::io_error));
+        context->storage->record_async_read(count, completion.bytes_completed, storage_error, completion.native_error);
+        bool integrity_matches = false;
+        if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready) {
+            uint64_t destination_digest = 1469598103934665603ULL;
+            for (size_t index = 0; index < count; ++index) {
+                const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);
+                for (uint64_t offset = 0; offset < destinations[index].extent; ++offset) {
+                    destination_digest ^= bytes[offset];
+                    destination_digest *= 1099511628211ULL;
+                }
+            }
+            integrity_matches = destination_digest == completion.digest;
+        }
+        if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready &&
+            integrity_matches) {
+            context->storage->record_integrity_check(true);
+            context->completed_io_handle = selected.handle;
+            context->completed_io_pending_publication = true;
+            return llm_expert_provider_result::success();
+        }
+        if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready) {
+            context->storage->record_integrity_check(false);
+        }
+        if (waited == llm_expert_async_result::closed) {
+            (void) context->scheduler->transition(selected.handle, llm_expert_request_state::io_in_flight,
+                llm_expert_request_state::cancelling);
+            (void) context->scheduler->transition(selected.handle, llm_expert_request_state::cancelling,
+                llm_expert_request_state::draining);
+            (void) context->scheduler->finish(selected.handle, llm_expert_request_state::cancelled);
+            (void) context->scheduler->release_terminal(selected.handle);
+            return llm_expert_provider_result::failure(llm_expert_provider_error::cancelled);
+        }
+        (void) context->scheduler->transition(selected.handle, llm_expert_request_state::io_in_flight,
+            llm_expert_request_state::draining);
+        (void) context->scheduler->finish(selected.handle, llm_expert_request_state::failed);
+        (void) context->scheduler->release_terminal(selected.handle);
+        return llm_expert_provider_result::failure(
+            !integrity_matches ? llm_expert_provider_error::metadata_mismatch :
+            (waited == llm_expert_async_result::stale_generation ?
+                llm_expert_provider_error::stale_generation : llm_expert_provider_error::copy_failed));
     }
     const auto result = context->storage->read_bundle(
         key, destinations.data(), count, context->abort_callback, context->abort_callback_data);
@@ -866,8 +989,12 @@ public:
             config.target_device == nullptr || (!config.allow_non_cuda_target_for_testing && config.storage == nullptr))) {
             throw std::invalid_argument("cold-cache mode requires byte budgets and a target device");
         }
+        if ((config.async_transport == nullptr) != (config.scheduler == nullptr) ||
+            (config.async_transport != nullptr && config.storage == nullptr)) {
+            throw std::invalid_argument("incomplete cold-cache async configuration");
+        }
         if (!config.cold_mode && (config.cold_cache_bytes != 0 || config.transfer_ring_bytes != 0 ||
-            config.force_pageable_transfer_for_testing)) {
+            config.force_pageable_transfer_for_testing || config.async_transport != nullptr || config.scheduler != nullptr)) {
             throw std::invalid_argument("cold-cache configuration outside cold mode");
         }
     }
@@ -1090,9 +1217,9 @@ public:
             int32_t * execution_ids,
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);
         return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr,
-            abort_callback, abort_callback_data);
+            abort_callback, abort_callback_data, &lock);
     }
 
     llm_expert_provider_result remap_checkpoint_tensor(
@@ -1100,7 +1227,7 @@ public:
             ggml_backend_t execution_backend,
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);
         (void) execution_backend;
         if (binding.execution_ids == nullptr || binding.execution_ids == binding.logical_ids ||
             binding.execution_ids->type != GGML_TYPE_I32 || binding.execution_ids->ne[0] < 0 ||
@@ -1117,7 +1244,7 @@ public:
         execution_id_read_bytes += bytes;
         auto result = remap_checkpoint_locked(
             binding, logical_id_scratch.data(), count, execution_id_scratch.data(), execution_backend,
-            abort_callback, abort_callback_data);
+            abort_callback, abort_callback_data, &lock);
         if (!result.is_ready()) {
             return result;
         }
@@ -1136,7 +1263,8 @@ public:
             int32_t * execution_ids,
             ggml_backend_t execution_backend,
             bool (*abort_callback)(void *),
-            void * abort_callback_data) noexcept {
+            void * abort_callback_data,
+            std::unique_lock<std::mutex> * provider_lock) noexcept {
         if (!active_request || !pool || logical_ids == nullptr || execution_ids == nullptr ||
             binding.provider_identity != this || binding.bootstrap || binding.graph_epoch != epoch ||
             binding.generation_lease.get() != pool.get() || !binding_uses_current_pool(binding) ||
@@ -1286,7 +1414,16 @@ public:
             copy_result = llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
         if (config.cold_mode) {
-            storage_load_context storage_context = { config.storage, abort_callback, abort_callback_data };
+            storage_load_context storage_context = {
+                config.storage,
+                config.async_transport,
+                config.scheduler,
+                provider_lock,
+                {},
+                false,
+                abort_callback,
+                abort_callback_data,
+            };
             for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
                 const uint32_t unique_index = miss_unique_indices[index];
                 const uint32_t slot = candidate_slots[index];
@@ -1296,6 +1433,32 @@ public:
                     cold_cache->find_or_admit(
                         unique_keys[unique_index], registration->second, cold_references[index],
                         faults.fail_copy_after_tensors);
+                if (storage_context.completed_io_pending_publication) {
+                    const auto handle = storage_context.completed_io_handle;
+                    if (copy_result.is_ready()) {
+                        const auto host_ready = config.scheduler->transition(
+                            handle, llm_expert_request_state::io_in_flight,
+                            llm_expert_request_state::host_ready);
+                        if (host_ready == llm_expert_schedule_disposition::admitted) {
+                            (void) config.scheduler->finish(handle, llm_expert_request_state::complete);
+                        } else {
+                            copy_result = llm_expert_provider_result::failure(
+                                llm_expert_provider_error::metadata_mismatch);
+                            (void) config.scheduler->transition(handle,
+                                llm_expert_request_state::io_in_flight,
+                                llm_expert_request_state::draining);
+                            (void) config.scheduler->finish(handle, llm_expert_request_state::failed);
+                        }
+                    } else {
+                        (void) config.scheduler->transition(handle,
+                            llm_expert_request_state::io_in_flight,
+                            llm_expert_request_state::draining);
+                        (void) config.scheduler->finish(handle, llm_expert_request_state::failed);
+                    }
+                    (void) config.scheduler->release_terminal(handle);
+                    storage_context.completed_io_handle = {};
+                    storage_context.completed_io_pending_publication = false;
+                }
                 if (copy_result.is_ready()) {
                     copy_result = cold_cache->acquire(cold_references[index], llm_cold_reference_kind::hot);
                 }

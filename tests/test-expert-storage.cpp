@@ -132,6 +132,16 @@ void test_configuration_directory_and_real_reads() {
     GGML_ASSERT(storage.add_bundle({ 0, 0 }, malformed).error == llm_expert_storage_error::invalid_directory);
 
     populate_and_seal(storage);
+    std::array<intptr_t, 2> native_handles{};
+    size_t native_handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        native_handles.data(), native_handles.size(), native_handle_count).is_ready());
+    GGML_ASSERT(native_handle_count == native_handles.size());
+    GGML_ASSERT(native_handles[0] >= 0 && native_handles[1] >= 0);
+    size_t rejected_handle_count = 99;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        native_handles.data(), 1, rejected_handle_count).error == llm_expert_storage_error::invalid_destination);
+    GGML_ASSERT(rejected_handle_count == 0);
     GGML_ASSERT(storage.add_bundle({ 0, 0 }, separate_bundle()).error == llm_expert_storage_error::invalid_key);
     const auto diagnostics = storage.diagnostics();
     GGML_ASSERT(diagnostics.sealed && diagnostics.source_file_count == 2);
@@ -172,6 +182,16 @@ void test_configuration_directory_and_real_reads() {
     GGML_ASSERT(std::memcmp(up.data(), first.bytes.data() + 3, up.size()) == 0);
     GGML_ASSERT(std::memcmp(gate.data(), second.bytes.data() + 7, gate.size()) == 0);
     GGML_ASSERT(std::memcmp(down.data(), first.bytes.data() + 124, down.size()) == 0);
+    std::array<llm_expert_storage_read_operation, 12> read_plan;
+    size_t read_operation_count = 0;
+    GGML_ASSERT(storage.make_read_plan({ 0, 0 }, scattered.data(), scattered.size(),
+        read_plan.data(), read_plan.size(), read_operation_count).is_ready());
+    GGML_ASSERT(read_operation_count == 3);
+    for (size_t index = 0; index < read_operation_count; ++index) {
+        GGML_ASSERT(read_plan[index].native_handle >= 0);
+        GGML_ASSERT(read_plan[index].segment_count == 1);
+        GGML_ASSERT(read_plan[index].byte_count == read_plan[index].segments[0].byte_count);
+    }
     auto malformed_destination = scattered;
     malformed_destination[1].extent--;
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, malformed_destination.data(), malformed_destination.size()).error ==
@@ -191,6 +211,105 @@ void test_configuration_directory_and_real_reads() {
     GGML_ASSERT(storage.diagnostics().integrity_mismatches == 1 && storage.diagnostics().poisoned);
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size()).error ==
         llm_expert_storage_error::poisoned);
+}
+
+void test_exact_adjacent_read_plan() {
+    temporary_file first(0x20), second(0x90);
+    llama_file first_loader(first.path.c_str(), "rb");
+    llama_file second_loader(second.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 1, 1, 64 }, {
+        { 0, &first_loader, 32 }, { 1, &second_loader, 32 },
+    });
+    GGML_ASSERT(storage.add_bundle({ 0, 0 }, {
+        span(0, 8, 5, llm_expert_storage_projection::up, 0),
+        span(0, 13, 7, llm_expert_storage_projection::gate, 5),
+        span(1, 4, 6, llm_expert_storage_projection::down, 12),
+    }).is_ready());
+    GGML_ASSERT(storage.seal().is_ready());
+    std::array<uint8_t, 5> up{};
+    std::array<uint8_t, 7> gate{};
+    std::array<uint8_t, 6> down{};
+    const std::array<llm_expert_storage_destination, 3> destinations = {{
+        { llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight, up.data(), up.size() },
+        { llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight, gate.data(), gate.size() },
+        { llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight, down.data(), down.size() },
+    }};
+    std::array<llm_expert_storage_read_operation, 12> operations;
+    size_t count = 0;
+    GGML_ASSERT(storage.make_read_plan({ 0, 0 }, destinations.data(), destinations.size(),
+        operations.data(), operations.size(), count).is_ready());
+    GGML_ASSERT(count == 2);
+    GGML_ASSERT(operations[0].split_index == 0 && operations[0].segment_count == 2);
+    GGML_ASSERT(operations[0].file_offset == 8 && operations[0].byte_count == 12);
+    GGML_ASSERT(operations[1].split_index == 1 && operations[1].segment_count == 1);
+}
+
+void test_direct_source_identity_and_explicit_support() {
+#if defined(__linux__)
+    temporary_file first(0x21, 8192), second(0x91, 8192);
+    llama_file buffered(first.path.c_str(), "rb");
+    llama_file buffered_second(second.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 1, 1, 64 }, {
+        { 0, &buffered, 32, first.path.c_str(), true },
+        { 1, &buffered_second, 32, second.path.c_str(), true },
+    });
+    GGML_ASSERT(storage.add_bundle({ 0, 0 }, separate_bundle()).is_ready());
+    GGML_ASSERT(storage.seal().is_ready());
+    const auto diagnostics = storage.diagnostics();
+    GGML_ASSERT(diagnostics.direct_source_count + diagnostics.direct_unsupported_source_count == 2);
+    std::array<uint8_t, 5> up{};
+    std::array<uint8_t, 6> gate{};
+    std::array<uint8_t, 4> down{};
+    const std::array<llm_expert_storage_destination, 3> targets = {{
+        { llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight, up.data(), up.size() },
+        { llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight, gate.data(), gate.size() },
+        { llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight, down.data(), down.size() },
+    }};
+    std::array<llm_expert_storage_read_operation, 3> operations;
+    size_t count = 0;
+    GGML_ASSERT(storage.make_read_plan({ 0, 0 }, targets.data(), targets.size(),
+        operations.data(), operations.size(), count).is_ready());
+    GGML_ASSERT(count == 3 && operations[0].source_size == first.bytes.size());
+    std::array<intptr_t, 2> transport_handles{};
+    size_t transport_handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(transport_handles.data(), transport_handles.size(),
+        transport_handle_count, true).is_ready());
+    GGML_ASSERT(transport_handle_count == 2);
+    if (operations[0].direct_native_handle >= 0) {
+        GGML_ASSERT(operations[0].direct_native_handle >= 0);
+        GGML_ASSERT(operations[0].direct_alignment == diagnostics.maximum_direct_alignment);
+        GGML_ASSERT(transport_handles[0] == operations[0].direct_native_handle);
+        bool identity_rejected = false;
+        try {
+            llm_expert_storage rejected({ 1, 1, 1, 64 }, {
+                { 0, &buffered, 32, second.path.c_str(), true },
+                { 1, &buffered_second, 32, second.path.c_str(), true },
+            });
+        } catch (const std::runtime_error &) {
+            identity_rejected = true;
+        }
+        GGML_ASSERT(identity_rejected);
+    } else {
+        GGML_ASSERT(diagnostics.direct_unsupported_source_count > 0);
+        GGML_ASSERT(diagnostics.first_direct_error != 0);
+    }
+
+    llm_expert_storage unsupported({ 1, 1, 1, 64 }, {
+        { 0, &buffered, 32, nullptr, true },
+        { 1, &buffered_second, 32, nullptr, true },
+    });
+    GGML_ASSERT(unsupported.add_bundle({ 0, 0 }, separate_bundle()).is_ready());
+    GGML_ASSERT(unsupported.seal().is_ready());
+    const auto unsupported_diagnostics = unsupported.diagnostics();
+    GGML_ASSERT(unsupported_diagnostics.direct_source_count == 0);
+    GGML_ASSERT(unsupported_diagnostics.direct_unsupported_source_count == 2);
+    GGML_ASSERT(unsupported_diagnostics.first_direct_error == ENOTSUP);
+    transport_handle_count = 0;
+    GGML_ASSERT(unsupported.copy_source_native_handles(transport_handles.data(), transport_handles.size(),
+        transport_handle_count, true).is_ready());
+    GGML_ASSERT(transport_handle_count == 2);
+    GGML_ASSERT(transport_handles[0] >= 0 && transport_handles[1] >= 0);
+#endif
 }
 
 struct scripted_reader : llm_expert_storage_read_override {
@@ -321,31 +440,35 @@ void test_duplicate_lifetime_and_transactional_close() {
 #endif
 }
 
-void test_cold_mode_rejects_non_mmap_before_loading() {
+void test_cold_mode_accepts_mmap_and_direct_before_loading() {
     llama_model_params params = llama_model_default_params();
     params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
     params.expert_hot_cache_capacity = 2;
     params.expert_cold_cache_bytes = 1U << 20;
     params.expert_transfer_ring_bytes = 1U << 20;
     for (const auto mode : { LLAMA_LOAD_MODE_NONE, LLAMA_LOAD_MODE_MLOCK,
-            LLAMA_LOAD_MODE_MMAP_MLOCK, LLAMA_LOAD_MODE_DIRECT_IO }) {
+            LLAMA_LOAD_MODE_MMAP_MLOCK }) {
         params.load_mode = mode;
         expect_invalid([&] {
             std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, params));
         });
     }
-    params.load_mode = LLAMA_LOAD_MODE_MMAP;
-    std::unique_ptr<llama_model> valid(llama_model_create(LLM_ARCH_KIMI_K3, params));
-    GGML_ASSERT(valid != nullptr);
+    for (const auto mode : { LLAMA_LOAD_MODE_MMAP, LLAMA_LOAD_MODE_DIRECT_IO }) {
+        params.load_mode = mode;
+        std::unique_ptr<llama_model> valid(llama_model_create(LLM_ARCH_KIMI_K3, params));
+        GGML_ASSERT(valid != nullptr);
+    }
 }
 
 } // namespace
 
 int main() {
     test_configuration_directory_and_real_reads();
+    test_exact_adjacent_read_plan();
+    test_direct_source_identity_and_explicit_support();
     test_retry_short_error_cancel_and_poison();
     test_duplicate_lifetime_and_transactional_close();
-    test_cold_mode_rejects_non_mmap_before_loading();
+    test_cold_mode_accepts_mmap_and_direct_before_loading();
     std::cout << "PHASE6_STORAGE_LIFETIME"
               << "\tsupported=" << lifetime_evidence.supported
               << "\tbaseline=" << lifetime_evidence.baseline

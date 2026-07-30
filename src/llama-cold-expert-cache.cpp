@@ -348,9 +348,32 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit_with_loader(
         llm_cold_reference & reference,
         llm_cold_cache_loader loader,
         void * loader_data) noexcept {
+    if (loader == nullptr) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+    }
+    bool hit = false;
+    auto reserved = reserve_or_find(key, reference, hit);
+    if (!reserved.is_ready() || hit) {
+        return reserved;
+    }
+    const auto result = loader(loader_data, key, pimpl->arena->bundle, reference.slot);
+    if (!result.is_ready()) {
+        (void) fail_reservation(key, reference);
+        return result;
+    }
+    const auto published = publish_ready(key, reference);
+    if (!published.is_ready()) (void) fail_reservation(key, reference);
+    return published;
+}
+
+llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
+        llm_expert_key key,
+        llm_cold_reference & reference,
+        bool & hit) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     pimpl->counters.requests++;
-    if (!pimpl->arena || !key.is_valid(LLAMA_MAX_LAYERS, pimpl->n_expert) || loader == nullptr) {
+    hit = false;
+    if (!pimpl->arena || !key.is_valid(LLAMA_MAX_LAYERS, pimpl->n_expert)) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
     }
     auto & forward = pimpl->directory[pimpl->forward_index(key)];
@@ -359,15 +382,16 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit_with_loader(
             pimpl->counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
-        auto & slot = pimpl->slots[forward.slot];
-        if (!key_matches(slot.key, key) || slot.generation != forward.generation ||
-            slot.state != llm_cold_slot_state::ready) {
+        auto & existing = pimpl->slots[forward.slot];
+        if (!key_matches(existing.key, key) || existing.generation != forward.generation ||
+            existing.state != llm_cold_slot_state::ready) {
             pimpl->counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
-        slot.last_use = ++pimpl->use_clock;
+        existing.last_use = ++pimpl->use_clock;
         reference = { uint32_t(forward.slot), forward.generation };
         pimpl->counters.hits++;
+        hit = true;
         return llm_expert_provider_result::success();
     }
     pimpl->counters.misses++;
@@ -404,17 +428,48 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit_with_loader(
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     reference = { uint32_t(victim), slot.generation };
-    const auto result = loader(loader_data, key, pimpl->arena->bundle, uint32_t(victim));
-    if (!result.is_ready()) {
-        slot.state = llm_cold_slot_state::failed;
-        pimpl->counters.failed_copies++;
-        return result;
+    pimpl->counters.reservations++;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_cold_expert_cache::publish_ready(
+        llm_expert_key key, llm_cold_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (reference.slot >= pimpl->slots.size()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & slot = pimpl->slots[reference.slot];
+    if (slot.generation != reference.generation || slot.state != llm_cold_slot_state::loading ||
+        !key_matches(slot.key, key)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & forward = pimpl->directory[pimpl->forward_index(key)];
+    if (forward.slot >= 0) {
+        pimpl->counters.invariant_failures++;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
     slot.state = llm_cold_slot_state::ready;
     slot.last_use = ++pimpl->use_clock;
-    pimpl->directory[pimpl->forward_index(key)] = { victim, slot.generation };
+    forward = { int32_t(reference.slot), reference.generation };
     pimpl->counters.admissions++;
-    reference = { uint32_t(victim), slot.generation };
+    pimpl->counters.publications++;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_cold_expert_cache::fail_reservation(
+        llm_expert_key key, llm_cold_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (reference.slot >= pimpl->slots.size()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & slot = pimpl->slots[reference.slot];
+    if (slot.generation != reference.generation || slot.state != llm_cold_slot_state::loading ||
+        !key_matches(slot.key, key)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    slot.state = llm_cold_slot_state::failed;
+    pimpl->counters.failed_copies++;
+    pimpl->counters.failed_reservations++;
     return llm_expert_provider_result::success();
 }
 
@@ -587,7 +642,7 @@ llm_expert_provider_result llm_cold_expert_cache::trim() noexcept {
 llm_expert_provider_result llm_cold_expert_cache::surrender() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     for (const auto & slot : pimpl->slots) {
-        if (!pimpl->no_refs(slot)) {
+        if (!pimpl->no_refs(slot) || slot.state == llm_cold_slot_state::loading) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         }
     }

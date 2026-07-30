@@ -1,5 +1,7 @@
 #include "llama-expert-transfer-ring.h"
 #include "llama-expert-storage.h"
+#include "llama-expert-async-io.h"
+#include "llama-expert-scheduler.h"
 #include "llama-context.h"
 #include "llama-model.h"
 #include "llama.h"
@@ -206,6 +208,8 @@ int run_live(int argc, char ** argv) {
         model->expert_weight_provider()->hot_cache_diagnostics() : llm_hot_cache_diagnostics {};
     const auto storage_diagnostics = model->expert_storage() ?
         model->expert_storage()->diagnostics() : llm_expert_storage_diagnostics {};
+    const auto async_diagnostics = model->expert_async_diagnostics();
+    const auto scheduler_diagnostics = model->expert_scheduler_diagnostics();
     if (!args.dump_cold_bundle.empty()) {
         if (args.mode != "cold" || !model->expert_storage() || !model->expert_weight_provider()) return 29;
         llm_expert_key key = { -1, -1 };
@@ -299,6 +303,38 @@ int run_live(int argc, char ** argv) {
               << "\tstorage_integrity_checks=" << storage_diagnostics.integrity_checks
               << "\tstorage_integrity_mismatches=" << storage_diagnostics.integrity_mismatches
               << "\tstorage_poisoned=" << storage_diagnostics.poisoned
+              << "\tstorage_direct_sources=" << storage_diagnostics.direct_source_count
+              << "\tstorage_direct_unsupported=" << storage_diagnostics.direct_unsupported_source_count
+              << "\tstorage_direct_alignment=" << storage_diagnostics.maximum_direct_alignment
+              << "\tio_async=" << async_diagnostics.io_uring_enabled
+              << "\tio_setup_error=" << async_diagnostics.io_uring_setup_error
+              << "\tio_probe_error=" << async_diagnostics.io_uring_probe_error
+              << "\tio_runtime_error=" << async_diagnostics.io_uring_runtime_error
+              << "\tio_sq_entries=" << async_diagnostics.actual_sq_entries
+              << "\tio_cq_entries=" << async_diagnostics.actual_cq_entries
+              << "\tio_registered_files=" << async_diagnostics.registered_file_count
+              << "\tio_file_registration_error=" << async_diagnostics.file_registration_error
+              << "\tio_requests=" << async_diagnostics.read_requests_submitted
+              << "\tio_operations=" << async_diagnostics.read_operations_completed
+              << "\tio_peak_sq_occupancy=" << async_diagnostics.peak_sq_occupancy
+              << "\tio_peak_cq_occupancy=" << async_diagnostics.peak_cq_occupancy
+              << "\tio_bytes=" << async_diagnostics.read_bytes_completed
+              << "\tio_sync_fallback_operations=" << async_diagnostics.synchronous_fallback_operations
+              << "\tio_registered_buffers=" << async_diagnostics.registered_buffer_count
+              << "\tio_registered_buffer_bytes=" << async_diagnostics.registered_buffer_bytes
+              << "\tio_buffer_registration_error=" << async_diagnostics.buffer_registration_error
+              << "\tio_direct_staging_error=" << async_diagnostics.direct_staging_error
+              << "\tio_direct_operations=" << async_diagnostics.direct_read_operations
+              << "\tio_direct_useful_bytes=" << async_diagnostics.direct_useful_bytes
+              << "\tio_direct_aligned_bytes=" << async_diagnostics.direct_aligned_bytes
+              << "\tio_direct_scatter_bytes=" << async_diagnostics.direct_scatter_bytes
+              << "\tio_buffered_fallback_operations=" << async_diagnostics.buffered_fallback_operations
+              << "\tio_buffered_fallback_bytes=" << async_diagnostics.buffered_fallback_bytes
+              << "\tio_direct_capability_retries=" << async_diagnostics.direct_capability_retries
+              << "\tio_active_requests=" << async_diagnostics.active_read_requests
+              << "\tio_active_operations=" << async_diagnostics.active_operations
+              << "\tscheduler_flights=" << scheduler_diagnostics.flights_created
+              << "\tscheduler_active=" << scheduler_diagnostics.active_requests
               << "\tsource_pageable=" << diagnostics.source_pageable
               << "\tsource_pinned_bytes=" << diagnostics.source_pinned_bytes
               << "\tno_writeback_evictions=" << diagnostics.no_writeback_evictions

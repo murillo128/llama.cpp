@@ -2,14 +2,21 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #if defined(__linux__)
 #include <linux/io_uring.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -44,6 +51,11 @@ bool include_field(uint64_t offset, uint64_t extent, uint64_t & size) {
     return true;
 }
 
+bool recoverable_registration_error(int error) {
+    return error == EINVAL || error == ENOSYS || error == EOPNOTSUPP || error == ENOMEM ||
+        error == EMFILE || error == ENFILE || error == EPERM;
+}
+
 uint32_t auto_queue_depth(uint32_t hot_capacity) {
     uint64_t target = std::max<uint64_t>(32, uint64_t(hot_capacity)*4);
     target = std::min<uint64_t>(target, 256);
@@ -54,13 +66,255 @@ uint32_t auto_queue_depth(uint32_t hot_capacity) {
     return result;
 }
 
+#if defined(__linux__)
+class io_uring_owner {
+public:
+    ~io_uring_owner() { close_ring(); }
+
+    bool open_ring(uint32_t entries, int & native_error) {
+        io_uring_params requested{};
+        requested.flags = IORING_SETUP_CQSIZE;
+        requested.cq_entries = entries*2;
+        fd = int(syscall(__NR_io_uring_setup, entries, &requested));
+        if (fd < 0 && errno == EINVAL) {
+            requested = {};
+            fd = int(syscall(__NR_io_uring_setup, entries, &requested));
+        }
+        if (fd < 0) {
+            native_error = errno;
+            return false;
+        }
+        params = requested;
+        const llm_expert_async_ring_layout layout = {
+            params.sq_entries, params.cq_entries,
+            params.sq_off.head, params.sq_off.tail, params.sq_off.ring_mask, params.sq_off.ring_entries,
+            params.sq_off.flags, params.sq_off.dropped, params.sq_off.array,
+            params.cq_off.head, params.cq_off.tail, params.cq_off.ring_mask, params.cq_off.ring_entries,
+            params.cq_off.overflow, params.cq_off.cqes,
+        };
+        llm_expert_async_mapping_sizes sizes;
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0 || !llm_expert_async_transport::validate_ring_layout(layout, uint64_t(page_size), sizes)) {
+            native_error = EINVAL;
+            close_ring();
+            return false;
+        }
+        sq_ring_size = size_t(sizes.sq_ring_bytes);
+        cq_ring_size = size_t(sizes.cq_ring_bytes);
+        sqes_size = size_t(sizes.sqes_bytes);
+        if (params.features & IORING_FEAT_SINGLE_MMAP) {
+            sq_ring_size = cq_ring_size = std::max(sq_ring_size, cq_ring_size);
+            sq_ring = mmap(nullptr, sq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                fd, IORING_OFF_SQ_RING);
+            cq_ring = sq_ring;
+        } else {
+            sq_ring = mmap(nullptr, sq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                fd, IORING_OFF_SQ_RING);
+            if (sq_ring != MAP_FAILED) {
+                cq_ring = mmap(nullptr, cq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                    fd, IORING_OFF_CQ_RING);
+            }
+        }
+        if (sq_ring == MAP_FAILED || cq_ring == MAP_FAILED) {
+            native_error = errno;
+            close_ring();
+            return false;
+        }
+        sqes = static_cast<io_uring_sqe *>(mmap(nullptr, sqes_size, PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES));
+        if (sqes == MAP_FAILED) {
+            native_error = errno;
+            close_ring();
+            return false;
+        }
+        sq_head = pointer<uint32_t>(sq_ring, params.sq_off.head);
+        sq_tail = pointer<uint32_t>(sq_ring, params.sq_off.tail);
+        sq_mask = pointer<uint32_t>(sq_ring, params.sq_off.ring_mask);
+        sq_entries = pointer<uint32_t>(sq_ring, params.sq_off.ring_entries);
+        sq_array = pointer<uint32_t>(sq_ring, params.sq_off.array);
+        cq_head = pointer<uint32_t>(cq_ring, params.cq_off.head);
+        cq_tail = pointer<uint32_t>(cq_ring, params.cq_off.tail);
+        cq_mask = pointer<uint32_t>(cq_ring, params.cq_off.ring_mask);
+        cq_entries = pointer<uint32_t>(cq_ring, params.cq_off.ring_entries);
+        cqes = pointer<io_uring_cqe>(cq_ring, params.cq_off.cqes);
+        return true;
+    }
+
+    void close_ring() {
+        if (sqes != MAP_FAILED) munmap(sqes, sqes_size);
+        if (cq_ring != MAP_FAILED && cq_ring != sq_ring) munmap(cq_ring, cq_ring_size);
+        if (sq_ring != MAP_FAILED) munmap(sq_ring, sq_ring_size);
+        if (fd >= 0) close(fd);
+        fd = -1;
+        sq_ring = cq_ring = MAP_FAILED;
+        sqes = static_cast<io_uring_sqe *>(MAP_FAILED);
+        pending = 0;
+        files_registered = false;
+        buffer_registered = false;
+    }
+
+    io_uring_sqe * acquire_sqe() {
+        const uint32_t head = __atomic_load_n(sq_head, __ATOMIC_ACQUIRE);
+        const uint32_t tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
+        if (tail - head >= *sq_entries) return nullptr;
+        io_uring_sqe * sqe = &sqes[tail & *sq_mask];
+        std::memset(sqe, 0, sizeof(*sqe));
+        sq_array[tail & *sq_mask] = tail & *sq_mask;
+        __atomic_store_n(sq_tail, tail + 1, __ATOMIC_RELEASE);
+        pending++;
+        return sqe;
+    }
+
+    int submit(int & native_error) {
+        if (pending == 0) return 0;
+        if (injected_submit_error != 0 && injected_submissions_remaining == 0) {
+            native_error = injected_submit_error;
+            return -1;
+        }
+        const uint32_t requested = injected_submit_error == 0 ? pending :
+            std::min(pending, injected_submissions_remaining);
+        int submitted = -1;
+        for (uint32_t attempt = 0; attempt < 64; ++attempt) {
+            submitted = int(syscall(__NR_io_uring_enter, fd, requested, 0, 0, nullptr, 0));
+            if (submitted >= 0 || (errno != EINTR && errno != EAGAIN)) break;
+            if (errno == EAGAIN) std::this_thread::yield();
+        }
+        if (submitted < 0) {
+            native_error = errno;
+            return -1;
+        }
+        pending -= uint32_t(submitted);
+        if (injected_submit_error != 0) injected_submissions_remaining -= uint32_t(submitted);
+        return submitted;
+    }
+
+    bool try_cqe(io_uring_cqe & result) {
+        const uint32_t head = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
+        const uint32_t tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+        if (head == tail) return false;
+        result = cqes[head & *cq_mask];
+        __atomic_store_n(cq_head, head + 1, __ATOMIC_RELEASE);
+        return true;
+    }
+
+    bool wait_cqe(io_uring_cqe & result, int & native_error) {
+        for (;;) {
+            if (try_cqe(result)) return true;
+            const int entered = int(syscall(__NR_io_uring_enter, fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0));
+            if (entered < 0 && errno == EINTR) continue;
+            if (entered < 0) {
+                native_error = errno;
+                return false;
+            }
+        }
+    }
+
+    bool register_files(const int * handles, uint32_t count, int & native_error) {
+        if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_FILES, handles, count) < 0) {
+            native_error = errno;
+            return false;
+        }
+        files_registered = true;
+        return true;
+    }
+
+    bool register_buffer(void * address, size_t size, int & native_error) {
+        iovec buffer = { address, size };
+        if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_BUFFERS, &buffer, 1) < 0) {
+            native_error = errno;
+            return false;
+        }
+        buffer_registered = true;
+        return true;
+    }
+
+    bool probe_opcodes(bool & read, bool & readv, bool & async_cancel,
+            bool & read_fixed, int & native_error) {
+        constexpr uint32_t operation_count = 256;
+        std::vector<uint8_t> storage(sizeof(io_uring_probe) +
+            operation_count*sizeof(io_uring_probe_op));
+        auto * probe = reinterpret_cast<io_uring_probe *>(storage.data());
+        if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_PROBE, probe, operation_count) < 0) {
+            native_error = errno;
+            return false;
+        }
+        for (uint32_t index = 0; index < probe->ops_len; ++index) {
+            if ((probe->ops[index].flags & IO_URING_OP_SUPPORTED) == 0) continue;
+            read |= probe->ops[index].op == IORING_OP_READ;
+            readv |= probe->ops[index].op == IORING_OP_READV;
+            async_cancel |= probe->ops[index].op == IORING_OP_ASYNC_CANCEL;
+            read_fixed |= probe->ops[index].op == IORING_OP_READ_FIXED;
+        }
+        return true;
+    }
+
+    uint32_t actual_sq_entries() const { return params.sq_entries; }
+    uint32_t actual_cq_entries() const { return params.cq_entries; }
+    uint32_t completion_occupancy() const {
+        const uint32_t head = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
+        const uint32_t tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+        return tail - head;
+    }
+    void inject_submit_error_after(uint32_t count, int error) {
+        injected_submissions_remaining = count;
+        injected_submit_error = error;
+    }
+
+private:
+    template<class T> static T * pointer(void * base, uint32_t offset) {
+        return reinterpret_cast<T *>(static_cast<uint8_t *>(base) + offset);
+    }
+
+    int fd = -1;
+    io_uring_params params{};
+    void * sq_ring = MAP_FAILED;
+    void * cq_ring = MAP_FAILED;
+    io_uring_sqe * sqes = static_cast<io_uring_sqe *>(MAP_FAILED);
+    size_t sq_ring_size = 0;
+    size_t cq_ring_size = 0;
+    size_t sqes_size = 0;
+    uint32_t * sq_head = nullptr;
+    uint32_t * sq_tail = nullptr;
+    uint32_t * sq_mask = nullptr;
+    uint32_t * sq_entries = nullptr;
+    uint32_t * sq_array = nullptr;
+    uint32_t * cq_head = nullptr;
+    uint32_t * cq_tail = nullptr;
+    uint32_t * cq_mask = nullptr;
+    uint32_t * cq_entries = nullptr;
+    io_uring_cqe * cqes = nullptr;
+    uint32_t pending = 0;
+    bool files_registered = false;
+    bool buffer_registered = false;
+    uint32_t injected_submissions_remaining = 0;
+    int injected_submit_error = 0;
+};
+#endif
+
 } // namespace
 
 struct llm_expert_async_transport::impl {
     struct operation_record {
         llm_expert_async_operation_identity identity;
+        llm_expert_storage_read_operation read;
         uint32_t generation = 0;
         bool active = false;
+        bool read_operation = false;
+        bool ring_completed = false;
+        bool cancel_submitted = false;
+#if defined(__linux__)
+        std::array<iovec, 12> iovecs;
+#endif
+    };
+
+    enum class read_state { free, queued, running, complete };
+
+    struct read_request_record {
+        llm_expert_request_handle handle;
+        uint64_t ordinal = 0;
+        read_state state = read_state::free;
+        bool cancel_requested = false;
+        llm_expert_async_read_completion completion;
     };
 
     struct trace_record {
@@ -69,9 +323,560 @@ struct llm_expert_async_transport::impl {
 
     llm_expert_async_config config;
     std::vector<operation_record> operations;
+    std::vector<read_request_record> read_requests;
     std::vector<trace_record> traces;
+    std::vector<uint32_t> batch_slots;
     mutable std::mutex mutex;
+    std::condition_variable condition;
+    std::thread worker;
     llm_expert_async_diagnostics counters;
+    uint64_t next_read_ordinal = 1;
+    bool worker_stop = false;
+    std::vector<int> registered_files;
+    uint32_t registered_file_count = 0;
+    void * staging = nullptr;
+    uint64_t staging_bytes = 0;
+    uint64_t staging_alignment = 0;
+    std::vector<intptr_t> direct_disabled_handles;
+    uint32_t direct_disabled_handle_count = 0;
+    bool staging_registered = false;
+#if defined(__linux__)
+    io_uring_owner ring;
+#endif
+
+    ~impl() { std::free(staging); }
+
+    read_request_record * find_read(llm_expert_request_handle handle) {
+        if (!handle.valid() || handle.slot >= read_requests.size()) return nullptr;
+        auto & request = read_requests[handle.slot];
+        return request.state != read_state::free && request.handle.generation == handle.generation ? &request : nullptr;
+    }
+
+    bool direct_is_disabled(intptr_t handle) const {
+        for (uint32_t index = 0; index < direct_disabled_handle_count; ++index) {
+            if (direct_disabled_handles[index] == handle) return true;
+        }
+        return false;
+    }
+
+    bool disable_direct(intptr_t handle) {
+        if (handle < 0 || direct_is_disabled(handle)) return handle >= 0;
+        if (direct_disabled_handle_count == direct_disabled_handles.size()) return false;
+        direct_disabled_handles[direct_disabled_handle_count++] = handle;
+        return true;
+    }
+
+    bool prepare_direct(const operation_record & operation, uint64_t & aligned_offset,
+            uint64_t & aligned_bytes) const {
+        aligned_offset = 0;
+        aligned_bytes = 0;
+        if (!config.direct_io_requested || operation.read.direct_native_handle < 0 ||
+            direct_is_disabled(operation.read.direct_native_handle) ||
+            operation.read.direct_alignment == 0 || operation.read.direct_alignment > staging_alignment ||
+            staging == nullptr || !is_power_of_two(operation.read.direct_alignment)) return false;
+        uint64_t useful_end = 0;
+        uint64_t rounded_end = 0;
+        aligned_offset = operation.read.file_offset & ~(operation.read.direct_alignment - 1);
+        if (!checked_add(operation.read.file_offset, operation.read.byte_count, useful_end) ||
+            !checked_add(useful_end, operation.read.direct_alignment - 1, rounded_end)) return false;
+        rounded_end &= ~(operation.read.direct_alignment - 1);
+        if (rounded_end < aligned_offset || rounded_end > operation.read.source_size) return false;
+        aligned_bytes = rounded_end - aligned_offset;
+        return aligned_bytes != 0 && aligned_bytes <= staging_bytes && aligned_bytes <= UINT32_MAX;
+    }
+
+#if defined(__linux__)
+    bool run_ring(llm_expert_request_handle handle, llm_expert_async_read_completion & completion,
+            intptr_t & direct_capability_handle, bool & transport_failed) {
+        direct_capability_handle = -1;
+        transport_failed = false;
+        size_t next = 0;
+        size_t remaining = 0;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            for (const auto & operation : operations) {
+                if (operation.active && operation.read_operation &&
+                    operation.identity.request.slot == handle.slot &&
+                    operation.identity.request.generation == handle.generation) remaining++;
+            }
+        }
+        while (remaining > 0) {
+            uint32_t batch = 0;
+            for (; next < operations.size(); ++next) {
+                std::lock_guard<std::mutex> guard(mutex);
+                auto & operation = operations[next];
+                if (!operation.active || !operation.read_operation ||
+                    operation.identity.request.slot != handle.slot ||
+                    operation.identity.request.generation != handle.generation) continue;
+                if (read_requests[handle.slot].cancel_requested) {
+                    completion.result = llm_expert_async_result::closed;
+                    return false;
+                }
+                io_uring_sqe * sqe = ring.acquire_sqe();
+                if (sqe == nullptr) break;
+                batch_slots[batch] = uint32_t(next);
+                operation.ring_completed = false;
+                operation.cancel_submitted = false;
+                uint64_t direct_offset = 0;
+                uint64_t direct_bytes = 0;
+                const bool direct = prepare_direct(operation, direct_offset, direct_bytes);
+                if (direct) {
+                    sqe->opcode = staging_registered ? IORING_OP_READ_FIXED : IORING_OP_READ;
+                    sqe->addr = uint64_t(staging);
+                    sqe->len = uint32_t(direct_bytes);
+                    sqe->off = direct_offset;
+                    sqe->fd = int(operation.read.direct_native_handle);
+                    if (staging_registered) sqe->buf_index = 0;
+                } else if (operation.read.segment_count == 1) {
+                    const auto & segment = operation.read.segments[0];
+                    sqe->opcode = IORING_OP_READ;
+                    sqe->addr = uint64_t(segment.data);
+                    sqe->len = uint32_t(segment.byte_count);
+                    sqe->off = segment.file_offset;
+                } else {
+                    for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
+                        operation.iovecs[index] = {
+                            operation.read.segments[index].data,
+                            size_t(operation.read.segments[index].byte_count),
+                        };
+                    }
+                    sqe->opcode = IORING_OP_READV;
+                    sqe->addr = uint64_t(operation.iovecs.data());
+                    sqe->len = operation.read.segment_count;
+                    sqe->off = operation.read.file_offset;
+                }
+                if (!direct) sqe->fd = int(operation.read.native_handle);
+                for (uint32_t file_index = 0; file_index < registered_file_count; ++file_index) {
+                    if (registered_files[file_index] == sqe->fd) {
+                        sqe->fd = int(file_index);
+                        sqe->flags |= IOSQE_FIXED_FILE;
+                        break;
+                    }
+                }
+                sqe->user_data = llm_expert_async_transport::encode_user_data(uint32_t(next), operation.generation);
+                batch++;
+                if (config.direct_io_requested) {
+                    ++next;
+                    break;
+                }
+            }
+            if (batch == 0) {
+                completion.result = llm_expert_async_result::busy;
+                return false;
+            }
+            int native_error = 0;
+            uint32_t submitted = 0;
+            while (submitted < batch) {
+                const int count = ring.submit(native_error);
+                if (count <= 0) {
+                    // SQEs are published before enter. A hard enter failure after a partial
+                    // submission cannot safely leave the unpublished tail for a later request.
+                    // Closing the ring blocks until the kernel releases every submitted file,
+                    // iovec, and destination reference; the complete unpublished bundle can
+                    // then be retried by the buffered positional fallback.
+                    ring.close_ring();
+                    {
+                        std::lock_guard<std::mutex> guard(mutex);
+                        counters.io_uring_enabled = false;
+                        counters.io_uring_runtime_error = count == 0 ? EAGAIN : native_error;
+                    }
+                    transport_failed = true;
+                    completion.result = llm_expert_async_result::invalid;
+                    completion.native_error = count == 0 ? EAGAIN : native_error;
+                    return false;
+                }
+                submitted += uint32_t(count);
+            }
+            {
+                std::lock_guard<std::mutex> guard(mutex);
+                counters.ring_submissions += submitted;
+                counters.peak_sq_occupancy = std::max(counters.peak_sq_occupancy, submitted);
+            }
+            uint32_t read_completions_left = submitted;
+            uint32_t cancel_completions_left = 0;
+            bool cancel_requested = false;
+            llm_expert_async_result first_error = llm_expert_async_result::ready;
+            int first_native_error = 0;
+            while (read_completions_left > 0 || cancel_completions_left > 0) {
+                uint32_t cancels_prepared = 0;
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    cancel_requested = read_requests[handle.slot].cancel_requested;
+                    if (cancel_requested) {
+                        for (uint32_t index = 0; index < batch; ++index) {
+                            auto & operation = operations[batch_slots[index]];
+                            if (operation.ring_completed || operation.cancel_submitted) continue;
+                            io_uring_sqe * cancel = ring.acquire_sqe();
+                            if (cancel == nullptr) break;
+                            cancel->opcode = IORING_OP_ASYNC_CANCEL;
+                            cancel->addr = llm_expert_async_transport::encode_user_data(
+                                batch_slots[index], operation.generation);
+                            cancel->cancel_flags = IORING_ASYNC_CANCEL_USERDATA;
+                            cancel->user_data = llm_expert_async_transport::encode_user_data(
+                                batch_slots[index] | 0x80000000U, operation.generation);
+                            operation.cancel_submitted = true;
+                            cancels_prepared++;
+                        }
+                    }
+                }
+                if (cancels_prepared != 0) {
+                    uint32_t cancel_submitted = 0;
+                    while (cancel_submitted < cancels_prepared) {
+                        const int count = ring.submit(native_error);
+                        if (count <= 0) {
+                            if (first_error == llm_expert_async_result::ready) {
+                                first_error = llm_expert_async_result::invalid;
+                                first_native_error = count == 0 ? EAGAIN : native_error;
+                            }
+                            break;
+                        }
+                        cancel_submitted += uint32_t(count);
+                    }
+                    cancel_completions_left += cancel_submitted;
+                    std::lock_guard<std::mutex> guard(mutex);
+                    counters.ring_cancel_submissions += cancel_submitted;
+                }
+                io_uring_cqe cqe{};
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    counters.peak_cq_occupancy = std::max(
+                        counters.peak_cq_occupancy, ring.completion_occupancy());
+                }
+                if (!ring.wait_cqe(cqe, native_error)) {
+                    completion.result = llm_expert_async_result::invalid;
+                    completion.native_error = native_error;
+                    return false;
+                }
+                uint32_t operation_slot = 0;
+                uint32_t operation_generation = 0;
+                const bool decoded = llm_expert_async_transport::decode_user_data(
+                    cqe.user_data, operation_slot, operation_generation);
+                const bool cancel_completion = (operation_slot & 0x80000000U) != 0;
+                operation_slot &= 0x7fffffffU;
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!decoded || operation_slot >= operations.size()) {
+                    counters.stale_completions++;
+                    if (first_error == llm_expert_async_result::ready) first_error = llm_expert_async_result::stale_generation;
+                    if (cancel_completion) cancel_completions_left--;
+                    else read_completions_left--;
+                    continue;
+                }
+                auto & operation = operations[operation_slot];
+                if (!operation.active || operation.generation != operation_generation ||
+                    operation.identity.request.slot != handle.slot ||
+                    operation.identity.request.generation != handle.generation) {
+                    counters.stale_completions++;
+                    if (first_error == llm_expert_async_result::ready) first_error = llm_expert_async_result::stale_generation;
+                    if (cancel_completion) cancel_completions_left--;
+                    else read_completions_left--;
+                    continue;
+                }
+                if (cancel_completion) {
+                    cancel_completions_left--;
+                    counters.ring_cancel_completions++;
+                    if (cqe.res < 0 && cqe.res != -ENOENT && cqe.res != -EALREADY &&
+                        first_error == llm_expert_async_result::ready) {
+                        first_error = llm_expert_async_result::invalid;
+                        first_native_error = -cqe.res;
+                    }
+                    continue;
+                }
+                operation.ring_completed = true;
+                read_completions_left--;
+                if (cqe.res < 0) {
+                    uint64_t ignored_offset = 0;
+                    uint64_t ignored_bytes = 0;
+                    const bool direct = prepare_direct(operation, ignored_offset, ignored_bytes);
+                    if (direct && (cqe.res == -EINVAL || cqe.res == -EOPNOTSUPP || cqe.res == -ENOTSUP)) {
+                        direct_capability_handle = operation.read.direct_native_handle;
+                    }
+                    if (cqe.res != -ECANCELED || !cancel_requested) {
+                        if (first_error == llm_expert_async_result::ready) {
+                            first_error = llm_expert_async_result::invalid;
+                            first_native_error = -cqe.res;
+                        }
+                    }
+                    counters.ring_completions++;
+                    continue;
+                }
+                uint64_t direct_offset = 0;
+                uint64_t direct_bytes = 0;
+                const bool direct = prepare_direct(operation, direct_offset, direct_bytes);
+                const uint64_t expected_bytes = direct ? direct_bytes : operation.read.byte_count;
+                if (uint64_t(cqe.res) != expected_bytes) {
+                    if (first_error == llm_expert_async_result::ready) first_error = llm_expert_async_result::invalid;
+                    counters.ring_completions++;
+                    continue;
+                }
+                if (direct) {
+                    for (uint8_t segment_index = 0; segment_index < operation.read.segment_count; ++segment_index) {
+                        const auto & segment = operation.read.segments[segment_index];
+                        std::memcpy(segment.data,
+                            static_cast<const uint8_t *>(staging) + (segment.file_offset - direct_offset),
+                            size_t(segment.byte_count));
+                    }
+                    completion.bytes_completed += operation.read.byte_count;
+                    counters.direct_read_operations++;
+                    counters.direct_useful_bytes += operation.read.byte_count;
+                    counters.direct_aligned_bytes += direct_bytes;
+                    counters.direct_scatter_bytes += operation.read.byte_count;
+                } else {
+                    completion.bytes_completed += uint64_t(cqe.res);
+                    if (config.direct_io_requested) {
+                        counters.buffered_fallback_operations++;
+                        counters.buffered_fallback_bytes += operation.read.byte_count;
+                    }
+                }
+                counters.ring_completions++;
+            }
+            if (cancel_requested) {
+                completion.result = llm_expert_async_result::closed;
+                return false;
+            }
+            if (first_error != llm_expert_async_result::ready) {
+                completion.result = first_error;
+                completion.native_error = first_native_error;
+                return false;
+            }
+            remaining -= submitted;
+        }
+        return true;
+    }
+#endif
+
+    void worker_main() {
+        std::unique_lock<std::mutex> lock(mutex);
+        for (;;) {
+            condition.wait(lock, [&] {
+                if (worker_stop) return true;
+                for (const auto & request : read_requests) if (request.state == read_state::queued) return true;
+                return false;
+            });
+            uint32_t selected = UINT32_MAX;
+            for (uint32_t slot = 0; slot < read_requests.size(); ++slot) {
+                if (read_requests[slot].state == read_state::queued &&
+                    (selected == UINT32_MAX || read_requests[slot].ordinal < read_requests[selected].ordinal)) {
+                    selected = slot;
+                }
+            }
+            if (selected == UINT32_MAX) {
+                if (worker_stop) break;
+                continue;
+            }
+            auto & request = read_requests[selected];
+            request.state = read_state::running;
+            const auto handle = request.handle;
+            lock.unlock();
+
+            llm_expert_async_read_completion completion = { llm_expert_async_result::ready, 0, 0 };
+            bool used_ring = false;
+            bool execute_fallback = true;
+            bool ring_fallback_buffered = false;
+#if defined(__linux__)
+            if (counters.io_uring_enabled && config.read_override_for_testing == nullptr) {
+                used_ring = true;
+                execute_fallback = false;
+                intptr_t direct_capability_handle = -1;
+                bool transport_failed = false;
+                bool ring_ready = run_ring(handle, completion, direct_capability_handle, transport_failed);
+                if (!ring_ready && !transport_failed &&
+                    completion.result == llm_expert_async_result::invalid && direct_capability_handle >= 0 &&
+                    (completion.native_error == EINVAL || completion.native_error == EOPNOTSUPP ||
+                     completion.native_error == ENOTSUP)) {
+                    completion = { llm_expert_async_result::ready, 0, 0 };
+                    {
+                        std::lock_guard<std::mutex> guard(mutex);
+                        (void) disable_direct(direct_capability_handle);
+                        counters.direct_capability_retries++;
+                    }
+                    direct_capability_handle = -1;
+                    ring_ready = run_ring(handle, completion, direct_capability_handle, transport_failed);
+                }
+                if (!ring_ready && transport_failed) {
+                    completion = { llm_expert_async_result::ready, 0, 0 };
+                    execute_fallback = true;
+                    ring_fallback_buffered = true;
+                    used_ring = false;
+                }
+            }
+#endif
+            if (execute_fallback) {
+            bool force_buffered = ring_fallback_buffered;
+            for (size_t operation_index = 0; operation_index < operations.size(); ++operation_index) {
+                lock.lock();
+                const auto & stored = operations[operation_index];
+                if (!stored.active || !stored.read_operation ||
+                    stored.identity.request.slot != handle.slot ||
+                    stored.identity.request.generation != handle.generation) {
+                    lock.unlock();
+                    continue;
+                }
+                const llm_expert_storage_read_operation operation = stored.read;
+                if (read_requests[handle.slot].cancel_requested) {
+                    completion.result = llm_expert_async_result::closed;
+                }
+                lock.unlock();
+                if (completion.result != llm_expert_async_result::ready) break;
+                auto read_all = [&](intptr_t native_handle, void * destination,
+                                    uint64_t byte_count, uint64_t file_offset) {
+                    uint64_t completed = 0;
+                    while (completed < byte_count) {
+#if defined(__linux__)
+                        int native_error = 0;
+                        const size_t remaining = size_t(byte_count - completed);
+                        const int64_t result = config.read_override_for_testing != nullptr ?
+                            config.read_override_for_testing->read_at(native_handle,
+                                static_cast<uint8_t *>(destination) + completed, remaining,
+                                file_offset + completed, native_error) :
+                            int64_t(pread(int(native_handle),
+                                static_cast<uint8_t *>(destination) + completed,
+                                remaining, off_t(file_offset + completed)));
+                        if (result < 0 && config.read_override_for_testing == nullptr) native_error = errno;
+                        if (result < 0 && native_error == EINTR) {
+                            std::lock_guard<std::mutex> guard(mutex);
+                            counters.interrupted_reads_retried++;
+                            continue;
+                        }
+                        if (result < 0 && native_error == EAGAIN) {
+                            std::lock_guard<std::mutex> guard(mutex);
+                            counters.would_block_reads_retried++;
+                            if (read_requests[handle.slot].cancel_requested) {
+                                completion.result = llm_expert_async_result::closed;
+                                break;
+                            }
+                            continue;
+                        }
+                        if (result < 0) {
+                            completion.result = llm_expert_async_result::invalid;
+                            completion.native_error = native_error;
+                            break;
+                        }
+                        if (result == 0 || uint64_t(result) > byte_count - completed) {
+                            completion.result = llm_expert_async_result::invalid;
+                            completion.native_error = 0;
+                            break;
+                        }
+                        if (uint64_t(result) < byte_count - completed) {
+                            std::lock_guard<std::mutex> guard(mutex);
+                            counters.short_positive_reads++;
+                        }
+                        completed += uint64_t(result);
+#else
+                        completion.result = llm_expert_async_result::invalid;
+                        completion.native_error = ENOSYS;
+                        break;
+#endif
+                        std::lock_guard<std::mutex> guard(mutex);
+                        if (read_requests[handle.slot].cancel_requested) {
+                            completion.result = llm_expert_async_result::closed;
+                            break;
+                        }
+                    }
+                    return completion.result == llm_expert_async_result::ready;
+                };
+
+                uint64_t aligned_offset = 0;
+                uint64_t aligned_bytes = 0;
+                const bool direct = !force_buffered && prepare_direct(stored, aligned_offset, aligned_bytes);
+                if (direct) {
+                    if (read_all(operation.direct_native_handle, staging, aligned_bytes, aligned_offset)) {
+                        for (uint8_t segment_index = 0; segment_index < operation.segment_count; ++segment_index) {
+                            const auto & segment = operation.segments[segment_index];
+                            std::memcpy(segment.data,
+                                static_cast<const uint8_t *>(staging) + (segment.file_offset - aligned_offset),
+                                size_t(segment.byte_count));
+                            completion.bytes_completed += segment.byte_count;
+                        }
+                        std::lock_guard<std::mutex> guard(mutex);
+                        counters.direct_read_operations++;
+                        counters.direct_useful_bytes += operation.byte_count;
+                        counters.direct_aligned_bytes += aligned_bytes;
+                        counters.direct_scatter_bytes += operation.byte_count;
+                    }
+                    if (completion.result == llm_expert_async_result::invalid &&
+                        (completion.native_error == EINVAL || completion.native_error == EOPNOTSUPP ||
+                         completion.native_error == ENOTSUP)) {
+                        force_buffered = true;
+                        completion = { llm_expert_async_result::ready, 0, 0 };
+                        operation_index = size_t(-1);
+                        std::lock_guard<std::mutex> guard(mutex);
+                        (void) disable_direct(operation.direct_native_handle);
+                        counters.direct_capability_retries++;
+                        continue;
+                    }
+                } else {
+                    {
+                        std::lock_guard<std::mutex> guard(mutex);
+                        if (config.direct_io_requested) {
+                            counters.buffered_fallback_operations++;
+                            counters.buffered_fallback_bytes += operation.byte_count;
+                        }
+                    }
+                    for (uint8_t segment_index = 0; segment_index < operation.segment_count; ++segment_index) {
+                        const auto & segment = operation.segments[segment_index];
+                        if (!read_all(operation.native_handle, segment.data, segment.byte_count, segment.file_offset)) break;
+                        completion.bytes_completed += segment.byte_count;
+                    }
+                }
+                if (completion.result != llm_expert_async_result::ready) break;
+            }
+            }
+
+            lock.lock();
+            auto * current = find_read(handle);
+            if (current != nullptr) {
+                if (current->cancel_requested) completion.result = llm_expert_async_result::closed;
+                if (completion.result == llm_expert_async_result::ready) {
+                    std::array<const llm_expert_storage_read_segment *, 12> completed_segments{};
+                    size_t completed_segment_count = 0;
+                    for (const auto & operation : operations) {
+                        if (!operation.active || !operation.read_operation ||
+                            operation.identity.request.slot != handle.slot ||
+                            operation.identity.request.generation != handle.generation) continue;
+                        for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
+                            if (completed_segment_count < completed_segments.size()) {
+                                completed_segments[completed_segment_count++] = &operation.read.segments[index];
+                            }
+                        }
+                    }
+                    std::sort(completed_segments.begin(), completed_segments.begin() + completed_segment_count,
+                        [](const auto * lhs, const auto * rhs) {
+                            const uint8_t lhs_identity = uint8_t(lhs->projection)*3 + uint8_t(lhs->sidecar);
+                            const uint8_t rhs_identity = uint8_t(rhs->projection)*3 + uint8_t(rhs->sidecar);
+                            return lhs_identity < rhs_identity;
+                        });
+                    completion.digest = 1469598103934665603ULL;
+                    for (size_t segment_index = 0; segment_index < completed_segment_count; ++segment_index) {
+                        const auto & segment = *completed_segments[segment_index];
+                        const auto * bytes = static_cast<const uint8_t *>(segment.data);
+                        for (uint64_t byte_index = 0; byte_index < segment.byte_count; ++byte_index) {
+                            completion.digest ^= bytes[byte_index];
+                            completion.digest *= 1099511628211ULL;
+                        }
+                    }
+                }
+                current->completion = completion;
+                current->state = read_state::complete;
+                counters.read_requests_completed++;
+                if (completion.result == llm_expert_async_result::closed) counters.read_requests_cancelled++;
+                for (auto & operation : operations) {
+                    if (operation.active && operation.read_operation &&
+                        operation.identity.request.slot == handle.slot &&
+                        operation.identity.request.generation == handle.generation) {
+                        operation.active = false;
+                        operation.read_operation = false;
+                        operation.ring_completed = false;
+                        operation.cancel_submitted = false;
+                        counters.active_operations--;
+                        counters.read_operations_completed++;
+                        if (!used_ring) counters.synchronous_fallback_operations++;
+                    }
+                }
+                counters.read_bytes_completed += completion.bytes_completed;
+            }
+            condition.notify_all();
+        }
+    }
 };
 
 llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config config) : pimpl(std::make_unique<impl>()) {
@@ -100,7 +905,11 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
 
     pimpl->config = config;
     pimpl->operations.resize(cq_entries);
+    pimpl->read_requests.resize(config.request_capacity);
     pimpl->traces.resize(config.trace_capacity);
+    pimpl->batch_slots.resize(sq_entries);
+    pimpl->registered_files.resize(config.source_file_capacity == 0 ? 256 : config.source_file_capacity);
+    pimpl->direct_disabled_handles.resize(pimpl->registered_files.size());
     for (auto & operation : pimpl->operations) {
         operation.generation = config.initial_operation_generation_for_testing;
     }
@@ -109,17 +918,99 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     pimpl->counters.operation_capacity = cq_entries;
     pimpl->counters.trace_capacity = config.trace_capacity;
     pimpl->counters.staging_ceiling_bytes = staging_ceiling;
+    if (config.direct_io_requested && config.maximum_direct_alignment != 0 && staging_ceiling == 0) {
+        pimpl->counters.direct_staging_error = ENOBUFS;
+    }
     pimpl->counters.administration_bytes = sizeof(*pimpl) +
         pimpl->operations.capacity()*sizeof(impl::operation_record) +
-        pimpl->traces.capacity()*sizeof(impl::trace_record);
+        pimpl->read_requests.capacity()*sizeof(impl::read_request_record) +
+        pimpl->traces.capacity()*sizeof(impl::trace_record) +
+        pimpl->batch_slots.capacity()*sizeof(uint32_t) +
+        pimpl->registered_files.capacity()*sizeof(int) +
+        pimpl->direct_disabled_handles.capacity()*sizeof(intptr_t);
+#if defined(__linux__)
+    if (config.direct_io_requested && staging_ceiling != 0 && config.maximum_direct_alignment != 0) {
+        const uint64_t allocation_alignment = std::max<uint64_t>(config.maximum_direct_alignment, sizeof(void *));
+        if (!is_power_of_two(config.maximum_direct_alignment) || !is_power_of_two(allocation_alignment) ||
+            staging_ceiling > SIZE_MAX) {
+            throw std::invalid_argument("invalid direct-I/O staging alignment");
+        }
+        if (allocation_alignment <= staging_ceiling) {
+            void * staging = nullptr;
+            const int allocation_error = posix_memalign(
+                &staging, size_t(allocation_alignment), size_t(staging_ceiling));
+            if (allocation_error == 0) {
+                pimpl->staging = staging;
+                pimpl->staging_bytes = staging_ceiling;
+                pimpl->staging_alignment = allocation_alignment;
+            } else {
+                pimpl->counters.direct_staging_error = allocation_error;
+            }
+        } else {
+            pimpl->counters.direct_staging_error = ENOBUFS;
+        }
+    }
+#endif
 #if defined(__linux__)
     static_assert(sizeof(io_uring_sqe) == 64, "unexpected io_uring SQE size");
     static_assert(sizeof(io_uring_cqe) == 16, "unexpected io_uring CQE size");
     pimpl->counters.linux_uapi = true;
+    int ring_error = 0;
+    if (pimpl->ring.open_ring(sq_entries, ring_error)) {
+        pimpl->counters.actual_sq_entries = pimpl->ring.actual_sq_entries();
+        pimpl->counters.actual_cq_entries = pimpl->ring.actual_cq_entries();
+        int probe_error = 0;
+        const bool cq_capacity_safe = pimpl->counters.actual_sq_entries <= UINT32_MAX/2 &&
+            pimpl->counters.actual_cq_entries >= pimpl->counters.actual_sq_entries*2;
+        const bool probed = cq_capacity_safe && pimpl->ring.probe_opcodes(
+                pimpl->counters.opcode_read,
+                pimpl->counters.opcode_readv,
+                pimpl->counters.opcode_async_cancel,
+                pimpl->counters.opcode_read_fixed,
+                probe_error);
+        if (!cq_capacity_safe || !probed || !pimpl->counters.opcode_read || !pimpl->counters.opcode_readv ||
+            !pimpl->counters.opcode_async_cancel) {
+            pimpl->counters.io_uring_probe_error = !cq_capacity_safe ? ENOBUFS :
+                (probe_error != 0 ? probe_error : EOPNOTSUPP);
+            pimpl->ring.close_ring();
+        } else {
+            pimpl->counters.io_uring_enabled = true;
+            if (config.submit_error_for_testing != 0) {
+                pimpl->ring.inject_submit_error_after(
+                    config.partial_submit_count_before_error_for_testing,
+                    config.submit_error_for_testing);
+            }
+        }
+        if (pimpl->counters.io_uring_enabled && pimpl->staging != nullptr &&
+            pimpl->counters.opcode_read_fixed) {
+            int registration_error = 0;
+            const bool registered = !config.force_buffer_registration_failure_for_testing &&
+                pimpl->ring.register_buffer(pimpl->staging, size_t(pimpl->staging_bytes), registration_error);
+            if (config.force_buffer_registration_failure_for_testing) registration_error = ENOMEM;
+            if (registered) {
+                pimpl->staging_registered = true;
+                pimpl->counters.registered_buffer_count = 1;
+                pimpl->counters.registered_buffer_bytes = pimpl->staging_bytes;
+            } else if (recoverable_registration_error(registration_error)) {
+                pimpl->counters.buffer_registration_error = registration_error;
+            } else {
+                throw std::runtime_error("hard direct-I/O staging registration failure");
+            }
+        } else if (pimpl->counters.io_uring_enabled && pimpl->staging != nullptr &&
+                   !pimpl->counters.opcode_read_fixed) {
+            pimpl->counters.buffer_registration_error = EOPNOTSUPP;
+        }
+    } else {
+        pimpl->counters.io_uring_setup_error = ring_error;
+    }
 #endif
+    pimpl->worker = std::thread([this] { pimpl->worker_main(); });
+    pimpl->counters.worker_started = true;
 }
 
-llm_expert_async_transport::~llm_expert_async_transport() = default;
+llm_expert_async_transport::~llm_expert_async_transport() {
+    (void) shutdown();
+}
 
 bool llm_expert_async_transport::validate_ring_layout(
         const llm_expert_async_ring_layout & layout,
@@ -291,11 +1182,174 @@ void llm_expert_async_transport::record_trace_for_testing() noexcept {
     pimpl->counters.trace_records++;
 }
 
-bool llm_expert_async_transport::shutdown() noexcept {
+llm_expert_async_result llm_expert_async_transport::submit_read_plan(
+        const llm_expert_async_operation_identity & identity,
+        const llm_expert_storage_read_operation * reads,
+        size_t read_count) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
-    pimpl->counters.admission_closed = true;
-    pimpl->counters.transport_epoch++;
-    return pimpl->counters.active_operations == 0;
+    if (pimpl->counters.admission_closed) return llm_expert_async_result::closed;
+    if (!identity.request.valid() || identity.request.slot >= pimpl->read_requests.size() ||
+        identity.transport_epoch != pimpl->counters.transport_epoch || reads == nullptr || read_count == 0 ||
+        read_count > pimpl->operations.size()) return llm_expert_async_result::invalid;
+    auto & request = pimpl->read_requests[identity.request.slot];
+    if (request.state != impl::read_state::free) return llm_expert_async_result::busy;
+    size_t inactive_operations = 0;
+    size_t free_operations = 0;
+    for (const auto & operation : pimpl->operations) {
+        if (!operation.active) {
+            inactive_operations++;
+            if (operation.generation != std::numeric_limits<uint32_t>::max()) free_operations++;
+        }
+    }
+    if (free_operations < read_count) return inactive_operations >= read_count ?
+        llm_expert_async_result::generation_exhausted : llm_expert_async_result::busy;
+    size_t source_index = 0;
+    for (uint32_t slot = 0; slot < pimpl->operations.size() && source_index < read_count; ++slot) {
+        auto & operation = pimpl->operations[slot];
+        if (operation.active) continue;
+        if (operation.generation == std::numeric_limits<uint32_t>::max()) continue;
+        operation.generation++;
+        operation.identity = identity;
+        operation.identity.request_operation_index = uint32_t(source_index);
+        operation.read = reads[source_index++];
+        operation.active = true;
+        operation.read_operation = true;
+        pimpl->counters.active_operations++;
+        pimpl->counters.operations_reserved++;
+    }
+    pimpl->counters.peak_active_operations = std::max(
+        pimpl->counters.peak_active_operations, pimpl->counters.active_operations);
+    request.handle = identity.request;
+    request.ordinal = pimpl->next_read_ordinal++;
+    request.state = impl::read_state::queued;
+    request.cancel_requested = false;
+    request.completion = {};
+    pimpl->counters.read_requests_submitted++;
+    pimpl->counters.active_read_requests++;
+    pimpl->counters.peak_active_read_requests = std::max(
+        pimpl->counters.peak_active_read_requests, pimpl->counters.active_read_requests);
+    pimpl->condition.notify_one();
+    return llm_expert_async_result::ready;
+}
+
+llm_expert_async_result llm_expert_async_transport::register_files(
+        const intptr_t * handles, size_t handle_count) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (pimpl->counters.admission_closed) return llm_expert_async_result::closed;
+    if (handles == nullptr || handle_count == 0 || handle_count > pimpl->registered_files.size() ||
+        pimpl->counters.read_requests_submitted != 0) return llm_expert_async_result::invalid;
+    for (size_t index = 0; index < handle_count; ++index) {
+        if (handles[index] < 0 || handles[index] > std::numeric_limits<int>::max()) {
+            return llm_expert_async_result::invalid;
+        }
+        pimpl->registered_files[index] = int(handles[index]);
+    }
+#if defined(__linux__)
+    if (pimpl->counters.io_uring_enabled) {
+        int native_error = 0;
+        const bool registered = !pimpl->config.force_file_registration_failure_for_testing &&
+            pimpl->ring.register_files(pimpl->registered_files.data(), uint32_t(handle_count), native_error);
+        if (pimpl->config.force_file_registration_failure_for_testing) native_error = ENOMEM;
+        if (!registered) {
+            pimpl->counters.file_registration_error = native_error;
+            pimpl->registered_file_count = 0;
+            return recoverable_registration_error(native_error) ?
+                llm_expert_async_result::ready : llm_expert_async_result::invalid;
+        }
+        pimpl->registered_file_count = uint32_t(handle_count);
+        pimpl->counters.registered_file_count = uint32_t(handle_count);
+    }
+#endif
+    return llm_expert_async_result::ready;
+}
+
+llm_expert_async_result llm_expert_async_transport::wait_read(
+        llm_expert_request_handle handle,
+        llm_expert_async_read_completion & completion,
+        bool (*abort_callback)(void *),
+        void * abort_callback_data) noexcept {
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    auto * request = pimpl->find_read(handle);
+    if (request == nullptr) return llm_expert_async_result::stale_generation;
+    while (true) {
+        const auto * current = pimpl->find_read(handle);
+        if (current == nullptr || current->state == impl::read_state::complete) break;
+        if (abort_callback != nullptr) {
+            lock.unlock();
+            const bool cancelled = abort_callback(abort_callback_data);
+            lock.lock();
+            current = pimpl->find_read(handle);
+            if (current == nullptr) return llm_expert_async_result::stale_generation;
+            if (cancelled) {
+                auto * mutable_request = pimpl->find_read(handle);
+                mutable_request->cancel_requested = true;
+                pimpl->condition.notify_all();
+            }
+        }
+        pimpl->condition.wait_for(lock, std::chrono::milliseconds(1));
+    }
+    request = pimpl->find_read(handle);
+    if (request == nullptr) return llm_expert_async_result::stale_generation;
+    completion = request->completion;
+    return completion.result;
+}
+
+llm_expert_async_result llm_expert_async_transport::cancel_read(llm_expert_request_handle handle) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    auto * request = pimpl->find_read(handle);
+    if (request == nullptr) return llm_expert_async_result::stale_generation;
+    request->cancel_requested = true;
+    pimpl->condition.notify_all();
+    return llm_expert_async_result::ready;
+}
+
+llm_expert_async_result llm_expert_async_transport::release_read(llm_expert_request_handle handle) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    auto * request = pimpl->find_read(handle);
+    if (request == nullptr) return llm_expert_async_result::stale_generation;
+    if (request->state != impl::read_state::complete) return llm_expert_async_result::busy;
+    request->state = impl::read_state::free;
+    request->handle = {};
+    request->ordinal = 0;
+    request->cancel_requested = false;
+    pimpl->counters.active_read_requests--;
+    return llm_expert_async_result::ready;
+}
+
+bool llm_expert_async_transport::shutdown() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(pimpl->mutex);
+        if (!pimpl->counters.admission_closed) {
+            pimpl->counters.admission_closed = true;
+            pimpl->counters.transport_epoch++;
+        }
+        for (auto & request : pimpl->read_requests) {
+            if (request.state != impl::read_state::free && request.state != impl::read_state::complete) {
+                request.cancel_requested = true;
+            }
+        }
+        pimpl->worker_stop = true;
+        pimpl->condition.notify_all();
+    }
+    if (pimpl->worker.joinable() && pimpl->worker.get_id() != std::this_thread::get_id()) {
+        pimpl->worker.join();
+    }
+#if defined(__linux__)
+    // The worker is the only ring submitter. Tear the ring down only after it
+    // has observed cancellation and drained every in-flight completion.
+    pimpl->ring.close_ring();
+#endif
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    bool drained = pimpl->counters.active_operations == 0;
+    for (auto & request : pimpl->read_requests) {
+        if (request.state == impl::read_state::complete) {
+            request.state = impl::read_state::free;
+            if (pimpl->counters.active_read_requests > 0) pimpl->counters.active_read_requests--;
+        } else if (request.state != impl::read_state::free) {
+            drained = false;
+        }
+    }
+    return drained;
 }
 
 llm_expert_async_diagnostics llm_expert_async_transport::diagnostics() const noexcept {

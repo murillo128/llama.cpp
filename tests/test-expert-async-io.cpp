@@ -2,7 +2,12 @@
 
 #include "ggml.h"
 
+#include <algorithm>
 #include <limits>
+#include <condition_variable>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -29,6 +34,41 @@ llm_expert_async_config config(uint32_t queue_depth = 0, uint32_t operation_gene
     };
 }
 
+struct scripted_async_reader : llm_expert_async_read_override {
+    enum class action { interrupted, would_block, partial, error, normal, block_then_would_block };
+    std::vector<action> actions;
+    std::array<uint8_t, 64> bytes{};
+    size_t call = 0;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false;
+    bool released = false;
+    int error_code = EIO;
+
+    scripted_async_reader() {
+        for (size_t index = 0; index < bytes.size(); ++index) bytes[index] = uint8_t(0x50 + index);
+    }
+
+    int64_t read_at(intptr_t, void * destination, size_t byte_count, uint64_t file_offset,
+            int & native_error) noexcept override {
+        const action current = call < actions.size() ? actions[call++] : action::normal;
+        if (current == action::block_then_would_block) {
+            std::unique_lock<std::mutex> lock(mutex);
+            entered = true;
+            condition.notify_all();
+            condition.wait(lock, [&] { return released; });
+            native_error = EAGAIN;
+            return -1;
+        }
+        if (current == action::interrupted) { native_error = EINTR; return -1; }
+        if (current == action::would_block) { native_error = EAGAIN; return -1; }
+        if (current == action::error) { native_error = error_code; return -1; }
+        const size_t count = current == action::partial ? std::min<size_t>(3, byte_count) : byte_count;
+        std::memcpy(destination, bytes.data() + file_offset, count);
+        return int64_t(count);
+    }
+};
+
 void test_configuration() {
     expect_invalid([] { llm_expert_async_transport transport({}); });
     expect_invalid([] { llm_expert_async_transport transport(config(7)); });
@@ -44,6 +84,13 @@ void test_configuration() {
     GGML_ASSERT(diagnostics.administration_bytes > 0);
 #if defined(__linux__)
     GGML_ASSERT(diagnostics.linux_uapi);
+    if (diagnostics.io_uring_enabled) {
+        GGML_ASSERT(diagnostics.actual_sq_entries >= diagnostics.requested_sq_entries);
+        GGML_ASSERT(diagnostics.actual_cq_entries >= diagnostics.actual_sq_entries*2);
+        GGML_ASSERT(diagnostics.io_uring_setup_error == 0);
+    } else {
+        GGML_ASSERT(diagnostics.io_uring_setup_error != 0 || diagnostics.io_uring_probe_error != 0);
+    }
 #else
     GGML_ASSERT(!diagnostics.linux_uapi);
 #endif
@@ -52,6 +99,13 @@ void test_configuration() {
     bounded.requested_staging_bytes = 1024;
     llm_expert_async_transport explicit_transport(bounded);
     GGML_ASSERT(explicit_transport.diagnostics().staging_ceiling_bytes == 1024);
+
+    auto undersized = config(8);
+    undersized.direct_io_requested = true;
+    undersized.maximum_direct_alignment = 8;
+    undersized.requested_staging_bytes = 4;
+    llm_expert_async_transport undersized_transport(undersized);
+    GGML_ASSERT(undersized_transport.diagnostics().direct_staging_error == ENOBUFS);
 }
 
 void test_ring_layout_validation() {
@@ -111,11 +165,15 @@ void test_user_data_and_fake_completion() {
     GGML_ASSERT(actual.request.generation == expected.request.generation);
     GGML_ASSERT(actual.request_operation_index == expected.request_operation_index);
     GGML_ASSERT(actual.key.layer == expected.key.layer && actual.key.expert == expected.key.expert);
+    const auto reused = transport.reserve_operation(expected);
+    GGML_ASSERT(reused.result == llm_expert_async_result::ready && reused.user_data != operation.user_data);
     GGML_ASSERT(transport.consume_completion_for_testing(operation.user_data, actual) ==
         llm_expert_async_result::stale_generation);
+    GGML_ASSERT(transport.consume_completion_for_testing(reused.user_data, actual) ==
+        llm_expert_async_result::ready);
     const auto diagnostics = transport.diagnostics();
-    GGML_ASSERT(diagnostics.operations_reserved == 1);
-    GGML_ASSERT(diagnostics.completions_consumed == 1);
+    GGML_ASSERT(diagnostics.operations_reserved == 2);
+    GGML_ASSERT(diagnostics.completions_consumed == 2);
     GGML_ASSERT(diagnostics.stale_completions == 1);
     GGML_ASSERT(diagnostics.active_operations == 0);
 }
@@ -149,6 +207,337 @@ void test_generation_exhaustion() {
     GGML_ASSERT(transport.reserve_operation(identity).result == llm_expert_async_result::generation_exhausted);
 }
 
+void test_worker_read_and_drain() {
+#if defined(__linux__)
+    FILE * file = std::tmpfile();
+    GGML_ASSERT(file != nullptr);
+    std::array<uint8_t, 32> source;
+    for (size_t index = 0; index < source.size(); ++index) source[index] = uint8_t(0x30 + index);
+    GGML_ASSERT(std::fwrite(source.data(), source.size(), 1, file) == 1);
+    GGML_ASSERT(std::fflush(file) == 0);
+    std::array<uint8_t, 7> first{};
+    std::array<uint8_t, 9> second{};
+    llm_expert_storage_read_operation read;
+    read.native_handle = fileno(file);
+    read.file_offset = 3;
+    read.byte_count = first.size() + second.size();
+    read.segment_count = 2;
+    read.segments[0] = { first.data(), first.size(), 3,
+        llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+    read.segments[1] = { second.data(), second.size(), 10,
+        llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight };
+    llm_expert_async_transport transport(config(8));
+    const llm_expert_async_operation_identity identity = {
+        1, { 1, 7 }, 0, { 0, 2 }, llm_expert_readiness::host_ready,
+        llm_expert_priority::demand_current_layer,
+    };
+    GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
+    llm_expert_async_read_completion completion;
+    GGML_ASSERT(transport.wait_read(identity.request, completion) == llm_expert_async_result::ready);
+    GGML_ASSERT(completion.bytes_completed == first.size() + second.size());
+    GGML_ASSERT(std::memcmp(first.data(), source.data() + 3, first.size()) == 0);
+    GGML_ASSERT(std::memcmp(second.data(), source.data() + 10, second.size()) == 0);
+    GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+    const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(diagnostics.read_requests_submitted == 1 && diagnostics.read_requests_completed == 1);
+    GGML_ASSERT(diagnostics.read_operations_completed == 1);
+    GGML_ASSERT(diagnostics.read_bytes_completed == first.size() + second.size());
+    GGML_ASSERT(diagnostics.active_read_requests == 0);
+    GGML_ASSERT(std::fclose(file) == 0);
+#endif
+}
+
+void test_partial_ring_submission_falls_back_after_quiescence() {
+#if defined(__linux__)
+    FILE * file = std::tmpfile();
+    GGML_ASSERT(file != nullptr);
+    std::array<uint8_t, 32> source;
+    for (size_t index = 0; index < source.size(); ++index) source[index] = uint8_t(0x20 + index);
+    GGML_ASSERT(std::fwrite(source.data(), source.size(), 1, file) == 1);
+    GGML_ASSERT(std::fflush(file) == 0);
+
+    auto cfg = config(8);
+    cfg.partial_submit_count_before_error_for_testing = 1;
+    cfg.submit_error_for_testing = EBADF;
+    llm_expert_async_transport transport(cfg);
+    if (!transport.diagnostics().io_uring_enabled) {
+        GGML_ASSERT(std::fclose(file) == 0);
+        return;
+    }
+    std::array<uint8_t, 5> first{};
+    std::array<uint8_t, 7> second{};
+    std::array<llm_expert_storage_read_operation, 2> reads;
+    reads[0].native_handle = fileno(file);
+    reads[0].file_offset = 2;
+    reads[0].byte_count = first.size();
+    reads[0].segment_count = 1;
+    reads[0].segments[0] = { first.data(), first.size(), 2,
+        llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+    reads[1].native_handle = fileno(file);
+    reads[1].file_offset = 17;
+    reads[1].byte_count = second.size();
+    reads[1].segment_count = 1;
+    reads[1].segments[0] = { second.data(), second.size(), 17,
+        llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight };
+    const llm_expert_async_operation_identity identity = {
+        1, { 0, 11 }, 0, { 0, 7 }, llm_expert_readiness::host_ready,
+        llm_expert_priority::demand_current_layer,
+    };
+    GGML_ASSERT(transport.submit_read_plan(identity, reads.data(), reads.size()) ==
+        llm_expert_async_result::ready);
+    llm_expert_async_read_completion completion;
+    GGML_ASSERT(transport.wait_read(identity.request, completion) == llm_expert_async_result::ready);
+    GGML_ASSERT(completion.bytes_completed == first.size() + second.size());
+    GGML_ASSERT(std::memcmp(first.data(), source.data() + 2, first.size()) == 0);
+    GGML_ASSERT(std::memcmp(second.data(), source.data() + 17, second.size()) == 0);
+    GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+    const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(!diagnostics.io_uring_enabled);
+    GGML_ASSERT(diagnostics.io_uring_runtime_error == EBADF);
+    GGML_ASSERT(diagnostics.synchronous_fallback_operations == reads.size());
+    GGML_ASSERT(diagnostics.active_operations == 0 && diagnostics.active_read_requests == 0);
+    GGML_ASSERT(std::fclose(file) == 0);
+#endif
+}
+
+void test_file_registration_or_explicit_fallback() {
+#if defined(__linux__)
+    FILE * file = std::tmpfile();
+    GGML_ASSERT(file != nullptr);
+    const intptr_t handle = fileno(file);
+    llm_expert_async_transport transport(config(8));
+    GGML_ASSERT(transport.register_files(&handle, 1) == llm_expert_async_result::ready);
+    const auto diagnostics = transport.diagnostics();
+    if (diagnostics.io_uring_enabled && diagnostics.file_registration_error == 0) {
+        GGML_ASSERT(diagnostics.registered_file_count == 1);
+    } else {
+        GGML_ASSERT(diagnostics.registered_file_count == 0);
+        GGML_ASSERT(diagnostics.io_uring_setup_error != 0 || diagnostics.io_uring_probe_error != 0 ||
+            diagnostics.file_registration_error != 0);
+    }
+    GGML_ASSERT(transport.register_files(nullptr, 0) == llm_expert_async_result::invalid);
+
+    auto forced_cfg = config(8);
+    forced_cfg.force_file_registration_failure_for_testing = true;
+    llm_expert_async_transport forced(forced_cfg);
+    GGML_ASSERT(forced.register_files(&handle, 1) == llm_expert_async_result::ready);
+    const auto forced_diagnostics = forced.diagnostics();
+    if (forced_diagnostics.io_uring_enabled) {
+        GGML_ASSERT(forced_diagnostics.registered_file_count == 0);
+        GGML_ASSERT(forced_diagnostics.file_registration_error == ENOMEM);
+    }
+
+    auto buffer_cfg = config(8);
+    buffer_cfg.direct_io_requested = true;
+    buffer_cfg.maximum_direct_alignment = 8;
+    buffer_cfg.force_buffer_registration_failure_for_testing = true;
+    llm_expert_async_transport forced_buffer(buffer_cfg);
+    const auto buffer_diagnostics = forced_buffer.diagnostics();
+    if (buffer_diagnostics.io_uring_enabled) {
+        GGML_ASSERT(buffer_diagnostics.registered_buffer_count == 0);
+        GGML_ASSERT(buffer_diagnostics.registered_buffer_bytes == 0);
+        GGML_ASSERT(buffer_diagnostics.buffer_registration_error == ENOMEM);
+    }
+    GGML_ASSERT(std::fclose(file) == 0);
+#endif
+}
+
+void test_fallback_retry_error_and_cancel_races() {
+#if defined(__linux__)
+    auto run = [](scripted_async_reader & reader, llm_expert_async_read_completion & completion) {
+        auto cfg = config(8);
+        cfg.read_override_for_testing = &reader;
+        llm_expert_async_transport transport(cfg);
+        std::array<uint8_t, 8> destination{};
+        llm_expert_storage_read_operation read;
+        read.native_handle = 17;
+        read.file_offset = 4;
+        read.byte_count = destination.size();
+        read.segment_count = 1;
+        read.segments[0] = { destination.data(), destination.size(), 4,
+            llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+        const llm_expert_async_operation_identity identity = {
+            1, { 0, 1 }, 0, { 0, 3 }, llm_expert_readiness::host_ready,
+            llm_expert_priority::demand_current_layer,
+        };
+        GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
+        const auto result = transport.wait_read(identity.request, completion);
+        const auto diagnostics = transport.diagnostics();
+        if (result == llm_expert_async_result::ready) {
+            GGML_ASSERT(std::memcmp(destination.data(), reader.bytes.data() + 4, destination.size()) == 0);
+        }
+        GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+        return diagnostics;
+    };
+
+    scripted_async_reader retry_reader;
+    retry_reader.actions = { scripted_async_reader::action::interrupted,
+        scripted_async_reader::action::would_block, scripted_async_reader::action::partial };
+    llm_expert_async_read_completion completion;
+    const auto retry = run(retry_reader, completion);
+    GGML_ASSERT(completion.result == llm_expert_async_result::ready && completion.bytes_completed == 8);
+    GGML_ASSERT(retry.interrupted_reads_retried == 1 && retry.would_block_reads_retried == 1);
+    GGML_ASSERT(retry.short_positive_reads == 1);
+
+    scripted_async_reader error_reader;
+    error_reader.actions = { scripted_async_reader::action::error };
+    const auto hard_error = run(error_reader, completion);
+    GGML_ASSERT(completion.result == llm_expert_async_result::invalid && completion.native_error == EIO);
+    GGML_ASSERT(hard_error.read_bytes_completed == 0);
+
+    scripted_async_reader cancel_reader;
+    cancel_reader.actions = { scripted_async_reader::action::block_then_would_block };
+    auto cfg = config(8);
+    cfg.read_override_for_testing = &cancel_reader;
+    llm_expert_async_transport transport(cfg);
+    std::array<uint8_t, 8> destination{};
+    llm_expert_storage_read_operation read;
+    read.native_handle = 17;
+    read.file_offset = 0;
+    read.byte_count = destination.size();
+    read.segment_count = 1;
+    read.segments[0] = { destination.data(), destination.size(), 0,
+        llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+    const llm_expert_async_operation_identity identity = {
+        1, { 0, 2 }, 0, { 0, 4 }, llm_expert_readiness::host_ready,
+        llm_expert_priority::demand_current_layer,
+    };
+    GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
+    {
+        std::unique_lock<std::mutex> lock(cancel_reader.mutex);
+        cancel_reader.condition.wait(lock, [&] { return cancel_reader.entered; });
+    }
+    GGML_ASSERT(transport.cancel_read(identity.request) == llm_expert_async_result::ready);
+    {
+        std::lock_guard<std::mutex> lock(cancel_reader.mutex);
+        cancel_reader.released = true;
+        cancel_reader.condition.notify_all();
+    }
+    GGML_ASSERT(transport.wait_read(identity.request, completion) == llm_expert_async_result::closed);
+    GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+    GGML_ASSERT(transport.diagnostics().read_requests_cancelled == 1);
+
+    cancel_reader.actions.clear();
+    cancel_reader.call = 0;
+    destination.fill(0);
+    const llm_expert_async_operation_identity retry_identity = {
+        1, { 0, 3 }, 0, { 0, 4 }, llm_expert_readiness::host_ready,
+        llm_expert_priority::demand_current_layer,
+    };
+    GGML_ASSERT(transport.submit_read_plan(retry_identity, &read, 1) == llm_expert_async_result::ready);
+    GGML_ASSERT(transport.wait_read(retry_identity.request, completion) == llm_expert_async_result::ready);
+    GGML_ASSERT(std::memcmp(destination.data(), cancel_reader.bytes.data(), destination.size()) == 0);
+    GGML_ASSERT(transport.wait_read(identity.request, completion) == llm_expert_async_result::stale_generation);
+    GGML_ASSERT(transport.release_read(retry_identity.request) == llm_expert_async_result::ready);
+#endif
+}
+
+void test_shutdown_drains_inflight_read() {
+#if defined(__linux__)
+    scripted_async_reader reader;
+    reader.actions = { scripted_async_reader::action::block_then_would_block };
+    auto cfg = config(8);
+    cfg.read_override_for_testing = &reader;
+    llm_expert_async_transport transport(cfg);
+    std::array<uint8_t, 8> destination{};
+    llm_expert_storage_read_operation read;
+    read.native_handle = 17;
+    read.file_offset = 0;
+    read.byte_count = destination.size();
+    read.segment_count = 1;
+    read.segments[0] = { destination.data(), destination.size(), 0,
+        llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+    const llm_expert_async_operation_identity identity = {
+        1, { 0, 7 }, 0, { 0, 6 }, llm_expert_readiness::host_ready,
+        llm_expert_priority::demand_current_layer,
+    };
+    GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
+    {
+        std::unique_lock<std::mutex> lock(reader.mutex);
+        reader.condition.wait(lock, [&] { return reader.entered; });
+    }
+    bool shutdown_result = false;
+    std::thread shutdown([&] { shutdown_result = transport.shutdown(); });
+    while (!transport.diagnostics().admission_closed) std::this_thread::yield();
+    {
+        std::lock_guard<std::mutex> lock(reader.mutex);
+        reader.released = true;
+        reader.condition.notify_all();
+    }
+    shutdown.join();
+    GGML_ASSERT(shutdown_result);
+    const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(diagnostics.admission_closed);
+    GGML_ASSERT(diagnostics.active_read_requests == 0);
+    GGML_ASSERT(diagnostics.active_operations == 0);
+    GGML_ASSERT(diagnostics.read_requests_cancelled == 1);
+#endif
+}
+
+void test_direct_alignment_fallback_and_retry() {
+#if defined(__linux__)
+    auto run = [](scripted_async_reader & reader, uint64_t source_size,
+                  llm_expert_async_read_completion & completion) {
+        auto cfg = config(8);
+        cfg.read_override_for_testing = &reader;
+        cfg.direct_io_requested = true;
+        cfg.maximum_direct_alignment = 8;
+        llm_expert_async_transport transport(cfg);
+        std::array<uint8_t, 8> destination{};
+        llm_expert_storage_read_operation read;
+        read.native_handle = 17;
+        read.direct_native_handle = 18;
+        read.direct_alignment = 8;
+        read.source_size = source_size;
+        read.file_offset = 3;
+        read.byte_count = destination.size();
+        read.segment_count = 1;
+        read.segments[0] = { destination.data(), destination.size(), 3,
+            llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+        const llm_expert_async_operation_identity identity = {
+            1, { 0, 3 }, 0, { 0, 5 }, llm_expert_readiness::host_ready,
+            llm_expert_priority::demand_current_layer,
+        };
+        GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
+        const auto result = transport.wait_read(identity.request, completion);
+        const auto diagnostics = transport.diagnostics();
+        if (result == llm_expert_async_result::ready) {
+            GGML_ASSERT(std::memcmp(destination.data(), reader.bytes.data() + 3, destination.size()) == 0);
+        }
+        GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+        return diagnostics;
+    };
+
+    scripted_async_reader aligned_reader;
+    llm_expert_async_read_completion completion;
+    const auto aligned = run(aligned_reader, 64, completion);
+    GGML_ASSERT(completion.result == llm_expert_async_result::ready);
+    GGML_ASSERT(aligned.direct_read_operations == 1 && aligned.direct_useful_bytes == 8);
+    GGML_ASSERT(aligned.direct_aligned_bytes == 16 && aligned.direct_scatter_bytes == 8);
+    GGML_ASSERT(aligned.buffered_fallback_operations == 0);
+
+    scripted_async_reader tail_reader;
+    const auto tail = run(tail_reader, 11, completion);
+    GGML_ASSERT(completion.result == llm_expert_async_result::ready);
+    GGML_ASSERT(tail.direct_read_operations == 0 && tail.buffered_fallback_operations == 1);
+    GGML_ASSERT(tail.buffered_fallback_bytes == 8);
+
+    scripted_async_reader capability_reader;
+    capability_reader.error_code = EINVAL;
+    capability_reader.actions = { scripted_async_reader::action::error };
+    const auto capability = run(capability_reader, 64, completion);
+    GGML_ASSERT(completion.result == llm_expert_async_result::ready);
+    GGML_ASSERT(capability.direct_capability_retries == 1);
+    GGML_ASSERT(capability.buffered_fallback_operations == 1);
+
+    scripted_async_reader hard_error_reader;
+    hard_error_reader.actions = { scripted_async_reader::action::error };
+    const auto hard_error = run(hard_error_reader, 64, completion);
+    GGML_ASSERT(completion.result == llm_expert_async_result::invalid && completion.native_error == EIO);
+    GGML_ASSERT(hard_error.direct_capability_retries == 0 && hard_error.buffered_fallback_operations == 0);
+#endif
+}
+
 void test_concurrent_bounded_access() {
     llm_expert_async_transport transport(config(8));
     std::vector<std::thread> threads;
@@ -175,6 +564,34 @@ void test_concurrent_bounded_access() {
     GGML_ASSERT(diagnostics.active_operations == 0);
 }
 
+void test_reversed_fake_cq_and_saturation() {
+    llm_expert_async_transport transport(config(8));
+    std::array<uint64_t, 16> tokens{};
+    for (uint32_t index = 0; index < tokens.size(); ++index) {
+        const llm_expert_async_operation_identity identity = {
+            1, { index, uint64_t(index) + 1 }, index, { 0, int32_t(index) },
+            llm_expert_readiness::host_ready, llm_expert_priority::demand_current_layer,
+        };
+        const auto operation = transport.reserve_operation(identity);
+        GGML_ASSERT(operation.result == llm_expert_async_result::ready);
+        tokens[index] = operation.user_data;
+    }
+    const llm_expert_async_operation_identity overflow = {
+        1, { 16, 17 }, 16, { 0, 16 }, llm_expert_readiness::host_ready,
+        llm_expert_priority::demand_current_layer,
+    };
+    GGML_ASSERT(transport.reserve_operation(overflow).result == llm_expert_async_result::busy);
+    for (size_t index = tokens.size(); index-- > 0;) {
+        llm_expert_async_operation_identity identity;
+        GGML_ASSERT(transport.consume_completion_for_testing(tokens[index], identity) ==
+            llm_expert_async_result::ready);
+        GGML_ASSERT(identity.request.slot == index);
+    }
+    const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(diagnostics.peak_active_operations == tokens.size());
+    GGML_ASSERT(diagnostics.active_operations == 0);
+}
+
 } // namespace
 
 int main() {
@@ -183,6 +600,13 @@ int main() {
     test_user_data_and_fake_completion();
     test_bounded_trace_and_shutdown();
     test_generation_exhaustion();
+    test_worker_read_and_drain();
+    test_partial_ring_submission_falls_back_after_quiescence();
+    test_file_registration_or_explicit_fallback();
+    test_fallback_retry_error_and_cancel_races();
+    test_shutdown_drains_inflight_read();
+    test_direct_alignment_fallback_and_retry();
     test_concurrent_bounded_access();
+    test_reversed_fake_cq_and_saturation();
     return 0;
 }

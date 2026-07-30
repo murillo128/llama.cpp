@@ -21,6 +21,8 @@ class llm_expert_weight_provider;
 struct llm_expert_provider_stats;
 class llm_expert_storage;
 struct llm_expert_storage_diagnostics;
+struct llm_expert_async_diagnostics;
+struct llm_expert_scheduler_diagnostics;
 
 struct llm_deferred_expert_diagnostics {
     uint64_t tensor_count = 0;
@@ -702,6 +704,8 @@ struct llama_model {
     void init_expert_weight_provider();
     void init_expert_storage(llama_model_loader & ml);
     llm_expert_storage * expert_storage() const;
+    llm_expert_async_diagnostics expert_async_diagnostics() const;
+    llm_expert_scheduler_diagnostics expert_scheduler_diagnostics() const;
     llm_deferred_expert_diagnostics deferred_expert_diagnostics() const;
     llm_expert_weight_provider * expert_weight_provider() const;
     llm_expert_provider_stats expert_weight_provider_stats() const;

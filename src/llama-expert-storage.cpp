@@ -39,6 +39,8 @@ struct llm_expert_storage::impl {
         uint16_t split_index = 0;
         uint64_t alignment = 1;
         llama_file_read_handle handle;
+        llama_file_read_handle direct_handle;
+        uint64_t direct_alignment = 0;
     };
     struct entry {
         bool present = false;
@@ -91,7 +93,33 @@ llm_expert_storage::llm_expert_storage(llm_expert_storage_config config,
         if (!handle.valid() || !handle.identity().valid || handle.size() != item.file->size()) {
             throw std::runtime_error("unable to establish duplicated source identity");
         }
-        pimpl->sources.push_back({ item.split_index, item.alignment, std::move(handle) });
+        llama_file_read_handle direct_handle;
+        uint64_t direct_alignment = 0;
+        if (item.direct_requested) {
+            if (item.path == nullptr || item.path[0] == '\0') {
+                pimpl->counters.direct_unsupported_source_count++;
+                if (pimpl->counters.first_direct_error == 0) pimpl->counters.first_direct_error = ENOTSUP;
+            } else {
+                llama_file direct_file(item.path, "rb", true);
+                if (direct_file.has_direct_io()) {
+                    direct_handle = direct_file.duplicate_read_handle();
+                    if (!(direct_handle.identity() == handle.identity()) || direct_handle.size() != handle.size()) {
+                        throw std::runtime_error("direct expert source identity or size mismatch");
+                    }
+                    direct_alignment = direct_file.read_alignment();
+                    pimpl->counters.direct_source_count++;
+                    pimpl->counters.maximum_direct_alignment = std::max(
+                        pimpl->counters.maximum_direct_alignment, direct_alignment);
+                } else {
+                    pimpl->counters.direct_unsupported_source_count++;
+                    if (pimpl->counters.first_direct_error == 0) {
+                        pimpl->counters.first_direct_error = direct_file.direct_io_error();
+                    }
+                }
+            }
+        }
+        pimpl->sources.push_back({ item.split_index, item.alignment, std::move(handle),
+            std::move(direct_handle), direct_alignment });
     }
     std::sort(pimpl->sources.begin(), pimpl->sources.end(),
         [](const impl::source & lhs, const impl::source & rhs) { return lhs.split_index < rhs.split_index; });
@@ -150,6 +178,12 @@ llm_expert_storage_result llm_expert_storage::add_bundle(
     if (!down || !((up && gate && !gate_up) || (!up && !gate && gate_up))) {
         return { llm_expert_storage_error::invalid_directory, 0 };
     }
+    uint64_t bundle_bytes = 0;
+    for (const auto & span : spans) {
+        if (!checked_add(bundle_bytes, span.byte_count, bundle_bytes)) {
+            return { llm_expert_storage_error::invalid_directory, 0 };
+        }
+    }
     for (size_t left = 0; left < spans.size(); ++left) {
         const uint64_t left_end = spans[left].destination_offset + spans[left].destination_extent;
         for (size_t right = left + 1; right < spans.size(); ++right) {
@@ -164,6 +198,7 @@ llm_expert_storage_result llm_expert_storage::add_bundle(
     });
     entry.present = true;
     entry.spans = std::move(spans);
+    pimpl->counters.maximum_bundle_bytes = std::max(pimpl->counters.maximum_bundle_bytes, bundle_bytes);
     return {};
 }
 
@@ -197,6 +232,116 @@ const std::vector<llm_expert_storage_span> * llm_expert_storage::find(llm_expert
     }
     const auto & entry = pimpl->directory[pimpl->index(key)];
     return entry.present ? &entry.spans : nullptr;
+}
+
+llm_expert_storage_result llm_expert_storage::make_read_plan(
+        llm_expert_key key,
+        const llm_expert_storage_destination * destinations,
+        size_t destination_count,
+        llm_expert_storage_read_operation * operations,
+        size_t operation_capacity,
+        size_t & operation_count) const noexcept {
+    operation_count = 0;
+    if (!pimpl->sealed.load() || pimpl->poisoned.load() ||
+        !key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer) ||
+        destinations == nullptr || destination_count == 0 || destination_count > 12 ||
+        operations == nullptr || operation_capacity == 0) {
+        return { llm_expert_storage_error::invalid_destination, 0 };
+    }
+    const auto & entry = pimpl->directory[pimpl->index(key)];
+    if (!entry.present || entry.spans.size() > 12) {
+        return { llm_expert_storage_error::invalid_key, 0 };
+    }
+    struct candidate {
+        uint16_t split_index = 0;
+        intptr_t native_handle = -1;
+        intptr_t direct_native_handle = -1;
+        uint64_t direct_alignment = 0;
+        uint64_t source_size = 0;
+        llm_expert_storage_read_segment segment;
+    };
+    std::array<candidate, 12> candidates;
+    size_t candidate_count = 0;
+    std::array<bool, 12> seen{};
+    for (const auto & span : entry.spans) {
+        const size_t identity = identity_index(span.projection, span.sidecar);
+        const llm_expert_storage_destination * destination = nullptr;
+        for (size_t index = 0; index < destination_count; ++index) {
+            if (destinations[index].projection == span.projection && destinations[index].sidecar == span.sidecar) {
+                destination = &destinations[index];
+                break;
+            }
+        }
+        const impl::source * source = pimpl->find_source(span.split_index);
+        if (identity >= seen.size() || seen[identity] || destination == nullptr || destination->data == nullptr ||
+            destination->extent != span.destination_extent || source == nullptr || source->handle.native_handle() < 0) {
+            return { llm_expert_storage_error::invalid_destination, 0 };
+        }
+        seen[identity] = true;
+        candidates[candidate_count++] = {
+            span.split_index,
+            source->handle.native_handle(),
+            source->direct_handle.native_handle(),
+            source->direct_alignment,
+            source->handle.size(),
+            { destination->data, span.byte_count, span.file_offset, span.projection, span.sidecar },
+        };
+    }
+    std::sort(candidates.begin(), candidates.begin() + candidate_count, [](const candidate & lhs, const candidate & rhs) {
+        if (lhs.split_index != rhs.split_index) return lhs.split_index < rhs.split_index;
+        return lhs.segment.file_offset < rhs.segment.file_offset;
+    });
+    for (size_t index = 0; index < candidate_count; ++index) {
+        const candidate & item = candidates[index];
+        bool adjacent = false;
+        if (operation_count > 0) {
+            const auto & prior = operations[operation_count - 1];
+            uint64_t prior_end = 0;
+            adjacent = prior.split_index == item.split_index && prior.segment_count < prior.segments.size() &&
+                checked_add(prior.file_offset, prior.byte_count, prior_end) && prior_end == item.segment.file_offset;
+        }
+        if (!adjacent) {
+            if (operation_count == operation_capacity) {
+                operation_count = 0;
+                return { llm_expert_storage_error::invalid_destination, 0 };
+            }
+            operations[operation_count] = {};
+            operations[operation_count].split_index = item.split_index;
+            operations[operation_count].native_handle = item.native_handle;
+            operations[operation_count].direct_native_handle = item.direct_native_handle;
+            operations[operation_count].direct_alignment = item.direct_alignment;
+            operations[operation_count].source_size = item.source_size;
+            operations[operation_count].file_offset = item.segment.file_offset;
+            operation_count++;
+        }
+        auto & operation = operations[operation_count - 1];
+        uint64_t total = 0;
+        if (!checked_add(operation.byte_count, item.segment.byte_count, total)) {
+            operation_count = 0;
+            return { llm_expert_storage_error::invalid_destination, 0 };
+        }
+        operation.segments[operation.segment_count++] = item.segment;
+        operation.byte_count = total;
+    }
+    return {};
+}
+
+llm_expert_storage_result llm_expert_storage::copy_source_native_handles(
+        intptr_t * handles, size_t handle_capacity, size_t & handle_count, bool prefer_direct) const noexcept {
+    handle_count = 0;
+    if (!pimpl->sealed.load() || handles == nullptr || handle_capacity < pimpl->sources.size()) {
+        return { llm_expert_storage_error::invalid_destination, 0 };
+    }
+    for (const auto & source : pimpl->sources) {
+        const intptr_t direct = source.direct_handle.native_handle();
+        const intptr_t handle = prefer_direct && direct >= 0 ? direct : source.handle.native_handle();
+        if (handle < 0) {
+            handle_count = 0;
+            return { llm_expert_storage_error::io_error, 0 };
+        }
+        handles[handle_count++] = handle;
+    }
+    return {};
 }
 
 llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key, void * destination,
@@ -383,6 +528,23 @@ void llm_expert_storage::record_integrity_check(bool matches) noexcept {
     if (!matches) {
         pimpl->counters.integrity_mismatches++;
         pimpl->poisoned.store(true);
+    }
+}
+
+void llm_expert_storage::record_async_read(
+        uint64_t chunk_count, uint64_t byte_count,
+        llm_expert_storage_error error, int native_error) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+    pimpl->counters.read_requests++;
+    pimpl->counters.read_chunks += chunk_count;
+    pimpl->counters.read_bytes += byte_count;
+    if (error == llm_expert_storage_error::cancelled) {
+        pimpl->counters.cancelled_reads++;
+    } else if (error == llm_expert_storage_error::short_read) {
+        pimpl->counters.short_reads++;
+    } else if (error == llm_expert_storage_error::io_error) {
+        pimpl->counters.io_errors++;
+        if (pimpl->counters.first_native_error == 0) pimpl->counters.first_native_error = native_error;
     }
 }
 

@@ -60,6 +60,9 @@ struct llm_cold_cache_diagnostics {
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t admissions = 0;
+    uint64_t reservations = 0;
+    uint64_t publications = 0;
+    uint64_t failed_reservations = 0;
     uint64_t evictions = 0;
     uint64_t source_copy_bundles = 0;
     uint64_t source_copy_bytes = 0;
@@ -108,6 +111,12 @@ public:
             llm_cold_reference & reference,
             llm_cold_cache_loader loader,
             void * loader_data) noexcept;
+    llm_expert_provider_result reserve_or_find(
+            llm_expert_key key,
+            llm_cold_reference & reference,
+            bool & hit) noexcept;
+    llm_expert_provider_result publish_ready(llm_expert_key key, llm_cold_reference reference) noexcept;
+    llm_expert_provider_result fail_reservation(llm_expert_key key, llm_cold_reference reference) noexcept;
     llm_expert_provider_result acquire(
             llm_cold_reference reference,
             llm_cold_reference_kind kind) noexcept;

@@ -8,6 +8,8 @@
 #include "llama-cparams.h"
 #include "llama-expert-weight-provider.h"
 #include "llama-expert-storage.h"
+#include "llama-expert-async-io.h"
+#include "llama-expert-scheduler.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -1030,6 +1032,8 @@ struct llama_model::impl {
     // Deferred routed metadata and storage outlive the provider that borrows them.
     ggml_context_ptr deferred_expert_ctx;
     std::unique_ptr<llm_expert_storage> expert_storage;
+    std::unique_ptr<llm_expert_async_transport> expert_async_transport;
+    std::unique_ptr<llm_expert_scheduler> expert_scheduler;
     llm_deferred_expert_diagnostics deferred_expert_diagnostics;
 
     // Declared after model buffers so provider leases and borrowed tensor references are destroyed first.
@@ -1091,8 +1095,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
                        params.expert_transfer_ring_bytes == 0))) {
         throw std::invalid_argument("invalid cold-cache byte budgets");
     }
-    if (cold_mode && params.load_mode != LLAMA_LOAD_MODE_MMAP) {
-        throw std::invalid_argument("cold-cache mode requires pageable mmap source tensors");
+    if (cold_mode && params.load_mode != LLAMA_LOAD_MODE_MMAP && params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO) {
+        throw std::invalid_argument("cold-cache mode requires mmap or direct-I/O source tensors");
     }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1148,6 +1152,8 @@ void llama_model::init_expert_weight_provider() {
                 config.transfer_ring_bytes = params.expert_transfer_ring_bytes;
                 config.target_device = target;
                 config.storage = pimpl->expert_storage.get();
+                config.async_transport = pimpl->expert_async_transport.get();
+                config.scheduler = pimpl->expert_scheduler.get();
                 pimpl->expert_weight_provider = llm_create_cold_cache_expert_weight_provider(config);
             } else {
                 pimpl->expert_weight_provider = llm_create_hot_cache_expert_weight_provider(config);
@@ -1197,7 +1203,9 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     std::vector<llm_expert_storage_source> sources;
     sources.reserve(ml.files.size());
     for (uint32_t index = 0; index < ml.files.size(); ++index) {
-        sources.push_back({ uint16_t(index), ml.files[index].get(), uint64_t(ml.source_files[index].alignment) });
+        sources.push_back({ uint16_t(index), ml.files[index].get(), uint64_t(ml.source_files[index].alignment),
+            ml.source_files[index].has_authoritative_identity ? ml.source_files[index].identity.c_str() : nullptr,
+            params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO });
     }
     uint32_t routed_layer_count = 0;
     for (const auto & layer : layers) if (layer.ffn_down_exps != nullptr) routed_layer_count++;
@@ -1256,10 +1264,62 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     }
     const auto result = storage->seal();
     if (!result.is_ready()) throw std::runtime_error("incomplete routed expert storage directory");
+    const auto storage_diagnostics = storage->diagnostics();
+    if (storage_diagnostics.source_file_count == 0 || storage_diagnostics.source_file_count > UINT32_MAX) {
+        throw std::overflow_error("expert async source-file capacity overflow");
+    }
+    uint64_t maximum_aligned_read_bytes = 0;
+    if (!checked_storage_add(storage_diagnostics.maximum_bundle_bytes,
+            storage_diagnostics.maximum_direct_alignment, maximum_aligned_read_bytes)) {
+        throw std::overflow_error("expert async maximum aligned read size overflow");
+    }
+    const uint64_t request_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
+    if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
+    const uint32_t request_capacity = uint32_t(request_capacity_64);
+    const uint64_t trace_capacity_64 = std::min<uint64_t>(65536, std::max<uint64_t>(256, request_capacity_64*16));
+    auto scheduler = std::make_unique<llm_expert_scheduler>(llm_expert_scheduler_config{
+        uint32_t(layers.size()), uint32_t(hparams.n_expert), request_capacity,
+        uint32_t(std::max<int64_t>(1, hparams.n_expert_used)), 0,
+    });
+    auto transport = std::make_unique<llm_expert_async_transport>(llm_expert_async_config{
+        params.expert_io_queue_depth,
+        params.expert_hot_cache_capacity,
+        request_capacity,
+        uint32_t(trace_capacity_64),
+        params.expert_cold_cache_bytes,
+        params.expert_io_staging_bytes,
+        maximum_aligned_read_bytes,
+        params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO,
+        0,
+        nullptr,
+        params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO,
+        storage_diagnostics.maximum_direct_alignment,
+        false,
+        false,
+        0,
+        0,
+        uint32_t(storage_diagnostics.source_file_count),
+    });
+    std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
+    size_t source_handle_count = 0;
+    if (!storage->copy_source_native_handles(source_handles.data(), source_handles.size(), source_handle_count,
+            params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO).is_ready() ||
+        source_handle_count != source_handles.size() ||
+        transport->register_files(source_handles.data(), source_handles.size()) != llm_expert_async_result::ready) {
+        throw std::runtime_error("unable to initialize expert async source registration");
+    }
     pimpl->expert_storage = std::move(storage);
+    pimpl->expert_async_transport = std::move(transport);
+    pimpl->expert_scheduler = std::move(scheduler);
 }
 
 llm_expert_storage * llama_model::expert_storage() const { return pimpl->expert_storage.get(); }
+llm_expert_async_diagnostics llama_model::expert_async_diagnostics() const {
+    return pimpl->expert_async_transport ? pimpl->expert_async_transport->diagnostics() : llm_expert_async_diagnostics{};
+}
+llm_expert_scheduler_diagnostics llama_model::expert_scheduler_diagnostics() const {
+    return pimpl->expert_scheduler ? pimpl->expert_scheduler->diagnostics() : llm_expert_scheduler_diagnostics{};
+}
 llm_deferred_expert_diagnostics llama_model::deferred_expert_diagnostics() const {
     return pimpl->deferred_expert_diagnostics;
 }

@@ -38,6 +38,7 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+    int direct_io_error() const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -66,6 +67,7 @@ struct llama_file_read_handle {
     bool valid() const;
     uint64_t size() const;
     llama_file_identity identity() const;
+    intptr_t native_handle() const;
     int64_t read_at(void * data, size_t size, uint64_t offset, int & native_error) const noexcept;
 
 private:

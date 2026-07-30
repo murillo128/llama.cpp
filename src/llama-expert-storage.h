@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -28,10 +29,32 @@ struct llm_expert_storage_destination {
     uint64_t extent = 0;
 };
 
+struct llm_expert_storage_read_segment {
+    void * data = nullptr;
+    uint64_t byte_count = 0;
+    uint64_t file_offset = 0;
+    llm_expert_storage_projection projection = llm_expert_storage_projection::up;
+    llm_expert_storage_sidecar sidecar = llm_expert_storage_sidecar::weight;
+};
+
+struct llm_expert_storage_read_operation {
+    uint16_t split_index = 0;
+    intptr_t native_handle = -1;
+    intptr_t direct_native_handle = -1;
+    uint64_t direct_alignment = 0;
+    uint64_t source_size = 0;
+    uint64_t file_offset = 0;
+    uint64_t byte_count = 0;
+    uint8_t segment_count = 0;
+    std::array<llm_expert_storage_read_segment, 12> segments;
+};
+
 struct llm_expert_storage_source {
     uint16_t split_index = 0;
     const llama_file * file = nullptr;
     uint64_t alignment = 1;
+    const char * path = nullptr;
+    bool direct_requested = false;
 };
 
 struct llm_expert_storage_config {
@@ -80,6 +103,11 @@ struct llm_expert_storage_diagnostics {
     uint64_t io_errors = 0;
     uint64_t integrity_checks = 0;
     uint64_t integrity_mismatches = 0;
+    uint64_t direct_source_count = 0;
+    uint64_t direct_unsupported_source_count = 0;
+    uint64_t maximum_direct_alignment = 0;
+    uint64_t maximum_bundle_bytes = 0;
+    int first_direct_error = 0;
     int first_native_error = 0;
     bool sealed = false;
     bool poisoned = false;
@@ -100,6 +128,16 @@ public:
     llm_expert_storage_result add_bundle(llm_expert_key key, std::vector<llm_expert_storage_span> spans) noexcept;
     llm_expert_storage_result seal() noexcept;
     const std::vector<llm_expert_storage_span> * find(llm_expert_key key) const noexcept;
+    llm_expert_storage_result make_read_plan(
+            llm_expert_key key,
+            const llm_expert_storage_destination * destinations,
+            size_t destination_count,
+            llm_expert_storage_read_operation * operations,
+            size_t operation_capacity,
+            size_t & operation_count) const noexcept;
+    llm_expert_storage_result copy_source_native_handles(
+            intptr_t * handles, size_t handle_capacity, size_t & handle_count,
+            bool prefer_direct = false) const noexcept;
     llm_expert_storage_result read_bundle(llm_expert_key key, void * destination, uint64_t destination_size,
             llm_expert_storage_abort abort = nullptr, void * abort_data = nullptr) noexcept;
     llm_expert_storage_result read_bundle(llm_expert_key key,
@@ -107,6 +145,11 @@ public:
             llm_expert_storage_abort abort = nullptr, void * abort_data = nullptr) noexcept;
     void poison() noexcept;
     void record_integrity_check(bool matches) noexcept;
+    void record_async_read(
+            uint64_t chunk_count,
+            uint64_t byte_count,
+            llm_expert_storage_error error,
+            int native_error = 0) noexcept;
     llm_expert_storage_diagnostics diagnostics() const noexcept;
 
 private:

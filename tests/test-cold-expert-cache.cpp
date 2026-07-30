@@ -154,6 +154,35 @@ void test_publication_hits_and_copy_failure() {
     GGML_ASSERT(diagnostics.failed_cleanups == 1);
 }
 
+void test_two_phase_publication_and_failure() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    llm_cold_reference reserved;
+    bool hit = true;
+    GGML_ASSERT(cache.reserve_or_find({ 0, 2 }, reserved, hit).is_ready());
+    GGML_ASSERT(!hit);
+    auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.slots[reserved.slot].state == llm_cold_slot_state::loading);
+    GGML_ASSERT(diagnostics.reservations == 1 && diagnostics.publications == 0);
+    GGML_ASSERT(cache.surrender().error == llm_expert_provider_error::busy);
+    GGML_ASSERT(cache.acquire(reserved, llm_cold_reference_kind::request).error ==
+        llm_expert_provider_error::stale_generation);
+    GGML_ASSERT(cache.publish_ready({ 0, 2 }, reserved).is_ready());
+    llm_cold_reference found;
+    GGML_ASSERT(cache.reserve_or_find({ 0, 2 }, found, hit).is_ready() && hit);
+    GGML_ASSERT(found.slot == reserved.slot && found.generation == reserved.generation);
+
+    llm_cold_reference failed;
+    GGML_ASSERT(cache.reserve_or_find({ 0, 3 }, failed, hit).is_ready() && !hit);
+    GGML_ASSERT(cache.fail_reservation({ 0, 3 }, failed).is_ready());
+    GGML_ASSERT(cache.publish_ready({ 0, 3 }, failed).error ==
+        llm_expert_provider_error::stale_generation);
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.publications == 1 && diagnostics.failed_reservations == 1);
+    GGML_ASSERT(cache.cleanup_failed_slots().is_ready());
+}
+
 void test_lru_references_and_inclusion() {
     fixture tensors;
     llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
@@ -251,6 +280,7 @@ void test_loader_publication_failure_cleanup_and_reread() {
 int main() {
     test_configuration_and_budget_edges();
     test_publication_hits_and_copy_failure();
+    test_two_phase_publication_and_failure();
     test_lru_references_and_inclusion();
     test_generation_wrap_and_reinitialize();
     test_loader_publication_failure_cleanup_and_reread();

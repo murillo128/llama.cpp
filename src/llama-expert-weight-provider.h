@@ -10,6 +10,8 @@
 #include <vector>
 
 class llm_expert_storage;
+class llm_expert_async_transport;
+class llm_expert_scheduler;
 
 enum class llm_expert_provider_status {
     ready,
@@ -429,6 +431,8 @@ struct llm_hot_cache_config {
     ggml_backend_dev_t target_device = nullptr;
     bool force_pageable_transfer_for_testing = false;
     llm_expert_storage * storage = nullptr;
+    llm_expert_async_transport * async_transport = nullptr;
+    llm_expert_scheduler * scheduler = nullptr;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(
