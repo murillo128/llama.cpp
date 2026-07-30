@@ -19,6 +19,7 @@ add_library(llama
             llama-cparams.cpp
             llama-cold-expert-cache.cpp
             llama-expert-transfer-ring.cpp
+            llama-expert-storage.cpp
             llama-expert-weight-provider.cpp
             llama-grammar.cpp
             llama-graph.cpp

@@ -6,6 +6,7 @@
 #include <cstdio>
 
 struct llama_file;
+struct llama_file_read_handle;
 struct llama_mmap;
 struct llama_mlock;
 
@@ -23,6 +24,8 @@ struct llama_file {
 
     int file_id() const; // fileno overload
 
+    llama_file_read_handle duplicate_read_handle() const;
+
     void seek(size_t offset, int whence) const;
 
     void read_raw(void * ptr, size_t len);
@@ -37,6 +40,38 @@ struct llama_file {
     bool has_direct_io() const;
 private:
     struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
+struct llama_file_identity {
+    uint64_t device = 0;
+    uint64_t file = 0;
+    bool valid = false;
+
+    bool operator==(const llama_file_identity & other) const {
+        return valid && other.valid && device == other.device && file == other.file;
+    }
+};
+
+// A model-lifetime, cursor-independent read handle duplicated from a loader file.
+// read_at() performs one positional system call and never advances shared state.
+struct llama_file_read_handle {
+    llama_file_read_handle();
+    ~llama_file_read_handle();
+    llama_file_read_handle(const llama_file_read_handle &) = delete;
+    llama_file_read_handle & operator=(const llama_file_read_handle &) = delete;
+    llama_file_read_handle(llama_file_read_handle &&) noexcept;
+    llama_file_read_handle & operator=(llama_file_read_handle &&) noexcept;
+
+    bool valid() const;
+    uint64_t size() const;
+    llama_file_identity identity() const;
+    int64_t read_at(void * data, size_t size, uint64_t offset, int & native_error) const noexcept;
+
+private:
+    friend struct llama_file;
+    struct impl;
+    explicit llama_file_read_handle(std::unique_ptr<impl> impl);
     std::unique_ptr<impl> pimpl;
 };
 

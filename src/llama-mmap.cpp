@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <limits>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -420,6 +421,143 @@ int llama_file::file_id() const {
 #else
     return ::fileno(pimpl->fp);
 #endif
+#endif
+}
+
+// llama_file_read_handle
+
+struct llama_file_read_handle::impl {
+#if defined(_WIN32)
+    HANDLE handle = INVALID_HANDLE_VALUE;
+#else
+    int fd = -1;
+#endif
+    uint64_t file_size = 0;
+    llama_file_identity file_identity;
+
+    ~impl() {
+#if defined(_WIN32)
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+        }
+#else
+        if (fd >= 0) {
+            close(fd);
+        }
+#endif
+    }
+};
+
+namespace {
+
+#if defined(_WIN32)
+llama_file_identity identity_for_handle(HANDLE handle, uint64_t & size) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(handle, &info)) {
+        throw std::runtime_error(format("GetFileInformationByHandle failed: %s",
+            llama_format_win_err(GetLastError()).c_str()));
+    }
+    size = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    return {
+        info.dwVolumeSerialNumber,
+        (uint64_t(info.nFileIndexHigh) << 32) | info.nFileIndexLow,
+        true,
+    };
+}
+#else
+llama_file_identity identity_for_fd(int fd, uint64_t & size) {
+    struct stat info{};
+    if (fstat(fd, &info) != 0) {
+        throw std::runtime_error(format("fstat failed: %s", strerror(errno)));
+    }
+    if (info.st_size < 0) {
+        throw std::runtime_error("file has negative size");
+    }
+    size = uint64_t(info.st_size);
+    return { uint64_t(info.st_dev), uint64_t(info.st_ino), true };
+}
+#endif
+
+} // namespace
+
+llama_file_read_handle llama_file::duplicate_read_handle() const {
+    auto result = std::make_unique<llama_file_read_handle::impl>();
+#if defined(_WIN32)
+    HANDLE source = pimpl->fp_win32;
+    if (!DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &result->handle,
+            GENERIC_READ, FALSE, 0)) {
+        throw std::runtime_error(format("DuplicateHandle failed: %s",
+            llama_format_win_err(GetLastError()).c_str()));
+    }
+    uint64_t source_size = 0;
+    const auto source_identity = identity_for_handle(source, source_size);
+    result->file_identity = identity_for_handle(result->handle, result->file_size);
+#else
+    const int source = file_id();
+    result->fd = dup(source);
+    if (result->fd < 0) {
+        throw std::runtime_error(format("dup failed: %s", strerror(errno)));
+    }
+    uint64_t source_size = 0;
+    const auto source_identity = identity_for_fd(source, source_size);
+    result->file_identity = identity_for_fd(result->fd, result->file_size);
+#endif
+    if (!(source_identity == result->file_identity) || source_size != result->file_size || source_size != size()) {
+        throw std::runtime_error("duplicated read handle identity or size mismatch");
+    }
+    return llama_file_read_handle(std::move(result));
+}
+
+llama_file_read_handle::llama_file_read_handle() = default;
+llama_file_read_handle::llama_file_read_handle(std::unique_ptr<impl> impl) : pimpl(std::move(impl)) {}
+llama_file_read_handle::~llama_file_read_handle() = default;
+llama_file_read_handle::llama_file_read_handle(llama_file_read_handle &&) noexcept = default;
+llama_file_read_handle & llama_file_read_handle::operator=(llama_file_read_handle &&) noexcept = default;
+
+bool llama_file_read_handle::valid() const {
+    if (!pimpl) {
+        return false;
+    }
+#if defined(_WIN32)
+    return pimpl->handle != INVALID_HANDLE_VALUE;
+#else
+    return pimpl->fd >= 0;
+#endif
+}
+
+uint64_t llama_file_read_handle::size() const { return pimpl ? pimpl->file_size : 0; }
+llama_file_identity llama_file_read_handle::identity() const { return pimpl ? pimpl->file_identity : llama_file_identity{}; }
+
+int64_t llama_file_read_handle::read_at(void * data, size_t size, uint64_t offset, int & native_error) const noexcept {
+    native_error = 0;
+    if (!valid() || data == nullptr || size == 0) {
+        native_error = EINVAL;
+        return -1;
+    }
+#if defined(_WIN32)
+    OVERLAPPED position{};
+    position.Offset = DWORD(offset & 0xffffffffU);
+    position.OffsetHigh = DWORD(offset >> 32);
+    DWORD transferred = 0;
+    if (!ReadFile(pimpl->handle, data, DWORD(size), &transferred, &position)) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_HANDLE_EOF) {
+            return 0;
+        }
+        native_error = int(error);
+        return -1;
+    }
+    return int64_t(transferred);
+#else
+    if (offset > uint64_t(std::numeric_limits<off_t>::max())) {
+        native_error = EOVERFLOW;
+        return -1;
+    }
+    const ssize_t transferred = pread(pimpl->fd, data, size, off_t(offset));
+    if (transferred < 0) {
+        native_error = errno;
+    }
+    return int64_t(transferred);
 #endif
 }
 

@@ -279,6 +279,8 @@ target_include_directories(test-cold-expert-cache PRIVATE ${PROJECT_SOURCE_DIR}/
 
 llama_build_and_test(test-expert-transfer-ring.cpp LABEL "model")
 target_include_directories(test-expert-transfer-ring PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-expert-storage.cpp LABEL "model")
+target_include_directories(test-expert-storage PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build(phase5-cold-cache-probe.cpp)
 target_include_directories(phase5-cold-cache-probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build(phase4-hot-cache-probe.cpp)
