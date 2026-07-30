@@ -131,6 +131,43 @@ void test_quiescent_shutdown() {
         llm_expert_schedule_disposition::closed);
 }
 
+void test_post_h2d_cancellation_path() {
+    llm_expert_scheduler scheduler(config(1));
+    const auto admitted = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer, llm_expert_readiness::device_ready);
+    GGML_ASSERT(admitted.accepted());
+    llm_expert_request_snapshot request;
+    GGML_ASSERT(scheduler.take_next(request).accepted());
+    GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::submitting,
+        llm_expert_request_state::io_in_flight) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::io_in_flight,
+        llm_expert_request_state::host_ready) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::host_ready,
+        llm_expert_request_state::h2d_in_flight) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::h2d_in_flight,
+        llm_expert_request_state::cancelling) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::cancelling,
+        llm_expert_request_state::draining) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.finish(admitted.handle, llm_expert_request_state::cancelled) ==
+        llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.release_terminal(admitted.handle) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.diagnostics().active_requests == 0);
+}
+
+void test_cold_hit_reaches_host_ready_without_io() {
+    llm_expert_scheduler scheduler(config(1));
+    const auto admitted = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer, llm_expert_readiness::device_ready);
+    GGML_ASSERT(admitted.accepted());
+    llm_expert_request_snapshot request;
+    GGML_ASSERT(scheduler.take_next(request).accepted());
+    GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::submitting,
+        llm_expert_request_state::host_ready) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.finish(admitted.handle, llm_expert_request_state::complete) ==
+        llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.release_terminal(admitted.handle) == llm_expert_schedule_disposition::admitted);
+}
+
 void test_concurrent_duplicate_joins() {
     llm_expert_scheduler scheduler({ 1, 8, 2, 8, 0 });
     std::vector<llm_expert_schedule_result> results(8);
@@ -166,6 +203,8 @@ int main() {
     test_saturation_and_preemption();
     test_stale_completion_and_generation_exhaustion();
     test_quiescent_shutdown();
+    test_post_h2d_cancellation_path();
+    test_cold_hit_reaches_host_ready_without_io();
     test_concurrent_duplicate_joins();
     return 0;
 }

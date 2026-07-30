@@ -167,6 +167,10 @@ public:
         uint64_t work) noexcept;
     llm_expert_provider_result cancel_after_h2d(
         llm_transfer_lane_reference lane) noexcept;
+    // Internal test seam. The supplied event is borrowed and must outlive any
+    // transfer submitted while it is installed.
+    llm_expert_provider_result set_h2d_gate_event_for_testing(
+        ggml_backend_event_t event) noexcept;
     llm_expert_provider_result retire_hot(uint32_t hot_slot, uint64_t hot_generation) noexcept;
     llm_expert_provider_result cleanup_failed_lanes() noexcept;
     llm_expert_provider_result surrender() noexcept;

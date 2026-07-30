@@ -421,6 +421,10 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
         if (!checked_mul(footprint, lane_count, requested) || requested > SIZE_MAX) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
         }
+        uint64_t total_event_capacity = 0;
+        if (!checked_mul(lane_count64, 2, total_event_capacity) || total_event_capacity > UINT32_MAX) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
 
         ggml_backend_buffer_ptr candidate;
         bool pinned = false;
@@ -486,15 +490,6 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
         }
         pimpl->counters.pageable_fallback = !pinned;
         pimpl->counters.pinned_or_registered_bytes = pinned ? actual : 0;
-        uint64_t total_event_capacity = 0;
-        if (event_capable && (!checked_mul(lane_count, 2, total_event_capacity) || total_event_capacity > UINT32_MAX)) {
-            for (auto & lane : pimpl->lanes) {
-                pimpl->free_event_objects(lane);
-            }
-            pimpl->transfer_backend.reset();
-            event_capable = false;
-            fallback_reason = "transfer-event-capacity-overflow";
-        }
         pimpl->counters.acquisition_method = pinned ?
             (event_capable ? "device-native-host-events" : "device-native-host-synchronous") : "pageable-cpu";
         pimpl->counters.fallback_reason = event_capable ? "" : fallback_reason;
@@ -776,11 +771,17 @@ llm_expert_provider_result llm_expert_transfer_ring::begin_compute_work(
 llm_expert_provider_result llm_expert_transfer_ring::cancel_after_h2d(
         llm_transfer_lane_reference reference) noexcept {
     std::unique_lock<std::mutex> lock(pimpl->mutex);
-    if (!pimpl->valid_lane(reference) ||
-        pimpl->lanes[reference.lane].state != llm_transfer_lane_state::in_flight) {
+    if (reference.lane >= pimpl->lanes.size() ||
+        pimpl->lanes[reference.lane].generation != reference.generation) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
+    if (lane.state == llm_transfer_lane_state::free) {
+        return llm_expert_provider_result::success();
+    }
+    if (lane.state != llm_transfer_lane_state::in_flight) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
     lane.cancelled = true;
     lane.wait_enqueued = true;
     pimpl->counters.h2d_event_cancellations++;
@@ -793,6 +794,18 @@ llm_expert_provider_result llm_expert_transfer_ring::cancel_after_h2d(
     if (lane.generation == reference.generation && lane.state == llm_transfer_lane_state::in_flight) {
         pimpl->release_lane(lane);
     }
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::set_h2d_gate_event_for_testing(
+        ggml_backend_event_t event) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    for (const auto & lane : pimpl->lanes) {
+        if (lane.state != llm_transfer_lane_state::free) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+        }
+    }
+    pimpl->config.h2d_gate_event_for_testing = event;
     return llm_expert_provider_result::success();
 }
 

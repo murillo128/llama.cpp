@@ -180,6 +180,18 @@ void test_budget_and_generation_rejection() {
     GGML_ASSERT(insufficient.initialize(source.bundle()).error ==
         llm_expert_provider_error::unsupported_configuration);
 
+    const uint64_t overflow_lanes = uint64_t(UINT32_MAX)/2 + 1;
+    GGML_ASSERT(footprint <= UINT64_MAX/overflow_lanes);
+    llm_expert_transfer_ring event_capacity_overflow(ring_config(footprint*overflow_lanes));
+    GGML_ASSERT(event_capacity_overflow.initialize(source.bundle()).error ==
+        llm_expert_provider_error::unsupported_configuration);
+    const auto overflow = event_capacity_overflow.diagnostics();
+    GGML_ASSERT(overflow.actual_bytes == 0 && overflow.effective_lanes == 0 &&
+        overflow.pinned_or_registered_bytes == 0 && !overflow.dedicated_transfer_backend &&
+        !overflow.event_capable && overflow.h2d_event_allocations == 0 &&
+        overflow.compute_event_allocations == 0 && overflow.event_capacity == 0 &&
+        overflow.live_events == 0);
+
     auto cold = make_cold(source);
     llm_cold_reference cold_zero;
     GGML_ASSERT(cold.find_or_admit({ 0, 0 }, source.bundle(), cold_zero).is_ready());
@@ -286,6 +298,8 @@ void test_native_event_ordering_reuse_and_unload() {
             backend.get(), { { cancelled_lane, hot.bundle(), 0 } }).is_ready());
         GGML_ASSERT(cancelling.diagnostics().live_h2d_events == 1);
         GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::h2d_in_flight,
+            llm_expert_request_state::cancelling) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::cancelling,
             llm_expert_request_state::draining) == llm_expert_schedule_disposition::admitted);
 
         std::atomic<bool> cancel_done = false;

@@ -1268,6 +1268,12 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_expert_abort_callback_for_testing(
+        bool (*callback)(void * data), void * callback_data) {
+    expert_abort_callback_for_testing = callback;
+    expert_abort_callback_data_for_testing = callback_data;
+}
+
 int32_t llama_context::set_route_observer(llama_route_observer_callback callback, void * user_data) {
     synchronize();
 
@@ -1642,6 +1648,7 @@ bool llama_context::set_adapter_cvec(
 
 bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     auto * ctx = static_cast<llama_context *>(user_data);
+    if (!ctx->expert_eval_result.is_ready()) return false;
     const llm_expert_graph_binding * checkpoint = nullptr;
     if (ctx->expert_eval_bindings != nullptr) {
         for (const auto & binding : *ctx->expert_eval_bindings) {
@@ -1677,8 +1684,12 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
                 llm_expert_provider_error::invalid_binding);
             return false;
         }
+        const auto expert_abort_callback = ctx->expert_abort_callback_for_testing != nullptr ?
+            ctx->expert_abort_callback_for_testing : ctx->abort_callback;
+        void * expert_abort_callback_data = ctx->expert_abort_callback_for_testing != nullptr ?
+            ctx->expert_abort_callback_data_for_testing : ctx->abort_callback_data;
         ctx->expert_eval_result = ctx->expert_weight_provider->remap_checkpoint_tensor(
-            *checkpoint, execution_backend, ctx->abort_callback, ctx->abort_callback_data);
+            *checkpoint, execution_backend, expert_abort_callback, expert_abort_callback_data);
         if (!ctx->expert_eval_result.is_ready()) {
             return false;
         }

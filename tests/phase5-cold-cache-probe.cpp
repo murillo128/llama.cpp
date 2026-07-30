@@ -38,10 +38,61 @@ uint64_t hash_bytes(uint64_t hash, const void * data, size_t size) {
     return hash;
 }
 
+bool same_flight(const llm_expert_flight_id & lhs, const llm_expert_flight_id & rhs) {
+    return lhs.transport_epoch == rhs.transport_epoch && lhs.request_slot == rhs.request_slot &&
+        lhs.request_generation == rhs.request_generation && lhs.key.layer == rhs.key.layer &&
+        lhs.key.expert == rhs.key.expert;
+}
+
+uint64_t overlap_pair_hash(
+        const llm_expert_async_read_interval & read,
+        const llm_transfer_interval & transfer) {
+    uint64_t hash = 1469598103934665603ULL;
+    const auto append = [&](uint64_t value) {
+        for (size_t byte = 0; byte < sizeof(value); ++byte) {
+            hash ^= (value >> (byte*8)) & 0xffU;
+            hash *= 1099511628211ULL;
+        }
+    };
+    append(read.flight.transport_epoch);
+    append(read.flight.request_slot);
+    append(read.flight.request_generation);
+    append(uint32_t(read.flight.key.layer));
+    append(uint32_t(read.flight.key.expert));
+    append(read.operation_index);
+    append(transfer.flight.transport_epoch);
+    append(transfer.flight.request_slot);
+    append(transfer.flight.request_generation);
+    append(uint32_t(transfer.flight.key.layer));
+    append(uint32_t(transfer.flight.key.expert));
+    append(transfer.lane.generation);
+    append(transfer.hot_generation);
+    return hash;
+}
+
 struct route_hash {
     uint64_t value = 1469598103934665603ULL;
     uint64_t records = 0;
 };
+
+struct execution_id_placement {
+    llama_context * context = nullptr;
+    uint64_t cpu = 0;
+    uint64_t non_cpu = 0;
+};
+
+bool capture_execution_id_placement(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * placement = static_cast<execution_id_placement *>(user_data);
+    if (std::strncmp(tensor->name, "expert_execution_ids-", 21) != 0) return false;
+    if (!ask) return true;
+    if (placement->context == nullptr) return true;
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(
+        placement->context->get_sched(), tensor);
+    ggml_backend_dev_t device = backend == nullptr ? nullptr : ggml_backend_get_device(backend);
+    if (device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) placement->cpu++;
+    else placement->non_cpu++;
+    return true;
+}
 
 bool capture_route(const llama_route_observation * observation, void * user_data) {
     auto * state = static_cast<route_hash *>(user_data);
@@ -62,6 +113,7 @@ struct live_arguments {
     int steps = 5;
     llama_load_mode load_mode = LLAMA_LOAD_MODE_MMAP;
     bool cancel_on_storage = false;
+    bool cancel_after_h2d = false;
     bool require_overlap = false;
     std::string dump_cold_bundle;
 };
@@ -78,6 +130,10 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
     for (int index = 1; index < argc; ++index) {
         if (std::string(argv[index]) == "--cancel-on-storage") {
             result.cancel_on_storage = true;
+            continue;
+        }
+        if (std::string(argv[index]) == "--cancel-after-h2d") {
+            result.cancel_after_h2d = true;
             continue;
         }
         if (std::string(argv[index]) == "--require-overlap") {
@@ -104,7 +160,8 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
         }
         else return false;
     }
-    return !result.model.empty() && (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold") &&
+    return !(result.cancel_on_storage && result.cancel_after_h2d) && !result.model.empty() &&
+        (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold") &&
         (result.mode == "disabled" || result.capacity > 0) &&
         (result.mode != "cold" || (result.cold_bytes > 0 && result.ring_bytes > 0));
 }
@@ -112,6 +169,22 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
 struct storage_cancel_state {
     const llama_model * model = nullptr;
 };
+
+struct post_h2d_cancel_state {
+    const llama_model * model = nullptr;
+    uint64_t initial_compute_waits = 0;
+    bool observed_live_h2d = false;
+};
+
+bool cancel_after_provider_compute_wait(void * user_data) {
+    auto * state = static_cast<post_h2d_cancel_state *>(user_data);
+    if (state == nullptr || state->model == nullptr || state->model->expert_weight_provider() == nullptr) return false;
+    const auto diagnostics = state->model->expert_weight_provider()->hot_cache_diagnostics();
+    const bool cancel = diagnostics.ring_compute_waits > state->initial_compute_waits &&
+        diagnostics.ring_live_h2d_events > 0 && !diagnostics.last_completed_flight.valid();
+    state->observed_live_h2d = state->observed_live_h2d || cancel;
+    return cancel;
+}
 
 bool cancel_after_first_storage_read(void * user_data) {
     const auto * state = static_cast<const storage_cancel_state *>(user_data);
@@ -140,11 +213,198 @@ int run_live(int argc, char ** argv) {
     llama_model * model = llama_model_load_from_file(args.model.c_str(), model_params);
     if (!model) return 21;
     llama_context_params context_params = llama_context_default_params();
+    execution_id_placement placement;
     context_params.n_ctx = 64;
     context_params.n_batch = 64;
     context_params.n_ubatch = 1;
+    context_params.cb_eval = capture_execution_id_placement;
+    context_params.cb_eval_user_data = &placement;
     llama_context * context = llama_init_from_model(model, context_params);
     if (!context) return 22;
+    placement.context = context;
+
+    if (args.cancel_after_h2d) {
+        if (args.mode != "cold" || model->expert_storage() == nullptr ||
+            model->expert_weight_provider() == nullptr) return 36;
+        auto * provider = model->expert_weight_provider();
+        const auto initial = provider->hot_cache_diagnostics();
+        if (!initial.ring_event_capable) return 37;
+        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_ptr gate_backend(device == nullptr ? nullptr : ggml_backend_dev_init(device, nullptr));
+        if (device == nullptr || !gate_backend) return 38;
+        ggml_init_params compute_params = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), nullptr, true };
+        ggml_context_ptr compute_ctx(ggml_init(compute_params));
+        if (!compute_ctx) return 39;
+        constexpr int64_t gate_dimension = 6144;
+        ggml_tensor * gate_a = ggml_new_tensor_2d(
+            compute_ctx.get(), GGML_TYPE_F32, gate_dimension, gate_dimension);
+        ggml_tensor * gate_b = ggml_new_tensor_2d(
+            compute_ctx.get(), GGML_TYPE_F32, gate_dimension, gate_dimension);
+        ggml_tensor * gate_c = ggml_mul_mat(compute_ctx.get(), gate_a, gate_b);
+        ggml_backend_buffer_ptr compute_buffer(
+            ggml_backend_alloc_ctx_tensors_from_buft(compute_ctx.get(), ggml_backend_dev_buffer_type(device)));
+        if (!compute_buffer) return 40;
+        std::vector<float> zeros(size_t(gate_dimension)*gate_dimension, 0.0f);
+        ggml_backend_tensor_set(gate_a, zeros.data(), 0, zeros.size()*sizeof(float));
+        ggml_backend_tensor_set(gate_b, zeros.data(), 0, zeros.size()*sizeof(float));
+        ggml_cgraph * gate_graph = ggml_new_graph_custom(compute_ctx.get(), 8, false);
+        ggml_build_forward_expand(gate_graph, gate_c);
+        ggml_backend_event_t gate_event = ggml_backend_event_new(device);
+        if (gate_event == nullptr ||
+            ggml_backend_graph_compute_async(gate_backend.get(), gate_graph) != GGML_STATUS_SUCCESS) return 41;
+        ggml_backend_event_record(gate_event, gate_backend.get());
+        if (!provider->set_h2d_gate_event_for_testing(gate_event).is_ready()) return 42;
+
+        post_h2d_cancel_state cancel_state = { model, initial.ring_compute_waits, false };
+        context->set_expert_abort_callback_for_testing(cancel_after_provider_compute_wait, &cancel_state);
+        llama_token token = 1;
+        const int cancelled = llama_decode(context, llama_batch_get_one(&token, 1));
+        llama_synchronize(context);
+        const auto cancelled_cache = provider->hot_cache_diagnostics();
+        const auto cancelled_provider_stats = provider->get_stats();
+        const auto cancelled_scheduler = model->expert_scheduler_diagnostics();
+        uint64_t cancelled_mapping_generation = 0;
+        uint32_t cancelled_mapping_slot = UINT32_MAX;
+        const bool cancelled_mapping = provider->debug_hot_mapping(
+            cancelled_cache.last_cancelled_flight.key,
+            &cancelled_mapping_generation, &cancelled_mapping_slot);
+        uint64_t cancelled_cold_generation = 0;
+        uint32_t cancelled_cold_slot = UINT32_MAX;
+        const bool cancelled_cold_ready = provider->debug_cold_ready(
+            cancelled_cache.last_cancelled_flight.key,
+            &cancelled_cold_generation, &cancelled_cold_slot);
+        std::cerr << "PHASE7_PROVIDER_H2D_CANCEL_CHECKPOINT"
+                  << "\tdecode_status=" << cancelled
+                  << "\tabort_observed=" << cancel_state.observed_live_h2d
+                  << "\tpost_h2d_cancellations=" << cancelled_cache.post_h2d_cancellations
+                  << "\tprovider_cancellations=" << cancelled_provider_stats.cancellations
+                  << "\tprovider_failures=" << cancelled_provider_stats.failures
+                  << "\tlast_failure_error=" << int(cancelled_cache.last_failure_error)
+                  << "\tlast_remap_error=" << int(cancelled_cache.last_remap_error)
+                  << "\tcopy_failures=" << cancelled_cache.copy_failures
+                  << "\tlast_completed_valid=" << cancelled_cache.last_completed_flight.valid()
+                  << "\th2d_event_cancellations=" << cancelled_cache.ring_h2d_event_cancellations
+                  << "\tlive_events=" << cancelled_cache.ring_live_events
+                  << "\tscheduler_active=" << cancelled_scheduler.active_requests
+                  << "\tcold_ready=" << cancelled_cold_ready
+                  << '\n';
+
+        context->set_expert_abort_callback_for_testing(nullptr, nullptr);
+        if (!provider->set_h2d_gate_event_for_testing(nullptr).is_ready()) return 43;
+        route_hash retry_routes;
+        if (llama_set_route_observer(context, capture_route, &retry_routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK ||
+            llama_route_observer_begin(context, 1, LLAMA_ROUTE_PHASE_DECODE) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 44;
+        const int retry = llama_decode(context, llama_batch_get_one(&token, 1));
+        llama_synchronize(context);
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        const float * retry_logits_ptr = llama_get_logits_ith(context, -1);
+        if (retry != 0 || retry_logits_ptr == nullptr) return 45;
+        const std::vector<float> retry_logits(retry_logits_ptr, retry_logits_ptr + n_vocab);
+        const llama_token retry_token = std::max_element(retry_logits.begin(), retry_logits.end()) - retry_logits.begin();
+        const auto retry_cache = provider->hot_cache_diagnostics();
+        const auto retry_scheduler = model->expert_scheduler_diagnostics();
+        uint64_t retry_mapping_generation = 0;
+        uint32_t retry_mapping_slot = UINT32_MAX;
+        const bool retry_mapping = provider->debug_hot_mapping(
+            cancelled_cache.last_cancelled_flight.key,
+            &retry_mapping_generation, &retry_mapping_slot);
+        std::vector<uint8_t> cold_bytes;
+        std::vector<uint8_t> hot_bytes;
+        const bool exact_retry_bytes = provider->debug_copy_cold_bundle(
+                cancelled_cache.last_cancelled_flight.key, cold_bytes).is_ready() &&
+            provider->debug_copy_hot_bundle(
+                cancelled_cache.last_cancelled_flight.key, hot_bytes).is_ready() &&
+            !cold_bytes.empty() && cold_bytes == hot_bytes;
+
+        llama_free(context);
+        placement.context = nullptr;
+        ggml_backend_event_free(gate_event);
+        llama_model_free(model);
+
+        llama_model_params baseline_params = llama_model_default_params();
+        baseline_params.n_gpu_layers = -1;
+        llama_model * baseline_model = llama_model_load_from_file(args.model.c_str(), baseline_params);
+        if (!baseline_model) return 46;
+        llama_context_params baseline_context_params = llama_context_default_params();
+        baseline_context_params.n_ctx = 64;
+        baseline_context_params.n_batch = 64;
+        baseline_context_params.n_ubatch = 1;
+        llama_context * baseline_context = llama_init_from_model(baseline_model, baseline_context_params);
+        if (!baseline_context) return 47;
+        route_hash baseline_routes;
+        if (llama_set_route_observer(baseline_context, capture_route, &baseline_routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK ||
+            llama_route_observer_begin(baseline_context, 1, LLAMA_ROUTE_PHASE_DECODE) != LLAMA_ROUTE_OBSERVER_STATUS_OK ||
+            llama_decode(baseline_context, llama_batch_get_one(&token, 1)) != 0) return 48;
+        llama_synchronize(baseline_context);
+        const float * baseline_logits_ptr = llama_get_logits_ith(baseline_context, -1);
+        const bool exact_logits = baseline_logits_ptr != nullptr &&
+            std::equal(retry_logits.begin(), retry_logits.end(), baseline_logits_ptr);
+        const llama_token baseline_token = baseline_logits_ptr == nullptr ? -1 :
+            std::max_element(baseline_logits_ptr, baseline_logits_ptr + n_vocab) - baseline_logits_ptr;
+        const bool exact_routes = retry_routes.records == baseline_routes.records &&
+            retry_routes.value == baseline_routes.value;
+
+        const bool new_generations = retry_cache.retry_after_cancel_flight.valid() &&
+            retry_cache.retry_after_cancel_flight.key.layer == cancelled_cache.last_cancelled_flight.key.layer &&
+            retry_cache.retry_after_cancel_flight.key.expert == cancelled_cache.last_cancelled_flight.key.expert &&
+            retry_cache.retry_after_cancel_flight.request_generation !=
+                cancelled_cache.last_cancelled_flight.request_generation &&
+            retry_cache.retry_after_cancel_lane_generation != cancelled_cache.last_cancelled_lane_generation &&
+            retry_cache.retry_after_cancel_hot_generation > cancelled_cache.last_cancelled_hot_generation;
+        const bool valid = cancelled == 2 && cancel_state.observed_live_h2d &&
+            cancelled_cache.post_h2d_cancellations == 1 && cancelled_cache.admissions == 0 &&
+            cancelled_cache.ring_h2d_event_cancellations > initial.ring_h2d_event_cancellations &&
+            !cancelled_mapping && cancelled_mapping_generation == 0 && cancelled_mapping_slot == UINT32_MAX &&
+            cancelled_cold_ready && cancelled_cold_generation > 0 && cancelled_cold_slot != UINT32_MAX &&
+            cancelled_cache.current_pins == 0 && cancelled_cache.cold_current_hot_refs == 0 &&
+            cancelled_cache.cold_current_transfer_refs == 0 && cancelled_cache.cold_current_request_refs == 0 &&
+            cancelled_cache.ring_live_h2d_events == 0 && cancelled_cache.ring_live_compute_events == 0 &&
+            cancelled_cache.ring_live_events == 0 && cancelled_scheduler.active_requests == 0 &&
+            retry == 0 && retry_mapping && retry_mapping_generation == retry_cache.retry_after_cancel_hot_generation &&
+            retry_mapping_slot == retry_cache.retry_after_cancel_hot_slot && retry_cache.admissions > 0 &&
+            retry_cache.current_pins == 0 && retry_cache.cold_current_hot_refs > 0 &&
+            retry_cache.cold_current_transfer_refs == 0 && retry_cache.cold_current_request_refs == 0 &&
+            retry_cache.ring_live_events == 0 && retry_scheduler.active_requests == 0 && new_generations &&
+            placement.cpu > 0 && placement.non_cpu == 0 &&
+            retry_cache.last_execution_backend_device_type == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            exact_retry_bytes && exact_routes && exact_logits && retry_token == baseline_token;
+        std::cout << "PHASE7_PROVIDER_H2D_CANCEL"
+                  << "\tcancelled_status=" << cancelled
+                  << "\tobserved_live_h2d=" << cancel_state.observed_live_h2d
+                  << "\tcancelled_flight_generation=" << cancelled_cache.last_cancelled_flight.request_generation
+                  << "\tcancelled_lane_generation=" << cancelled_cache.last_cancelled_lane_generation
+                  << "\tcancelled_hot_generation=" << cancelled_cache.last_cancelled_hot_generation
+                  << "\tcancelled_hot_admissions=" << cancelled_cache.admissions
+                  << "\tcancelled_hot_mapping=" << cancelled_mapping
+                  << "\tcancelled_cold_ready=" << cancelled_cold_ready
+                  << "\tcancelled_cold_slot=" << cancelled_cold_slot
+                  << "\tcancelled_cold_generation=" << cancelled_cold_generation
+                  << "\th2d_event_cancellations=" << cancelled_cache.ring_h2d_event_cancellations
+                  << "\tcancelled_scheduler_active=" << cancelled_scheduler.active_requests
+                  << "\tcancelled_live_events=" << cancelled_cache.ring_live_events
+                  << "\tcancelled_hot_refs=" << cancelled_cache.cold_current_hot_refs
+                  << "\tcancelled_transfer_refs=" << cancelled_cache.cold_current_transfer_refs
+                  << "\tcancelled_request_refs=" << cancelled_cache.cold_current_request_refs
+                  << "\tretry_status=" << retry
+                  << "\tretry_flight_generation=" << retry_cache.retry_after_cancel_flight.request_generation
+                  << "\tretry_lane_generation=" << retry_cache.retry_after_cancel_lane_generation
+                  << "\tretry_hot_generation=" << retry_cache.retry_after_cancel_hot_generation
+                  << "\tretry_hot_mapping=" << retry_mapping
+                  << "\tretry_hot_admissions=" << retry_cache.admissions
+                  << "\tretry_scheduler_active=" << retry_scheduler.active_requests
+                  << "\tretry_live_events=" << retry_cache.ring_live_events
+                  << "\texecution_ids_cpu=" << placement.cpu
+                  << "\texecution_ids_non_cpu=" << placement.non_cpu
+                  << "\texecution_backend_device_type=" << retry_cache.last_execution_backend_device_type
+                  << "\texact_bytes=" << exact_retry_bytes
+                  << "\texact_routes=" << exact_routes
+                  << "\texact_logits=" << exact_logits
+                  << "\texact_token=" << (retry_token == baseline_token)
+                  << '\n';
+        llama_free(baseline_context);
+        llama_model_free(baseline_model);
+        return valid ? 0 : 49;
+    }
 
     if (args.cancel_on_storage) {
         if (args.mode != "cold" || model->expert_storage() == nullptr) return 27;
@@ -350,6 +610,7 @@ int run_live(int argc, char ** argv) {
               << "\tio_direct_capability_retries=" << async_diagnostics.direct_capability_retries
               << "\tio_active_requests=" << async_diagnostics.active_read_requests
               << "\tio_active_operations=" << async_diagnostics.active_operations
+              << "\tio_trace_dropped=" << async_diagnostics.trace_records_dropped
               << "\tscheduler_flights=" << scheduler_diagnostics.flights_created
               << "\tscheduler_active=" << scheduler_diagnostics.active_requests
               << "\tsource_pageable=" << diagnostics.source_pageable
@@ -412,7 +673,18 @@ int run_live(int argc, char ** argv) {
               << "\tdisk_h2d_overlap_read_bytes=" << diagnostics.disk_h2d_overlap_read_bytes
               << "\tdisk_h2d_overlap_flights=" << diagnostics.disk_h2d_overlap_flights
               << "\tdisk_h2d_overlap_events=" << diagnostics.disk_h2d_overlap_events
+              << "\tdisk_h2d_overlap_read_flights=" << diagnostics.disk_h2d_overlap_read_flights
+              << "\tdisk_h2d_overlap_transfer_flights=" << diagnostics.disk_h2d_overlap_transfer_flights
+              << "\tdisk_h2d_overlap_pairs=" << diagnostics.disk_h2d_overlap_pairs
+              << "\tdisk_h2d_overlap_pair_digest=" << diagnostics.disk_h2d_overlap_pair_digest
+              << "\texecution_ids_cpu=" << placement.cpu
+              << "\texecution_ids_non_cpu=" << placement.non_cpu
+              << "\texecution_backend_device_type=" << diagnostics.last_execution_backend_device_type
               << '\n';
+    const bool valid_placement = args.mode == "disabled" ?
+        placement.cpu == 0 && placement.non_cpu == 0 :
+        placement.cpu > 0 && placement.non_cpu == 0 &&
+            diagnostics.last_execution_backend_device_type == GGML_BACKEND_DEVICE_TYPE_GPU;
     bool valid_overlap = true;
     if (args.require_overlap) {
         valid_overlap = args.mode == "cold" && diagnostics.ring_event_capable &&
@@ -425,7 +697,8 @@ int run_live(int argc, char ** argv) {
             diagnostics.ring_event_capacity == diagnostics.ring_effective_lanes*2 &&
             diagnostics.ring_compute_event_records == 0 &&
             diagnostics.ring_live_h2d_events == 0 && diagnostics.ring_live_compute_events == 0 &&
-            diagnostics.ring_live_events == 0 && diagnostics.ring_trace_records_dropped == 0;
+            diagnostics.ring_live_events == 0 && diagnostics.ring_trace_records_dropped == 0 &&
+            async_diagnostics.trace_records_dropped == 0;
     }
     llama_free(context);
     llama_model_free(model);
@@ -435,6 +708,7 @@ int run_live(int argc, char ** argv) {
         valid_overlap = device != nullptr && backend && controlled_native_overlap(device, backend.get());
     }
     if (!valid_overlap) return 34;
+    if (!valid_placement) return 35;
     return 0;
 }
 
@@ -511,6 +785,7 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     llm_cold_reference cold_second;
     if (!cold.find_or_admit({ 0, 1 }, source.bundle(), cold_second).is_ready()) return fail(2);
     const llm_expert_flight_id controlled_flight = { 1, 0, 1, { 0, 0 } };
+    const llm_expert_flight_id read_flight = { 1, 0, 1, { 0, 1 } };
     llm_expert_transfer_ring ring({ 128ULL << 20, 1, device, false, false, false, 0, 64, 0, true });
     if (!ring.initialize(source.bundle()).is_ready()) return fail(3);
     llm_transfer_lane_reference lane;
@@ -560,9 +835,9 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     io_config.delay_cq_drain_ms_for_testing = 10;
     llm_expert_async_transport transport(io_config);
     const llm_expert_async_operation_identity identity = {
-        controlled_flight.transport_epoch,
-        { controlled_flight.request_slot, controlled_flight.request_generation },
-        0, controlled_flight.key, llm_expert_readiness::host_ready,
+        read_flight.transport_epoch,
+        { read_flight.request_slot, read_flight.request_generation },
+        0, read_flight.key, llm_expert_readiness::host_ready,
         llm_expert_priority::demand_current_layer,
     };
     ggml_init_params compute_params = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), nullptr, true };
@@ -611,11 +886,83 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     const auto reads = transport.completed_read_intervals();
     const auto transfers = ring.completed_intervals();
     const auto diagnostics = ring.diagnostics();
+    const auto io_diagnostics = transport.diagnostics();
     std::vector<std::pair<uint64_t, uint64_t>> read_ranges;
     std::vector<std::pair<uint64_t, uint64_t>> transfer_ranges;
-    for (const auto & interval : reads) read_ranges.emplace_back(interval.submit_us, interval.complete_us);
-    for (const auto & transfer : transfers) {
-        transfer_ranges.emplace_back(transfer.h2d_enqueue_us, transfer.h2d_complete_us);
+    std::vector<bool> transfer_participates(transfers.size(), false);
+    uint64_t overlap_read_bytes = 0;
+    uint64_t overlap_transfer_bytes = 0;
+    uint64_t overlap_pairs = 0;
+    uint64_t overlap_pair_digest = 0;
+    for (const auto & interval : reads) {
+        bool participates = false;
+        for (size_t transfer_index = 0; transfer_index < transfers.size(); ++transfer_index) {
+            const auto & transfer = transfers[transfer_index];
+            if (!interval.flight.valid() || !transfer.flight.valid() ||
+                same_flight(interval.flight, transfer.flight)) continue;
+            const uint64_t begin = std::max(interval.submit_us, transfer.h2d_enqueue_us);
+            const uint64_t end = std::min(interval.complete_us, transfer.h2d_complete_us);
+            if (end <= begin) continue;
+            participates = true;
+            transfer_participates[transfer_index] = true;
+            overlap_pairs++;
+            const uint64_t pair_hash = overlap_pair_hash(interval, transfer);
+            overlap_pair_digest ^=
+                pair_hash + 0x9e3779b97f4a7c15ULL + (pair_hash << 6) + (pair_hash >> 2);
+            std::cout << "PHASE7_OVERLAP_PAIR"
+                      << "\tread_epoch=" << interval.flight.transport_epoch
+                      << "\tread_slot=" << interval.flight.request_slot
+                      << "\tread_generation=" << interval.flight.request_generation
+                      << "\tread_layer=" << interval.flight.key.layer
+                      << "\tread_expert=" << interval.flight.key.expert
+                      << "\tread_operation=" << interval.operation_index
+                      << "\ttransfer_epoch=" << transfer.flight.transport_epoch
+                      << "\ttransfer_slot=" << transfer.flight.request_slot
+                      << "\ttransfer_generation=" << transfer.flight.request_generation
+                      << "\ttransfer_layer=" << transfer.flight.key.layer
+                      << "\ttransfer_expert=" << transfer.flight.key.expert
+                      << "\tlane_generation=" << transfer.lane.generation
+                      << "\thot_generation=" << transfer.hot_generation
+                      << "\toverlap_us=" << end - begin
+                      << "\tpair_hash=" << pair_hash
+                      << '\n';
+        }
+        if (participates) {
+            read_ranges.emplace_back(interval.submit_us, interval.complete_us);
+            overlap_read_bytes += interval.bytes;
+        }
+        std::cout << "PHASE7_READ_INTERVAL"
+                  << "\tepoch=" << interval.flight.transport_epoch
+                  << "\tslot=" << interval.flight.request_slot
+                  << "\tgeneration=" << interval.flight.request_generation
+                  << "\tlayer=" << interval.flight.key.layer
+                  << "\texpert=" << interval.flight.key.expert
+                  << "\toperation=" << interval.operation_index
+                  << "\tsubmit_us=" << interval.submit_us
+                  << "\tcomplete_us=" << interval.complete_us
+                  << "\tbytes=" << interval.bytes
+                  << '\n';
+    }
+    for (size_t transfer_index = 0; transfer_index < transfers.size(); ++transfer_index) {
+        const auto & transfer = transfers[transfer_index];
+        if (transfer_participates[transfer_index]) {
+            transfer_ranges.emplace_back(transfer.h2d_enqueue_us, transfer.h2d_complete_us);
+            overlap_transfer_bytes += transfer.bytes;
+        }
+        std::cout << "PHASE7_H2D_INTERVAL"
+                  << "\tepoch=" << transfer.flight.transport_epoch
+                  << "\tslot=" << transfer.flight.request_slot
+                  << "\tgeneration=" << transfer.flight.request_generation
+                  << "\tlayer=" << transfer.flight.key.layer
+                  << "\texpert=" << transfer.flight.key.expert
+                  << "\tlane=" << transfer.lane.lane
+                  << "\tlane_generation=" << transfer.lane.generation
+                  << "\thot_slot=" << transfer.hot_slot
+                  << "\thot_generation=" << transfer.hot_generation
+                  << "\tenqueue_us=" << transfer.h2d_enqueue_us
+                  << "\tcomplete_us=" << transfer.h2d_complete_us
+                  << "\tbytes=" << transfer.bytes
+                  << '\n';
     }
     const auto merge_ranges = [](std::vector<std::pair<uint64_t, uint64_t>> ranges) {
         std::sort(ranges.begin(), ranges.end());
@@ -661,18 +1008,26 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
         diagnostics.peak_live_h2d_events == 1 && diagnostics.peak_live_compute_events == 1 &&
         diagnostics.wave_synchronizations == 0 && diagnostics.live_h2d_events == 0 &&
         diagnostics.live_compute_events == 0 && diagnostics.live_events == 0 &&
-        diagnostics.trace_records_dropped == 0 &&
-        disk_h2d_overlap_us > 0 && reuse_was_blocked && unload_drained &&
+        diagnostics.trace_records_dropped == 0 && io_diagnostics.trace_records_dropped == 0 &&
+        disk_h2d_overlap_us > 0 && overlap_pairs > 0 && overlap_pair_digest != 0 &&
+        overlap_read_bytes > 0 && overlap_transfer_bytes > 0 &&
+        reuse_was_blocked && unload_drained &&
         reads.size() == 2 && reads[0].operation_index != reads[1].operation_index &&
         transfers.size() == 1 && reads[0].flight.valid() && reads[1].flight.valid() &&
         transfers[0].flight.valid() &&
-        reads[0].flight.transport_epoch == transfers[0].flight.transport_epoch &&
-        reads[0].flight.request_slot == transfers[0].flight.request_slot &&
-        reads[0].flight.request_generation == transfers[0].flight.request_generation &&
-        reads[1].flight.request_generation == transfers[0].flight.request_generation &&
+        !same_flight(reads[0].flight, transfers[0].flight) &&
+        !same_flight(reads[1].flight, transfers[0].flight) &&
+        same_flight(reads[0].flight, reads[1].flight) &&
         slot_matches(source, hot, 0, 0);
     std::cout << "PHASE7_CONTROLLED_OVERLAP"
               << "\tdisk_h2d_overlap_us=" << disk_h2d_overlap_us
+              << "\tdisk_h2d_overlap_read_flights=1"
+              << "\tdisk_h2d_overlap_transfer_flights=1"
+              << "\tdisk_h2d_overlap_flights=2"
+              << "\tdisk_h2d_overlap_pairs=" << overlap_pairs
+              << "\tdisk_h2d_overlap_pair_digest=" << overlap_pair_digest
+              << "\tdisk_h2d_overlap_read_bytes=" << overlap_read_bytes
+              << "\tdisk_h2d_overlap_bytes=" << overlap_transfer_bytes
               << "\th2d_compute_overlap_us=" << diagnostics.h2d_compute_overlap_us
               << "\th2d_compute_overlap_bytes=" << diagnostics.h2d_compute_overlap_bytes
               << "\th2d_compute_overlap_work=" << diagnostics.h2d_compute_overlap_work
@@ -684,6 +1039,8 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
               << "\tunload_drained=" << unload_drained
               << "\tread_intervals=" << reads.size()
               << "\ttransfer_intervals=" << transfers.size()
+              << "\tread_trace_dropped=" << io_diagnostics.trace_records_dropped
+              << "\th2d_trace_dropped=" << diagnostics.trace_records_dropped
               << "\tread_submit_us=" << (reads.empty() ? 0 : reads[0].submit_us)
               << "\tread_complete_us=" << (reads.empty() ? 0 : reads[0].complete_us)
               << "\th2d_enqueue_us=" << (transfers.empty() ? 0 : transfers[0].h2d_enqueue_us)

@@ -25,12 +25,18 @@ bool is_submitted(llm_expert_request_state state) {
 }
 
 bool valid_transition(llm_expert_request_state current, llm_expert_request_state next) {
-    if (next == llm_expert_request_state::cancelling || next == llm_expert_request_state::draining) {
+    if (next == llm_expert_request_state::cancelling) {
         return current >= llm_expert_request_state::queued && current <= llm_expert_request_state::h2d_in_flight;
+    }
+    if (next == llm_expert_request_state::draining) {
+        return (current >= llm_expert_request_state::queued &&
+                current <= llm_expert_request_state::h2d_in_flight) ||
+            current == llm_expert_request_state::cancelling;
     }
     switch (current) {
         case llm_expert_request_state::submitting:
-            return next == llm_expert_request_state::io_in_flight;
+            return next == llm_expert_request_state::io_in_flight ||
+                next == llm_expert_request_state::host_ready;
         case llm_expert_request_state::io_in_flight:
             return next == llm_expert_request_state::host_ready;
         case llm_expert_request_state::host_ready:

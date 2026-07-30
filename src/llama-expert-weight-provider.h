@@ -301,6 +301,29 @@ struct llm_hot_cache_diagnostics {
     uint64_t disk_h2d_overlap_read_bytes = 0;
     uint64_t disk_h2d_overlap_flights = 0;
     uint64_t disk_h2d_overlap_events = 0;
+    uint64_t disk_h2d_overlap_read_flights = 0;
+    uint64_t disk_h2d_overlap_transfer_flights = 0;
+    uint64_t disk_h2d_overlap_pairs = 0;
+    uint64_t disk_h2d_overlap_pair_digest = 0;
+    uint64_t post_h2d_cancellations = 0;
+    llm_expert_flight_id last_cancelled_flight;
+    uint32_t last_cancelled_lane = UINT32_MAX;
+    uint64_t last_cancelled_lane_generation = 0;
+    uint32_t last_cancelled_hot_slot = UINT32_MAX;
+    uint64_t last_cancelled_hot_generation = 0;
+    llm_expert_flight_id last_completed_flight;
+    uint32_t last_completed_lane = UINT32_MAX;
+    uint64_t last_completed_lane_generation = 0;
+    uint32_t last_completed_hot_slot = UINT32_MAX;
+    uint64_t last_completed_hot_generation = 0;
+    llm_expert_flight_id retry_after_cancel_flight;
+    uint32_t retry_after_cancel_lane = UINT32_MAX;
+    uint64_t retry_after_cancel_lane_generation = 0;
+    uint32_t retry_after_cancel_hot_slot = UINT32_MAX;
+    uint64_t retry_after_cancel_hot_generation = 0;
+    int32_t last_execution_backend_device_type = -1;
+    llm_expert_provider_error last_failure_error = llm_expert_provider_error::none;
+    llm_expert_provider_error last_remap_error = llm_expert_provider_error::none;
     uint64_t ring_h2d_bytes = 0;
     uint64_t ring_h2d_time_us = 0;
     uint64_t ring_failed_cleanup = 0;
@@ -451,6 +474,37 @@ public:
         (void) key;
         bytes.clear();
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual llm_expert_provider_result debug_copy_hot_bundle(
+            llm_expert_key key,
+            std::vector<uint8_t> & bytes) const noexcept {
+        (void) key;
+        bytes.clear();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    // Internal focused-test seams. Production execution never calls these.
+    virtual llm_expert_provider_result set_h2d_gate_event_for_testing(
+            ggml_backend_event_t event) noexcept {
+        (void) event;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual bool debug_hot_mapping(
+            llm_expert_key key,
+            uint64_t * generation = nullptr,
+            uint32_t * slot = nullptr) const noexcept {
+        (void) key;
+        if (generation) *generation = 0;
+        if (slot) *slot = UINT32_MAX;
+        return false;
+    }
+    virtual bool debug_cold_ready(
+            llm_expert_key key,
+            uint64_t * generation = nullptr,
+            uint32_t * slot = nullptr) const noexcept {
+        (void) key;
+        if (generation) *generation = 0;
+        if (slot) *slot = UINT32_MAX;
+        return false;
     }
 
 protected:

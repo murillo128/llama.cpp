@@ -114,6 +114,9 @@ struct llama_context {
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+    // Internal focused-test seam; unlike set_abort_callback, this is not installed on graph backends.
+    void set_expert_abort_callback_for_testing(
+        bool (*abort_callback)(void * data), void * abort_callback_data);
 
     int32_t set_route_observer(llama_route_observer_callback callback, void * user_data);
     int32_t route_observer_begin(uint64_t request_ordinal, llama_route_phase phase);
@@ -371,6 +374,8 @@ private:
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
+    ggml_abort_callback expert_abort_callback_for_testing = nullptr;
+    void *              expert_abort_callback_data_for_testing = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 
