@@ -561,6 +561,9 @@ struct hot_slot_entry {
     uint64_t generation = 0;
     uint64_t last_use = 0;
     uint32_t refcount = 0;
+    uint32_t cold_slot = 0;
+    uint64_t cold_generation = 0;
+    bool has_cold_backing = false;
     hot_slot_state state = hot_slot_state::free;
 };
 
@@ -1394,6 +1397,9 @@ public:
                 entry.generation,
                 entry.last_use,
                 entry.refcount,
+                entry.cold_slot,
+                entry.cold_generation,
+                entry.has_cold_backing,
                 entry.state,
             });
         }

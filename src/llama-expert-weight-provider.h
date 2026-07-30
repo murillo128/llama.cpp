@@ -181,6 +181,9 @@ struct llm_hot_cache_diagnostics {
         uint64_t generation = 0;
         uint64_t last_use = 0;
         uint32_t refcount = 0;
+        uint32_t cold_slot = 0;
+        uint64_t cold_generation = 0;
+        bool has_cold_backing = false;
         enum state_type {
             free,
             reserved,

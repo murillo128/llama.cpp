@@ -273,6 +273,9 @@ target_include_directories(test-expert-weight-provider PRIVATE ${PROJECT_SOURCE_
 
 llama_build_and_test(test-hot-expert-cache.cpp LABEL "model")
 target_include_directories(test-hot-expert-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-cold-expert-cache.cpp LABEL "model")
+target_include_directories(test-cold-expert-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build(phase4-hot-cache-probe.cpp)
 target_include_directories(phase4-hot-cache-probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

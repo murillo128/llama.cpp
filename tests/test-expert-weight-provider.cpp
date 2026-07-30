@@ -111,6 +111,8 @@ void test_default_and_model_ownership() {
     auto params = llama_model_default_params();
     GGML_ASSERT(params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_DISABLED);
     GGML_ASSERT(params.expert_hot_cache_capacity == 0);
+    GGML_ASSERT(params.expert_cold_cache_bytes == 0);
+    GGML_ASSERT(params.expert_transfer_ring_bytes == 0);
 
     llama_model * model = llama_model_create(LLM_ARCH_KIMI_K3, params);
     GGML_ASSERT(model != nullptr);
@@ -127,6 +129,16 @@ void test_default_and_model_ownership() {
     GGML_ASSERT(stats.synchronizations == 0);
     delete model;
 
+    params.expert_cold_cache_bytes = 4096;
+    bool invalid = false;
+    try {
+        model = llama_model_create(LLM_ARCH_KIMI_K3, params);
+    } catch (const std::invalid_argument &) {
+        invalid = true;
+    }
+    GGML_ASSERT(invalid);
+    params.expert_cold_cache_bytes = 0;
+
     params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT;
     model = llama_model_create(LLM_ARCH_KIMI_K3, params);
     model->init_expert_weight_provider();
@@ -135,7 +147,7 @@ void test_default_and_model_ownership() {
     delete model;
 
     params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COUNT;
-    bool invalid = false;
+    invalid = false;
     try {
         model = llama_model_create(LLM_ARCH_KIMI_K3, params);
     } catch (const std::invalid_argument &) {

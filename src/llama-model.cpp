@@ -1075,8 +1075,15 @@ struct llama_model::impl {
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_DISABLED &&
         params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT &&
-        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE) {
+        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE &&
+        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
         throw std::invalid_argument("invalid expert weights mode");
+    }
+    const bool cold_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+    if ((!cold_mode && (params.expert_cold_cache_bytes != 0 || params.expert_transfer_ring_bytes != 0)) ||
+        (cold_mode && (params.expert_hot_cache_capacity == 0 || params.expert_cold_cache_bytes == 0 ||
+                       params.expert_transfer_ring_bytes == 0))) {
+        throw std::invalid_argument("invalid cold-cache byte budgets");
     }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1123,6 +1130,10 @@ void llama_model::init_expert_weight_provider() {
             });
             return;
         }
+        case LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE:
+            // Phase 1 establishes the byte-budgeted CPU mechanism. Live provider
+            // construction is enabled only after the bounded transfer ring exists.
+            throw std::invalid_argument("cold-cache live integration is not initialized");
         case LLAMA_EXPERT_WEIGHTS_MODE_COUNT:
             break;
     }
@@ -2563,6 +2574,8 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
         /*.expert_weights_mode         =*/ LLAMA_EXPERT_WEIGHTS_MODE_DISABLED,
         /*.expert_hot_cache_capacity   =*/ 0,
+        /*.expert_cold_cache_bytes     =*/ 0,
+        /*.expert_transfer_ring_bytes  =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
