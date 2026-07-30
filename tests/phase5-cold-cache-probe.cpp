@@ -49,6 +49,7 @@ struct live_arguments {
     uint64_t ring_bytes = 0;
     int steps = 5;
     llama_load_mode load_mode = LLAMA_LOAD_MODE_MMAP;
+    bool cancel_on_storage = false;
 };
 
 bool parse_u64(const char * text, uint64_t & result) {
@@ -61,6 +62,10 @@ bool parse_u64(const char * text, uint64_t & result) {
 
 bool parse_live(int argc, char ** argv, live_arguments & result) {
     for (int index = 1; index < argc; ++index) {
+        if (std::string(argv[index]) == "--cancel-on-storage") {
+            result.cancel_on_storage = true;
+            continue;
+        }
         if (index + 1 >= argc) return false;
         const std::string option = argv[index];
         const char * value = argv[++index];
@@ -83,6 +88,15 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
     return !result.model.empty() && (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold") &&
         (result.mode == "disabled" || result.capacity > 0) &&
         (result.mode != "cold" || (result.cold_bytes > 0 && result.ring_bytes > 0));
+}
+
+struct storage_cancel_state {
+    const llm_expert_storage * storage = nullptr;
+};
+
+bool cancel_after_first_storage_read(void * user_data) {
+    const auto * state = static_cast<const storage_cancel_state *>(user_data);
+    return state && state->storage && state->storage->diagnostics().read_bytes > 0;
 }
 
 int run_live(int argc, char ** argv) {
@@ -112,6 +126,50 @@ int run_live(int argc, char ** argv) {
     context_params.n_ubatch = 1;
     llama_context * context = llama_init_from_model(model, context_params);
     if (!context) return 22;
+
+    if (args.cancel_on_storage) {
+        if (args.mode != "cold" || model->expert_storage() == nullptr) return 27;
+        storage_cancel_state cancel_state = { model->expert_storage() };
+        llama_set_abort_callback(context, cancel_after_first_storage_read, &cancel_state);
+        llama_token token = 1;
+        const int cancelled = llama_decode(context, llama_batch_get_one(&token, 1));
+        llama_synchronize(context);
+        const auto cancelled_cache = model->expert_weight_provider()->hot_cache_diagnostics();
+        const auto cancelled_storage = model->expert_storage()->diagnostics();
+        llama_set_abort_callback(context, nullptr, nullptr);
+        const int retry = llama_decode(context, llama_batch_get_one(&token, 1));
+        llama_synchronize(context);
+        const auto retry_cache = model->expert_weight_provider()->hot_cache_diagnostics();
+        const auto retry_storage = model->expert_storage()->diagnostics();
+        std::cout << "PHASE6_CANCEL"
+                  << "\tcancelled_status=" << cancelled
+                  << "\tcancelled_storage_reads=" << cancelled_storage.read_requests
+                  << "\tcancelled_storage_bytes=" << cancelled_storage.read_bytes
+                  << "\tcancelled_storage_cancellations=" << cancelled_storage.cancelled_reads
+                  << "\tcancelled_hot_admissions=" << cancelled_cache.admissions
+                  << "\tcancelled_cold_admissions=" << cancelled_cache.cold_admissions
+                  << "\tcancelled_hot_refs=" << cancelled_cache.cold_current_hot_refs
+                  << "\tcancelled_transfer_refs=" << cancelled_cache.cold_current_transfer_refs
+                  << "\tcancelled_request_refs=" << cancelled_cache.cold_current_request_refs
+                  << "\tcancelled_failed_cleanups=" << cancelled_cache.failed_cleanups
+                  << "\tcancelled_cold_failed_cleanups=" << cancelled_cache.cold_failed_cleanups
+                  << "\tretry_status=" << retry
+                  << "\tretry_storage_reads=" << retry_storage.read_requests
+                  << "\tretry_hot_admissions=" << retry_cache.admissions
+                  << "\tretry_cold_admissions=" << retry_cache.cold_admissions
+                  << '\n';
+        const bool valid = cancelled == 2 && cancelled_storage.read_requests == 1 &&
+            cancelled_storage.read_bytes > 0 && cancelled_storage.cancelled_reads == 1 &&
+            cancelled_cache.admissions == 0 && cancelled_cache.cold_admissions == 0 &&
+            cancelled_cache.cold_current_hot_refs == 0 && cancelled_cache.cold_current_transfer_refs == 0 &&
+            cancelled_cache.cold_current_request_refs == 0 && cancelled_cache.failed_cleanups > 0 &&
+            cancelled_cache.cold_failed_cleanups > 0 && retry == 0 &&
+            retry_storage.read_requests > cancelled_storage.read_requests && retry_cache.admissions > 0 &&
+            retry_cache.cold_admissions > 0;
+        llama_free(context);
+        llama_model_free(model);
+        return valid ? 0 : 28;
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const std::string prompt_text = "According to all known laws";
     const int prompt_count = -llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), nullptr, 0, true, true);

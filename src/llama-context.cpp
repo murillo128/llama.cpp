@@ -1818,8 +1818,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!cleanup_result.is_ready()) {
             LLAMA_LOG_ERROR("%s: expert cache failure cleanup failed\n", __func__);
         }
-        ret = expert_eval_result.status == llm_expert_provider_status::allocation_failed ?
-            GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
+        ret = expert_eval_result.status == llm_expert_provider_status::cancelled ? GGML_STATUS_ABORTED :
+            expert_eval_result.status == llm_expert_provider_status::allocation_failed ?
+                GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
         return nullptr;
     }
     if (status != GGML_STATUS_SUCCESS) {
