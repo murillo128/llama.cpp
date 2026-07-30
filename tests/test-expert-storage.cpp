@@ -139,6 +139,23 @@ void test_configuration_directory_and_real_reads() {
     GGML_ASSERT(std::memcmp(destination.data() + 11, first.bytes.data() + 124, 4) == 0);
     GGML_ASSERT(storage.diagnostics().read_chunks == 5);
     GGML_ASSERT(storage.diagnostics().read_bytes == 15);
+
+    std::array<uint8_t, 5> up{};
+    std::array<uint8_t, 6> gate{};
+    std::array<uint8_t, 4> down{};
+    const std::array<llm_expert_storage_destination, 3> scattered = {{
+        { llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight, up.data(), up.size() },
+        { llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight, gate.data(), gate.size() },
+        { llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight, down.data(), down.size() },
+    }};
+    GGML_ASSERT(storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size()).is_ready());
+    GGML_ASSERT(std::memcmp(up.data(), first.bytes.data() + 3, up.size()) == 0);
+    GGML_ASSERT(std::memcmp(gate.data(), second.bytes.data() + 7, gate.size()) == 0);
+    GGML_ASSERT(std::memcmp(down.data(), first.bytes.data() + 124, down.size()) == 0);
+    auto malformed_destination = scattered;
+    malformed_destination[1].extent--;
+    GGML_ASSERT(storage.read_bundle({ 0, 0 }, malformed_destination.data(), malformed_destination.size()).error ==
+        llm_expert_storage_error::invalid_destination);
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, destination.data(), 14).error ==
         llm_expert_storage_error::invalid_destination);
 }
@@ -199,9 +216,20 @@ void test_retry_short_error_cancel_and_poison() {
     abort_counter abort{ 0, 3 };
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, destination.data(), destination.size(), abort_after, &abort).error ==
         llm_expert_storage_error::cancelled);
+    std::array<uint8_t, 5> up{};
+    std::array<uint8_t, 6> gate{};
+    std::array<uint8_t, 4> down{};
+    const std::array<llm_expert_storage_destination, 3> scattered = {{
+        { llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight, up.data(), up.size() },
+        { llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight, gate.data(), gate.size() },
+        { llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight, down.data(), down.size() },
+    }};
+    abort = { 0, 2 };
+    GGML_ASSERT(storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size(), abort_after, &abort).error ==
+        llm_expert_storage_error::cancelled);
     const auto diagnostics = storage.diagnostics();
     GGML_ASSERT(diagnostics.short_reads == 1 && diagnostics.io_errors == 1);
-    GGML_ASSERT(diagnostics.cancelled_reads == 1 && diagnostics.first_native_error == EIO);
+    GGML_ASSERT(diagnostics.cancelled_reads == 2 && diagnostics.first_native_error == EIO);
 
     storage.poison();
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, destination.data(), destination.size()).error ==

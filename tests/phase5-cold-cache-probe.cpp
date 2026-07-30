@@ -1,4 +1,5 @@
 #include "llama-expert-transfer-ring.h"
+#include "llama-expert-storage.h"
 #include "llama-context.h"
 #include "llama-model.h"
 #include "llama.h"
@@ -142,6 +143,8 @@ int run_live(int argc, char ** argv) {
     llama_synchronize(context);
     const auto diagnostics = model->expert_weight_provider() ?
         model->expert_weight_provider()->hot_cache_diagnostics() : llm_hot_cache_diagnostics {};
+    const auto storage_diagnostics = model->expert_storage() ?
+        model->expert_storage()->diagnostics() : llm_expert_storage_diagnostics {};
     std::ostringstream tokens;
     for (size_t index = 0; index < generated.size(); ++index) {
         if (index) tokens << ',';
@@ -193,6 +196,13 @@ int run_live(int argc, char ** argv) {
               << "\tcold_failed_copies=" << diagnostics.cold_failed_copies
               << "\tcold_failed_cleanups=" << diagnostics.cold_failed_cleanups
               << "\tcold_generation_changes=" << diagnostics.cold_generation_changes
+              << "\tstorage_read_requests=" << storage_diagnostics.read_requests
+              << "\tstorage_read_chunks=" << storage_diagnostics.read_chunks
+              << "\tstorage_read_bytes=" << storage_diagnostics.read_bytes
+              << "\tstorage_cancelled_reads=" << storage_diagnostics.cancelled_reads
+              << "\tstorage_short_reads=" << storage_diagnostics.short_reads
+              << "\tstorage_io_errors=" << storage_diagnostics.io_errors
+              << "\tstorage_poisoned=" << storage_diagnostics.poisoned
               << "\tsource_pageable=" << diagnostics.source_pageable
               << "\tsource_pinned_bytes=" << diagnostics.source_pinned_bytes
               << "\tno_writeback_evictions=" << diagnostics.no_writeback_evictions

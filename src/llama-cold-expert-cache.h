@@ -41,6 +41,12 @@ struct llm_cold_cache_config {
     uint64_t initial_slot_generation_for_testing = 0;
 };
 
+using llm_cold_cache_loader = llm_expert_provider_result (*)(
+        void * user_data,
+        llm_expert_key key,
+        const llm_expert_bundle_descriptor & destination,
+        uint32_t slot) noexcept;
+
 struct llm_cold_cache_diagnostics {
     uint64_t requested_bytes = 0;
     uint64_t actual_bytes = 0;
@@ -97,6 +103,11 @@ public:
             const llm_expert_bundle_descriptor & source,
             llm_cold_reference & reference,
             size_t fail_copy_after_tensors = SIZE_MAX) noexcept;
+    llm_expert_provider_result find_or_admit_with_loader(
+            llm_expert_key key,
+            llm_cold_reference & reference,
+            llm_cold_cache_loader loader,
+            void * loader_data) noexcept;
     llm_expert_provider_result acquire(
             llm_cold_reference reference,
             llm_cold_reference_kind kind) noexcept;

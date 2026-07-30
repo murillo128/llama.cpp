@@ -192,6 +192,60 @@ void test_generation_wrap_and_reinitialize() {
     GGML_ASSERT(cache.validate_invariants().is_ready());
 }
 
+struct loader_state {
+    size_t calls = 0;
+    llm_expert_provider_error failure = llm_expert_provider_error::none;
+};
+
+llm_expert_provider_result fill_slot(void * user_data, llm_expert_key key,
+        const llm_expert_bundle_descriptor & destination, uint32_t slot) noexcept {
+    auto & state = *static_cast<loader_state *>(user_data);
+    state.calls++;
+    if (state.failure != llm_expert_provider_error::none) {
+        return llm_expert_provider_result::failure(state.failure);
+    }
+    uint8_t pattern = uint8_t(0x40 + key.expert);
+    for (auto * tensor : { destination.up.weight, destination.up.bias, destination.up.scale,
+            destination.gate.weight, destination.down.weight }) {
+        const int axis = tensor->ne[2] == destination.n_expert ? 2 : 1;
+        std::memset(static_cast<uint8_t *>(tensor->data) + size_t(slot)*tensor->nb[axis],
+            pattern++, tensor->nb[axis]);
+    }
+    return llm_expert_provider_result::success();
+}
+
+void test_loader_publication_failure_cleanup_and_reread() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 1), 1));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    loader_state state;
+    llm_cold_reference first;
+    GGML_ASSERT(cache.find_or_admit_with_loader({ 0, 0 }, first, fill_slot, &state).is_ready());
+    GGML_ASSERT(state.calls == 1);
+    llm_cold_reference hit;
+    GGML_ASSERT(cache.find_or_admit_with_loader({ 0, 0 }, hit, fill_slot, &state).is_ready());
+    GGML_ASSERT(state.calls == 1 && hit.slot == first.slot && hit.generation == first.generation);
+
+    state.failure = llm_expert_provider_error::cancelled;
+    llm_cold_reference cancelled;
+    GGML_ASSERT(cache.find_or_admit_with_loader({ 0, 1 }, cancelled, fill_slot, &state).error ==
+        llm_expert_provider_error::cancelled);
+    auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.slots[cancelled.slot].state == llm_cold_slot_state::failed);
+    GGML_ASSERT(diagnostics.admissions == 1 && diagnostics.source_copy_bundles == 0);
+    GGML_ASSERT(cache.cleanup_failed_slots().is_ready());
+
+    state.failure = llm_expert_provider_error::none;
+    llm_cold_reference retried;
+    GGML_ASSERT(cache.find_or_admit_with_loader({ 0, 1 }, retried, fill_slot, &state).is_ready());
+    GGML_ASSERT(retried.generation > cancelled.generation);
+    llm_cold_reference reread;
+    GGML_ASSERT(cache.find_or_admit_with_loader({ 0, 0 }, reread, fill_slot, &state).is_ready());
+    GGML_ASSERT(state.calls == 4 && reread.generation > first.generation);
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.evictions >= 2 && diagnostics.source_copy_bytes == 0);
+}
+
 } // namespace
 
 int main() {
@@ -199,6 +253,7 @@ int main() {
     test_publication_hits_and_copy_failure();
     test_lru_references_and_inclusion();
     test_generation_wrap_and_reinitialize();
+    test_loader_publication_failure_cleanup_and_reread();
     std::cout << "cold expert cache tests passed\n";
     return 0;
 }

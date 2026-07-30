@@ -1675,7 +1675,7 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
             return false;
         }
         ctx->expert_eval_result = ctx->expert_weight_provider->remap_checkpoint_tensor(
-            *checkpoint, execution_backend);
+            *checkpoint, execution_backend, ctx->abort_callback, ctx->abort_callback_data);
         if (!ctx->expert_eval_result.is_ready()) {
             return false;
         }
@@ -1814,6 +1814,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_synchronize(sched.get());
         expert_plans->pending.reset();
         expert_plans->inflight.reset();
+        const auto cleanup_result = expert_weight_provider->cleanup_failed_slots();
+        if (!cleanup_result.is_ready()) {
+            LLAMA_LOG_ERROR("%s: expert cache failure cleanup failed\n", __func__);
+        }
         ret = expert_eval_result.status == llm_expert_provider_status::allocation_failed ?
             GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
         return nullptr;
@@ -1824,6 +1828,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
             expert_plans->pending.reset();
             expert_plans->inflight.reset();
+            const auto cleanup_result = expert_weight_provider->cleanup_failed_slots();
+            if (!cleanup_result.is_ready()) {
+                LLAMA_LOG_ERROR("%s: expert cache failure cleanup failed\n", __func__);
+            }
         }
         ret = status;
         return nullptr;

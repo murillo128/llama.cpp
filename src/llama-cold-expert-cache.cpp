@@ -286,7 +286,7 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
     if (pimpl->arena) {
         return llm_expert_provider_result::success();
     }
-    if (!prototype.validate().is_ready() || !bundle_is_host_accessible(prototype)) {
+    if (!prototype.validate().is_ready()) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
     }
     try {
@@ -341,6 +341,81 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
         pimpl->slots.clear();
         return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
     }
+}
+
+llm_expert_provider_result llm_cold_expert_cache::find_or_admit_with_loader(
+        llm_expert_key key,
+        llm_cold_reference & reference,
+        llm_cold_cache_loader loader,
+        void * loader_data) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    pimpl->counters.requests++;
+    if (!pimpl->arena || !key.is_valid(LLAMA_MAX_LAYERS, pimpl->n_expert) || loader == nullptr) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+    }
+    auto & forward = pimpl->directory[pimpl->forward_index(key)];
+    if (forward.slot >= 0) {
+        if (uint32_t(forward.slot) >= pimpl->slots.size()) {
+            pimpl->counters.invariant_failures++;
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        auto & slot = pimpl->slots[forward.slot];
+        if (!key_matches(slot.key, key) || slot.generation != forward.generation ||
+            slot.state != llm_cold_slot_state::ready) {
+            pimpl->counters.invariant_failures++;
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        slot.last_use = ++pimpl->use_clock;
+        reference = { uint32_t(forward.slot), forward.generation };
+        pimpl->counters.hits++;
+        return llm_expert_provider_result::success();
+    }
+    pimpl->counters.misses++;
+    int32_t victim = -1;
+    for (uint32_t index = 0; index < pimpl->slots.size(); ++index) {
+        const auto & slot = pimpl->slots[index];
+        if (slot.state == llm_cold_slot_state::free) {
+            victim = index;
+            break;
+        }
+        if (slot.state == llm_cold_slot_state::ready && pimpl->no_refs(slot) &&
+            (victim < 0 || slot.last_use < pimpl->slots[victim].last_use ||
+             (slot.last_use == pimpl->slots[victim].last_use && index < uint32_t(victim)))) {
+            victim = index;
+        }
+    }
+    if (victim < 0) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+    }
+    auto & slot = pimpl->slots[victim];
+    if (slot.generation == std::numeric_limits<uint64_t>::max()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
+    }
+    if (slot.state == llm_cold_slot_state::ready) {
+        slot.state = llm_cold_slot_state::evicting;
+        pimpl->clear_forward(victim);
+        pimpl->counters.evictions++;
+    }
+    slot.state = llm_cold_slot_state::reserved;
+    slot.key = key;
+    slot.generation++;
+    slot.last_use = 0;
+    slot.hot_refs = slot.transfer_refs = slot.request_refs = 0;
+    pimpl->counters.generation_changes++;
+    slot.state = llm_cold_slot_state::loading;
+    reference = { uint32_t(victim), slot.generation };
+    const auto result = loader(loader_data, key, pimpl->arena->bundle, uint32_t(victim));
+    if (!result.is_ready()) {
+        slot.state = llm_cold_slot_state::failed;
+        pimpl->counters.failed_copies++;
+        return result;
+    }
+    slot.state = llm_cold_slot_state::ready;
+    slot.last_use = ++pimpl->use_clock;
+    pimpl->directory[pimpl->forward_index(key)] = { victim, slot.generation };
+    pimpl->counters.admissions++;
+    reference = { uint32_t(victim), slot.generation };
+    return llm_expert_provider_result::success();
 }
 
 llm_expert_provider_result llm_cold_expert_cache::find_or_admit(

@@ -345,18 +345,26 @@ public:
             const llm_expert_graph_binding & binding,
             const int32_t * logical_ids,
             size_t logical_id_count,
-            int32_t * execution_ids) noexcept {
+            int32_t * execution_ids,
+            bool (*abort_callback)(void *) = nullptr,
+            void * abort_callback_data = nullptr) noexcept {
         (void) binding;
         (void) logical_ids;
         (void) logical_id_count;
         (void) execution_ids;
+        (void) abort_callback;
+        (void) abort_callback_data;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     virtual llm_expert_provider_result remap_checkpoint_tensor(
             const llm_expert_graph_binding & binding,
-            ggml_backend_t execution_backend = nullptr) noexcept {
+            ggml_backend_t execution_backend = nullptr,
+            bool (*abort_callback)(void *) = nullptr,
+            void * abort_callback_data = nullptr) noexcept {
         (void) binding;
         (void) execution_backend;
+        (void) abort_callback;
+        (void) abort_callback_data;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     virtual llm_expert_provider_result cleanup_failed_slots() noexcept {

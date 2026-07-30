@@ -21,6 +21,13 @@ struct llm_expert_storage_span {
     uint64_t destination_extent = 0;
 };
 
+struct llm_expert_storage_destination {
+    llm_expert_storage_projection projection = llm_expert_storage_projection::up;
+    llm_expert_storage_sidecar sidecar = llm_expert_storage_sidecar::weight;
+    void * data = nullptr;
+    uint64_t extent = 0;
+};
+
 struct llm_expert_storage_source {
     uint16_t split_index = 0;
     const llama_file * file = nullptr;
@@ -91,6 +98,9 @@ public:
     llm_expert_storage_result seal() noexcept;
     const std::vector<llm_expert_storage_span> * find(llm_expert_key key) const noexcept;
     llm_expert_storage_result read_bundle(llm_expert_key key, void * destination, uint64_t destination_size,
+            llm_expert_storage_abort abort = nullptr, void * abort_data = nullptr) noexcept;
+    llm_expert_storage_result read_bundle(llm_expert_key key,
+            const llm_expert_storage_destination * destinations, size_t destination_count,
             llm_expert_storage_abort abort = nullptr, void * abort_data = nullptr) noexcept;
     void poison() noexcept;
     llm_expert_storage_diagnostics diagnostics() const noexcept;

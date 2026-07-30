@@ -268,6 +268,99 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key, vo
     return {};
 }
 
+llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
+        const llm_expert_storage_destination * destinations, size_t destination_count,
+        llm_expert_storage_abort abort, void * abort_data) noexcept {
+    if (pimpl->poisoned.load()) {
+        return { llm_expert_storage_error::poisoned, 0 };
+    }
+    if (!pimpl->sealed.load() || !key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer) ||
+        !pimpl->directory[pimpl->index(key)].present) {
+        return { llm_expert_storage_error::invalid_key, 0 };
+    }
+    if (destinations == nullptr || destination_count == 0 || destination_count > 12) {
+        return { llm_expert_storage_error::invalid_destination, 0 };
+    }
+    std::array<bool, 12> seen{};
+    for (size_t index = 0; index < destination_count; ++index) {
+        const size_t identity = identity_index(destinations[index].projection, destinations[index].sidecar);
+        if (identity >= seen.size() || seen[identity] || destinations[index].data == nullptr || destinations[index].extent == 0) {
+            return { llm_expert_storage_error::invalid_destination, 0 };
+        }
+        seen[identity] = true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+        pimpl->counters.read_requests++;
+    }
+    const auto & spans = pimpl->directory[pimpl->index(key)].spans;
+    for (const auto & span : spans) {
+        const llm_expert_storage_destination * destination = nullptr;
+        for (size_t index = 0; index < destination_count; ++index) {
+            if (destinations[index].projection == span.projection && destinations[index].sidecar == span.sidecar) {
+                destination = &destinations[index];
+                break;
+            }
+        }
+        if (destination == nullptr || destination->extent != span.destination_extent) {
+            return { llm_expert_storage_error::invalid_destination, 0 };
+        }
+        if (abort && abort(abort_data)) {
+            std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+            pimpl->counters.cancelled_reads++;
+            return { llm_expert_storage_error::cancelled, 0 };
+        }
+        const impl::source * source = pimpl->find_source(span.split_index);
+        uint64_t completed = 0;
+        while (completed < span.byte_count) {
+            if (abort && abort(abort_data)) {
+                std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+                pimpl->counters.cancelled_reads++;
+                return { llm_expert_storage_error::cancelled, 0 };
+            }
+            const size_t chunk = size_t(std::min<uint64_t>(pimpl->config.maximum_read_chunk, span.byte_count - completed));
+            size_t chunk_completed = 0;
+            while (chunk_completed < chunk) {
+                int native_error = 0;
+                auto * target = static_cast<uint8_t *>(destination->data) + completed + chunk_completed;
+                const size_t remaining = chunk - chunk_completed;
+                const int64_t result = pimpl->read_override ?
+                    pimpl->read_override->read_at(span.split_index, target, remaining,
+                        span.file_offset + completed + chunk_completed, native_error) :
+                    source->handle.read_at(target, remaining, span.file_offset + completed + chunk_completed, native_error);
+                if (result < 0 && native_error == EINTR) {
+                    continue;
+                }
+                if (result < 0) {
+                    std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+                    pimpl->counters.io_errors++;
+                    if (pimpl->counters.first_native_error == 0) pimpl->counters.first_native_error = native_error;
+                    return { llm_expert_storage_error::io_error, native_error };
+                }
+                if (result == 0 || uint64_t(result) > remaining) {
+                    std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+                    pimpl->counters.short_reads++;
+                    return { llm_expert_storage_error::short_read, 0 };
+                }
+                chunk_completed += size_t(result);
+                {
+                    std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+                    pimpl->counters.read_bytes += uint64_t(result);
+                }
+                if (abort && abort(abort_data)) {
+                    std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+                    pimpl->counters.cancelled_reads++;
+                    return { llm_expert_storage_error::cancelled, 0 };
+                }
+            }
+            completed += chunk;
+            std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+            pimpl->counters.read_chunks++;
+        }
+    }
+    return {};
+}
+
 void llm_expert_storage::poison() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
     pimpl->poisoned.store(true);

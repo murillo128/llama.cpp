@@ -1,5 +1,6 @@
 #include "llama-expert-weight-provider.h"
 #include "llama-cold-expert-cache.h"
+#include "llama-expert-storage.h"
 #include "llama-expert-transfer-ring.h"
 #include "llama-hparams.h"
 
@@ -169,6 +170,95 @@ bool projection_is_pageable_cpu(const llm_expert_projection_descriptor & project
         }
     }
     return true;
+}
+
+struct storage_load_context {
+    llm_expert_storage * storage = nullptr;
+    bool (*abort_callback)(void *) = nullptr;
+    void * abort_callback_data = nullptr;
+};
+
+bool append_storage_destination(
+        std::array<llm_expert_storage_destination, 12> & destinations,
+        size_t & count,
+        ggml_tensor * tensor,
+        int32_t n_expert,
+        uint32_t slot,
+        bool weight,
+        llm_expert_storage_projection projection,
+        llm_expert_storage_sidecar sidecar) {
+    if (tensor == nullptr) {
+        return true;
+    }
+    const int axis = expert_axis(tensor, n_expert, weight);
+    if (axis < 0 || tensor->data == nullptr || slot >= uint32_t(tensor->ne[axis]) || count >= destinations.size()) {
+        return false;
+    }
+    for (int upper = axis + 1; upper < ggml_n_dims(tensor); ++upper) {
+        if (tensor->ne[upper] != 1) {
+            return false;
+        }
+    }
+    destinations[count++] = {
+        projection,
+        sidecar,
+        static_cast<uint8_t *>(tensor->data) + size_t(slot)*tensor->nb[axis],
+        tensor->nb[axis],
+    };
+    return true;
+}
+
+bool append_storage_projection(
+        std::array<llm_expert_storage_destination, 12> & destinations,
+        size_t & count,
+        const llm_expert_projection_descriptor & projection,
+        int32_t n_expert,
+        uint32_t slot,
+        llm_expert_storage_projection identity) {
+    return append_storage_destination(destinations, count, projection.weight, n_expert, slot, true,
+               identity, llm_expert_storage_sidecar::weight) &&
+        append_storage_destination(destinations, count, projection.bias, n_expert, slot, false,
+               identity, llm_expert_storage_sidecar::bias) &&
+        append_storage_destination(destinations, count, projection.scale, n_expert, slot, false,
+               identity, llm_expert_storage_sidecar::scale);
+}
+
+llm_expert_provider_result load_storage_bundle(
+        void * user_data,
+        llm_expert_key key,
+        const llm_expert_bundle_descriptor & destination,
+        uint32_t slot) noexcept {
+    auto * context = static_cast<storage_load_context *>(user_data);
+    std::array<llm_expert_storage_destination, 12> destinations;
+    size_t count = 0;
+    if (context == nullptr || context->storage == nullptr ||
+        !append_storage_projection(destinations, count, destination.up, destination.n_expert, slot,
+            llm_expert_storage_projection::up) ||
+        !append_storage_projection(destinations, count, destination.gate, destination.n_expert, slot,
+            llm_expert_storage_projection::gate) ||
+        !append_storage_projection(destinations, count, destination.gate_up, destination.n_expert, slot,
+            llm_expert_storage_projection::gate_up) ||
+        !append_storage_projection(destinations, count, destination.down, destination.n_expert, slot,
+            llm_expert_storage_projection::down)) {
+        if (context && context->storage) context->storage->poison();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    const auto result = context->storage->read_bundle(
+        key, destinations.data(), count, context->abort_callback, context->abort_callback_data);
+    if (result.is_ready()) {
+        return llm_expert_provider_result::success();
+    }
+    if (result.error == llm_expert_storage_error::cancelled) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::cancelled);
+    }
+    if (result.error == llm_expert_storage_error::invalid_key ||
+        result.error == llm_expert_storage_error::invalid_destination ||
+        result.error == llm_expert_storage_error::invalid_directory ||
+        result.error == llm_expert_storage_error::poisoned) {
+        context->storage->poison();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
 }
 
 } // namespace
@@ -986,14 +1076,19 @@ public:
             const llm_expert_graph_binding & binding,
             const int32_t * logical_ids,
             size_t logical_id_count,
-            int32_t * execution_ids) noexcept override {
+            int32_t * execution_ids,
+            bool (*abort_callback)(void *),
+            void * abort_callback_data) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
-        return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr);
+        return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr,
+            abort_callback, abort_callback_data);
     }
 
     llm_expert_provider_result remap_checkpoint_tensor(
             const llm_expert_graph_binding & binding,
-            ggml_backend_t execution_backend) noexcept override {
+            ggml_backend_t execution_backend,
+            bool (*abort_callback)(void *),
+            void * abort_callback_data) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
         (void) execution_backend;
         if (binding.execution_ids == nullptr || binding.execution_ids == binding.logical_ids ||
@@ -1010,7 +1105,8 @@ public:
         ggml_backend_tensor_get(binding.execution_ids, logical_id_scratch.data(), 0, bytes);
         execution_id_read_bytes += bytes;
         auto result = remap_checkpoint_locked(
-            binding, logical_id_scratch.data(), count, execution_id_scratch.data(), execution_backend);
+            binding, logical_id_scratch.data(), count, execution_id_scratch.data(), execution_backend,
+            abort_callback, abort_callback_data);
         if (!result.is_ready()) {
             return result;
         }
@@ -1027,7 +1123,9 @@ public:
             const int32_t * logical_ids,
             size_t logical_id_count,
             int32_t * execution_ids,
-            ggml_backend_t execution_backend) noexcept {
+            ggml_backend_t execution_backend,
+            bool (*abort_callback)(void *),
+            void * abort_callback_data) noexcept {
         if (!active_request || !pool || logical_ids == nullptr || execution_ids == nullptr ||
             binding.provider_identity != this || binding.bootstrap || binding.graph_epoch != epoch ||
             binding.generation_lease.get() != pool.get() || !binding_uses_current_pool(binding) ||
@@ -1177,13 +1275,16 @@ public:
             copy_result = llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
         if (config.cold_mode) {
+            storage_load_context storage_context = { config.storage, abort_callback, abort_callback_data };
             for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
                 const uint32_t unique_index = miss_unique_indices[index];
                 const uint32_t slot = candidate_slots[index];
                 auto & entry = directory_slots[slot];
-                copy_result = cold_cache->find_or_admit(
-                    unique_keys[unique_index], registration->second, cold_references[index],
-                    faults.fail_copy_after_tensors);
+                copy_result = config.storage ? cold_cache->find_or_admit_with_loader(
+                    unique_keys[unique_index], cold_references[index], load_storage_bundle, &storage_context) :
+                    cold_cache->find_or_admit(
+                        unique_keys[unique_index], registration->second, cold_references[index],
+                        faults.fail_copy_after_tensors);
                 if (copy_result.is_ready()) {
                     copy_result = cold_cache->acquire(cold_references[index], llm_cold_reference_kind::hot);
                 }
@@ -1815,6 +1916,9 @@ private:
     llm_expert_provider_result validate_source_bundle(const llm_expert_bundle_descriptor & bundle) const {
         auto result = bundle.validate();
         if (!result.is_ready()) {
+            return result;
+        }
+        if (config.cold_mode && config.storage != nullptr) {
             return result;
         }
         for (const auto * projection : { &bundle.up, &bundle.gate, &bundle.gate_up, &bundle.down }) {
