@@ -29,9 +29,15 @@ struct llm_transfer_ring_config {
     bool force_no_events_for_testing = false;
     uint64_t initial_lane_generation_for_testing = 0;
     uint32_t trace_capacity = 256;
+    uint32_t delay_event_monitor_ms_for_testing = 0;
+    bool allow_controlled_compute_for_testing = false;
+    ggml_backend_event_t h2d_gate_event_for_testing = nullptr;
 };
 
 struct llm_transfer_interval {
+    llm_expert_flight_id flight;
+    llm_cold_reference cold;
+    llm_transfer_lane_reference lane;
     uint32_t hot_slot = 0;
     uint64_t hot_generation = 0;
     uint64_t h2d_enqueue_us = 0;
@@ -39,7 +45,9 @@ struct llm_transfer_interval {
     uint64_t compute_begin_us = 0;
     uint64_t compute_complete_us = 0;
     uint64_t bytes = 0;
+    uint64_t compute_work_id = 0;
     uint64_t compute_work = 0;
+    bool cancelled = false;
 };
 
 struct llm_transfer_ring_faults {
@@ -78,14 +86,30 @@ struct llm_transfer_ring_diagnostics {
     uint64_t wave_synchronizations = 0;
     bool dedicated_transfer_backend = false;
     bool event_capable = false;
+    uint32_t h2d_event_capacity = 0;
+    uint32_t compute_event_capacity = 0;
     uint32_t event_capacity = 0;
+    uint32_t live_h2d_events = 0;
+    uint32_t peak_live_h2d_events = 0;
+    uint32_t live_compute_events = 0;
+    uint32_t peak_live_compute_events = 0;
     uint32_t live_events = 0;
     uint32_t peak_live_events = 0;
+    uint64_t h2d_event_records = 0;
+    uint64_t h2d_event_waits = 0;
+    uint64_t h2d_event_synchronizations = 0;
     uint64_t event_records = 0;
     uint64_t compute_waits = 0;
     uint64_t event_synchronizations = 0;
     uint64_t compute_event_records = 0;
+    uint64_t compute_event_waits = 0;
     uint64_t compute_event_synchronizations = 0;
+    uint64_t h2d_event_cancellations = 0;
+    uint64_t compute_event_cancellations = 0;
+    uint64_t h2d_event_allocations = 0;
+    uint64_t compute_event_allocations = 0;
+    uint64_t h2d_event_frees = 0;
+    uint64_t compute_event_frees = 0;
     uint64_t compute_work = 0;
     uint32_t trace_capacity = 0;
     uint64_t trace_records = 0;
@@ -94,6 +118,8 @@ struct llm_transfer_ring_diagnostics {
     uint64_t last_h2d_event_complete_us = 0;
     uint64_t h2d_compute_overlap_us = 0;
     uint64_t h2d_compute_overlap_bytes = 0;
+    uint64_t h2d_compute_overlap_work = 0;
+    uint64_t h2d_compute_overlap_flights = 0;
     uint64_t h2d_bytes = 0;
     uint64_t h2d_time_us = 0;
     uint64_t failed_cleanups = 0;
@@ -124,7 +150,8 @@ public:
         llm_cold_reference cold,
         uint32_t hot_slot,
         uint64_t hot_generation,
-        llm_transfer_lane_reference & lane) noexcept;
+        llm_transfer_lane_reference & lane,
+        llm_expert_flight_id flight = {}) noexcept;
     llm_expert_provider_result stage(
         llm_transfer_lane_reference lane,
         const llm_expert_bundle_descriptor & cold_bundle) noexcept;
@@ -138,6 +165,8 @@ public:
     llm_expert_provider_result begin_compute_work(
         ggml_backend_t compute_backend,
         uint64_t work) noexcept;
+    llm_expert_provider_result cancel_after_h2d(
+        llm_transfer_lane_reference lane) noexcept;
     llm_expert_provider_result retire_hot(uint32_t hot_slot, uint64_t hot_generation) noexcept;
     llm_expert_provider_result cleanup_failed_lanes() noexcept;
     llm_expert_provider_result surrender() noexcept;

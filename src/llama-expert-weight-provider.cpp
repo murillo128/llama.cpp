@@ -24,6 +24,45 @@
 
 namespace {
 
+bool same_flight(const llm_expert_flight_id & lhs, const llm_expert_flight_id & rhs) {
+    return lhs.transport_epoch == rhs.transport_epoch && lhs.request_slot == rhs.request_slot &&
+        lhs.request_generation == rhs.request_generation && lhs.key.layer == rhs.key.layer &&
+        lhs.key.expert == rhs.key.expert;
+}
+
+uint64_t overlap_union_us(
+        std::vector<std::pair<uint64_t, uint64_t>> lhs,
+        std::vector<std::pair<uint64_t, uint64_t>> rhs) {
+    const auto merge = [](std::vector<std::pair<uint64_t, uint64_t>> values) {
+        values.erase(std::remove_if(values.begin(), values.end(), [](const auto & value) {
+            return value.second <= value.first;
+        }), values.end());
+        std::sort(values.begin(), values.end());
+        size_t output = 0;
+        for (const auto & value : values) {
+            if (output == 0 || value.first > values[output - 1].second) {
+                values[output++] = value;
+            } else {
+                values[output - 1].second = std::max(values[output - 1].second, value.second);
+            }
+        }
+        values.resize(output);
+        return values;
+    };
+    lhs = merge(std::move(lhs));
+    rhs = merge(std::move(rhs));
+    uint64_t total = 0;
+    size_t left = 0, right = 0;
+    while (left < lhs.size() && right < rhs.size()) {
+        const uint64_t begin = std::max(lhs[left].first, rhs[right].first);
+        const uint64_t end = std::min(lhs[left].second, rhs[right].second);
+        if (end > begin) total += end - begin;
+        if (lhs[left].second < rhs[right].second) left++;
+        else right++;
+    }
+    return total;
+}
+
 bool tensor_is_expert_table(const ggml_tensor * tensor, int32_t n_expert) {
     return tensor != nullptr && ggml_n_dims(tensor) >= 3 && tensor->ne[2] == n_expert;
 }
@@ -189,6 +228,7 @@ struct storage_async_flight {
     llm_expert_key key = { -1, -1 };
     llm_cold_reference cold;
     llm_expert_request_handle handle;
+    llm_expert_flight_id flight_id;
     std::array<llm_expert_storage_destination, 12> destinations;
     std::array<llm_expert_storage_read_operation, 12> operations;
     size_t destination_count = 0;
@@ -1487,6 +1527,12 @@ public:
                         break;
                     }
                     flight.handle = scheduled.handle;
+                    flight.flight_id = {
+                        config.async_transport->diagnostics().transport_epoch,
+                        scheduled.handle.slot,
+                        scheduled.handle.generation,
+                        flight.key,
+                    };
                     flight.scheduler_active = true;
                     flight.scheduler_state = llm_expert_request_state::queued;
                     llm_expert_request_snapshot selected;
@@ -1628,7 +1674,7 @@ public:
                     }
                     if (copy_result.is_ready()) {
                         copy_result = transfer_ring->reserve(*cold_cache, flight.cold, slot,
-                            entry.generation, transfer_lanes[index]);
+                            entry.generation, transfer_lanes[index], flight.flight_id);
                     }
                     if (copy_result.is_ready()) {
                         copy_result = transfer_ring->stage(transfer_lanes[index], cold_cache->bundle());
@@ -2235,14 +2281,30 @@ public:
             result.ring_wave_synchronizations = ring.wave_synchronizations;
             result.ring_dedicated_transfer_backend = ring.dedicated_transfer_backend;
             result.ring_event_capable = ring.event_capable;
+            result.ring_h2d_event_capacity = ring.h2d_event_capacity;
+            result.ring_compute_event_capacity = ring.compute_event_capacity;
             result.ring_event_capacity = ring.event_capacity;
+            result.ring_live_h2d_events = ring.live_h2d_events;
+            result.ring_peak_live_h2d_events = ring.peak_live_h2d_events;
+            result.ring_live_compute_events = ring.live_compute_events;
+            result.ring_peak_live_compute_events = ring.peak_live_compute_events;
             result.ring_live_events = ring.live_events;
             result.ring_peak_live_events = ring.peak_live_events;
+            result.ring_h2d_event_records = ring.h2d_event_records;
+            result.ring_h2d_event_waits = ring.h2d_event_waits;
+            result.ring_h2d_event_synchronizations = ring.h2d_event_synchronizations;
             result.ring_event_records = ring.event_records;
             result.ring_compute_waits = ring.compute_waits;
             result.ring_event_synchronizations = ring.event_synchronizations;
             result.ring_compute_event_records = ring.compute_event_records;
+            result.ring_compute_event_waits = ring.compute_event_waits;
             result.ring_compute_event_synchronizations = ring.compute_event_synchronizations;
+            result.ring_h2d_event_cancellations = ring.h2d_event_cancellations;
+            result.ring_compute_event_cancellations = ring.compute_event_cancellations;
+            result.ring_h2d_event_allocations = ring.h2d_event_allocations;
+            result.ring_compute_event_allocations = ring.compute_event_allocations;
+            result.ring_h2d_event_frees = ring.h2d_event_frees;
+            result.ring_compute_event_frees = ring.compute_event_frees;
             result.ring_compute_work = ring.compute_work;
             result.ring_trace_capacity = ring.trace_capacity;
             result.ring_trace_records = ring.trace_records;
@@ -2251,19 +2313,50 @@ public:
             result.ring_last_h2d_event_complete_us = ring.last_h2d_event_complete_us;
             result.ring_h2d_compute_overlap_us = ring.h2d_compute_overlap_us;
             result.ring_h2d_compute_overlap_bytes = ring.h2d_compute_overlap_bytes;
+            result.ring_h2d_compute_overlap_work = ring.h2d_compute_overlap_work;
+            result.ring_h2d_compute_overlap_flights = ring.h2d_compute_overlap_flights;
             if (config.async_transport != nullptr && ring.event_capable) {
                 const auto reads = config.async_transport->completed_read_intervals();
                 const auto transfers = transfer_ring->completed_intervals();
+                std::vector<std::pair<uint64_t, uint64_t>> read_ranges;
+                std::vector<std::pair<uint64_t, uint64_t>> transfer_ranges;
+                read_ranges.reserve(reads.size());
+                transfer_ranges.reserve(transfers.size());
+                for (const auto & read : reads) {
+                    read_ranges.emplace_back(read.submit_us, read.complete_us);
+                }
                 for (const auto & transfer : transfers) {
-                    for (const auto & read : reads) {
+                    transfer_ranges.emplace_back(transfer.h2d_enqueue_us, transfer.h2d_complete_us);
+                }
+                result.disk_h2d_overlap_us = overlap_union_us(read_ranges, transfer_ranges);
+                std::vector<llm_expert_flight_id> participating_flights;
+                for (const auto & read : reads) {
+                    bool participates = false;
+                    for (const auto & transfer : transfers) {
                         const uint64_t begin = std::max(transfer.h2d_enqueue_us, read.submit_us);
                         const uint64_t end = std::min(transfer.h2d_complete_us, read.complete_us);
                         if (end <= begin) continue;
-                        result.disk_h2d_overlap_us += end - begin;
-                        result.disk_h2d_overlap_bytes += transfer.bytes;
+                        participates = true;
                         result.disk_h2d_overlap_events++;
                     }
+                    if (participates) result.disk_h2d_overlap_read_bytes += read.bytes;
                 }
+                for (const auto & transfer : transfers) {
+                    bool participates = false;
+                    for (const auto & read : reads) {
+                        const uint64_t begin = std::max(transfer.h2d_enqueue_us, read.submit_us);
+                        const uint64_t end = std::min(transfer.h2d_complete_us, read.complete_us);
+                        if (end > begin) participates = true;
+                    }
+                    if (!participates) continue;
+                    result.disk_h2d_overlap_bytes += transfer.bytes;
+                    if (transfer.flight.valid() && std::none_of(
+                            participating_flights.begin(), participating_flights.end(),
+                            [&](const auto & flight) { return same_flight(flight, transfer.flight); })) {
+                        participating_flights.push_back(transfer.flight);
+                    }
+                }
+                result.disk_h2d_overlap_flights = participating_flights.size();
             }
             result.ring_h2d_bytes = ring.h2d_bytes;
             result.ring_h2d_time_us = ring.h2d_time_us;

@@ -8,6 +8,7 @@
 
 #include "ggml-cpp.h"
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -377,7 +379,13 @@ int run_live(int argc, char ** argv) {
               << "\tring_wave_syncs=" << diagnostics.ring_wave_synchronizations
               << "\tring_dedicated_backend=" << diagnostics.ring_dedicated_transfer_backend
               << "\tring_event_capable=" << diagnostics.ring_event_capable
+              << "\tring_h2d_event_capacity=" << diagnostics.ring_h2d_event_capacity
+              << "\tring_compute_event_capacity=" << diagnostics.ring_compute_event_capacity
               << "\tring_event_capacity=" << diagnostics.ring_event_capacity
+              << "\tring_live_h2d_events=" << diagnostics.ring_live_h2d_events
+              << "\tring_peak_live_h2d_events=" << diagnostics.ring_peak_live_h2d_events
+              << "\tring_live_compute_events=" << diagnostics.ring_live_compute_events
+              << "\tring_peak_live_compute_events=" << diagnostics.ring_peak_live_compute_events
               << "\tring_live_events=" << diagnostics.ring_live_events
               << "\tring_peak_live_events=" << diagnostics.ring_peak_live_events
               << "\tring_event_records=" << diagnostics.ring_event_records
@@ -385,6 +393,10 @@ int run_live(int argc, char ** argv) {
               << "\tring_event_syncs=" << diagnostics.ring_event_synchronizations
               << "\tring_compute_event_records=" << diagnostics.ring_compute_event_records
               << "\tring_compute_event_syncs=" << diagnostics.ring_compute_event_synchronizations
+              << "\tring_h2d_event_allocations=" << diagnostics.ring_h2d_event_allocations
+              << "\tring_compute_event_allocations=" << diagnostics.ring_compute_event_allocations
+              << "\tring_h2d_event_frees=" << diagnostics.ring_h2d_event_frees
+              << "\tring_compute_event_frees=" << diagnostics.ring_compute_event_frees
               << "\tring_compute_work=" << diagnostics.ring_compute_work
               << "\tring_trace_capacity=" << diagnostics.ring_trace_capacity
               << "\tring_trace_records=" << diagnostics.ring_trace_records
@@ -393,8 +405,12 @@ int run_live(int argc, char ** argv) {
               << "\tring_last_h2d_complete_us=" << diagnostics.ring_last_h2d_event_complete_us
               << "\th2d_compute_overlap_us=" << diagnostics.ring_h2d_compute_overlap_us
               << "\th2d_compute_overlap_bytes=" << diagnostics.ring_h2d_compute_overlap_bytes
+              << "\th2d_compute_overlap_work=" << diagnostics.ring_h2d_compute_overlap_work
+              << "\th2d_compute_overlap_flights=" << diagnostics.ring_h2d_compute_overlap_flights
               << "\tdisk_h2d_overlap_us=" << diagnostics.disk_h2d_overlap_us
               << "\tdisk_h2d_overlap_bytes=" << diagnostics.disk_h2d_overlap_bytes
+              << "\tdisk_h2d_overlap_read_bytes=" << diagnostics.disk_h2d_overlap_read_bytes
+              << "\tdisk_h2d_overlap_flights=" << diagnostics.disk_h2d_overlap_flights
               << "\tdisk_h2d_overlap_events=" << diagnostics.disk_h2d_overlap_events
               << '\n';
     bool valid_overlap = true;
@@ -404,7 +420,12 @@ int run_live(int argc, char ** argv) {
             diagnostics.ring_event_records == diagnostics.ring_waves &&
             diagnostics.ring_compute_waits == diagnostics.ring_waves &&
             diagnostics.ring_event_synchronizations == diagnostics.ring_waves &&
-            diagnostics.ring_live_events == 0;
+            diagnostics.ring_h2d_event_capacity == diagnostics.ring_effective_lanes &&
+            diagnostics.ring_compute_event_capacity == diagnostics.ring_effective_lanes &&
+            diagnostics.ring_event_capacity == diagnostics.ring_effective_lanes*2 &&
+            diagnostics.ring_compute_event_records == 0 &&
+            diagnostics.ring_live_h2d_events == 0 && diagnostics.ring_live_compute_events == 0 &&
+            diagnostics.ring_live_events == 0 && diagnostics.ring_trace_records_dropped == 0;
     }
     llama_free(context);
     llama_model_free(model);
@@ -489,10 +510,11 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     if (!cold.find_or_admit({ 0, 0 }, source.bundle(), cold_ref).is_ready()) return fail(2);
     llm_cold_reference cold_second;
     if (!cold.find_or_admit({ 0, 1 }, source.bundle(), cold_second).is_ready()) return fail(2);
-    llm_expert_transfer_ring ring({ 128ULL << 20, 1, device, false, false, false, 0, 64 });
+    const llm_expert_flight_id controlled_flight = { 1, 0, 1, { 0, 0 } };
+    llm_expert_transfer_ring ring({ 128ULL << 20, 1, device, false, false, false, 0, 64, 0, true });
     if (!ring.initialize(source.bundle()).is_ready()) return fail(3);
     llm_transfer_lane_reference lane;
-    const auto reserved = ring.reserve(cold, cold_ref, 0, 1, lane);
+    const auto reserved = ring.reserve(cold, cold_ref, 0, 1, lane, controlled_flight);
     if (!reserved.is_ready()) { std::cerr << "reserve error=" << int(reserved.error) << '\n'; return fail(4); }
     const auto staged = ring.stage(lane, cold.bundle());
     if (!staged.is_ready()) { std::cerr << "stage error=" << int(staged.error) << '\n'; return fail(4); }
@@ -513,15 +535,20 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     (void) posix_fadvise(fd, 0, off_t(disk_bytes), POSIX_FADV_DONTNEED);
 #endif
     std::vector<uint8_t> disk_destination(size_t(disk_bytes), uint8_t(0));
-    llm_expert_storage_read_operation read;
-    read.native_handle = fd;
-    read.source_size = disk_bytes;
-    read.byte_count = disk_bytes;
-    read.segment_count = 1;
-    read.segments[0].data = disk_destination.data();
-    read.segments[0].byte_count = disk_bytes;
-    read.segments[0].projection = llm_expert_storage_projection::up;
-    read.segments[0].sidecar = llm_expert_storage_sidecar::weight;
+    std::array<llm_expert_storage_read_operation, 2> read{};
+    for (size_t index = 0; index < read.size(); ++index) {
+        read[index].native_handle = fd;
+        read[index].source_size = disk_bytes;
+        read[index].file_offset = index*(disk_bytes/2);
+        read[index].byte_count = disk_bytes/2;
+        read[index].segment_count = 1;
+        read[index].segments[0].data = disk_destination.data() + index*(disk_bytes/2);
+        read[index].segments[0].file_offset = index*(disk_bytes/2);
+        read[index].segments[0].byte_count = disk_bytes/2;
+        read[index].segments[0].projection = llm_expert_storage_projection::up;
+        read[index].segments[0].sidecar = index == 0 ?
+            llm_expert_storage_sidecar::weight : llm_expert_storage_sidecar::bias;
+    }
     llm_expert_async_config io_config;
     io_config.requested_queue_depth = 32;
     io_config.effective_hot_capacity = 4;
@@ -533,7 +560,9 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     io_config.delay_cq_drain_ms_for_testing = 10;
     llm_expert_async_transport transport(io_config);
     const llm_expert_async_operation_identity identity = {
-        1, { 0, 1 }, 0, { 0, 0 }, llm_expert_readiness::host_ready,
+        controlled_flight.transport_epoch,
+        { controlled_flight.request_slot, controlled_flight.request_generation },
+        0, controlled_flight.key, llm_expert_readiness::host_ready,
         llm_expert_priority::demand_current_layer,
     };
     ggml_init_params compute_params = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), nullptr, true };
@@ -551,7 +580,7 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), 8, false);
     ggml_build_forward_expand(graph, c);
     constexpr uint64_t compute_work = 2ULL*1536*1536*1536;
-    if (transport.submit_read_plan(identity, &read, 1) != llm_expert_async_result::ready) {
+    if (transport.submit_read_plan(identity, read.data(), read.size()) != llm_expert_async_result::ready) {
         close(fd); return fail(7);
     }
     if (!transport.wait_until_read_submitted_for_testing(identity.request)) {
@@ -582,13 +611,32 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     const auto reads = transport.completed_read_intervals();
     const auto transfers = ring.completed_intervals();
     const auto diagnostics = ring.diagnostics();
-    uint64_t disk_h2d_overlap_us = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> read_ranges;
+    std::vector<std::pair<uint64_t, uint64_t>> transfer_ranges;
+    for (const auto & interval : reads) read_ranges.emplace_back(interval.submit_us, interval.complete_us);
     for (const auto & transfer : transfers) {
-        for (const auto & interval : reads) {
-            const uint64_t begin = std::max(transfer.h2d_enqueue_us, interval.submit_us);
-            const uint64_t end = std::min(transfer.h2d_complete_us, interval.complete_us);
-            if (end > begin) disk_h2d_overlap_us += end - begin;
+        transfer_ranges.emplace_back(transfer.h2d_enqueue_us, transfer.h2d_complete_us);
+    }
+    const auto merge_ranges = [](std::vector<std::pair<uint64_t, uint64_t>> ranges) {
+        std::sort(ranges.begin(), ranges.end());
+        size_t output = 0;
+        for (const auto & range : ranges) {
+            if (range.second <= range.first) continue;
+            if (output == 0 || range.first > ranges[output - 1].second) ranges[output++] = range;
+            else ranges[output - 1].second = std::max(ranges[output - 1].second, range.second);
         }
+        ranges.resize(output);
+        return ranges;
+    };
+    read_ranges = merge_ranges(std::move(read_ranges));
+    transfer_ranges = merge_ranges(std::move(transfer_ranges));
+    uint64_t disk_h2d_overlap_us = 0;
+    for (size_t left = 0, right = 0; left < read_ranges.size() && right < transfer_ranges.size();) {
+        const uint64_t begin = std::max(read_ranges[left].first, transfer_ranges[right].first);
+        const uint64_t end = std::min(read_ranges[left].second, transfer_ranges[right].second);
+        if (end > begin) disk_h2d_overlap_us += end - begin;
+        if (read_ranges[left].second < transfer_ranges[right].second) left++;
+        else right++;
     }
     {
         llm_expert_transfer_ring unloading({ 128ULL << 20, 1, device, false, false, false, 0, 16 });
@@ -604,16 +652,30 @@ bool controlled_native_overlap(ggml_backend_dev_t device, ggml_backend_t backend
     const bool valid = waited == llm_expert_async_result::ready &&
         released == llm_expert_async_result::ready && transport.shutdown() &&
         completion.bytes_completed == disk_bytes && diagnostics.h2d_compute_overlap_us > 0 &&
-        diagnostics.h2d_compute_overlap_bytes > 0 && diagnostics.compute_work >= compute_work &&
+        diagnostics.h2d_compute_overlap_bytes > 0 &&
+        diagnostics.h2d_compute_overlap_work >= compute_work && diagnostics.compute_work >= compute_work &&
         diagnostics.compute_event_records == 1 && diagnostics.compute_event_synchronizations == 1 &&
-        diagnostics.wave_synchronizations == 0 && diagnostics.live_events == 0 &&
+        diagnostics.h2d_event_capacity == diagnostics.effective_lanes &&
+        diagnostics.compute_event_capacity == diagnostics.effective_lanes &&
+        diagnostics.event_capacity == diagnostics.effective_lanes*2 &&
+        diagnostics.peak_live_h2d_events == 1 && diagnostics.peak_live_compute_events == 1 &&
+        diagnostics.wave_synchronizations == 0 && diagnostics.live_h2d_events == 0 &&
+        diagnostics.live_compute_events == 0 && diagnostics.live_events == 0 &&
         diagnostics.trace_records_dropped == 0 &&
         disk_h2d_overlap_us > 0 && reuse_was_blocked && unload_drained &&
+        reads.size() == 2 && reads[0].operation_index != reads[1].operation_index &&
+        transfers.size() == 1 && reads[0].flight.valid() && reads[1].flight.valid() &&
+        transfers[0].flight.valid() &&
+        reads[0].flight.transport_epoch == transfers[0].flight.transport_epoch &&
+        reads[0].flight.request_slot == transfers[0].flight.request_slot &&
+        reads[0].flight.request_generation == transfers[0].flight.request_generation &&
+        reads[1].flight.request_generation == transfers[0].flight.request_generation &&
         slot_matches(source, hot, 0, 0);
     std::cout << "PHASE7_CONTROLLED_OVERLAP"
               << "\tdisk_h2d_overlap_us=" << disk_h2d_overlap_us
               << "\th2d_compute_overlap_us=" << diagnostics.h2d_compute_overlap_us
               << "\th2d_compute_overlap_bytes=" << diagnostics.h2d_compute_overlap_bytes
+              << "\th2d_compute_overlap_work=" << diagnostics.h2d_compute_overlap_work
               << "\tcompute_work=" << diagnostics.compute_work
               << "\tread_bytes=" << completion.bytes_completed
               << "\tevent_records=" << diagnostics.event_records
@@ -673,11 +735,17 @@ int main(int argc, char ** argv) {
         cold.diagnostics().current_transfer_refs != 0 || !ring.validate_invariants().is_ready()) return 11;
     if (force_pageable) {
         if (!value.pageable_fallback || value.pinned_or_registered_bytes != 0 ||
-            value.async_enqueues != 0 || value.wave_synchronizations != 0 || value.synchronous_copies != 6) return 12;
+            value.async_enqueues != 0 || value.wave_synchronizations != 0 || value.synchronous_copies != 6 ||
+            value.h2d_event_capacity != 0 || value.compute_event_capacity != 0 || value.event_capacity != 0 ||
+            value.live_h2d_events != 0 || value.live_compute_events != 0 || value.live_events != 0 ||
+            value.event_records != 0 || value.compute_event_records != 0) return 12;
     } else {
         if (value.pageable_fallback || value.pinned_or_registered_bytes == 0 ||
             value.async_enqueues != 6 || value.wave_synchronizations != 0 || value.event_records != 2 ||
-            value.compute_waits != 2 || value.live_events != 0 ||
+            value.compute_waits != 2 || value.h2d_event_capacity != value.effective_lanes ||
+            value.compute_event_capacity != value.effective_lanes ||
+            value.event_capacity != value.effective_lanes*2 ||
+            value.live_h2d_events != 0 || value.live_compute_events != 0 || value.live_events != 0 ||
             value.peak_in_flight_lanes != 2 || value.synchronous_copies != 0) return 13;
         if (!controlled_native_overlap(device, backend.get())) return 14;
     }

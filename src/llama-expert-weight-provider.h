@@ -55,6 +55,18 @@ struct llm_expert_key {
     bool is_valid(int32_t n_layer, int32_t n_expert) const;
 };
 
+struct llm_expert_flight_id {
+    uint64_t transport_epoch = 0;
+    uint32_t request_slot = UINT32_MAX;
+    uint64_t request_generation = 0;
+    llm_expert_key key = { -1, -1 };
+
+    bool valid() const {
+        return transport_epoch != 0 && request_slot != UINT32_MAX && request_generation != 0 &&
+            key.layer >= 0 && key.expert >= 0;
+    }
+};
+
 struct llm_expert_projection_descriptor {
     ggml_tensor * weight = nullptr;
     ggml_tensor * bias = nullptr;
@@ -250,14 +262,30 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_wave_synchronizations = 0;
     bool ring_dedicated_transfer_backend = false;
     bool ring_event_capable = false;
+    uint32_t ring_h2d_event_capacity = 0;
+    uint32_t ring_compute_event_capacity = 0;
     uint32_t ring_event_capacity = 0;
+    uint32_t ring_live_h2d_events = 0;
+    uint32_t ring_peak_live_h2d_events = 0;
+    uint32_t ring_live_compute_events = 0;
+    uint32_t ring_peak_live_compute_events = 0;
     uint32_t ring_live_events = 0;
     uint32_t ring_peak_live_events = 0;
+    uint64_t ring_h2d_event_records = 0;
+    uint64_t ring_h2d_event_waits = 0;
+    uint64_t ring_h2d_event_synchronizations = 0;
     uint64_t ring_event_records = 0;
     uint64_t ring_compute_waits = 0;
     uint64_t ring_event_synchronizations = 0;
     uint64_t ring_compute_event_records = 0;
+    uint64_t ring_compute_event_waits = 0;
     uint64_t ring_compute_event_synchronizations = 0;
+    uint64_t ring_h2d_event_cancellations = 0;
+    uint64_t ring_compute_event_cancellations = 0;
+    uint64_t ring_h2d_event_allocations = 0;
+    uint64_t ring_compute_event_allocations = 0;
+    uint64_t ring_h2d_event_frees = 0;
+    uint64_t ring_compute_event_frees = 0;
     uint64_t ring_compute_work = 0;
     uint32_t ring_trace_capacity = 0;
     uint64_t ring_trace_records = 0;
@@ -266,8 +294,12 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_last_h2d_event_complete_us = 0;
     uint64_t ring_h2d_compute_overlap_us = 0;
     uint64_t ring_h2d_compute_overlap_bytes = 0;
+    uint64_t ring_h2d_compute_overlap_work = 0;
+    uint64_t ring_h2d_compute_overlap_flights = 0;
     uint64_t disk_h2d_overlap_us = 0;
     uint64_t disk_h2d_overlap_bytes = 0;
+    uint64_t disk_h2d_overlap_read_bytes = 0;
+    uint64_t disk_h2d_overlap_flights = 0;
     uint64_t disk_h2d_overlap_events = 0;
     uint64_t ring_h2d_bytes = 0;
     uint64_t ring_h2d_time_us = 0;

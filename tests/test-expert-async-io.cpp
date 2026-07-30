@@ -285,6 +285,18 @@ void test_worker_read_and_drain() {
     GGML_ASSERT(std::memcmp(first.data(), source.data() + 3, first.size()) == 0);
     GGML_ASSERT(std::memcmp(second.data(), source.data() + 10, second.size()) == 0);
     GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+    const auto intervals = transport.completed_read_intervals();
+    GGML_ASSERT(intervals.size() == 1);
+    for (size_t index = 0; index < intervals.size(); ++index) {
+        GGML_ASSERT(intervals[index].flight.transport_epoch == identity.transport_epoch);
+        GGML_ASSERT(intervals[index].flight.request_slot == identity.request.slot);
+        GGML_ASSERT(intervals[index].flight.request_generation == identity.request.generation);
+        GGML_ASSERT(intervals[index].flight.key.layer == identity.key.layer &&
+            intervals[index].flight.key.expert == identity.key.expert);
+        GGML_ASSERT(intervals[index].operation_index == index);
+        GGML_ASSERT(intervals[index].complete_us >= intervals[index].submit_us);
+        GGML_ASSERT(intervals[index].bytes == read.byte_count);
+    }
     const auto diagnostics = transport.diagnostics();
     GGML_ASSERT(diagnostics.read_requests_submitted == 1 && diagnostics.read_requests_completed == 1);
     GGML_ASSERT(diagnostics.read_operations_completed == 1);

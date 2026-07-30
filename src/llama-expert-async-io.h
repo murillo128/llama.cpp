@@ -187,7 +187,8 @@ struct llm_expert_async_read_completion {
 };
 
 struct llm_expert_async_read_interval {
-    llm_expert_request_handle request;
+    llm_expert_flight_id flight;
+    uint32_t operation_index = 0;
     uint64_t submit_us = 0;
     uint64_t complete_us = 0;
     uint64_t bytes = 0;

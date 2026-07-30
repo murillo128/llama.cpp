@@ -1,12 +1,16 @@
 #include "llama-expert-transfer-ring.h"
+#include "llama-expert-scheduler.h"
 
 #include "ggml-cpp.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -219,13 +223,138 @@ void test_native_event_ordering_reuse_and_unload() {
     assert_slot_matches(source, hot, 1, 1);
     const auto diagnostics = ring.diagnostics();
     GGML_ASSERT(diagnostics.event_capable && diagnostics.event_capacity == diagnostics.effective_lanes*2);
+    GGML_ASSERT(diagnostics.h2d_event_capacity == diagnostics.effective_lanes &&
+        diagnostics.compute_event_capacity == diagnostics.effective_lanes &&
+        diagnostics.h2d_event_allocations == diagnostics.h2d_event_capacity &&
+        diagnostics.compute_event_allocations == diagnostics.compute_event_capacity);
     GGML_ASSERT(diagnostics.event_records == 2 && diagnostics.compute_waits == 2);
-    GGML_ASSERT(diagnostics.event_synchronizations == 2 && diagnostics.live_events == 0);
+    GGML_ASSERT(diagnostics.event_synchronizations == 2 && diagnostics.live_h2d_events == 0 &&
+        diagnostics.live_compute_events == 0 && diagnostics.live_events == 0);
     const auto intervals = ring.completed_intervals();
     GGML_ASSERT(intervals.size() == 2 && intervals[0].h2d_enqueue_us != 0 &&
         intervals[0].h2d_complete_us >= intervals[0].h2d_enqueue_us &&
         intervals[0].bytes == diagnostics.lane_payload_bytes);
     GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+
+    {
+        ggml_backend_ptr gate_backend(ggml_backend_dev_init(device, nullptr));
+        GGML_ASSERT(gate_backend);
+        ggml_init_params compute_params = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), nullptr, true };
+        ggml_context_ptr compute_ctx(ggml_init(compute_params));
+        GGML_ASSERT(compute_ctx);
+        ggml_tensor * a = ggml_new_tensor_2d(compute_ctx.get(), GGML_TYPE_F32, 1536, 1536);
+        ggml_tensor * b = ggml_new_tensor_2d(compute_ctx.get(), GGML_TYPE_F32, 1536, 1536);
+        ggml_tensor * c = ggml_mul_mat(compute_ctx.get(), a, b);
+        ggml_backend_buffer_ptr compute_buffer(
+            ggml_backend_alloc_ctx_tensors_from_buft(compute_ctx.get(), ggml_backend_dev_buffer_type(device)));
+        GGML_ASSERT(compute_buffer);
+        std::vector<float> zeros(size_t(1536)*1536, 0.0f);
+        ggml_backend_tensor_set(a, zeros.data(), 0, zeros.size()*sizeof(float));
+        ggml_backend_tensor_set(b, zeros.data(), 0, zeros.size()*sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), 8, false);
+        ggml_build_forward_expand(graph, c);
+        ggml_backend_event_t gate_event = ggml_backend_event_new(device);
+        GGML_ASSERT(gate_event != nullptr);
+        GGML_ASSERT(ggml_backend_graph_compute_async(gate_backend.get(), graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_event_record(gate_event, gate_backend.get());
+
+        llm_transfer_ring_config cancel_config = { diagnostics.lane_footprint, 1, device };
+        cancel_config.trace_capacity = 32;
+        cancel_config.h2d_gate_event_for_testing = gate_event;
+        llm_expert_transfer_ring cancelling(cancel_config);
+        GGML_ASSERT(cancelling.initialize(source.bundle()).is_ready());
+        llm_expert_scheduler scheduler({ 1, 4, 2, 1, 0 });
+        const llm_expert_key key = { 0, 0 };
+        const auto admitted = scheduler.enqueue(key, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::device_ready);
+        GGML_ASSERT(admitted.disposition == llm_expert_schedule_disposition::admitted);
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(scheduler.take_next(selected).disposition == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::submitting,
+            llm_expert_request_state::io_in_flight) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::io_in_flight,
+            llm_expert_request_state::host_ready) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::host_ready,
+            llm_expert_request_state::h2d_in_flight) == llm_expert_schedule_disposition::admitted);
+        const llm_expert_flight_id cancelled_flight = {
+            7, admitted.handle.slot, admitted.handle.generation, key,
+        };
+        llm_transfer_lane_reference cancelled_lane;
+        GGML_ASSERT(cancelling.reserve(cold, cold_zero, 0, 7, cancelled_lane, cancelled_flight).is_ready());
+        GGML_ASSERT(cancelling.stage(cancelled_lane, cold.bundle()).is_ready());
+        GGML_ASSERT(cancelling.transfer_wave(
+            backend.get(), { { cancelled_lane, hot.bundle(), 0 } }).is_ready());
+        GGML_ASSERT(cancelling.diagnostics().live_h2d_events == 1);
+        GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::h2d_in_flight,
+            llm_expert_request_state::draining) == llm_expert_schedule_disposition::admitted);
+
+        std::atomic<bool> cancel_done = false;
+        std::atomic<bool> reuse_done = false;
+        llm_transfer_lane_reference blocked_reuse;
+        std::thread cancel_thread([&] {
+            GGML_ASSERT(cancelling.cancel_after_h2d(cancelled_lane).is_ready());
+            cancel_done.store(true, std::memory_order_release);
+        });
+        std::thread reuse_thread([&] {
+            GGML_ASSERT(cancelling.reserve(cold, cold_one, 0, 8, blocked_reuse).is_ready());
+            reuse_done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        GGML_ASSERT(!cancel_done.load(std::memory_order_acquire));
+        GGML_ASSERT(!reuse_done.load(std::memory_order_acquire));
+        cancel_thread.join();
+        reuse_thread.join();
+        GGML_ASSERT(blocked_reuse.generation != cancelled_lane.generation);
+        GGML_ASSERT(cancelling.cleanup_failed_lanes().is_ready());
+        GGML_ASSERT(scheduler.finish(admitted.handle, llm_expert_request_state::cancelled) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.release_terminal(admitted.handle) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.diagnostics().active_requests == 0);
+
+        const auto retry = scheduler.enqueue(key, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::device_ready);
+        GGML_ASSERT(retry.disposition == llm_expert_schedule_disposition::admitted &&
+            retry.handle.generation != admitted.handle.generation);
+        GGML_ASSERT(scheduler.take_next(selected).disposition == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(retry.handle, llm_expert_request_state::submitting,
+            llm_expert_request_state::io_in_flight) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(retry.handle, llm_expert_request_state::io_in_flight,
+            llm_expert_request_state::host_ready) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(retry.handle, llm_expert_request_state::host_ready,
+            llm_expert_request_state::h2d_in_flight) == llm_expert_schedule_disposition::admitted);
+        const llm_expert_flight_id retry_flight = { 7, retry.handle.slot, retry.handle.generation, key };
+        llm_transfer_lane_reference retry_lane;
+        GGML_ASSERT(cancelling.reserve(cold, cold_zero, 0, 9, retry_lane, retry_flight).is_ready());
+        GGML_ASSERT(cancelling.stage(retry_lane, cold.bundle()).is_ready());
+        GGML_ASSERT(cancelling.transfer_wave(backend.get(), { { retry_lane, hot.bundle(), 0 } }).is_ready());
+        GGML_ASSERT(cancelling.wait_for_hot(backend.get(), 0, 9).is_ready());
+        GGML_ASSERT(scheduler.transition(retry.handle, llm_expert_request_state::h2d_in_flight,
+            llm_expert_request_state::device_ready) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.finish(retry.handle, llm_expert_request_state::complete) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.release_terminal(retry.handle) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(cancelling.retire_hot(0, 9).is_ready());
+        assert_slot_matches(source, hot, 0, 0);
+        auto cancellation_diagnostics = cancelling.diagnostics();
+        GGML_ASSERT(cancellation_diagnostics.h2d_event_cancellations == 1);
+        GGML_ASSERT(cancellation_diagnostics.live_h2d_events == 0 &&
+            cancellation_diagnostics.live_compute_events == 0 && cancellation_diagnostics.live_events == 0);
+        GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+        const auto cancellation_intervals = cancelling.completed_intervals();
+        GGML_ASSERT(cancellation_intervals.size() == 2 && cancellation_intervals[0].cancelled &&
+            cancellation_intervals[0].flight.request_generation == admitted.handle.generation &&
+            !cancellation_intervals[1].cancelled &&
+            cancellation_intervals[1].flight.request_generation == retry.handle.generation);
+        GGML_ASSERT(cancelling.surrender().is_ready());
+        cancellation_diagnostics = cancelling.diagnostics();
+        GGML_ASSERT(cancellation_diagnostics.h2d_event_frees == 1 &&
+            cancellation_diagnostics.compute_event_frees == 1 &&
+            cancellation_diagnostics.h2d_event_allocations == cancellation_diagnostics.h2d_event_frees &&
+            cancellation_diagnostics.compute_event_allocations == cancellation_diagnostics.compute_event_frees &&
+            cancellation_diagnostics.event_capacity == 0);
+        GGML_ASSERT(cancelling.validate_invariants().is_ready());
+        ggml_backend_event_free(gate_event);
+    }
 
     {
         llm_expert_transfer_ring unloading({ 1U << 20, 2, device, false, false, false, 0, 32 });
