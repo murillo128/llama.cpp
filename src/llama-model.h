@@ -18,6 +18,8 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 class llm_expert_weight_provider;
+class llm_expert_async_transport;
+class llm_expert_scheduler;
 struct llm_expert_provider_stats;
 class llm_expert_storage;
 struct llm_expert_storage_diagnostics;
@@ -33,6 +35,12 @@ struct llm_deferred_expert_diagnostics {
     uint64_t resident_loaded_bytes = 0;
     bool full_file_prefetch_disabled = false;
 };
+
+void llm_shutdown_expert_runtime(
+        std::unique_ptr<llm_expert_async_transport> & transport,
+        std::unique_ptr<llm_expert_scheduler> & scheduler,
+        std::unique_ptr<llm_expert_weight_provider> & provider,
+        std::unique_ptr<llm_expert_storage> & storage) noexcept;
 
 // available models
 enum llm_type {

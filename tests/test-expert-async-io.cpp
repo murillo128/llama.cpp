@@ -1,8 +1,11 @@
 #include "llama-expert-async-io.h"
+#include "llama-expert-weight-provider.h"
+#include "llama-model.h"
 
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <condition_variable>
 #include <cstdio>
@@ -71,6 +74,40 @@ struct scripted_async_reader : llm_expert_async_read_override {
         std::memcpy(destination, bytes.data() + file_offset, count);
         return int64_t(count);
     }
+};
+
+class provider_owned_destination final : public llm_expert_weight_provider {
+public:
+    provider_owned_destination(llm_expert_async_transport * transport, bool & drained_before_destroy) :
+        transport(transport), drained_before_destroy(drained_before_destroy) {}
+
+    ~provider_owned_destination() override {
+        const auto diagnostics = transport->diagnostics();
+        drained_before_destroy = diagnostics.admission_closed && diagnostics.active_operations == 0 &&
+            diagnostics.active_read_requests == 0;
+    }
+
+    llm_expert_provider_result bind(
+            const llm_expert_bundle_descriptor &,
+            const llm_expert_selection &,
+            llm_expert_graph_binding &) noexcept override {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+
+    llm_expert_provider_result prepare(
+            const std::vector<llm_expert_graph_binding> &,
+            llm_expert_execution_plan &) noexcept override {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+
+    llm_expert_provider_stats get_stats() const noexcept override { return {}; }
+    void release_handle(uint64_t) noexcept override {}
+
+    std::array<uint8_t, 8> destination{};
+
+private:
+    llm_expert_async_transport * transport;
+    bool & drained_before_destroy;
 };
 
 void test_configuration() {
@@ -380,6 +417,7 @@ void test_native_ring_cancel_and_shutdown_drain() {
 
     auto cancel_cfg = config(8);
     cancel_cfg.pause_after_ring_submit_for_testing = true;
+    cancel_cfg.hide_cqes_after_cancel_polls_for_testing = 8;
     llm_expert_async_transport cancel_transport(cancel_cfg);
     if (cancel_transport.diagnostics().io_uring_enabled) {
         std::array<uint8_t, 8> destination{};
@@ -390,14 +428,18 @@ void test_native_ring_cancel_and_shutdown_drain() {
         };
         GGML_ASSERT(cancel_transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
         GGML_ASSERT(cancel_transport.wait_until_ring_submitted_for_testing());
+        const auto cancel_start = std::chrono::steady_clock::now();
         GGML_ASSERT(cancel_transport.cancel_read(identity.request) == llm_expert_async_result::ready);
         llm_expert_async_read_completion completion;
         GGML_ASSERT(cancel_transport.wait_read(identity.request, completion) == llm_expert_async_result::closed);
+        const auto cancel_elapsed = std::chrono::steady_clock::now() - cancel_start;
         GGML_ASSERT(cancel_transport.release_read(identity.request) == llm_expert_async_result::ready);
         const auto diagnostics = cancel_transport.diagnostics();
         GGML_ASSERT(diagnostics.ring_cancel_submissions == 1);
         GGML_ASSERT(diagnostics.ring_cancel_completions == 1);
         GGML_ASSERT(diagnostics.ring_completions == 1);
+        GGML_ASSERT(diagnostics.cq_empty_waits_after_cancel >= 8);
+        GGML_ASSERT(cancel_elapsed >= std::chrono::milliseconds(4));
         GGML_ASSERT(diagnostics.active_operations == 0);
     }
 
@@ -485,6 +527,48 @@ void test_native_ring_cqe_failure_matrix() {
         GGML_ASSERT(completion.native_error == EIO);
         GGML_ASSERT(hard_error.interrupted_reads_retried == 0 && hard_error.would_block_reads_retried == 0);
     }
+    GGML_ASSERT(std::fclose(file) == 0);
+#endif
+}
+
+void test_model_owner_drains_before_provider_destination_destroy() {
+#if defined(__linux__)
+    FILE * file = std::tmpfile();
+    GGML_ASSERT(file != nullptr);
+    const std::array<uint8_t, 8> source = { 4, 8, 15, 16, 23, 42, 7, 9 };
+    GGML_ASSERT(std::fwrite(source.data(), 1, source.size(), file) == source.size());
+    GGML_ASSERT(std::fflush(file) == 0);
+
+    auto cfg = config(8);
+    cfg.pause_after_ring_submit_for_testing = true;
+    auto transport = std::make_unique<llm_expert_async_transport>(cfg);
+    auto scheduler = std::make_unique<llm_expert_scheduler>(llm_expert_scheduler_config{ 1, 1, 1, 1, 0 });
+    bool drained_before_provider_destroy = false;
+    auto destination_owner = std::make_unique<provider_owned_destination>(
+        transport.get(), drained_before_provider_destroy);
+    auto * owner = destination_owner.get();
+    std::unique_ptr<llm_expert_weight_provider> provider = std::move(destination_owner);
+    std::unique_ptr<llm_expert_storage> storage;
+
+    if (transport->diagnostics().io_uring_enabled) {
+        llm_expert_storage_read_operation read;
+        read.native_handle = fileno(file);
+        read.source_size = source.size();
+        read.byte_count = owner->destination.size();
+        read.segment_count = 1;
+        read.segments[0] = { owner->destination.data(), owner->destination.size(), 0,
+            llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+        const llm_expert_async_operation_identity identity = {
+            1, { 0, 31 }, 0, { 0, 10 }, llm_expert_readiness::host_ready,
+            llm_expert_priority::demand_current_layer,
+        };
+        GGML_ASSERT(transport->submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
+        GGML_ASSERT(transport->wait_until_ring_submitted_for_testing());
+    }
+
+    llm_shutdown_expert_runtime(transport, scheduler, provider, storage);
+    GGML_ASSERT(drained_before_provider_destroy);
+    GGML_ASSERT(transport == nullptr && scheduler == nullptr && provider == nullptr && storage == nullptr);
     GGML_ASSERT(std::fclose(file) == 0);
 #endif
 }
@@ -756,6 +840,7 @@ int main() {
     test_file_registration_or_explicit_fallback();
     test_native_ring_cancel_and_shutdown_drain();
     test_native_ring_cqe_failure_matrix();
+    test_model_owner_drains_before_provider_destination_destroy();
     test_fallback_retry_error_and_cancel_races();
     test_shutdown_drains_inflight_read();
     test_direct_alignment_fallback_and_retry();

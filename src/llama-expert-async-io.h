@@ -37,6 +37,7 @@ struct llm_expert_async_config {
     bool pause_after_ring_submit_for_testing = false;
     bool inject_first_read_cqe_for_testing = false;
     int32_t first_read_cqe_result_for_testing = 0;
+    uint32_t hide_cqes_after_cancel_polls_for_testing = 0;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {
@@ -146,6 +147,8 @@ struct llm_expert_async_diagnostics {
     uint32_t peak_cq_occupancy = 0;
     uint64_t ring_cancel_submissions = 0;
     uint64_t ring_cancel_completions = 0;
+    uint64_t cq_empty_waits = 0;
+    uint64_t cq_empty_waits_after_cancel = 0;
     uint32_t registered_file_count = 0;
     int file_registration_error = 0;
     uint32_t registered_buffer_count = 0;

@@ -1336,20 +1336,32 @@ void llama_model::replace_expert_weight_provider_for_testing(std::unique_ptr<llm
     pimpl->expert_weight_provider = std::move(provider);
 }
 
-llama_model::~llama_model() {
+void llm_shutdown_expert_runtime(
+        std::unique_ptr<llm_expert_async_transport> & transport,
+        std::unique_ptr<llm_expert_scheduler> & scheduler,
+        std::unique_ptr<llm_expert_weight_provider> & provider,
+        std::unique_ptr<llm_expert_storage> & storage) noexcept {
     // Contexts are required to be gone before model destruction. Keep the provider
     // and its cold destinations alive until every model-owned asynchronous read has
     // been cancelled, completed, and drained.
-    if (pimpl->expert_async_transport) {
-        GGML_ASSERT(pimpl->expert_async_transport->shutdown());
+    if (transport) {
+        GGML_ASSERT(transport->shutdown());
     }
-    if (pimpl->expert_scheduler) {
-        GGML_ASSERT(pimpl->expert_scheduler->shutdown());
+    if (scheduler) {
+        GGML_ASSERT(scheduler->shutdown());
     }
-    pimpl->expert_weight_provider.reset();
-    pimpl->expert_scheduler.reset();
-    pimpl->expert_async_transport.reset();
-    pimpl->expert_storage.reset();
+    provider.reset();
+    scheduler.reset();
+    transport.reset();
+    storage.reset();
+}
+
+llama_model::~llama_model() {
+    llm_shutdown_expert_runtime(
+        pimpl->expert_async_transport,
+        pimpl->expert_scheduler,
+        pimpl->expert_weight_provider,
+        pimpl->expert_storage);
     for (auto * lora : loras) {
         delete lora;
     }

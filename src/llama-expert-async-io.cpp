@@ -331,6 +331,7 @@ struct llm_expert_async_transport::impl {
     bool staging_registered = false;
     bool ring_submit_paused_for_testing = false;
     bool read_cqe_injected_for_testing = false;
+    uint32_t hidden_cqe_polls_for_testing = 0;
 #if defined(__linux__)
     io_uring_owner ring;
 #endif
@@ -561,14 +562,23 @@ struct llm_expert_async_transport::impl {
                     counters.peak_cq_occupancy = std::max(
                         counters.peak_cq_occupancy, ring.completion_occupancy());
                 }
-                if (!ring.try_cqe(cqe)) {
+                const bool hide_cqe_for_testing = cancel_requested &&
+                    hidden_cqe_polls_for_testing < config.hide_cqes_after_cancel_polls_for_testing;
+                if (hide_cqe_for_testing) hidden_cqe_polls_for_testing++;
+                if (hide_cqe_for_testing || !ring.try_cqe(cqe)) {
                     // The worker must remain responsive to cancellation and shutdown.
                     // Polling the bounded CQ with a condition-variable timeout lets the
                     // sole submitter observe cancellation and issue ASYNC_CANCEL SQEs.
                     std::unique_lock<std::mutex> guard(mutex);
-                    condition.wait_for(guard, std::chrono::milliseconds(1), [&] {
-                        return read_requests[handle.slot].cancel_requested || worker_stop;
-                    });
+                    counters.cq_empty_waits++;
+                    if (cancel_requested || worker_stop) {
+                        if (cancel_requested) counters.cq_empty_waits_after_cancel++;
+                        condition.wait_for(guard, std::chrono::milliseconds(1));
+                    } else {
+                        condition.wait_for(guard, std::chrono::milliseconds(1), [&] {
+                            return read_requests[handle.slot].cancel_requested || worker_stop;
+                        });
+                    }
                     continue;
                 }
                 uint32_t operation_slot = 0;
