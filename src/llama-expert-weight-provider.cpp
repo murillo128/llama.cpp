@@ -1636,7 +1636,17 @@ public:
                     if (copy_result.is_ready()) {
                         transfer_bindings.clear();
                         transfer_bindings.push_back({ transfer_lanes[index], pool->bundle, slot });
+                        const auto disk_before = config.async_transport->diagnostics();
+                        const int64_t overlap_start = ggml_time_us();
                         copy_result = transfer_ring->transfer_wave(execution_backend, transfer_bindings);
+                        const int64_t overlap_end = ggml_time_us();
+                        const auto disk_after = config.async_transport->diagnostics();
+                        if (copy_result.is_ready() && disk_before.active_operations != 0 &&
+                            disk_after.active_operations != 0 && overlap_end > overlap_start) {
+                            disk_h2d_overlap_us += uint64_t(overlap_end - overlap_start);
+                            disk_h2d_overlap_bytes += cold_bundle_payload;
+                            disk_h2d_overlap_events++;
+                        }
                     }
                     if (copy_result.is_ready()) {
                         copy_result = transfer_ring->wait_for_hot(
@@ -2240,6 +2250,13 @@ public:
             result.ring_event_records = ring.event_records;
             result.ring_compute_waits = ring.compute_waits;
             result.ring_event_synchronizations = ring.event_synchronizations;
+            result.ring_first_h2d_enqueue_us = ring.first_h2d_enqueue_us;
+            result.ring_last_h2d_event_complete_us = ring.last_h2d_event_complete_us;
+            result.ring_h2d_compute_overlap_us = ring.h2d_compute_overlap_us;
+            result.ring_h2d_compute_overlap_bytes = ring.h2d_compute_overlap_bytes;
+            result.disk_h2d_overlap_us = disk_h2d_overlap_us;
+            result.disk_h2d_overlap_bytes = disk_h2d_overlap_bytes;
+            result.disk_h2d_overlap_events = disk_h2d_overlap_events;
             result.ring_h2d_bytes = ring.h2d_bytes;
             result.ring_h2d_time_us = ring.h2d_time_us;
             result.ring_failed_cleanup = ring.failed_cleanups;
@@ -2569,6 +2586,9 @@ private:
     uint64_t peak_pins = 0;
     uint64_t h2d_bytes = 0;
     uint64_t h2d_time_us = 0;
+    uint64_t disk_h2d_overlap_us = 0;
+    uint64_t disk_h2d_overlap_bytes = 0;
+    uint64_t disk_h2d_overlap_events = 0;
     uint64_t execution_id_read_bytes = 0;
     uint64_t execution_id_write_bytes = 0;
     uint64_t scratch_reservations = 0;

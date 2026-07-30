@@ -256,6 +256,13 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_event_records = 0;
     uint64_t ring_compute_waits = 0;
     uint64_t ring_event_synchronizations = 0;
+    uint64_t ring_first_h2d_enqueue_us = 0;
+    uint64_t ring_last_h2d_event_complete_us = 0;
+    uint64_t ring_h2d_compute_overlap_us = 0;
+    uint64_t ring_h2d_compute_overlap_bytes = 0;
+    uint64_t disk_h2d_overlap_us = 0;
+    uint64_t disk_h2d_overlap_bytes = 0;
+    uint64_t disk_h2d_overlap_events = 0;
     uint64_t ring_h2d_bytes = 0;
     uint64_t ring_h2d_time_us = 0;
     uint64_t ring_failed_cleanup = 0;

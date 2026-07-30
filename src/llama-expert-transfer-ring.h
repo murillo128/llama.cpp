@@ -72,6 +72,10 @@ struct llm_transfer_ring_diagnostics {
     uint64_t event_records = 0;
     uint64_t compute_waits = 0;
     uint64_t event_synchronizations = 0;
+    uint64_t first_h2d_enqueue_us = 0;
+    uint64_t last_h2d_event_complete_us = 0;
+    uint64_t h2d_compute_overlap_us = 0;
+    uint64_t h2d_compute_overlap_bytes = 0;
     uint64_t h2d_bytes = 0;
     uint64_t h2d_time_us = 0;
     uint64_t failed_cleanups = 0;

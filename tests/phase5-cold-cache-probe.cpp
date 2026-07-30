@@ -53,6 +53,7 @@ struct live_arguments {
     int steps = 5;
     llama_load_mode load_mode = LLAMA_LOAD_MODE_MMAP;
     bool cancel_on_storage = false;
+    bool require_overlap = false;
     std::string dump_cold_bundle;
 };
 
@@ -68,6 +69,10 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
     for (int index = 1; index < argc; ++index) {
         if (std::string(argv[index]) == "--cancel-on-storage") {
             result.cancel_on_storage = true;
+            continue;
+        }
+        if (std::string(argv[index]) == "--require-overlap") {
+            result.require_overlap = true;
             continue;
         }
         if (index + 1 >= argc) return false;
@@ -371,7 +376,25 @@ int run_live(int argc, char ** argv) {
               << "\tring_event_records=" << diagnostics.ring_event_records
               << "\tring_compute_waits=" << diagnostics.ring_compute_waits
               << "\tring_event_syncs=" << diagnostics.ring_event_synchronizations
+              << "\tring_first_h2d_us=" << diagnostics.ring_first_h2d_enqueue_us
+              << "\tring_last_h2d_complete_us=" << diagnostics.ring_last_h2d_event_complete_us
+              << "\th2d_compute_overlap_us=" << diagnostics.ring_h2d_compute_overlap_us
+              << "\th2d_compute_overlap_bytes=" << diagnostics.ring_h2d_compute_overlap_bytes
+              << "\tdisk_h2d_overlap_us=" << diagnostics.disk_h2d_overlap_us
+              << "\tdisk_h2d_overlap_bytes=" << diagnostics.disk_h2d_overlap_bytes
+              << "\tdisk_h2d_overlap_events=" << diagnostics.disk_h2d_overlap_events
               << '\n';
+    if (args.require_overlap) {
+        const bool valid_overlap = args.mode == "cold" && diagnostics.ring_event_capable &&
+            diagnostics.ring_dedicated_transfer_backend && diagnostics.ring_wave_synchronizations == 0 &&
+            diagnostics.ring_event_records == diagnostics.ring_waves &&
+            diagnostics.ring_compute_waits == diagnostics.ring_waves &&
+            diagnostics.ring_event_synchronizations == diagnostics.ring_waves &&
+            diagnostics.ring_live_events == 0 && diagnostics.disk_h2d_overlap_us > 0 &&
+            diagnostics.disk_h2d_overlap_bytes > 0 && diagnostics.ring_h2d_compute_overlap_us > 0 &&
+            diagnostics.ring_h2d_compute_overlap_bytes > 0;
+        if (!valid_overlap) return 34;
+    }
     llama_free(context);
     llama_model_free(model);
     return 0;
