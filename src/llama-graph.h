@@ -840,12 +840,14 @@ public:
     void add_fused_node(llm_graph_fused_node result);
 
     void add_route_output(llm_graph_route_output output);
+    void reserve_expert_bindings(size_t capacity);
     void add_expert_binding(llm_expert_graph_binding binding);
     void set_expert_provider_result(llm_expert_provider_result result);
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
     const std::vector<llm_graph_route_output> & get_route_outputs() const { return route_outputs; }
     const std::vector<llm_expert_graph_binding> & get_expert_bindings() const { return expert_bindings; }
+    size_t get_expert_binding_capacity() const { return expert_bindings.capacity(); }
     const llm_expert_provider_result & get_expert_provider_result() const { return expert_provider_result; }
 
     void set_params(const llm_graph_params & params);

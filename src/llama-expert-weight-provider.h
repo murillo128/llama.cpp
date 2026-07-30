@@ -106,12 +106,16 @@ struct llm_expert_provider_stats {
     uint64_t synchronizations = 0;
     uint64_t failures = 0;
     uint64_t cancellations = 0;
+    uint64_t bundle_registrations = 0;
+    uint64_t bundle_full_validations = 0;
+    uint64_t bundle_fast_path_hits = 0;
 };
 
 struct llm_expert_graph_diagnostics {
     uint64_t operation_hash = 0;
     int32_t node_count = 0;
     int32_t binding_count = 0;
+    int32_t binding_capacity = 0;
     uint64_t inflight_handles = 0;
     int32_t graphs_reused = 0;
 };
@@ -190,6 +194,7 @@ struct llm_expert_provider_faults {
     llm_expert_provider_error initialization = llm_expert_provider_error::none;
     llm_expert_provider_error binding = llm_expert_provider_error::none;
     llm_expert_provider_error preparation = llm_expert_provider_error::none;
+    size_t binding_successes_before_failure = 0;
     size_t fail_preparation_after_handles = SIZE_MAX;
 };
 

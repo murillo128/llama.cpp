@@ -20,8 +20,8 @@
 #include <string>
 
 struct llm_expert_context_plans {
-    explicit llm_expert_context_plans(size_t layer_capacity) {
-        pending.reserve(layer_capacity);
+    llm_expert_context_plans() {
+        pending.reserve(1);
         inflight.reserve(1);
     }
 
@@ -484,7 +484,7 @@ llama_context::llama_context(
     }
 
     if (expert_weight_provider) {
-        expert_plans = std::make_unique<llm_expert_context_plans>(model.hparams.n_layer());
+        expert_plans = std::make_unique<llm_expert_context_plans>();
     }
 }
 
@@ -609,6 +609,11 @@ void llama_context::sched_reserve() {
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    if (expert_weight_provider) {
+        const size_t binding_capacity = model.hparams.n_layer();
+        gf_res_prev->reserve_expert_bindings(binding_capacity);
+        gf_res_reserve->reserve_expert_bindings(binding_capacity);
+    }
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
@@ -774,6 +779,7 @@ llm_expert_graph_diagnostics llama_context::expert_graph_diagnostics() const {
     ggml_cgraph * graph = gf_res_prev->get_gf();
     result.node_count = graph ? ggml_graph_n_nodes(graph) : 0;
     result.binding_count = int32_t(gf_res_prev->get_expert_bindings().size());
+    result.binding_capacity = int32_t(gf_res_prev->get_expert_binding_capacity());
 
     uint64_t hash = 1469598103934665603ULL;
     constexpr uint64_t prime = 1099511628211ULL;

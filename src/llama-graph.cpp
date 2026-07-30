@@ -1333,6 +1333,10 @@ void llm_graph_result::add_route_output(llm_graph_route_output output) {
     route_outputs.push_back(output);
 }
 
+void llm_graph_result::reserve_expert_bindings(size_t capacity) {
+    expert_bindings.reserve(capacity);
+}
+
 void llm_graph_result::add_expert_binding(llm_expert_graph_binding binding) {
     GGML_ASSERT(expert_bindings.empty() || expert_bindings.back().layer <= binding.layer);
     expert_bindings.push_back(std::move(binding));
@@ -2045,16 +2049,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             selected_experts,
         };
         llm_expert_graph_binding binding;
-        auto provider_result = bundle.validate();
-        if (provider_result.is_ready()) {
-            provider_result = selection.validate();
-        }
-        if (provider_result.is_ready()) {
-            provider_result = expert_weight_provider->bind(bundle, selection, binding);
-        }
-        if (provider_result.is_ready()) {
-            provider_result = binding.validate(selection);
-        }
+        auto provider_result = expert_weight_provider->bind(bundle, selection, binding);
         if (provider_result.is_ready()) {
             execution_up_exps = binding.up.weight;
             execution_up_exps_b = binding.up.bias;

@@ -1,13 +1,15 @@
 #include "llama-expert-weight-provider.h"
 #include "llama-model.h"
 
-#include <cstdint>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -215,6 +217,15 @@ void test_failed_graph_binding_is_never_reusable() {
     GGML_ASSERT(graph_result.can_reuse(params));
 }
 
+void test_graph_binding_capacity_survives_reset() {
+    llm_graph_result graph_result(16);
+    GGML_ASSERT(graph_result.get_expert_binding_capacity() == 0);
+    graph_result.reserve_expert_bindings(7);
+    GGML_ASSERT(graph_result.get_expert_binding_capacity() >= 7);
+    graph_result.reset();
+    GGML_ASSERT(graph_result.get_expert_binding_capacity() >= 7);
+}
+
 void test_resident_provider_and_plan_retention() {
     test_tensors tensors;
     auto bundle = separate_bundle(tensors);
@@ -229,29 +240,88 @@ void test_resident_provider_and_plan_retention() {
     GGML_ASSERT(binding.gate.weight == bundle.gate.weight);
     GGML_ASSERT(binding.down.weight == bundle.down.weight);
 
+    llm_expert_graph_binding repeated_binding;
+    GGML_ASSERT(provider->bind(bundle, selection, repeated_binding).is_ready());
+    auto stats = provider->get_stats();
+    GGML_ASSERT(stats.bundle_registrations == 1);
+    GGML_ASSERT(stats.bundle_full_validations == 1);
+    GGML_ASSERT(stats.bundle_fast_path_hits == 1);
+
+    test_tensors conflicting_tensors;
+    const auto conflicting_bundle = separate_bundle(conflicting_tensors);
+    GGML_ASSERT(provider->bind(conflicting_bundle, selection, repeated_binding).error ==
+        llm_expert_provider_error::invalid_descriptor);
+
+    llm_expert_selection invalid_selection = selection;
+    invalid_selection.logical_ids = tensors.ids_f32;
+    GGML_ASSERT(provider->bind(bundle, invalid_selection, repeated_binding).error ==
+        llm_expert_provider_error::invalid_selection);
+
     llm_expert_execution_plan request;
+    request.reserve(1);
     std::vector<llm_expert_graph_binding> bindings = { binding, binding };
     GGML_ASSERT(provider->prepare(bindings, request).is_ready());
-    GGML_ASSERT(request.handle_count() == 2);
+    GGML_ASSERT(request.handle_count() == 1);
 
     llm_expert_execution_plan inflight;
     inflight.reserve(1);
     inflight.absorb(std::move(request));
     GGML_ASSERT(request.handle_count() == 0);
-    GGML_ASSERT(inflight.handle_count() == 2);
+    GGML_ASSERT(inflight.handle_count() == 1);
     GGML_ASSERT(provider->get_stats().handles_released == 0);
     inflight.reset();
 
-    const auto stats = provider->get_stats();
+    stats = provider->get_stats();
     GGML_ASSERT(stats.objects_created == 1);
-    GGML_ASSERT(stats.bind_calls == 1);
+    GGML_ASSERT(stats.bind_calls == 4);
     GGML_ASSERT(stats.prepare_calls == 1);
-    GGML_ASSERT(stats.handles_acquired == 2);
-    GGML_ASSERT(stats.handles_released == 2);
+    GGML_ASSERT(stats.handles_acquired == 1);
+    GGML_ASSERT(stats.handles_released == 1);
     GGML_ASSERT(stats.allocations == 0);
     GGML_ASSERT(stats.callbacks == 0);
     GGML_ASSERT(stats.tensor_copies == 0);
     GGML_ASSERT(stats.synchronizations == 0);
+
+    llm_expert_provider_faults cached_fault;
+    cached_fault.binding = llm_expert_provider_error::preparation_failed;
+    cached_fault.binding_successes_before_failure = 1;
+    provider = llm_create_resident_expert_weight_provider(cached_fault);
+    GGML_ASSERT(provider->bind(bundle, selection, binding).is_ready());
+    GGML_ASSERT(provider->bind(bundle, selection, binding).error == llm_expert_provider_error::preparation_failed);
+    GGML_ASSERT(provider->get_stats().bundle_fast_path_hits == 1);
+
+    auto concurrent_provider = llm_create_resident_expert_weight_provider();
+    std::atomic<int> ready_count { 0 };
+    std::vector<std::thread> binders;
+    for (int index = 0; index < 8; ++index) {
+        binders.emplace_back([&] {
+            llm_expert_graph_binding concurrent_binding;
+            if (concurrent_provider->bind(bundle, selection, concurrent_binding).is_ready()) {
+                ready_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto & binder : binders) {
+        binder.join();
+    }
+    const auto concurrent_stats = concurrent_provider->get_stats();
+    GGML_ASSERT(ready_count.load(std::memory_order_relaxed) == 8);
+    GGML_ASSERT(concurrent_stats.bundle_registrations == 1);
+    GGML_ASSERT(concurrent_stats.bundle_full_validations == 1);
+    GGML_ASSERT(concurrent_stats.bundle_fast_path_hits == 7);
+
+    llm_expert_execution_plan empty;
+    GGML_ASSERT(provider->prepare({}, empty).is_ready());
+    GGML_ASSERT(empty.handle_count() == 0);
+
+    auto invalid_binding = binding;
+    invalid_binding.down.weight = conflicting_bundle.down.weight;
+    GGML_ASSERT(provider->prepare({ invalid_binding }, empty).error == llm_expert_provider_error::invalid_binding);
+    GGML_ASSERT(empty.handle_count() == 0);
+    invalid_binding = binding;
+    invalid_binding.execution_ids = tensors.ids_f32;
+    GGML_ASSERT(provider->prepare({ invalid_binding }, empty).error == llm_expert_provider_error::invalid_binding);
+    GGML_ASSERT(empty.handle_count() == 0);
 }
 
 void test_resident_provider_failures_cleanup_partially_acquired_handles() {
@@ -273,21 +343,27 @@ void test_resident_provider_failures_cleanup_partially_acquired_handles() {
     prepare_faults.preparation = llm_expert_provider_error::allocation_failed;
     prepare_faults.fail_preparation_after_handles = 1;
     provider = llm_create_resident_expert_weight_provider(prepare_faults);
-    binding.provider_identity = provider.get();
+    GGML_ASSERT(provider->bind(bundle, selection, binding).is_ready());
     llm_expert_execution_plan plan;
+    plan.reserve(1);
     const auto result = provider->prepare({ binding, binding }, plan);
     GGML_ASSERT(result.status == llm_expert_provider_status::allocation_failed);
-    GGML_ASSERT(plan.handle_count() == 1);
-    GGML_ASSERT(provider->get_stats().handles_released == 0);
-    plan.reset();
+    GGML_ASSERT(plan.handle_count() == 0);
     GGML_ASSERT(provider->get_stats().handles_acquired == 1);
     GGML_ASSERT(provider->get_stats().handles_released == 1);
+
+    prepare_faults.preparation = llm_expert_provider_error::none;
+    provider = llm_create_resident_expert_weight_provider(prepare_faults);
+    GGML_ASSERT(provider->bind(bundle, selection, binding).is_ready());
+    GGML_ASSERT(provider->prepare({ binding }, plan).error == llm_expert_provider_error::preparation_failed);
+    GGML_ASSERT(plan.handle_count() == 0);
+    GGML_ASSERT(provider->get_stats().handles_acquired == provider->get_stats().handles_released);
 
     llm_expert_provider_faults cancellation;
     cancellation.preparation = llm_expert_provider_error::cancelled;
     cancellation.fail_preparation_after_handles = 0;
     provider = llm_create_resident_expert_weight_provider(cancellation);
-    binding.provider_identity = provider.get();
+    GGML_ASSERT(provider->bind(bundle, selection, binding).is_ready());
     const auto cancelled = provider->prepare({ binding }, plan);
     GGML_ASSERT(cancelled.status == llm_expert_provider_status::cancelled);
     GGML_ASSERT(plan.handle_count() == 0);
@@ -521,8 +597,11 @@ void test_model_integration(const char * model_path, int n_gpu_layers) {
     GGML_ASSERT(resident_stats.objects_created == 1);
     GGML_ASSERT(resident_stats.bind_calls > 0);
     GGML_ASSERT(resident_stats.prepare_calls == 11);
-    GGML_ASSERT(resident_stats.handles_acquired > 0);
-    GGML_ASSERT(resident_stats.handles_acquired == resident_stats.handles_released);
+    GGML_ASSERT(resident_stats.handles_acquired == resident_stats.prepare_calls);
+    GGML_ASSERT(resident_stats.handles_released == resident_stats.prepare_calls);
+    GGML_ASSERT(resident_stats.bundle_registrations == 7);
+    GGML_ASSERT(resident_stats.bundle_full_validations == 7);
+    GGML_ASSERT(resident_stats.bundle_fast_path_hits > 0);
     GGML_ASSERT(resident_stats.allocations == 0);
     GGML_ASSERT(resident_stats.callbacks == 0);
     GGML_ASSERT(resident_stats.tensor_copies == 0);
@@ -545,6 +624,7 @@ int main(int argc, char ** argv) {
     test_keys_and_descriptors();
     test_selection_binding_and_handles();
     test_failed_graph_binding_is_never_reusable();
+    test_graph_binding_capacity_survives_reset();
     test_resident_provider_and_plan_retention();
     test_resident_provider_failures_cleanup_partially_acquired_handles();
     if (argc == 3 || argc == 4) {

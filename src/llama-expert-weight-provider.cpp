@@ -1,6 +1,9 @@
 #include "llama-expert-weight-provider.h"
+#include "llama-hparams.h"
 
+#include <array>
 #include <atomic>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -25,6 +28,35 @@ bool projection_is_valid(const llm_expert_projection_descriptor & projection, in
 
     const auto actual_buffer_type = projection.weight->buffer ? ggml_backend_buffer_get_type(projection.weight->buffer) : nullptr;
     return actual_buffer_type == projection.buffer_type;
+}
+
+bool projection_identity_matches(
+        const llm_expert_projection_descriptor & lhs,
+        const llm_expert_projection_descriptor & rhs) {
+    return lhs.weight == rhs.weight && lhs.bias == rhs.bias && lhs.scale == rhs.scale && lhs.buffer_type == rhs.buffer_type;
+}
+
+bool bundle_identity_matches(
+        const llm_expert_bundle_descriptor & lhs,
+        const llm_expert_bundle_descriptor & rhs) {
+    return lhs.layer == rhs.layer && lhs.n_expert == rhs.n_expert &&
+        projection_identity_matches(lhs.up, rhs.up) &&
+        projection_identity_matches(lhs.gate, rhs.gate) &&
+        projection_identity_matches(lhs.gate_up, rhs.gate_up) &&
+        projection_identity_matches(lhs.down, rhs.down);
+}
+
+bool binding_identity_matches(
+        const llm_expert_graph_binding & binding,
+        const llm_expert_bundle_descriptor & bundle) {
+    return binding.layer == bundle.layer &&
+        projection_identity_matches(binding.up, bundle.up) &&
+        projection_identity_matches(binding.gate, bundle.gate) &&
+        projection_identity_matches(binding.gate_up, bundle.gate_up) &&
+        projection_identity_matches(binding.down, bundle.down) &&
+        binding.execution_ids != nullptr && binding.execution_ids->type == GGML_TYPE_I32 &&
+        binding.execution_ids->ne[0] > 0 && binding.execution_ids->ne[0] <= bundle.n_expert &&
+        binding.execution_ids->ne[1] >= 0;
 }
 
 } // namespace
@@ -239,6 +271,15 @@ struct resident_provider_stats {
     std::atomic<uint64_t> handles_released { 0 };
     std::atomic<uint64_t> failures { 0 };
     std::atomic<uint64_t> cancellations { 0 };
+    std::atomic<uint64_t> bundle_registrations { 0 };
+    std::atomic<uint64_t> bundle_full_validations { 0 };
+    std::atomic<uint64_t> bundle_fast_path_hits { 0 };
+};
+
+struct resident_bundle_registration {
+    std::atomic<bool> registered { false };
+    std::mutex mutex;
+    llm_expert_bundle_descriptor bundle = {};
 };
 
 class llm_resident_expert_weight_provider final : public llm_expert_weight_provider {
@@ -254,11 +295,40 @@ public:
             const llm_expert_selection & selection,
             llm_expert_graph_binding & binding) noexcept override {
         stats.bind_calls.fetch_add(1, std::memory_order_relaxed);
-        auto result = bundle.validate();
-        if (result.is_ready()) {
-            result = selection.validate();
+        auto result = selection.validate();
+        if (!result.is_ready() || bundle.layer < 0 || bundle.layer >= LLAMA_MAX_LAYERS) {
+            if (result.is_ready()) {
+                result = llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+            }
+            record_failure(result);
+            return result;
         }
-        if (result.is_ready() && faults.binding != llm_expert_provider_error::none) {
+
+        auto & registration = registrations[bundle.layer];
+        if (registration.registered.load(std::memory_order_acquire)) {
+            stats.bundle_fast_path_hits.fetch_add(1, std::memory_order_relaxed);
+            if (!bundle_identity_matches(registration.bundle, bundle)) {
+                result = llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(registration.mutex);
+            if (registration.registered.load(std::memory_order_relaxed)) {
+                stats.bundle_fast_path_hits.fetch_add(1, std::memory_order_relaxed);
+                if (!bundle_identity_matches(registration.bundle, bundle)) {
+                    result = llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+                }
+            } else {
+                stats.bundle_full_validations.fetch_add(1, std::memory_order_relaxed);
+                result = bundle.validate();
+                if (result.is_ready()) {
+                    registration.bundle = bundle;
+                    registration.registered.store(true, std::memory_order_release);
+                    stats.bundle_registrations.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (result.is_ready() && faults.binding != llm_expert_provider_error::none &&
+            successful_bindings.load(std::memory_order_relaxed) >= faults.binding_successes_before_failure) {
             result = llm_expert_provider_result::failure(faults.binding);
         }
         if (!result.is_ready()) {
@@ -275,7 +345,13 @@ public:
             bundle.down,
             selection.logical_ids,
         };
-        return binding.validate(selection);
+        result = binding.validate(selection);
+        if (result.is_ready()) {
+            successful_bindings.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            record_failure(result);
+        }
+        return result;
     }
 
     llm_expert_provider_result prepare(
@@ -283,48 +359,47 @@ public:
             llm_expert_execution_plan & plan) noexcept override {
         stats.prepare_calls.fetch_add(1, std::memory_order_relaxed);
         plan.reset();
+        auto fail = [&](llm_expert_provider_result result) {
+            record_failure(result);
+            plan.reset();
+            plan.set_result(result);
+            return result;
+        };
         try {
-            plan.reserve(bindings.size());
             for (size_t index = 0; index < bindings.size(); ++index) {
-                if (bindings[index].provider_identity != this) {
-                    const auto result = llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
-                    record_failure(result);
-                    plan.set_result(result);
-                    return result;
+                const auto & binding = bindings[index];
+                if (binding.provider_identity != this || binding.layer < 0 || binding.layer >= LLAMA_MAX_LAYERS) {
+                    return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
                 }
-                if (index == faults.fail_preparation_after_handles) {
-                    const auto error = faults.preparation == llm_expert_provider_error::none
-                        ? llm_expert_provider_error::preparation_failed
-                        : faults.preparation;
-                    const auto result = llm_expert_provider_result::failure(error);
-                    record_failure(result);
-                    plan.set_result(result);
-                    return result;
+                const auto & registration = registrations[binding.layer];
+                if (!registration.registered.load(std::memory_order_acquire) ||
+                    !binding_identity_matches(binding, registration.bundle)) {
+                    return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
                 }
+            }
 
-                stats.handles_acquired.fetch_add(1, std::memory_order_relaxed);
-                // The resident provider has one immutable model-lifetime binding, so all
-                // request leases share one opaque token and compact into bounded storage.
-                plan.add_handle({ this, 1 });
+            if (bindings.empty()) {
+                plan.set_result(llm_expert_provider_result::success());
+                return llm_expert_provider_result::success();
+            }
+
+            const auto injected_preparation_error = faults.preparation == llm_expert_provider_error::none
+                ? llm_expert_provider_error::preparation_failed
+                : faults.preparation;
+            if (faults.fail_preparation_after_handles == 0) {
+                return fail(llm_expert_provider_result::failure(injected_preparation_error));
+            }
+
+            stats.handles_acquired.fetch_add(1, std::memory_order_relaxed);
+            plan.add_handle({ this, 1 });
+
+            if (faults.preparation != llm_expert_provider_error::none || faults.fail_preparation_after_handles != SIZE_MAX) {
+                return fail(llm_expert_provider_result::failure(injected_preparation_error));
             }
         } catch (const std::bad_alloc &) {
-            const auto result = llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
-            record_failure(result);
-            plan.set_result(result);
-            return result;
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
         } catch (...) {
-            const auto result = llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
-            record_failure(result);
-            plan.set_result(result);
-            return result;
-        }
-
-        if (faults.preparation != llm_expert_provider_error::none &&
-            faults.fail_preparation_after_handles == SIZE_MAX) {
-            const auto result = llm_expert_provider_result::failure(faults.preparation);
-            record_failure(result);
-            plan.set_result(result);
-            return result;
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed));
         }
 
         plan.set_result(llm_expert_provider_result::success());
@@ -344,6 +419,9 @@ public:
             0,
             stats.failures.load(std::memory_order_relaxed),
             stats.cancellations.load(std::memory_order_relaxed),
+            stats.bundle_registrations.load(std::memory_order_relaxed),
+            stats.bundle_full_validations.load(std::memory_order_relaxed),
+            stats.bundle_fast_path_hits.load(std::memory_order_relaxed),
         };
     }
 
@@ -362,6 +440,8 @@ private:
 
     llm_expert_provider_faults faults;
     resident_provider_stats stats;
+    std::atomic<uint64_t> successful_bindings { 0 };
+    std::array<resident_bundle_registration, LLAMA_MAX_LAYERS> registrations;
 };
 
 } // namespace
