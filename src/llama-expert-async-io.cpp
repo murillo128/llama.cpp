@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -197,18 +198,6 @@ public:
         return true;
     }
 
-    bool wait_cqe(io_uring_cqe & result, int & native_error) {
-        for (;;) {
-            if (try_cqe(result)) return true;
-            const int entered = int(syscall(__NR_io_uring_enter, fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0));
-            if (entered < 0 && errno == EINTR) continue;
-            if (entered < 0) {
-                native_error = errno;
-                return false;
-            }
-        }
-    }
-
     bool register_files(const int * handles, uint32_t count, int & native_error) {
         if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_FILES, handles, count) < 0) {
             native_error = errno;
@@ -340,11 +329,23 @@ struct llm_expert_async_transport::impl {
     std::vector<intptr_t> direct_disabled_handles;
     uint32_t direct_disabled_handle_count = 0;
     bool staging_registered = false;
+    bool ring_submit_paused_for_testing = false;
+    bool read_cqe_injected_for_testing = false;
 #if defined(__linux__)
     io_uring_owner ring;
 #endif
 
     ~impl() { std::free(staging); }
+
+    void record_fallback(llm_expert_async_fallback_reason reason, int native_error, const char * detail) {
+        const uint64_t bit = static_cast<uint64_t>(reason);
+        const bool first = (counters.fallback_reason_mask & bit) == 0;
+        counters.fallback_reason_mask |= bit;
+        if (first) {
+            counters.fallback_diagnostics_emitted++;
+            std::fprintf(stderr, "warning: expert async fallback reason=%s error=%d\n", detail, native_error);
+        }
+    }
 
     read_request_record * find_read(llm_expert_request_handle handle) {
         if (!handle.valid() || handle.slot >= read_requests.size()) return nullptr;
@@ -386,6 +387,49 @@ struct llm_expert_async_transport::impl {
     }
 
 #if defined(__linux__)
+    bool fill_read_sqe(uint32_t operation_slot, io_uring_sqe & sqe) {
+        auto & operation = operations[operation_slot];
+        uint64_t direct_offset = 0;
+        uint64_t direct_bytes = 0;
+        const bool direct = prepare_direct(operation, direct_offset, direct_bytes);
+        if (direct) {
+            sqe.opcode = staging_registered ? IORING_OP_READ_FIXED : IORING_OP_READ;
+            sqe.addr = uint64_t(staging);
+            sqe.len = uint32_t(direct_bytes);
+            sqe.off = direct_offset;
+            sqe.fd = int(operation.read.direct_native_handle);
+            if (staging_registered) sqe.buf_index = 0;
+        } else if (operation.read.segment_count == 1) {
+            const auto & segment = operation.read.segments[0];
+            sqe.opcode = IORING_OP_READ;
+            sqe.addr = uint64_t(segment.data);
+            sqe.len = uint32_t(segment.byte_count);
+            sqe.off = segment.file_offset;
+            sqe.fd = int(operation.read.native_handle);
+        } else {
+            for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
+                operation.iovecs[index] = {
+                    operation.read.segments[index].data,
+                    size_t(operation.read.segments[index].byte_count),
+                };
+            }
+            sqe.opcode = IORING_OP_READV;
+            sqe.addr = uint64_t(operation.iovecs.data());
+            sqe.len = operation.read.segment_count;
+            sqe.off = operation.read.file_offset;
+            sqe.fd = int(operation.read.native_handle);
+        }
+        for (uint32_t file_index = 0; file_index < registered_file_count; ++file_index) {
+            if (registered_files[file_index] == sqe.fd) {
+                sqe.fd = int(file_index);
+                sqe.flags |= IOSQE_FIXED_FILE;
+                break;
+            }
+        }
+        sqe.user_data = llm_expert_async_transport::encode_user_data(operation_slot, operation.generation);
+        return true;
+    }
+
     bool run_ring(llm_expert_request_handle handle, llm_expert_async_read_completion & completion,
             intptr_t & direct_capability_handle, bool & transport_failed) {
         direct_capability_handle = -1;
@@ -417,43 +461,7 @@ struct llm_expert_async_transport::impl {
                 batch_slots[batch] = uint32_t(next);
                 operation.ring_completed = false;
                 operation.cancel_submitted = false;
-                uint64_t direct_offset = 0;
-                uint64_t direct_bytes = 0;
-                const bool direct = prepare_direct(operation, direct_offset, direct_bytes);
-                if (direct) {
-                    sqe->opcode = staging_registered ? IORING_OP_READ_FIXED : IORING_OP_READ;
-                    sqe->addr = uint64_t(staging);
-                    sqe->len = uint32_t(direct_bytes);
-                    sqe->off = direct_offset;
-                    sqe->fd = int(operation.read.direct_native_handle);
-                    if (staging_registered) sqe->buf_index = 0;
-                } else if (operation.read.segment_count == 1) {
-                    const auto & segment = operation.read.segments[0];
-                    sqe->opcode = IORING_OP_READ;
-                    sqe->addr = uint64_t(segment.data);
-                    sqe->len = uint32_t(segment.byte_count);
-                    sqe->off = segment.file_offset;
-                } else {
-                    for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
-                        operation.iovecs[index] = {
-                            operation.read.segments[index].data,
-                            size_t(operation.read.segments[index].byte_count),
-                        };
-                    }
-                    sqe->opcode = IORING_OP_READV;
-                    sqe->addr = uint64_t(operation.iovecs.data());
-                    sqe->len = operation.read.segment_count;
-                    sqe->off = operation.read.file_offset;
-                }
-                if (!direct) sqe->fd = int(operation.read.native_handle);
-                for (uint32_t file_index = 0; file_index < registered_file_count; ++file_index) {
-                    if (registered_files[file_index] == sqe->fd) {
-                        sqe->fd = int(file_index);
-                        sqe->flags |= IOSQE_FIXED_FILE;
-                        break;
-                    }
-                }
-                sqe->user_data = llm_expert_async_transport::encode_user_data(uint32_t(next), operation.generation);
+                (void) fill_read_sqe(uint32_t(next), *sqe);
                 batch++;
                 if (config.direct_io_requested) {
                     ++next;
@@ -479,6 +487,8 @@ struct llm_expert_async_transport::impl {
                         std::lock_guard<std::mutex> guard(mutex);
                         counters.io_uring_enabled = false;
                         counters.io_uring_runtime_error = count == 0 ? EAGAIN : native_error;
+                        record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                            counters.io_uring_runtime_error, "ring-runtime");
                     }
                     transport_failed = true;
                     completion.result = llm_expert_async_result::invalid;
@@ -491,6 +501,15 @@ struct llm_expert_async_transport::impl {
                 std::lock_guard<std::mutex> guard(mutex);
                 counters.ring_submissions += submitted;
                 counters.peak_sq_occupancy = std::max(counters.peak_sq_occupancy, submitted);
+            }
+            if (config.pause_after_ring_submit_for_testing) {
+                std::unique_lock<std::mutex> guard(mutex);
+                ring_submit_paused_for_testing = true;
+                condition.notify_all();
+                condition.wait(guard, [&] {
+                    return read_requests[handle.slot].cancel_requested || worker_stop;
+                });
+                ring_submit_paused_for_testing = false;
             }
             uint32_t read_completions_left = submitted;
             uint32_t cancel_completions_left = 0;
@@ -542,10 +561,15 @@ struct llm_expert_async_transport::impl {
                     counters.peak_cq_occupancy = std::max(
                         counters.peak_cq_occupancy, ring.completion_occupancy());
                 }
-                if (!ring.wait_cqe(cqe, native_error)) {
-                    completion.result = llm_expert_async_result::invalid;
-                    completion.native_error = native_error;
-                    return false;
+                if (!ring.try_cqe(cqe)) {
+                    // The worker must remain responsive to cancellation and shutdown.
+                    // Polling the bounded CQ with a condition-variable timeout lets the
+                    // sole submitter observe cancellation and issue ASYNC_CANCEL SQEs.
+                    std::unique_lock<std::mutex> guard(mutex);
+                    condition.wait_for(guard, std::chrono::milliseconds(1), [&] {
+                        return read_requests[handle.slot].cancel_requested || worker_stop;
+                    });
+                    continue;
                 }
                 uint32_t operation_slot = 0;
                 uint32_t operation_generation = 0;
@@ -580,6 +604,27 @@ struct llm_expert_async_transport::impl {
                         first_native_error = -cqe.res;
                     }
                     continue;
+                }
+                if (config.inject_first_read_cqe_for_testing && !read_cqe_injected_for_testing) {
+                    cqe.res = config.first_read_cqe_result_for_testing;
+                    read_cqe_injected_for_testing = true;
+                }
+                if (cqe.res == -EINTR || cqe.res == -EAGAIN) {
+                    io_uring_sqe * retry = ring.acquire_sqe();
+                    int retry_error = 0;
+                    const bool retry_ready = retry != nullptr && fill_read_sqe(operation_slot, *retry) &&
+                        ring.submit(retry_error) == 1;
+                    counters.ring_completions++;
+                    if (cqe.res == -EINTR) counters.interrupted_reads_retried++;
+                    else counters.would_block_reads_retried++;
+                    if (retry_ready) {
+                        counters.ring_submissions++;
+                        continue;
+                    }
+                    if (first_error == llm_expert_async_result::ready) {
+                        first_error = llm_expert_async_result::invalid;
+                        first_native_error = retry_error == 0 ? EAGAIN : retry_error;
+                    }
                 }
                 operation.ring_completed = true;
                 read_completions_left--;
@@ -625,6 +670,19 @@ struct llm_expert_async_transport::impl {
                     if (config.direct_io_requested) {
                         counters.buffered_fallback_operations++;
                         counters.buffered_fallback_bytes += operation.read.byte_count;
+                        uint64_t useful_end = 0;
+                        uint64_t rounded_end = 0;
+                        const bool eof_tail = operation.read.direct_alignment != 0 &&
+                            checked_add(operation.read.file_offset, operation.read.byte_count, useful_end) &&
+                            checked_add(useful_end, operation.read.direct_alignment - 1, rounded_end) &&
+                            (rounded_end & ~(operation.read.direct_alignment - 1)) > operation.read.source_size;
+                        const auto reason = eof_tail ? llm_expert_async_fallback_reason::direct_eof :
+                            (staging == nullptr || staging_bytes == 0 ?
+                                llm_expert_async_fallback_reason::direct_staging :
+                                llm_expert_async_fallback_reason::direct_alignment);
+                        record_fallback(reason, 0, eof_tail ? "direct-eof" :
+                            (reason == llm_expert_async_fallback_reason::direct_staging ?
+                                "direct-staging" : "direct-alignment"));
                     }
                 }
                 counters.ring_completions++;
@@ -683,12 +741,14 @@ struct llm_expert_async_transport::impl {
                     completion.result == llm_expert_async_result::invalid && direct_capability_handle >= 0 &&
                     (completion.native_error == EINVAL || completion.native_error == EOPNOTSUPP ||
                      completion.native_error == ENOTSUP)) {
-                    completion = { llm_expert_async_result::ready, 0, 0 };
                     {
                         std::lock_guard<std::mutex> guard(mutex);
                         (void) disable_direct(direct_capability_handle);
                         counters.direct_capability_retries++;
+                        record_fallback(llm_expert_async_fallback_reason::direct_capability,
+                            completion.native_error, "direct-capability");
                     }
+                    completion = { llm_expert_async_result::ready, 0, 0 };
                     direct_capability_handle = -1;
                     ring_ready = run_ring(handle, completion, direct_capability_handle, transport_failed);
                 }
@@ -796,12 +856,15 @@ struct llm_expert_async_transport::impl {
                     if (completion.result == llm_expert_async_result::invalid &&
                         (completion.native_error == EINVAL || completion.native_error == EOPNOTSUPP ||
                          completion.native_error == ENOTSUP)) {
+                        const int direct_error = completion.native_error;
                         force_buffered = true;
                         completion = { llm_expert_async_result::ready, 0, 0 };
                         operation_index = size_t(-1);
                         std::lock_guard<std::mutex> guard(mutex);
                         (void) disable_direct(operation.direct_native_handle);
                         counters.direct_capability_retries++;
+                        record_fallback(llm_expert_async_fallback_reason::direct_capability,
+                            direct_error, "direct-capability");
                         continue;
                     }
                 } else {
@@ -810,6 +873,19 @@ struct llm_expert_async_transport::impl {
                         if (config.direct_io_requested) {
                             counters.buffered_fallback_operations++;
                             counters.buffered_fallback_bytes += operation.byte_count;
+                            uint64_t useful_end = 0;
+                            uint64_t rounded_end = 0;
+                            const bool eof_tail = operation.direct_alignment != 0 &&
+                                checked_add(operation.file_offset, operation.byte_count, useful_end) &&
+                                checked_add(useful_end, operation.direct_alignment - 1, rounded_end) &&
+                                (rounded_end & ~(operation.direct_alignment - 1)) > operation.source_size;
+                            const auto reason = eof_tail ? llm_expert_async_fallback_reason::direct_eof :
+                                (staging == nullptr || staging_bytes == 0 ?
+                                    llm_expert_async_fallback_reason::direct_staging :
+                                    llm_expert_async_fallback_reason::direct_alignment);
+                            record_fallback(reason, 0, eof_tail ? "direct-eof" :
+                                (reason == llm_expert_async_fallback_reason::direct_staging ?
+                                    "direct-staging" : "direct-alignment"));
                         }
                     }
                     for (uint8_t segment_index = 0; segment_index < operation.segment_count; ++segment_index) {
@@ -950,6 +1026,10 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
             pimpl->counters.direct_staging_error = ENOBUFS;
         }
     }
+    if (pimpl->counters.direct_staging_error != 0) {
+        pimpl->record_fallback(llm_expert_async_fallback_reason::direct_staging,
+            pimpl->counters.direct_staging_error, "direct-staging");
+    }
 #endif
 #if defined(__linux__)
     static_assert(sizeof(io_uring_sqe) == 64, "unexpected io_uring SQE size");
@@ -972,6 +1052,8 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
             !pimpl->counters.opcode_async_cancel) {
             pimpl->counters.io_uring_probe_error = !cq_capacity_safe ? ENOBUFS :
                 (probe_error != 0 ? probe_error : EOPNOTSUPP);
+            pimpl->record_fallback(llm_expert_async_fallback_reason::ring_capability,
+                pimpl->counters.io_uring_probe_error, "ring-capability");
             pimpl->ring.close_ring();
         } else {
             pimpl->counters.io_uring_enabled = true;
@@ -993,15 +1075,21 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
                 pimpl->counters.registered_buffer_bytes = pimpl->staging_bytes;
             } else if (recoverable_registration_error(registration_error)) {
                 pimpl->counters.buffer_registration_error = registration_error;
+                pimpl->record_fallback(llm_expert_async_fallback_reason::buffer_registration,
+                    registration_error, "buffer-registration");
             } else {
                 throw std::runtime_error("hard direct-I/O staging registration failure");
             }
         } else if (pimpl->counters.io_uring_enabled && pimpl->staging != nullptr &&
                    !pimpl->counters.opcode_read_fixed) {
             pimpl->counters.buffer_registration_error = EOPNOTSUPP;
+            pimpl->record_fallback(llm_expert_async_fallback_reason::buffer_registration,
+                EOPNOTSUPP, "buffer-registration");
         }
     } else {
         pimpl->counters.io_uring_setup_error = ring_error;
+        pimpl->record_fallback(llm_expert_async_fallback_reason::ring_setup,
+            ring_error, "ring-setup");
     }
 #endif
     pimpl->worker = std::thread([this] { pimpl->worker_main(); });
@@ -1253,6 +1341,8 @@ llm_expert_async_result llm_expert_async_transport::register_files(
         if (!registered) {
             pimpl->counters.file_registration_error = native_error;
             pimpl->registered_file_count = 0;
+            pimpl->record_fallback(llm_expert_async_fallback_reason::file_registration,
+                native_error, "file-registration");
             return recoverable_registration_error(native_error) ?
                 llm_expert_async_result::ready : llm_expert_async_result::invalid;
         }
@@ -1314,6 +1404,14 @@ llm_expert_async_result llm_expert_async_transport::release_read(llm_expert_requ
     request->cancel_requested = false;
     pimpl->counters.active_read_requests--;
     return llm_expert_async_result::ready;
+}
+
+bool llm_expert_async_transport::wait_until_ring_submitted_for_testing() noexcept {
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->config.pause_after_ring_submit_for_testing || !pimpl->counters.io_uring_enabled) return false;
+    return pimpl->condition.wait_for(lock, std::chrono::seconds(5), [&] {
+        return pimpl->ring_submit_paused_for_testing || pimpl->counters.admission_closed;
+    }) && pimpl->ring_submit_paused_for_testing;
 }
 
 bool llm_expert_async_transport::shutdown() noexcept {

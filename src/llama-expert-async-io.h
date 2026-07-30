@@ -34,6 +34,22 @@ struct llm_expert_async_config {
     uint32_t partial_submit_count_before_error_for_testing = 0;
     int submit_error_for_testing = 0;
     uint32_t source_file_capacity = 0;
+    bool pause_after_ring_submit_for_testing = false;
+    bool inject_first_read_cqe_for_testing = false;
+    int32_t first_read_cqe_result_for_testing = 0;
+};
+
+enum class llm_expert_async_fallback_reason : uint64_t {
+    none                = 0,
+    ring_setup          = 1ULL << 0,
+    ring_capability     = 1ULL << 1,
+    ring_runtime        = 1ULL << 2,
+    file_registration   = 1ULL << 3,
+    buffer_registration = 1ULL << 4,
+    direct_staging      = 1ULL << 5,
+    direct_alignment    = 1ULL << 6,
+    direct_eof          = 1ULL << 7,
+    direct_capability   = 1ULL << 8,
 };
 
 struct llm_expert_async_ring_layout {
@@ -101,6 +117,8 @@ struct llm_expert_async_diagnostics {
     uint64_t staging_ceiling_bytes = 0;
     uint64_t administration_bytes = 0;
     uint64_t transport_epoch = 1;
+    uint64_t fallback_reason_mask = 0;
+    uint64_t fallback_diagnostics_emitted = 0;
     uint64_t operations_reserved = 0;
     uint64_t completions_consumed = 0;
     uint64_t stale_completions = 0;
@@ -191,6 +209,7 @@ public:
             void * abort_callback_data = nullptr) noexcept;
     llm_expert_async_result cancel_read(llm_expert_request_handle request) noexcept;
     llm_expert_async_result release_read(llm_expert_request_handle request) noexcept;
+    bool wait_until_ring_submitted_for_testing() noexcept;
     bool shutdown() noexcept;
     llm_expert_async_diagnostics diagnostics() const noexcept;
 
