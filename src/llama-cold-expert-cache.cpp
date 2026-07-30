@@ -277,6 +277,8 @@ llm_cold_expert_cache::llm_cold_expert_cache(llm_cold_cache_config config) :
     pimpl(std::make_unique<impl>(config)) {}
 
 llm_cold_expert_cache::~llm_cold_expert_cache() = default;
+llm_cold_expert_cache::llm_cold_expert_cache(llm_cold_expert_cache &&) noexcept = default;
+llm_cold_expert_cache & llm_cold_expert_cache::operator=(llm_cold_expert_cache &&) noexcept = default;
 
 llm_expert_provider_result llm_cold_expert_cache::initialize(
         const llm_expert_bundle_descriptor & prototype) noexcept {

@@ -88,6 +88,8 @@ public:
 
     llm_cold_expert_cache(const llm_cold_expert_cache &) = delete;
     llm_cold_expert_cache & operator=(const llm_cold_expert_cache &) = delete;
+    llm_cold_expert_cache(llm_cold_expert_cache &&) noexcept;
+    llm_cold_expert_cache & operator=(llm_cold_expert_cache &&) noexcept;
 
     llm_expert_provider_result initialize(const llm_expert_bundle_descriptor & prototype) noexcept;
     llm_expert_provider_result find_or_admit(

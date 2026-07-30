@@ -301,8 +301,10 @@ public:
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     virtual llm_expert_provider_result remap_checkpoint_tensor(
-            const llm_expert_graph_binding & binding) noexcept {
+            const llm_expert_graph_binding & binding,
+            ggml_backend_t execution_backend = nullptr) noexcept {
         (void) binding;
+        (void) execution_backend;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     virtual llm_expert_provider_result cleanup_failed_slots() noexcept {

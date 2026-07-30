@@ -964,8 +964,10 @@ public:
     }
 
     llm_expert_provider_result remap_checkpoint_tensor(
-            const llm_expert_graph_binding & binding) noexcept override {
+            const llm_expert_graph_binding & binding,
+            ggml_backend_t execution_backend) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
+        (void) execution_backend;
         if (binding.execution_ids == nullptr || binding.execution_ids == binding.logical_ids ||
             binding.execution_ids->type != GGML_TYPE_I32 || binding.execution_ids->ne[0] < 0 ||
             binding.execution_ids->ne[1] < 0) {

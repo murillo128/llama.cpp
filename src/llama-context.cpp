@@ -1668,7 +1668,14 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
     }
 
     if (checkpoint != nullptr) {
-        ctx->expert_eval_result = ctx->expert_weight_provider->remap_checkpoint_tensor(*checkpoint);
+        ggml_backend_t execution_backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
+        if (execution_backend == nullptr) {
+            ctx->expert_eval_result = llm_expert_provider_result::failure(
+                llm_expert_provider_error::invalid_binding);
+            return false;
+        }
+        ctx->expert_eval_result = ctx->expert_weight_provider->remap_checkpoint_tensor(
+            *checkpoint, execution_backend);
         if (!ctx->expert_eval_result.is_ready()) {
             return false;
         }
