@@ -309,6 +309,7 @@ struct llm_expert_async_transport::impl {
 
     struct trace_record {
         uint64_t sequence = 0;
+        llm_expert_async_read_interval read;
     };
 
     llm_expert_async_config config;
@@ -465,6 +466,16 @@ struct llm_expert_async_transport::impl {
                 }
             }
         }
+        request.completion.complete_us = uint64_t(ggml_time_us());
+        request.completion.request = request.handle;
+        if (counters.trace_records < traces.size()) {
+            auto & trace = traces[counters.trace_records++];
+            trace.sequence = counters.trace_records;
+            trace.read = { request.handle, request.completion.submit_us,
+                request.completion.complete_us, request.completion.bytes_completed };
+        } else {
+            counters.trace_records_dropped++;
+        }
         request.state = read_state::complete;
         request.operations_remaining = 0;
         counters.read_requests_completed++;
@@ -567,6 +578,18 @@ struct llm_expert_async_transport::impl {
                 std::lock_guard<std::mutex> guard(mutex);
                 counters.ring_submissions += submitted;
                 counters.peak_sq_occupancy = std::max(counters.peak_sq_occupancy, submitted);
+                const uint64_t submit_us = uint64_t(ggml_time_us());
+                for (uint32_t index = 0; index < batch; ++index) {
+                    auto * request = find_read(operations[batch_slots[index]].identity.request);
+                    if (request != nullptr && request->completion.submit_us == 0) {
+                        request->completion.submit_us = submit_us;
+                        request->completion.request = request->handle;
+                    }
+                }
+                condition.notify_all();
+            }
+            if (config.delay_cq_drain_ms_for_testing != 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(config.delay_cq_drain_ms_for_testing));
             }
             uint32_t reads_left = submitted;
             uint32_t cancels_left = 0;
@@ -996,7 +1019,10 @@ struct llm_expert_async_transport::impl {
             const auto handle = request.handle;
             lock.unlock();
 
-            llm_expert_async_read_completion completion = { llm_expert_async_result::ready, 0, 0 };
+            llm_expert_async_read_completion completion;
+            completion.result = llm_expert_async_result::ready;
+            completion.submit_us = uint64_t(ggml_time_us());
+            completion.request = handle;
             bool used_ring = false;
             bool execute_fallback = true;
             bool ring_fallback_buffered = false;
@@ -1018,12 +1044,18 @@ struct llm_expert_async_transport::impl {
                         record_fallback(llm_expert_async_fallback_reason::direct_capability,
                             completion.native_error, "direct-capability");
                     }
-                    completion = { llm_expert_async_result::ready, 0, 0 };
+                    completion = {};
+                    completion.result = llm_expert_async_result::ready;
+                    completion.submit_us = uint64_t(ggml_time_us());
+                    completion.request = handle;
                     direct_capability_handle = -1;
                     ring_ready = run_ring(handle, completion, direct_capability_handle, transport_failed);
                 }
                 if (!ring_ready && transport_failed) {
-                    completion = { llm_expert_async_result::ready, 0, 0 };
+                    completion = {};
+                    completion.result = llm_expert_async_result::ready;
+                    completion.submit_us = uint64_t(ggml_time_us());
+                    completion.request = handle;
                     execute_fallback = true;
                     ring_fallback_buffered = true;
                     used_ring = false;
@@ -1128,7 +1160,11 @@ struct llm_expert_async_transport::impl {
                          completion.native_error == ENOTSUP)) {
                         const int direct_error = completion.native_error;
                         force_buffered = true;
-                        completion = { llm_expert_async_result::ready, 0, 0 };
+                        const uint64_t submit_us = completion.submit_us;
+                        completion = {};
+                        completion.result = llm_expert_async_result::ready;
+                        completion.submit_us = submit_us;
+                        completion.request = handle;
                         operation_index = size_t(-1);
                         std::lock_guard<std::mutex> guard(mutex);
                         (void) disable_direct(operation.direct_native_handle);
@@ -1202,6 +1238,16 @@ struct llm_expert_async_transport::impl {
                     }
                 }
                 current->completion = completion;
+                current->completion.complete_us = uint64_t(ggml_time_us());
+                current->completion.request = handle;
+                if (counters.trace_records < traces.size()) {
+                    auto & trace = traces[counters.trace_records++];
+                    trace.sequence = counters.trace_records;
+                    trace.read = { handle, current->completion.submit_us,
+                        current->completion.complete_us, current->completion.bytes_completed };
+                } else {
+                    counters.trace_records_dropped++;
+                }
                 current->state = read_state::complete;
                 current->operations_remaining = 0;
                 counters.read_requests_completed++;
@@ -1586,7 +1632,9 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
     request.state = impl::read_state::queued;
     request.cancel_requested = false;
     request.operations_remaining = uint32_t(read_count);
-    request.completion = { llm_expert_async_result::ready, 0, 0 };
+    request.completion = {};
+    request.completion.result = llm_expert_async_result::ready;
+    request.completion.request = identity.request;
     pimpl->counters.read_requests_submitted++;
     pimpl->counters.active_read_requests++;
     pimpl->counters.peak_active_read_requests = std::max(
@@ -1736,6 +1784,17 @@ bool llm_expert_async_transport::wait_until_ring_submitted_for_testing() noexcep
     }) && pimpl->ring_submit_paused_for_testing;
 }
 
+bool llm_expert_async_transport::wait_until_read_submitted_for_testing(
+        llm_expert_request_handle handle) noexcept {
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    return pimpl->condition.wait_for(lock, std::chrono::seconds(5), [&] {
+        const auto * request = pimpl->find_read(handle);
+        return request == nullptr || request->completion.submit_us != 0 ||
+            request->state == impl::read_state::complete || pimpl->counters.admission_closed;
+    }) && pimpl->find_read(handle) != nullptr &&
+        pimpl->find_read(handle)->completion.submit_us != 0;
+}
+
 bool llm_expert_async_transport::shutdown() noexcept {
     {
         std::lock_guard<std::mutex> lock(pimpl->mutex);
@@ -1777,4 +1836,15 @@ bool llm_expert_async_transport::shutdown() noexcept {
 llm_expert_async_diagnostics llm_expert_async_transport::diagnostics() const noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     return pimpl->counters;
+}
+
+std::vector<llm_expert_async_read_interval> llm_expert_async_transport::completed_read_intervals() const {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    std::vector<llm_expert_async_read_interval> result;
+    result.reserve(size_t(pimpl->counters.trace_records));
+    for (uint64_t index = 0; index < pimpl->counters.trace_records; ++index) {
+        const auto & read = pimpl->traces[index].read;
+        if (read.submit_us != 0 && read.complete_us > read.submit_us) result.push_back(read);
+    }
+    return result;
 }

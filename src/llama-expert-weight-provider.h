@@ -256,6 +256,12 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_event_records = 0;
     uint64_t ring_compute_waits = 0;
     uint64_t ring_event_synchronizations = 0;
+    uint64_t ring_compute_event_records = 0;
+    uint64_t ring_compute_event_synchronizations = 0;
+    uint64_t ring_compute_work = 0;
+    uint32_t ring_trace_capacity = 0;
+    uint64_t ring_trace_records = 0;
+    uint64_t ring_trace_records_dropped = 0;
     uint64_t ring_first_h2d_enqueue_us = 0;
     uint64_t ring_last_h2d_event_complete_us = 0;
     uint64_t ring_h2d_compute_overlap_us = 0;
@@ -448,6 +454,7 @@ struct llm_hot_cache_config {
     llm_expert_storage * storage = nullptr;
     llm_expert_async_transport * async_transport = nullptr;
     llm_expert_scheduler * scheduler = nullptr;
+    uint32_t trace_capacity = 256;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(

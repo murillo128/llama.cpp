@@ -19,21 +19,22 @@ struct fixture {
     ggml_tensor * down = nullptr;
     int32_t n_expert;
 
-    explicit fixture(int32_t n_expert, bool fill = true) : n_expert(n_expert) {
+    explicit fixture(int32_t n_expert, bool fill = true,
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type()) : n_expert(n_expert) {
         ggml_init_params params = { ggml_tensor_overhead()*8, nullptr, true };
         ctx.reset(ggml_init(params));
         GGML_ASSERT(ctx);
         up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 8, 16, n_expert);
         gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 8, 16, n_expert);
         down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 16, 8, n_expert);
-        buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+        buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
         GGML_ASSERT(buffer);
         if (fill) {
             uint8_t pattern = 0x20;
             for (auto * tensor : { up, gate, down }) {
                 for (int32_t expert = 0; expert < n_expert; ++expert) {
-                    std::memset(static_cast<uint8_t *>(tensor->data) + size_t(expert)*tensor->nb[2],
-                        pattern + expert, tensor->nb[2]);
+                    std::vector<uint8_t> bytes(tensor->nb[2], pattern + expert);
+                    ggml_backend_tensor_set(tensor, bytes.data(), size_t(expert)*tensor->nb[2], bytes.size());
                 }
                 pattern += 0x20;
             }
@@ -78,10 +79,10 @@ void assert_slot_matches(const fixture & source, const fixture & hot, int32_t ex
             std::pair<const ggml_tensor *, const ggml_tensor *>(source_bundle.gate.weight, hot_bundle.gate.weight),
             std::pair<const ggml_tensor *, const ggml_tensor *>(source_bundle.down.weight, hot_bundle.down.weight) }) {
         const size_t span = pair.first->nb[2];
-        GGML_ASSERT(std::memcmp(
-            static_cast<const uint8_t *>(pair.first->data) + size_t(expert)*span,
-            static_cast<const uint8_t *>(pair.second->data) + size_t(slot)*span,
-            span) == 0);
+        std::vector<uint8_t> expected(span), actual(span);
+        ggml_backend_tensor_get(pair.first, expected.data(), size_t(expert)*span, span);
+        ggml_backend_tensor_get(pair.second, actual.data(), size_t(slot)*span, span);
+        GGML_ASSERT(expected == actual);
     }
 }
 
@@ -185,12 +186,65 @@ void test_budget_and_generation_rejection() {
         llm_expert_provider_error::generation_exhausted);
 }
 
+void test_native_event_ordering_reuse_and_unload() {
+    ggml_backend_load_all();
+    auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (device == nullptr) return;
+    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+    GGML_ASSERT(backend);
+    fixture source(4);
+    fixture hot(2, false, ggml_backend_dev_buffer_type(device));
+    auto cold = make_cold(source);
+    llm_cold_reference cold_zero, cold_one;
+    GGML_ASSERT(cold.find_or_admit({ 0, 0 }, source.bundle(), cold_zero).is_ready());
+    GGML_ASSERT(cold.find_or_admit({ 0, 1 }, source.bundle(), cold_one).is_ready());
+
+    llm_expert_transfer_ring ring({ 1U << 20, 2, device, false, false, false, 0, 32 });
+    GGML_ASSERT(ring.initialize(source.bundle()).is_ready());
+    llm_transfer_lane_reference lane_zero, lane_one;
+    GGML_ASSERT(ring.reserve(cold, cold_zero, 0, 1, lane_zero).is_ready());
+    GGML_ASSERT(ring.reserve(cold, cold_one, 1, 1, lane_one).is_ready());
+    GGML_ASSERT(ring.stage(lane_zero, cold.bundle()).is_ready());
+    GGML_ASSERT(ring.stage(lane_one, cold.bundle()).is_ready());
+    GGML_ASSERT(ring.transfer_wave(backend.get(), {
+        { lane_zero, hot.bundle(), 0 }, { lane_one, hot.bundle(), 1 },
+    }).is_ready());
+    GGML_ASSERT(ring.wait_for_hot(backend.get(), 0, 2).error ==
+        llm_expert_provider_error::stale_generation);
+    GGML_ASSERT(ring.wait_for_hot(backend.get(), 0, 1).is_ready());
+    GGML_ASSERT(ring.wait_for_hot(backend.get(), 1, 1).is_ready());
+    GGML_ASSERT(ring.retire_hot(0, 1).is_ready());
+    GGML_ASSERT(ring.retire_hot(1, 1).is_ready());
+    assert_slot_matches(source, hot, 0, 0);
+    assert_slot_matches(source, hot, 1, 1);
+    const auto diagnostics = ring.diagnostics();
+    GGML_ASSERT(diagnostics.event_capable && diagnostics.event_capacity == diagnostics.effective_lanes*2);
+    GGML_ASSERT(diagnostics.event_records == 2 && diagnostics.compute_waits == 2);
+    GGML_ASSERT(diagnostics.event_synchronizations == 2 && diagnostics.live_events == 0);
+    const auto intervals = ring.completed_intervals();
+    GGML_ASSERT(intervals.size() == 2 && intervals[0].h2d_enqueue_us != 0 &&
+        intervals[0].h2d_complete_us >= intervals[0].h2d_enqueue_us &&
+        intervals[0].bytes == diagnostics.lane_payload_bytes);
+    GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+
+    {
+        llm_expert_transfer_ring unloading({ 1U << 20, 2, device, false, false, false, 0, 32 });
+        GGML_ASSERT(unloading.initialize(source.bundle()).is_ready());
+        GGML_ASSERT(unloading.reserve(cold, cold_zero, 0, 2, lane_zero).is_ready());
+        GGML_ASSERT(unloading.stage(lane_zero, cold.bundle()).is_ready());
+        GGML_ASSERT(unloading.transfer_wave(backend.get(), { { lane_zero, hot.bundle(), 0 } }).is_ready());
+        GGML_ASSERT(cold.diagnostics().current_transfer_refs == 1);
+    }
+    GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+}
+
 } // namespace
 
 int main() {
     test_budget_fallback_and_wave();
     test_failures_cleanup_and_busy_surrender();
     test_budget_and_generation_rejection();
+    test_native_event_ordering_reuse_and_unload();
     std::cout << "expert transfer ring tests passed\n";
     return 0;
 }

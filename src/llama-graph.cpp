@@ -2063,6 +2063,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             execution_gate_exps_s = binding.gate.scale;
             execution_down_exps_s = binding.down.scale;
             execution_ids = binding.execution_ids;
+            // The remap checkpoint reads only the compact expert-id tensor. Keep
+            // that checkpoint on the CPU scheduler backend so observing it never
+            // host-synchronizes the CUDA compute backend.
+            ggml_backend_sched_set_tensor_backend(sched, execution_ids, backend_cpu);
             res->add_expert_binding(std::move(binding));
         } else {
             res->set_expert_provider_result(provider_result);

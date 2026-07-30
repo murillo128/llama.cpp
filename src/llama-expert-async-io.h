@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 struct llm_expert_async_read_override {
     virtual ~llm_expert_async_read_override() = default;
@@ -38,6 +39,7 @@ struct llm_expert_async_config {
     bool inject_first_read_cqe_for_testing = false;
     int32_t first_read_cqe_result_for_testing = 0;
     uint32_t hide_cqes_after_cancel_polls_for_testing = 0;
+    uint32_t delay_cq_drain_ms_for_testing = 0;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {
@@ -179,6 +181,16 @@ struct llm_expert_async_read_completion {
     int native_error = 0;
     uint64_t bytes_completed = 0;
     uint64_t digest = 1469598103934665603ULL;
+    uint64_t submit_us = 0;
+    uint64_t complete_us = 0;
+    llm_expert_request_handle request;
+};
+
+struct llm_expert_async_read_interval {
+    llm_expert_request_handle request;
+    uint64_t submit_us = 0;
+    uint64_t complete_us = 0;
+    uint64_t bytes = 0;
 };
 
 class llm_expert_async_transport {
@@ -224,8 +236,10 @@ public:
     llm_expert_async_result cancel_read(llm_expert_request_handle request) noexcept;
     llm_expert_async_result release_read(llm_expert_request_handle request) noexcept;
     bool wait_until_ring_submitted_for_testing() noexcept;
+    bool wait_until_read_submitted_for_testing(llm_expert_request_handle request) noexcept;
     bool shutdown() noexcept;
     llm_expert_async_diagnostics diagnostics() const noexcept;
+    std::vector<llm_expert_async_read_interval> completed_read_intervals() const;
 
 private:
     struct impl;

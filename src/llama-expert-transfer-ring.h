@@ -28,6 +28,18 @@ struct llm_transfer_ring_config {
     bool force_pageable_fallback_for_testing = false;
     bool force_no_events_for_testing = false;
     uint64_t initial_lane_generation_for_testing = 0;
+    uint32_t trace_capacity = 256;
+};
+
+struct llm_transfer_interval {
+    uint32_t hot_slot = 0;
+    uint64_t hot_generation = 0;
+    uint64_t h2d_enqueue_us = 0;
+    uint64_t h2d_complete_us = 0;
+    uint64_t compute_begin_us = 0;
+    uint64_t compute_complete_us = 0;
+    uint64_t bytes = 0;
+    uint64_t compute_work = 0;
 };
 
 struct llm_transfer_ring_faults {
@@ -72,6 +84,12 @@ struct llm_transfer_ring_diagnostics {
     uint64_t event_records = 0;
     uint64_t compute_waits = 0;
     uint64_t event_synchronizations = 0;
+    uint64_t compute_event_records = 0;
+    uint64_t compute_event_synchronizations = 0;
+    uint64_t compute_work = 0;
+    uint32_t trace_capacity = 0;
+    uint64_t trace_records = 0;
+    uint64_t trace_records_dropped = 0;
     uint64_t first_h2d_enqueue_us = 0;
     uint64_t last_h2d_event_complete_us = 0;
     uint64_t h2d_compute_overlap_us = 0;
@@ -117,11 +135,15 @@ public:
         ggml_backend_t compute_backend,
         uint32_t hot_slot,
         uint64_t hot_generation) noexcept;
+    llm_expert_provider_result begin_compute_work(
+        ggml_backend_t compute_backend,
+        uint64_t work) noexcept;
     llm_expert_provider_result retire_hot(uint32_t hot_slot, uint64_t hot_generation) noexcept;
     llm_expert_provider_result cleanup_failed_lanes() noexcept;
     llm_expert_provider_result surrender() noexcept;
     llm_expert_provider_result validate_invariants() noexcept;
     llm_transfer_ring_diagnostics diagnostics() const;
+    std::vector<llm_transfer_interval> completed_intervals() const;
 
 private:
     struct impl;
