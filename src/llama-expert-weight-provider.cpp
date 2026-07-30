@@ -604,8 +604,13 @@ public:
             throw std::runtime_error("hot-cache expert-weight provider initialization failed");
         }
         if (config.capacity < config.n_expert_used || config.capacity > config.total_expert_keys ||
-            config.n_expert_used == 0 || config.routed_layer_count == 0 || config.target_buffer_type == nullptr) {
+            config.n_expert_used == 0 || config.routed_layer_count == 0 || config.total_expert_keys == 0 ||
+            config.total_expert_keys % config.routed_layer_count != 0 || config.target_buffer_type == nullptr) {
             throw std::invalid_argument("invalid hot-cache capacity or topology");
+        }
+        n_expert = config.total_expert_keys/config.routed_layer_count;
+        if (config.n_expert_used > n_expert) {
+            throw std::invalid_argument("invalid hot-cache expert topology");
         }
         if (!config.allow_non_cuda_target_for_testing && !buffer_type_is_cuda(config.target_buffer_type)) {
             throw std::invalid_argument("hot-cache target must be one CUDA device");
@@ -697,6 +702,20 @@ public:
             return llm_expert_provider_result::success();
         }
 
+        for (const auto & binding : bindings) {
+            if (binding.provider_identity != this || binding.execution_ids == nullptr ||
+                binding.execution_ids->ne[0] != int64_t(config.n_expert_used) || binding.execution_ids->ne[1] < 0) {
+                auto result = llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+                plan.set_result(result);
+                return fail(result);
+            }
+            if (!extent_is_safe(uint64_t(binding.execution_ids->ne[1]))) {
+                auto result = llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+                plan.set_result(result);
+                return fail(result);
+            }
+        }
+
         // Runtime remapping is introduced by issue Phase 3. Reject submission
         // until then so bootstrap or unpopulated pool tensors cannot execute.
         auto result = llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
@@ -713,6 +732,23 @@ public:
         result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
         result.graph_epoch = epoch;
         return result;
+    }
+
+    llm_expert_provider_result validate_context_extent(
+            uint32_t n_ctx,
+            uint32_t n_ubatch) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        const uint32_t extent = std::min(n_ctx, n_ubatch);
+        last_context_n_ctx = n_ctx;
+        last_context_n_ubatch = n_ubatch;
+        last_context_extent = extent;
+        last_required_capacity = required_capacity(extent);
+        context_validations++;
+        if (n_ctx == 0 || n_ubatch == 0 || !extent_is_safe(extent)) {
+            context_rejections++;
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration));
+        }
+        return llm_expert_provider_result::success();
     }
 
     bool needs_post_reserve_initialization() const noexcept override {
@@ -818,6 +854,14 @@ public:
         result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
         result.graph_epoch = epoch;
         result.generation = pool ? pool->id : 0;
+        result.n_expert = n_expert;
+        result.n_expert_used = config.n_expert_used;
+        result.last_context_n_ctx = last_context_n_ctx;
+        result.last_context_n_ubatch = last_context_n_ubatch;
+        result.last_context_extent = last_context_extent;
+        result.conservative_required_capacity = last_required_capacity;
+        result.context_validations = context_validations;
+        result.context_rejections = context_rejections;
         result.slot_tensor_addresses = pool ? pool->addresses : std::vector<uintptr_t> {};
         result.source_buffer_type = prototype.has_value() ? prototype->down.buffer_type : nullptr;
         result.target_buffer_type = config.target_buffer_type;
@@ -831,6 +875,17 @@ protected:
     }
 
 private:
+    uint32_t required_capacity(uint64_t extent) const noexcept {
+        if (extent >= (uint64_t(n_expert) + config.n_expert_used - 1)/config.n_expert_used) {
+            return n_expert;
+        }
+        return uint32_t(extent*config.n_expert_used);
+    }
+
+    bool extent_is_safe(uint64_t extent) const noexcept {
+        return config.capacity >= n_expert || extent <= config.capacity/config.n_expert_used;
+    }
+
     llm_expert_provider_result validate_source_bundle(const llm_expert_bundle_descriptor & bundle) const {
         auto result = bundle.validate();
         if (!result.is_ready()) {
@@ -901,6 +956,7 @@ private:
 
     llm_hot_cache_config config;
     llm_expert_provider_faults faults;
+    uint32_t n_expert = 0;
     mutable std::mutex mutex;
     mutable llm_expert_provider_stats counters;
     std::map<int32_t, llm_expert_bundle_descriptor> registrations;
@@ -909,6 +965,12 @@ private:
     uint64_t successful_bindings = 0;
     uint64_t epoch = 0;
     uint64_t generation = 0;
+    uint32_t last_context_n_ctx = 0;
+    uint32_t last_context_n_ubatch = 0;
+    uint32_t last_context_extent = 0;
+    uint32_t last_required_capacity = 0;
+    uint64_t context_validations = 0;
+    uint64_t context_rejections = 0;
 };
 
 } // namespace

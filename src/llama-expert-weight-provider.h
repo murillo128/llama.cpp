@@ -135,6 +135,14 @@ struct llm_hot_cache_diagnostics {
     uint64_t pool_bytes = 0;
     uint64_t graph_epoch = 0;
     uint64_t generation = 0;
+    uint32_t n_expert = 0;
+    uint32_t n_expert_used = 0;
+    uint32_t last_context_n_ctx = 0;
+    uint32_t last_context_n_ubatch = 0;
+    uint32_t last_context_extent = 0;
+    uint32_t conservative_required_capacity = 0;
+    uint64_t context_validations = 0;
+    uint64_t context_rejections = 0;
     std::vector<uintptr_t> slot_tensor_addresses;
     ggml_backend_buffer_type_t source_buffer_type = nullptr;
     ggml_backend_buffer_type_t target_buffer_type = nullptr;
@@ -214,6 +222,13 @@ public:
 
     virtual llm_expert_provider_stats get_stats() const noexcept = 0;
 
+    virtual llm_expert_provider_result validate_context_extent(
+            uint32_t n_ctx,
+            uint32_t n_ubatch) noexcept {
+        (void) n_ctx;
+        (void) n_ubatch;
+        return llm_expert_provider_result::success();
+    }
     virtual bool needs_post_reserve_initialization() const noexcept { return false; }
     virtual llm_expert_provider_result initialize_after_reserve() noexcept {
         return llm_expert_provider_result::success();

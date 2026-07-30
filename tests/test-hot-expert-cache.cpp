@@ -20,8 +20,13 @@ struct tensor_fixture {
     ggml_tensor * gate = nullptr;
     ggml_tensor * down = nullptr;
     ggml_tensor * ids = nullptr;
+    int64_t n_tokens = 1;
 
-    tensor_fixture(int64_t n_in = 8, int64_t n_hidden = 16, int64_t n_expert = 4) {
+    tensor_fixture(
+            int64_t n_in = 8,
+            int64_t n_hidden = 16,
+            int64_t n_expert = 4,
+            int64_t n_tokens = 1) : n_tokens(n_tokens) {
         ggml_init_params params = {
             /*.mem_size   =*/ ggml_tensor_overhead()*8,
             /*.mem_buffer =*/ nullptr,
@@ -32,7 +37,7 @@ struct tensor_fixture {
         up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_in, n_hidden, n_expert);
         gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_in, n_hidden, n_expert);
         down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_hidden, n_in, n_expert);
-        ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, 1);
+        ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, n_tokens);
         buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
         GGML_ASSERT(buffer);
     }
@@ -49,7 +54,7 @@ struct tensor_fixture {
     }
 
     llm_expert_selection selection(int32_t layer) const {
-        return { layer, 4, 2, 1, ids };
+        return { layer, 4, 2, n_tokens, ids };
     }
 };
 
@@ -89,6 +94,52 @@ void test_configuration_matrix() {
 
     GGML_ASSERT(llm_create_hot_cache_expert_weight_provider(test_config(2)) != nullptr);
     GGML_ASSERT(llm_create_hot_cache_expert_weight_provider(test_config(4)) != nullptr);
+}
+
+void test_context_extent_matrix_and_prepare_revalidation() {
+    auto exact_top_k = llm_create_hot_cache_expert_weight_provider(test_config(2));
+    GGML_ASSERT(exact_top_k->validate_context_extent(64, 1).is_ready());
+    auto diagnostics = exact_top_k->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.n_expert == 4);
+    GGML_ASSERT(diagnostics.n_expert_used == 2);
+    GGML_ASSERT(diagnostics.last_context_extent == 1);
+    GGML_ASSERT(diagnostics.conservative_required_capacity == 2);
+    GGML_ASSERT(diagnostics.effective_capacity == 0);
+
+    const auto unsafe_exact = exact_top_k->validate_context_extent(64, 2);
+    GGML_ASSERT(unsafe_exact.error == llm_expert_provider_error::unsupported_configuration);
+    diagnostics = exact_top_k->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.last_context_extent == 2);
+    GGML_ASSERT(diagnostics.conservative_required_capacity == 4);
+    GGML_ASSERT(diagnostics.context_validations == 2);
+    GGML_ASSERT(diagnostics.context_rejections == 1);
+    GGML_ASSERT(diagnostics.effective_capacity == 0);
+
+    auto capacity_three = llm_create_hot_cache_expert_weight_provider(test_config(3));
+    GGML_ASSERT(capacity_three->validate_context_extent(64, 1).is_ready());
+    GGML_ASSERT(capacity_three->validate_context_extent(64, 2).error ==
+        llm_expert_provider_error::unsupported_configuration);
+
+    auto all_experts = llm_create_hot_cache_expert_weight_provider(test_config(4));
+    GGML_ASSERT(all_experts->validate_context_extent(64, 64).is_ready());
+    diagnostics = all_experts->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.last_context_extent == 64);
+    GGML_ASSERT(diagnostics.conservative_required_capacity == 4);
+
+    tensor_fixture two_tokens(8, 16, 4, 2);
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(exact_top_k->bind(two_tokens.bundle(0), two_tokens.selection(0), binding).is_ready());
+    GGML_ASSERT(exact_top_k->initialize_after_reserve().is_ready());
+    llm_expert_execution_plan unsafe_plan;
+    GGML_ASSERT(exact_top_k->prepare({ binding }, unsafe_plan).error ==
+        llm_expert_provider_error::unsupported_configuration);
+    GGML_ASSERT(unsafe_plan.handle_count() == 0);
+
+    GGML_ASSERT(all_experts->bind(two_tokens.bundle(0), two_tokens.selection(0), binding).is_ready());
+    GGML_ASSERT(all_experts->initialize_after_reserve().is_ready());
+    llm_expert_execution_plan safe_extent_plan;
+    GGML_ASSERT(all_experts->prepare({ binding }, safe_extent_plan).error ==
+        llm_expert_provider_error::preparation_failed);
 }
 
 void test_pool_lifetime_trim_surrender_and_epoch() {
@@ -225,18 +276,40 @@ void test_cuda_model_pool_smoke(const char * model_path) {
     llama_context_params context_params = llama_context_default_params();
     context_params.n_ctx = 64;
     context_params.n_batch = 64;
-    context_params.n_ubatch = 64;
-    llama_context * context = llama_init_from_model(model, context_params);
-    GGML_ASSERT(context != nullptr);
+    context_params.n_ubatch = 2;
+    llama_context * rejected = llama_init_from_model(model, context_params);
+    GGML_ASSERT(rejected == nullptr);
 
     auto * provider = model->expert_weight_provider();
     GGML_ASSERT(provider != nullptr);
-    const auto diagnostics = provider->hot_cache_diagnostics();
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.effective_capacity == 0);
+    GGML_ASSERT(diagnostics.last_context_extent == 2);
+    GGML_ASSERT(diagnostics.conservative_required_capacity == 4);
+    GGML_ASSERT(diagnostics.context_rejections == 1);
+
+    context_params.n_ubatch = 1;
+    llama_context * context = llama_init_from_model(model, context_params);
+    GGML_ASSERT(context != nullptr);
+
+    diagnostics = provider->hot_cache_diagnostics();
     GGML_ASSERT(diagnostics.effective_capacity == 2);
     GGML_ASSERT(diagnostics.pool_bytes > 0);
     GGML_ASSERT(!diagnostics.slot_tensor_addresses.empty());
+    GGML_ASSERT(diagnostics.last_context_extent == 1);
+    GGML_ASSERT(diagnostics.conservative_required_capacity == 2);
     GGML_ASSERT(provider->surrender().error == llm_expert_provider_error::busy);
 
+    context_params.n_ubatch = 2;
+    rejected = llama_init_from_model(model, context_params);
+    GGML_ASSERT(rejected == nullptr);
+    GGML_ASSERT(provider->hot_cache_diagnostics().effective_capacity == 2);
+
+    context_params.n_ubatch = 1;
+    llama_context * second_context = llama_init_from_model(model, context_params);
+    GGML_ASSERT(second_context != nullptr);
+
+    llama_free(second_context);
     llama_free(context);
     GGML_ASSERT(provider->surrender().is_ready());
     llama_model_free(model);
@@ -246,6 +319,7 @@ void test_cuda_model_pool_smoke(const char * model_path) {
 
 int main(int argc, char ** argv) {
     test_configuration_matrix();
+    test_context_extent_matrix_and_prepare_revalidation();
     test_pool_lifetime_trim_surrender_and_epoch();
     test_layout_host_and_partial_initialization_rejection();
     test_allocation_failure_is_recoverable_and_empty_prepare_is_safe();

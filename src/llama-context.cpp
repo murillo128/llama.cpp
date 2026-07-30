@@ -593,6 +593,15 @@ void llama_context::sched_reserve() {
         return;
     }
 
+    if (expert_weight_provider) {
+        const auto extent_result = expert_weight_provider->validate_context_extent(
+            cparams.n_ctx, cparams.n_ubatch);
+        if (!extent_result.is_ready()) {
+            throw std::invalid_argument(
+                "expert hot-cache capacity is insufficient for the requested context microbatch extent");
+        }
+    }
+
     sched_need_reserve = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
@@ -725,6 +734,8 @@ void llama_context::sched_reserve() {
 
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             const size_t final_size = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            LLAMA_LOG_DEBUG("%s: hot-cache workspace %s bootstrap=%zu final=%zu\n", __func__,
+                ggml_backend_name(backend_ptrs[i]), bootstrap_sizes[i], final_size);
             if (final_size > bootstrap_sizes[i]) {
                 abandon_pool();
                 throw std::runtime_error("persistent expert hot cache increased reserved compute workspace");
@@ -2786,6 +2797,30 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    // Bootstrap hot-cache graphs use host-resident expert bindings and can
+    // produce a different scheduler split layout than the final CUDA-resident
+    // cache graph. Reserve a small target-buffer alignment guard up front so
+    // switching to the fixed-address pool cannot trigger a post-pool workspace
+    // reallocation for allocator bookkeeping alone. This graph is reserve-only.
+    if (expert_weight_provider && expert_weight_provider->needs_post_reserve_initialization()) {
+        const auto diagnostics = expert_weight_provider->hot_cache_diagnostics();
+        for (auto * backend : backend_ptrs) {
+            const auto buft = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+            if (buft != diagnostics.target_buffer_type) {
+                continue;
+            }
+            const size_t alignment = ggml_backend_buft_get_alignment(buft);
+            ggml_tensor * guard_in = ggml_new_tensor_1d(res->get_ctx(), GGML_TYPE_I8, 2*alignment);
+            ggml_tensor * guard_out = ggml_dup(res->get_ctx(), guard_in);
+            ggml_set_name(guard_in, "expert_hot_cache_workspace_guard_in");
+            ggml_set_name(guard_out, "expert_hot_cache_workspace_guard_out");
+            ggml_backend_sched_set_tensor_backend(sched.get(), guard_in, backend);
+            ggml_backend_sched_set_tensor_backend(sched.get(), guard_out, backend);
+            ggml_build_forward_expand(gf, guard_out);
+            break;
+        }
+    }
 
     this->n_outputs = save_n_outputs;
 
