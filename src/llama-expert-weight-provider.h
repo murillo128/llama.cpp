@@ -218,6 +218,8 @@ struct llm_hot_cache_diagnostics {
     uint64_t cold_source_copy_bytes = 0;
     uint64_t cold_source_copy_time_us = 0;
     uint64_t cold_failed_copies = 0;
+    uint64_t cold_failed_cleanups = 0;
+    uint64_t cold_generation_changes = 0;
     uint64_t cold_invariant_failures = 0;
     uint64_t cold_current_hot_refs = 0;
     uint64_t cold_peak_hot_refs = 0;
@@ -236,12 +238,14 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_fallback_count = 0;
     uint64_t ring_lane_reservations = 0;
     uint64_t ring_stage_bytes = 0;
+    uint64_t ring_stage_time_us = 0;
     uint64_t ring_async_enqueues = 0;
     uint64_t ring_synchronous_copies = 0;
     uint64_t ring_waves = 0;
     uint64_t ring_peak_in_flight_lanes = 0;
     uint64_t ring_wave_synchronizations = 0;
     uint64_t ring_h2d_bytes = 0;
+    uint64_t ring_h2d_time_us = 0;
     uint64_t ring_failed_cleanup = 0;
 };
 

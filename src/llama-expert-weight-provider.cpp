@@ -1648,6 +1648,8 @@ public:
             result.cold_source_copy_bytes = cold.source_copy_bytes;
             result.cold_source_copy_time_us = cold.source_copy_time_us;
             result.cold_failed_copies = cold.failed_copies;
+            result.cold_failed_cleanups = cold.failed_cleanups;
+            result.cold_generation_changes = cold.generation_changes;
             result.cold_invariant_failures = cold.invariant_failures;
             result.cold_current_hot_refs = cold.current_hot_refs;
             result.cold_peak_hot_refs = cold.peak_hot_refs;
@@ -1669,12 +1671,14 @@ public:
             result.ring_fallback_count = ring.fallback_count;
             result.ring_lane_reservations = ring.lane_reservations;
             result.ring_stage_bytes = ring.stage_bytes;
+            result.ring_stage_time_us = ring.stage_time_us;
             result.ring_async_enqueues = ring.async_enqueues;
             result.ring_synchronous_copies = ring.synchronous_copies;
             result.ring_waves = ring.waves;
             result.ring_peak_in_flight_lanes = ring.peak_in_flight_lanes;
             result.ring_wave_synchronizations = ring.wave_synchronizations;
             result.ring_h2d_bytes = ring.h2d_bytes;
+            result.ring_h2d_time_us = ring.h2d_time_us;
             result.ring_failed_cleanup = ring.failed_cleanups;
         }
         return result;

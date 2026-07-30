@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -120,11 +121,14 @@ int run_live(int argc, char ** argv) {
     if (llama_set_route_observer(context, capture_route, &routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 24;
     uint64_t logits_hash = 1469598103934665603ULL;
     std::vector<llama_token> generated;
+    std::vector<uint64_t> decode_us;
     llama_batch batch = llama_batch_get_one(prompt.data(), prompt.size());
     for (int step = 0; step < args.steps; ++step) {
         const auto phase = step == 0 ? LLAMA_ROUTE_PHASE_PREFILL : LLAMA_ROUTE_PHASE_DECODE;
+        const int64_t begin_us = ggml_time_us();
         if (llama_route_observer_begin(context, step, phase) != LLAMA_ROUTE_OBSERVER_STATUS_OK ||
             llama_decode(context, batch) != 0) return 25;
+        decode_us.push_back(uint64_t(ggml_time_us() - begin_us));
         const float * logits = llama_get_logits_ith(context, -1);
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         if (!logits) return 26;
@@ -143,27 +147,64 @@ int run_live(int argc, char ** argv) {
         if (index) tokens << ',';
         tokens << generated[index];
     }
+    std::ostringstream prompt_ids;
+    for (size_t index = 0; index < prompt.size(); ++index) {
+        if (index) prompt_ids << ',';
+        prompt_ids << prompt[index];
+    }
+    std::vector<uint64_t> sorted_us = decode_us;
+    std::sort(sorted_us.begin(), sorted_us.end());
+    const auto percentile = [&](size_t numerator, size_t denominator) {
+        if (sorted_us.empty()) return uint64_t(0);
+        const size_t index = std::min(sorted_us.size() - 1,
+            (sorted_us.size()*numerator + denominator - 1)/denominator - 1);
+        return sorted_us[index];
+    };
+    uint64_t decode_total_us = 0;
+    for (size_t index = 1; index < decode_us.size(); ++index) decode_total_us += decode_us[index];
     std::cout << "PHASE5_LIVE"
               << "\tmode=" << args.mode
               << "\tload_mode=" << llama_load_mode_name(args.load_mode)
+              << "\tprompt_ids=" << prompt_ids.str()
               << "\ttokens=" << tokens.str()
               << "\tlogits_hash=" << logits_hash
               << "\troute_hash=" << routes.value
               << "\troute_records=" << routes.records
+              << "\tttft_us=" << (decode_us.empty() ? 0 : decode_us.front())
+              << "\tprompt_tokens_per_second=" << (decode_us.empty() || decode_us.front() == 0 ? 0.0 : double(prompt.size())*1e6/decode_us.front())
+              << "\tdecode_tokens_per_second=" << (decode_total_us == 0 ? 0.0 : double(decode_us.size() - 1)*1e6/decode_total_us)
+              << "\ttoken_p50_us=" << percentile(50, 100)
+              << "\ttoken_p95_us=" << percentile(95, 100)
+              << "\ttoken_p99_us=" << percentile(99, 100)
               << "\thot_hits=" << diagnostics.hits
               << "\thot_misses=" << diagnostics.misses
               << "\tcold_hits=" << diagnostics.cold_hits
               << "\tcold_misses=" << diagnostics.cold_misses
               << "\tcold_evictions=" << diagnostics.cold_evictions
               << "\tcold_actual_bytes=" << diagnostics.cold_actual_bytes
+              << "\tcold_requested_bytes=" << diagnostics.cold_requested_bytes
+              << "\tcold_unused_bytes=" << diagnostics.cold_unused_budget_bytes
+              << "\tcold_bundle_payload=" << diagnostics.cold_bundle_payload_bytes
               << "\tcold_slot_footprint=" << diagnostics.cold_slot_footprint
+              << "\tcold_alignment=" << diagnostics.cold_alignment
               << "\tcold_slots=" << diagnostics.cold_effective_slots
               << "\tcold_source_bytes=" << diagnostics.cold_source_copy_bytes
+              << "\tcold_source_time_us=" << diagnostics.cold_source_copy_time_us
+              << "\tcold_failed_copies=" << diagnostics.cold_failed_copies
+              << "\tcold_failed_cleanups=" << diagnostics.cold_failed_cleanups
+              << "\tcold_generation_changes=" << diagnostics.cold_generation_changes
               << "\tsource_pageable=" << diagnostics.source_pageable
               << "\tsource_pinned_bytes=" << diagnostics.source_pinned_bytes
               << "\tno_writeback_evictions=" << diagnostics.no_writeback_evictions
               << "\tcold_hot_refs=" << diagnostics.cold_current_hot_refs
               << "\tcold_transfer_refs=" << diagnostics.cold_current_transfer_refs
+              << "\tcold_request_refs=" << diagnostics.cold_current_request_refs
+              << "\tcold_peak_hot_refs=" << diagnostics.cold_peak_hot_refs
+              << "\tcold_peak_transfer_refs=" << diagnostics.cold_peak_transfer_refs
+              << "\tcold_peak_request_refs=" << diagnostics.cold_peak_request_refs
+              << "\tring_requested_bytes=" << diagnostics.ring_requested_bytes
+              << "\tring_actual_bytes=" << diagnostics.ring_actual_bytes
+              << "\tring_lane_footprint=" << diagnostics.ring_lane_footprint
               << "\tring_lanes=" << diagnostics.ring_effective_lanes
               << "\tring_pinned_bytes=" << diagnostics.ring_pinned_or_registered_bytes
               << "\tring_acquisition=" << diagnostics.ring_acquisition_method
@@ -171,6 +212,10 @@ int run_live(int argc, char ** argv) {
               << "\tring_fallback=" << diagnostics.ring_pageable_fallback
               << "\tring_async_enqueues=" << diagnostics.ring_async_enqueues
               << "\tring_sync_copies=" << diagnostics.ring_synchronous_copies
+              << "\tring_stage_bytes=" << diagnostics.ring_stage_bytes
+              << "\tring_stage_time_us=" << diagnostics.ring_stage_time_us
+              << "\tring_h2d_bytes=" << diagnostics.ring_h2d_bytes
+              << "\tring_h2d_time_us=" << diagnostics.ring_h2d_time_us
               << "\tring_waves=" << diagnostics.ring_waves
               << "\tring_wave_syncs=" << diagnostics.ring_wave_synchronizations
               << '\n';
