@@ -327,10 +327,14 @@ int main(int argc, char ** argv) {
     }
     std::cout << "PHASE5_TRANSFER_RING"
               << "\tmode=" << (force_pageable ? "pageable" : "pinned")
+              << "\trequested_bytes=" << value.requested_bytes
               << "\tlanes=" << value.effective_lanes
               << "\tlane_footprint=" << value.lane_footprint
               << "\tactual_bytes=" << value.actual_bytes
               << "\tpinned_bytes=" << value.pinned_or_registered_bytes
+              << "\tacquisition=" << value.acquisition_method
+              << "\tfallback_reason=" << value.fallback_reason
+              << "\tpageable_fallback=" << value.pageable_fallback
               << "\tasync_enqueues=" << value.async_enqueues
               << "\tsynchronous_copies=" << value.synchronous_copies
               << "\twaves=" << value.waves
