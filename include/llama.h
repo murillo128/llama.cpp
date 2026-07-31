@@ -364,6 +364,47 @@ extern "C" {
         LLAMA_EXPERT_MISS_POLICY_COUNT           = 3,
     };
 
+    enum llama_expert_cache_policy {
+        LLAMA_EXPERT_CACHE_POLICY_LRU       = 0,
+        LLAMA_EXPERT_CACHE_POLICY_LFRU      = 1,
+        LLAMA_EXPERT_CACHE_POLICY_SLRU      = 2,
+        LLAMA_EXPERT_CACHE_POLICY_LFU_AGING = 3,
+        LLAMA_EXPERT_CACHE_POLICY_COUNT     = 4,
+    };
+
+    enum llama_expert_cache_policy_scope {
+        LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL    = 0,
+        LLAMA_EXPERT_CACHE_POLICY_SCOPE_PER_LAYER = 1,
+        LLAMA_EXPERT_CACHE_POLICY_SCOPE_COUNT     = 2,
+    };
+
+    enum llama_expert_cache_admission {
+        LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS           = 0,
+        LLAMA_EXPERT_CACHE_ADMISSION_FREQUENCY_WINDOW = 1,
+        LLAMA_EXPERT_CACHE_ADMISSION_COUNT             = 2,
+    };
+
+    enum {
+        LLAMA_EXPERT_CACHE_POLICY_VERSION_1 = 1,
+        LLAMA_EXPERT_CACHE_POLICY_SLRU_PROTECTED_RATIO_DEFAULT_BPS = 7500,
+        LLAMA_EXPERT_CACHE_POLICY_FREQUENCY_WINDOW_DEFAULT_EVENTS = 1024,
+        LLAMA_EXPERT_CACHE_POLICY_LFU_AGING_DEFAULT_EVENTS = 1024,
+    };
+
+    // Versioned experimental cache-policy configuration. The model copies the
+    // complete v1 structure during load and never retains the caller's pointer.
+    struct llama_expert_cache_policy_config {
+        uint32_t version;
+        uint32_t struct_size;
+        enum llama_expert_cache_policy policy;
+        enum llama_expert_cache_policy_scope scope;
+        uint32_t slru_protected_ratio_bps;
+        enum llama_expert_cache_admission admission;
+        uint32_t admission_window_events;
+        uint32_t lfu_aging_interval_events;
+        uint64_t reserved[4];
+    };
+
     enum {
         LLAMA_EXPERT_AUTO_COST_MODEL_VERSION_1 = 1,
     };
@@ -406,6 +447,8 @@ extern "C" {
         enum llama_expert_miss_policy expert_miss_policy; // explicit demand-miss execution policy [EXPERIMENTAL]
         bool expert_background_promotion; // promote CPU-served demand keys for later use [EXPERIMENTAL]
         const struct llama_expert_auto_cost_model * expert_auto_cost_model; // copied at model load [EXPERIMENTAL]
+        const struct llama_expert_cache_policy_config * expert_hot_cache_policy; // copied at model load [EXPERIMENTAL]
+        const struct llama_expert_cache_policy_config * expert_cold_cache_policy; // copied at model load [EXPERIMENTAL]
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

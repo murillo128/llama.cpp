@@ -40,6 +40,10 @@ struct llm_cold_cache_config {
     uint32_t routed_layer_count = 0;
     uint32_t total_expert_keys = 0;
     uint64_t initial_slot_generation_for_testing = 0;
+    uint32_t minimum_domain_slots = 1;
+    llm_expert_cache_policy_config_internal cache_policy_config = {};
+    std::vector<int32_t> routed_layers;
+    uint32_t policy_trace_capacity = 4096;
 };
 
 using llm_cold_cache_loader = llm_expert_provider_result (*)(
@@ -80,6 +84,8 @@ struct llm_cold_cache_diagnostics {
     uint64_t peak_request_refs = 0;
     uint64_t current_cpu_execution_refs = 0;
     uint64_t peak_cpu_execution_refs = 0;
+    llm_expert_cache_policy_diagnostics policy;
+    std::vector<llm_expert_cache_policy_domain_diagnostics> policy_domains;
 
     struct slot {
         llm_expert_key key = { -1, -1 };
@@ -128,6 +134,10 @@ public:
             llm_cold_reference reference,
             llm_cold_reference_kind kind) noexcept;
     llm_expert_provider_result cleanup_failed_slots() noexcept;
+    llm_expert_provider_result policy_request_begin() noexcept;
+    llm_expert_provider_result policy_set_ubatch_ordinal(uint64_t ordinal) noexcept;
+    llm_expert_provider_result policy_phase_transition(llm_expert_cache_policy_phase phase) noexcept;
+    llm_expert_provider_result policy_request_end(bool success, bool cancelled) noexcept;
     llm_expert_provider_result trim() noexcept;
     llm_expert_provider_result surrender() noexcept;
     llm_expert_provider_result validate_invariants(

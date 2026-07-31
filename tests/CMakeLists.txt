@@ -274,6 +274,13 @@ target_include_directories(test-expert-weight-provider PRIVATE ${PROJECT_SOURCE_
 llama_build_and_test(test-expert-miss-policy.cpp LABEL "model")
 target_include_directories(test-expert-miss-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-expert-cache-policy.cpp LABEL "model")
+target_include_directories(test-expert-cache-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build(phase9-cache-replay.cpp)
+target_include_directories(phase9-cache-replay PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(phase9-cache-replay LABEL "model" ARGS --self-test)
+
 set(LLAMA_TEST_NAME phase8-miss-execution-probe)
 llama_build(phase8-miss-execution-probe.cpp)
 unset(LLAMA_TEST_NAME)

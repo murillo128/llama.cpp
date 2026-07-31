@@ -1236,6 +1236,7 @@ struct background_promotion_record {
     llm_expert_request_state scheduler_state = llm_expert_request_state::free;
     uint32_t hot_slot = UINT32_MAX;
     uint64_t hot_generation = 0;
+    uint64_t origin_operation_ordinal = 0;
     uint64_t remaining_bytes = 0;
     uint64_t h2d_work_ns = 0;
 };
@@ -1253,36 +1254,47 @@ struct hot_request_pin {
     uint64_t generation = 0;
 };
 
-struct deterministic_lru_policy {
-    int32_t select_victim(
-            const std::vector<hot_slot_entry> & slots,
-            const std::vector<uint8_t> & selected,
-            const std::vector<uint32_t> & candidates,
-            size_t candidate_count,
-            const std::vector<uint32_t> & releasable) const noexcept {
-        int32_t victim = -1;
-        for (uint32_t slot = 0; slot < slots.size(); ++slot) {
-            const auto & entry = slots[slot];
-            bool already_candidate = false;
-            for (size_t index = 0; index < candidate_count; ++index) {
-                already_candidate = already_candidate || candidates[index] == slot;
-            }
-            if (selected[slot] || already_candidate ||
-                (entry.state != hot_slot_state::ready && entry.state != hot_slot_state::pinned) ||
-                entry.refcount != releasable[slot]) {
-                continue;
-            }
-            if (victim < 0 || entry.last_use < slots[victim].last_use ||
-                (entry.last_use == slots[victim].last_use && slot < uint32_t(victim))) {
-                victim = int32_t(slot);
-            }
-        }
-        return victim;
-    }
-};
-
 bool expert_key_matches(const llm_expert_key & lhs, const llm_expert_key & rhs) {
     return lhs.layer == rhs.layer && lhs.expert == rhs.expert;
+}
+
+llm_expert_provider_result cache_policy_result(llm_expert_cache_policy_result result) {
+    if (result.is_ready()) return llm_expert_provider_result::success();
+    switch (result.error) {
+        case llm_expert_cache_policy_error::no_victim:
+            return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+        case llm_expert_cache_policy_error::metadata_mismatch:
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        case llm_expert_cache_policy_error::sequence_exhausted:
+        case llm_expert_cache_policy_error::overflow:
+        case llm_expert_cache_policy_error::transcript_full:
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        case llm_expert_cache_policy_error::invalid_configuration:
+        case llm_expert_cache_policy_error::invalid_key:
+        case llm_expert_cache_policy_error::invalid_event:
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+        case llm_expert_cache_policy_error::none:
+            break;
+    }
+    return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+}
+
+bool expert_bundle_payload_bytes(const llm_expert_bundle_descriptor & bundle, uint64_t & bytes) {
+    bytes = 0;
+    for (const auto * projection : { &bundle.up, &bundle.gate, &bundle.gate_up, &bundle.down }) {
+        size_t index = 0;
+        for (const auto * tensor : { projection->weight, projection->bias, projection->scale }) {
+            if (tensor == nullptr) {
+                index++;
+                continue;
+            }
+            const int axis = expert_axis(tensor, bundle.n_expert, index == 0);
+            if (axis < 0 || tensor->nb[axis] > UINT64_MAX - bytes) return false;
+            bytes += tensor->nb[axis];
+            index++;
+        }
+    }
+    return bytes != 0;
 }
 
 ggml_tensor * make_slot_tensor(
@@ -1416,6 +1428,24 @@ public:
             throw std::invalid_argument("invalid hot-cache capacity or topology");
         }
         n_expert = config.total_expert_keys/config.routed_layer_count;
+        if (this->config.hot_cache_policy_config.digest == 0) {
+            const auto copied = llm_expert_cache_policy_copy_config(
+                nullptr, llm_expert_cache_policy_tier::hot, this->config.hot_cache_policy_config);
+            if (!copied.is_ready()) throw std::invalid_argument("invalid hot-cache policy configuration");
+        }
+        if (this->config.cold_cache_policy_config.digest == 0) {
+            const auto copied = llm_expert_cache_policy_copy_config(
+                nullptr, llm_expert_cache_policy_tier::cold, this->config.cold_cache_policy_config);
+            if (!copied.is_ready()) throw std::invalid_argument("invalid cold-cache policy configuration");
+        }
+        if (!this->config.routed_layers.empty() &&
+            this->config.routed_layers.size() != config.routed_layer_count) {
+            throw std::invalid_argument("invalid hot-cache policy layer topology");
+        }
+        if (this->config.hot_cache_policy_config.scope == LLAMA_EXPERT_CACHE_POLICY_SCOPE_PER_LAYER &&
+            config.capacity < uint64_t(config.routed_layer_count)*config.n_expert_used) {
+            throw std::invalid_argument("per-layer hot-cache policy cannot satisfy simultaneous demand width");
+        }
         if (config.n_expert_used > n_expert) {
             throw std::invalid_argument("invalid hot-cache expert topology");
         }
@@ -1467,20 +1497,36 @@ public:
 
     ~llm_hot_cache_expert_weight_provider() override {
         std::lock_guard<std::mutex> lock(mutex);
-        if (!transfer_ring) return;
-        const auto ring_surrendered = transfer_ring->surrender();
-        release_request_pins_locked();
-        for (auto & record : background_promotions) {
-            if (!record.active) continue;
-            record.state = background_promotion_record::lifecycle::cancelled;
-            discard_background_slot_locked(record, false);
+        const auto ring_surrendered = transfer_ring ? transfer_ring->surrender() :
+            llm_expert_provider_result::success();
+        (void) release_request_pins_locked();
+        while (true) {
+            background_promotion_record * earliest = nullptr;
+            for (auto & record : background_promotions) {
+                if (record.active && (earliest == nullptr ||
+                    record.origin_operation_ordinal < earliest->origin_operation_ordinal)) {
+                    earliest = &record;
+                }
+            }
+            if (earliest == nullptr) break;
+            earliest->state = background_promotion_record::lifecycle::cancelled;
+            discard_background_slot_locked(*earliest, false);
             background_dropped++;
+        }
+        if (active_request) {
+            (void) end_policy_request_locked(false, true);
+            active_request = false;
         }
         for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
             auto & entry = directory_slots[slot];
             if (entry.background_origin && !entry.background_useful) background_wasted++;
+            if (entry.state == hot_slot_state::loading) {
+                (void) hot_policy.load_failed(slot, entry.generation);
+            } else if (entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned) {
+                (void) hot_policy.remove_resident(slot, entry.generation);
+            }
             clear_forward_locked(entry.key, slot, entry.generation);
-            if (entry.has_cold_backing) {
+            if (entry.has_cold_backing && cold_cache) {
                 (void) cold_cache->release(
                     { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
                 entry.has_cold_backing = false;
@@ -1489,6 +1535,7 @@ public:
         active_background_flights = 0;
         const auto cold_surrendered = cold_cache ? cold_cache->surrender() :
             llm_expert_provider_result::success();
+        (void) hot_policy.surrender();
         if (config.phase8_closeout_witness != nullptr && !config.phase8_closeout_witness->written) {
             auto & witness = *config.phase8_closeout_witness;
             witness.background_submitted = background_submitted;
@@ -1509,7 +1556,8 @@ public:
                 witness.scheduler_terminal_cancelled = scheduler.terminal_cancelled;
                 witness.scheduler_terminal_releases = scheduler.terminal_releases;
             }
-            const auto ring = transfer_ring->closeout_diagnostics();
+            const auto ring = transfer_ring ? transfer_ring->closeout_diagnostics() :
+                llm_transfer_ring_closeout_diagnostics {};
             witness.ring_queued_workers = ring.queued_workers;
             witness.ring_running_workers = ring.running_workers;
             witness.ring_non_free_lanes = ring.non_free_lanes;
@@ -1728,10 +1776,21 @@ public:
             return fail(result);
         }
 
+        auto policy_started = cache_policy_result(hot_policy.request_begin());
+        const bool hot_policy_started = policy_started.is_ready();
+        if (hot_policy_started && cold_cache) policy_started = cold_cache->policy_request_begin();
+        if (!policy_started.is_ready()) {
+            if (hot_policy_started) (void) hot_policy.request_end(false, false);
+            plan.set_result(policy_started);
+            return fail(policy_started);
+        }
+        hot_policy_phase = llm_expert_cache_policy_phase::prefill;
+        request_ubatch_ordinal = 0;
         active_request = true;
         active_request_id = ++next_request_id;
         request_pin_count = 0;
         cpu_execution_pin_count = 0;
+        last_remap_error = llm_expert_provider_error::none;
         requests++;
         counters.handles_acquired++;
         plan.add_handle({ this, active_request_id });
@@ -1913,14 +1972,48 @@ public:
             unique_lane_counts[unique_index]++;
         }
 
-        std::fill(slot_selected.begin(), slot_selected.end(), uint8_t(0));
-        std::fill(slot_releasable.begin(), slot_releasable.end(), uint32_t(0));
-        for (size_t index = 0; index < request_pin_count; ++index) {
-            slot_releasable[request_pins[index].slot]++;
+        const auto requested_phase = binding.execution_ids->ne[1] > 1 ?
+            llm_expert_cache_policy_phase::prefill : llm_expert_cache_policy_phase::decode;
+        if (request_ubatch_ordinal == UINT64_MAX) {
+            return fail(llm_expert_provider_result::failure(
+                llm_expert_provider_error::unsupported_configuration));
+        }
+        const uint64_t ubatch_ordinal = request_ubatch_ordinal + 1;
+        auto ubatch_set = cache_policy_result(hot_policy.set_ubatch_ordinal(ubatch_ordinal));
+        if (ubatch_set.is_ready() && cold_cache) {
+            ubatch_set = cold_cache->policy_set_ubatch_ordinal(ubatch_ordinal);
+        }
+        if (!ubatch_set.is_ready()) return fail(ubatch_set);
+        request_ubatch_ordinal = ubatch_ordinal;
+        if (requested_phase != hot_policy_phase) {
+            auto transitioned = cache_policy_result(hot_policy.phase_transition(requested_phase));
+            if (transitioned.is_ready() && cold_cache) {
+                transitioned = cold_cache->policy_phase_transition(requested_phase);
+            }
+            if (!transitioned.is_ready()) return fail(transitioned);
+            hot_policy_phase = requested_phase;
+        }
+        for (size_t index = 0; index < unique_count; ++index) policy_unique_indices[index] = uint32_t(index);
+        std::sort(policy_unique_indices.begin(), policy_unique_indices.begin() + unique_count,
+            [&](uint32_t lhs, uint32_t rhs) {
+                const auto & lhs_key = unique_keys[lhs];
+                const auto & rhs_key = unique_keys[rhs];
+                return lhs_key.layer != rhs_key.layer ? lhs_key.layer < rhs_key.layer :
+                    lhs_key.expert < rhs_key.expert;
+            });
+        for (size_t index = 0; index < unique_count; ++index) {
+            const uint32_t unique_index = policy_unique_indices[index];
+            const auto & key = unique_keys[unique_index];
+            const auto observed = cache_policy_result(hot_policy.demand(
+                { key.layer, key.expert }, unique_lane_counts[unique_index],
+                hot_logical_bundle_bytes, hot_physical_slot_footprint_bytes));
+            if (!observed.is_ready()) return fail(observed);
         }
 
+        std::fill(slot_selected.begin(), slot_selected.end(), uint8_t(0));
         size_t miss_count = 0;
-        for (size_t index = 0; index < unique_count; ++index) {
+        for (size_t policy_index = 0; policy_index < unique_count; ++policy_index) {
+            const size_t index = policy_unique_indices[policy_index];
             const auto & key = unique_keys[index];
             const auto & forward = directory_forward[forward_index(key)];
             if (forward.slot < 0) {
@@ -1934,6 +2027,16 @@ public:
             unique_slots[index] = forward.slot;
             slot_selected[forward.slot] = 1;
         }
+        for (size_t policy_index = 0; policy_index < unique_count; ++policy_index) {
+            const size_t index = policy_unique_indices[policy_index];
+            if (unique_slots[index] < 0) continue;
+            const auto & entry = directory_slots[unique_slots[index]];
+            const auto touched = cache_policy_result(hot_policy.hit(
+                uint32_t(unique_slots[index]), entry.generation));
+            if (!touched.is_ready()) return fail(touched);
+        }
+        const auto prior_pins_released = release_request_pins_locked();
+        if (!prior_pins_released.is_ready()) return fail(prior_pins_released);
 
         if (binding.hybrid && config.miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO) {
             std::sort(miss_unique_indices.begin(), miss_unique_indices.begin() + miss_count,
@@ -1946,7 +2049,6 @@ public:
         }
 
         if (binding.hybrid && config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
-            release_request_pins_locked();
             const auto abort_requested = [&]() {
                 if (abort_callback == nullptr) return false;
                 if (provider_lock != nullptr) provider_lock->unlock();
@@ -1972,7 +2074,8 @@ public:
                 if (!touched.is_ready()) return fail(touched);
                 touched = transfer_ring->wait_for_hot(execution_backend, uint32_t(unique_slots[index]), entry.generation);
                 if (!touched.is_ready()) return fail(touched);
-                pin_slot_locked(uint32_t(unique_slots[index]));
+                touched = pin_slot_locked(uint32_t(unique_slots[index]));
+                if (!touched.is_ready()) return fail(touched);
                 if (entry.background_origin && !entry.background_useful) {
                     entry.background_useful = true;
                     background_useful++;
@@ -2189,6 +2292,11 @@ public:
                         }
                         if (result.is_ready() && background != nullptr) {
                             auto & entry = directory_slots[background->hot_slot];
+                            result = cache_policy_result(hot_policy.load_complete(
+                                background->hot_slot, entry.generation));
+                        }
+                        if (result.is_ready() && background != nullptr) {
+                            auto & entry = directory_slots[background->hot_slot];
                             entry.state = hot_slot_state::ready;
                             entry.background_origin = true;
                             entry.background_useful = true;
@@ -2197,7 +2305,7 @@ public:
                                 int32_t(background->hot_slot), entry.generation };
                             background->state = background_promotion_record::lifecycle::published;
                             unique_slots[unique_index] = int32_t(background->hot_slot);
-                            pin_slot_locked(background->hot_slot);
+                            result = pin_slot_locked(background->hot_slot);
                             finish_background_scheduler_locked(*background, true);
                             background->active = false;
                             if (active_background_flights > 0) active_background_flights--;
@@ -2223,7 +2331,8 @@ public:
                 }
             }
             if (!result.is_ready()) {
-                release_request_pins_locked();
+                const auto released = release_request_pins_locked();
+                if (!released.is_ready()) result = released;
                 last_remap_error = result.error;
                 return fail(result);
             }
@@ -2233,12 +2342,12 @@ public:
             for (size_t index = 0; index < miss_count && result.is_ready(); ++index) {
                 const uint32_t unique_index = miss_unique_indices[index];
                 if (!unique_gpu_assignment[unique_index] || unique_slots[unique_index] >= 0) continue;
-                const int32_t selected = select_unpinned_hot_slot_locked();
-                if (selected < 0) {
-                    result = llm_expert_provider_result::failure(llm_expert_provider_error::busy);
-                    break;
-                }
+                int32_t selected = -1;
+                result = select_hot_slot_locked(unique_keys[unique_index],
+                    candidate_slots.data(), gpu_promotion_count, selected);
+                if (!result.is_ready()) break;
                 const uint32_t hot_slot = uint32_t(selected);
+                candidate_slots[gpu_promotion_count] = hot_slot;
                 result = prepare_hot_slot_locked(
                     hot_slot, unique_keys[unique_index], cold_references[unique_index]);
                 if (result.is_ready()) result = transfer_ring->reserve(
@@ -2266,11 +2375,14 @@ public:
                         const uint32_t unique_index = gpu_unique_indices[index];
                         const uint32_t hot_slot = uint32_t(unique_slots[unique_index]);
                         auto & entry = directory_slots[hot_slot];
+                        result = cache_policy_result(hot_policy.load_complete(hot_slot, entry.generation));
+                        if (!result.is_ready()) break;
                         entry.state = hot_slot_state::ready;
                         entry.last_use = ++use_clock;
                         directory_forward[forward_index(entry.key)] = { int32_t(hot_slot), entry.generation };
                         admissions++;
-                        pin_slot_locked(hot_slot);
+                        result = pin_slot_locked(hot_slot);
+                        if (!result.is_ready()) break;
                     }
                     const uint64_t bytes = cold_bundle_payload > UINT64_MAX/gpu_promotion_count ? UINT64_MAX :
                         cold_bundle_payload*gpu_promotion_count;
@@ -2283,6 +2395,15 @@ public:
                 for (size_t index = 0; index < gpu_promotion_count; ++index) {
                     const uint32_t unique_index = gpu_unique_indices[index];
                     auto & entry = directory_slots[uint32_t(unique_slots[unique_index])];
+                    const uint32_t hot_slot = uint32_t(unique_slots[unique_index]);
+                    llm_expert_cache_policy_result policy_cleanup;
+                    if (hot_policy.validate_resident(hot_slot, entry.generation,
+                            { entry.key.layer, entry.key.expert })) {
+                        policy_cleanup = hot_policy.remove_resident(hot_slot, entry.generation);
+                    } else if (entry.state == hot_slot_state::loading) {
+                        policy_cleanup = hot_policy.load_failed(hot_slot, entry.generation);
+                    }
+                    if (!policy_cleanup.is_ready()) metadata_mismatches++;
                     if (entry.has_cold_backing) {
                         (void) cold_cache->release(
                             { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
@@ -2292,7 +2413,8 @@ public:
                     entry.generation = generation;
                     unique_slots[unique_index] = -1;
                 }
-                release_request_pins_locked();
+                const auto released = release_request_pins_locked();
+                if (!released.is_ready()) result = released;
                 last_remap_error = result.error;
                 return fail(result);
             }
@@ -2320,8 +2442,8 @@ public:
             result = llm_validate_hybrid_execution_ids(execution_ids, cpu_execution_ids, logical_id_count,
                 int32_t(config.capacity), int32_t(cold_cache->diagnostics().effective_slots));
             if (!result.is_ready()) {
-                release_request_pins_locked();
-                return fail(result);
+                const auto released = release_request_pins_locked();
+                return fail(released.is_ready() ? result : released);
             }
             last_id_count = logical_id_count;
             last_remap_layer = binding.layer;
@@ -2342,18 +2464,13 @@ public:
         }
 
         size_t candidate_count = 0;
-        for (uint32_t slot = 0; slot < config.capacity && candidate_count < miss_count; ++slot) {
-            if (directory_slots[slot].state == hot_slot_state::free) {
-                candidate_slots[candidate_count++] = slot;
-            }
-        }
         while (candidate_count < miss_count) {
-            const int32_t victim = lru_policy.select_victim(
-                directory_slots, slot_selected, candidate_slots, candidate_count, slot_releasable);
-            if (victim < 0) {
-                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::busy));
-            }
-            candidate_slots[candidate_count++] = uint32_t(victim);
+            const uint32_t unique_index = miss_unique_indices[candidate_count];
+            int32_t selected = -1;
+            const auto selected_result = select_hot_slot_locked(
+                unique_keys[unique_index], candidate_slots.data(), candidate_count, selected);
+            if (!selected_result.is_ready()) return fail(selected_result);
+            candidate_slots[candidate_count++] = uint32_t(selected);
         }
 
         for (size_t index = 0; index < candidate_count; ++index) {
@@ -2361,8 +2478,6 @@ public:
                 return fail(llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted));
             }
         }
-
-        release_request_pins_locked();
 
         size_t hit_count = 0;
         for (size_t index = 0; index < unique_count; ++index) {
@@ -2381,7 +2496,8 @@ public:
                         entry.generation);
                     if (!touched.is_ready()) return fail(touched);
                 }
-                pin_slot_locked(uint32_t(unique_slots[index]));
+                const auto pinned = pin_slot_locked(uint32_t(unique_slots[index]));
+                if (!pinned.is_ready()) return fail(pinned);
                 hit_count++;
             }
         }
@@ -2391,6 +2507,8 @@ public:
             const uint32_t slot = candidate_slots[index];
             auto & entry = directory_slots[slot];
             if (entry.state != hot_slot_state::free) {
+                const auto policy_valid = cache_policy_result(hot_policy.validate_evictable(slot, entry.generation));
+                if (!policy_valid.is_ready()) return fail(policy_valid);
                 if (config.cold_mode) {
                     auto retired = transfer_ring->retire_hot(slot, entry.generation);
                     if (!retired.is_ready()) return fail(retired);
@@ -2405,6 +2523,8 @@ public:
                     entry.cold_slot = 0;
                     entry.cold_generation = 0;
                 }
+                const auto removed = cache_policy_result(hot_policy.evict(slot, entry.generation));
+                if (!removed.is_ready()) return fail(removed);
                 entry.state = hot_slot_state::evicting;
                 clear_forward_locked(entry.key, slot, entry.generation);
                 evictions++;
@@ -2417,6 +2537,10 @@ public:
             entry.has_cold_backing = false;
             generation_changes++;
             entry.state = hot_slot_state::loading;
+            const auto loading = cache_policy_result(hot_policy.load_begin(
+                slot, entry.generation, { entry.key.layer, entry.key.expert },
+                hot_logical_bundle_bytes, hot_physical_slot_footprint_bytes));
+            if (!loading.is_ready()) return fail(loading);
             unique_slots[unique_index] = int32_t(slot);
         }
 
@@ -2860,10 +2984,17 @@ public:
             }
             for (size_t index = 0; index < miss_count; ++index) {
                 auto & entry = directory_slots[candidate_slots[index]];
+                const auto failed = cache_policy_result(hot_policy.load_failed(
+                    candidate_slots[index], entry.generation));
+                if (!failed.is_ready()) {
+                    metadata_mismatches++;
+                    last_remap_error = failed.error;
+                }
                 entry.state = hot_slot_state::failed;
                 entry.refcount = 0;
             }
-            release_request_pins_locked();
+            const auto released = release_request_pins_locked();
+            if (!released.is_ready()) copy_result = released;
             faults.fail_copy_after_tensors = SIZE_MAX;
             copy_failures++;
             last_remap_error = copy_result.error;
@@ -2873,10 +3004,13 @@ public:
         for (size_t index = 0; index < miss_count; ++index) {
             const uint32_t slot = candidate_slots[index];
             auto & entry = directory_slots[slot];
+            const auto completed = cache_policy_result(hot_policy.load_complete(slot, entry.generation));
+            if (!completed.is_ready()) return fail(completed);
             entry.state = hot_slot_state::ready;
             directory_forward[forward_index(entry.key)] = { int32_t(slot), entry.generation };
             admissions++;
-            pin_slot_locked(slot);
+            const auto pinned = pin_slot_locked(slot);
+            if (!pinned.is_ready()) return fail(pinned);
         }
 
         if (config.cold_mode) {
@@ -3162,16 +3296,42 @@ public:
             collect_projection_addresses(candidate->bundle.gate_up, candidate->addresses);
             collect_projection_addresses(candidate->bundle.down, candidate->addresses);
 
+            uint64_t hot_bundle_payload = 0;
+            if (!expert_bundle_payload_bytes(source, hot_bundle_payload)) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor));
+            }
+            const uint64_t hot_buffer_bytes = ggml_backend_buffer_get_size(candidate->buffer.get());
+            const uint64_t hot_slot_footprint = hot_buffer_bytes/config.capacity +
+                (hot_buffer_bytes % config.capacity != 0);
+            std::vector<int32_t> policy_layers = config.routed_layers;
+            if (policy_layers.empty()) {
+                for (const auto & registration : registrations) policy_layers.push_back(registration.first);
+            }
+            if (policy_layers.size() != config.routed_layer_count) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::unsupported_configuration));
+            }
+            llm_expert_cache_policy hot_policy_candidate;
+            const uint32_t policy_trace_capacity = std::max<uint32_t>(65536, config.trace_capacity);
+            auto policy_initialized = hot_policy_candidate.initialize(
+                config.hot_cache_policy_config, llm_expert_cache_policy_tier::hot,
+                policy_layers.data(), config.routed_layer_count, n_expert,
+                config.n_expert_used, config.capacity, hot_slot_footprint, policy_trace_capacity);
+            if (!policy_initialized.is_ready()) return fail(cache_policy_result(policy_initialized));
+
             std::unique_ptr<llm_cold_expert_cache> cold_candidate;
             std::unique_ptr<llm_expert_transfer_ring> ring_candidate;
             if (config.cold_mode) {
-                cold_candidate = std::make_unique<llm_cold_expert_cache>(llm_cold_cache_config {
-                    config.cold_cache_bytes,
-                    config.capacity,
-                    config.routed_layer_count,
-                    config.total_expert_keys,
-                    0,
-                });
+                llm_cold_cache_config cold_config;
+                cold_config.byte_budget = config.cold_cache_bytes;
+                cold_config.minimum_slots = config.capacity;
+                cold_config.routed_layer_count = config.routed_layer_count;
+                cold_config.total_expert_keys = config.total_expert_keys;
+                cold_config.minimum_domain_slots = config.n_expert_used;
+                cold_config.cache_policy_config = config.cold_cache_policy_config;
+                cold_config.routed_layers = policy_layers;
+                cold_config.policy_trace_capacity = policy_trace_capacity;
+                cold_candidate = std::make_unique<llm_cold_expert_cache>(std::move(cold_config));
                 auto initialized = cold_candidate->initialize(source);
                 if (!initialized.is_ready()) {
                     return fail(initialized);
@@ -3218,8 +3378,9 @@ public:
             gpu_unique_indices.resize(config.capacity);
             miss_unique_indices.resize(config.capacity);
             candidate_slots.resize(config.capacity);
+            policy_candidate_slots.resize(config.capacity);
+            policy_unique_indices.resize(config.capacity);
             slot_selected.resize(config.capacity);
-            slot_releasable.resize(config.capacity);
             cold_references.resize(config.capacity);
             transfer_lanes.resize(config.capacity);
             async_flights.resize(config.capacity);
@@ -3245,6 +3406,11 @@ public:
             request_pin_count = 0;
             cpu_execution_pin_count = 0;
             active_request = false;
+
+            hot_policy = std::move(hot_policy_candidate);
+            hot_policy_phase = llm_expert_cache_policy_phase::prefill;
+            hot_logical_bundle_bytes = hot_bundle_payload;
+            hot_physical_slot_footprint_bytes = hot_slot_footprint;
 
             candidate->id = ++generation;
             pool = std::move(candidate);
@@ -3277,6 +3443,8 @@ public:
         for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
             auto & entry = directory_slots[slot];
             if (entry.state == hot_slot_state::ready && entry.refcount == 0) {
+                const auto policy_valid = cache_policy_result(hot_policy.validate_evictable(slot, entry.generation));
+                if (!policy_valid.is_ready()) return fail(policy_valid);
                 if (entry.background_origin && !entry.background_useful) background_wasted++;
                 if (config.cold_mode && entry.has_cold_backing) {
                     auto retired = transfer_ring->retire_hot(slot, entry.generation);
@@ -3288,6 +3456,8 @@ public:
                     entry.cold_slot = 0;
                     entry.cold_generation = 0;
                 }
+                const auto policy_removed = cache_policy_result(hot_policy.remove_resident(slot, entry.generation));
+                if (!policy_removed.is_ready()) return fail(policy_removed);
                 clear_forward_locked(entry.key, slot, entry.generation);
                 entry.key = { -1, -1 };
                 entry.state = hot_slot_state::free;
@@ -3331,6 +3501,18 @@ public:
             result = cold_cache->surrender();
             if (!result.is_ready()) return fail(result);
         }
+        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+            auto & entry = directory_slots[slot];
+            if (entry.state == hot_slot_state::loading) {
+                auto result = cache_policy_result(hot_policy.load_failed(slot, entry.generation));
+                if (!result.is_ready()) return fail(result);
+            } else if (entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned) {
+                auto result = cache_policy_result(hot_policy.remove_resident(slot, entry.generation));
+                if (!result.is_ready()) return fail(result);
+            }
+        }
+        auto policy_surrendered = cache_policy_result(hot_policy.surrender());
+        if (!policy_surrendered.is_ready()) return fail(policy_surrendered);
         pool.reset();
         cold_cache.reset();
         transfer_ring.reset();
@@ -3344,8 +3526,9 @@ public:
         gpu_unique_indices.clear();
         miss_unique_indices.clear();
         candidate_slots.clear();
+        policy_candidate_slots.clear();
+        policy_unique_indices.clear();
         slot_selected.clear();
-        slot_releasable.clear();
         cold_references.clear();
         transfer_lanes.clear();
         async_flights.clear();
@@ -3522,6 +3705,8 @@ public:
         result.last_failure_error = last_failure_error;
         result.last_remap_error = last_remap_error;
         result.remap_dynamic_allocations = 0;
+        result.policy = hot_policy.diagnostics();
+        result.policy_domains = hot_policy.domain_diagnostics();
         result.synchronization_checkpoints = synchronization_checkpoints;
         result.slot_tensor_addresses = pool ? pool->addresses : std::vector<uintptr_t> {};
         result.slots.reserve(directory_slots.size());
@@ -3572,6 +3757,8 @@ public:
             result.cold_peak_request_refs = cold.peak_request_refs;
             result.cold_current_cpu_execution_refs = cold.current_cpu_execution_refs;
             result.cold_peak_cpu_execution_refs = cold.peak_cpu_execution_refs;
+            result.cold_policy = cold.policy;
+            result.cold_policy_domains = cold.policy_domains;
         }
         if (transfer_ring) {
             const auto ring = transfer_ring->diagnostics();
@@ -3868,7 +4055,15 @@ protected:
         if (!active_request || lease_id != active_request_id || !validate_request_pins_locked()) {
             stale_generation_failures++;
         } else {
-            release_request_pins_locked();
+            const auto released = release_request_pins_locked();
+            if (!released.is_ready()) metadata_mismatches++;
+            const auto background_finished = finish_background_request_locked();
+            if (!background_finished.is_ready()) metadata_mismatches++;
+            const bool cancelled = last_remap_error == llm_expert_provider_error::cancelled;
+            const bool success = released.is_ready() && background_finished.is_ready() &&
+                last_remap_error == llm_expert_provider_error::none;
+            const auto ended = end_policy_request_locked(success, cancelled);
+            if (!ended.is_ready()) metadata_mismatches++;
             active_request = false;
             active_request_id = 0;
             if (config.cold_mode && !validate_inclusive_locked().is_ready()) {
@@ -3940,6 +4135,13 @@ private:
         if (record.hot_slot < directory_slots.size()) {
             auto & entry = directory_slots[record.hot_slot];
             if (entry.generation == record.hot_generation && expert_key_matches(entry.key, record.key)) {
+                llm_expert_cache_policy_result policy_result_value;
+                if (entry.state == hot_slot_state::loading) {
+                    policy_result_value = hot_policy.load_failed(record.hot_slot, entry.generation);
+                } else if (entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned) {
+                    policy_result_value = hot_policy.remove_resident(record.hot_slot, entry.generation);
+                }
+                if (!policy_result_value.is_ready()) metadata_mismatches++;
                 clear_forward_locked(entry.key, record.hot_slot, entry.generation);
                 if (entry.has_cold_backing) {
                     (void) cold_cache->release(
@@ -3993,6 +4195,12 @@ private:
                 continue;
             }
             record.state = background_promotion_record::lifecycle::h2d_complete_unpublished;
+            bool earlier_active = false;
+            for (const auto & candidate : background_promotions) {
+                earlier_active = earlier_active || (candidate.active &&
+                    candidate.origin_operation_ordinal < record.origin_operation_ordinal);
+            }
+            if (earlier_active) continue;
             auto & entry = directory_slots[record.hot_slot];
             const bool injected_metadata = config.phase8_test_control != nullptr &&
                 config.phase8_test_control->consume_fault(
@@ -4034,6 +4242,9 @@ private:
             }
             const auto released = transfer_ring->release_terminal_background(record.lane);
             if (!released.is_ready()) return released;
+            const auto completed = cache_policy_result(hot_policy.load_complete(
+                record.hot_slot, entry.generation));
+            if (!completed.is_ready()) return completed;
             entry.state = hot_slot_state::ready;
             entry.background_origin = true;
             entry.background_useful = false;
@@ -4049,28 +4260,129 @@ private:
         return llm_expert_provider_result::success();
     }
 
-    int32_t select_unpinned_hot_slot_locked() const noexcept {
-        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
-            if (directory_slots[slot].state == hot_slot_state::free) return int32_t(slot);
+    llm_expert_provider_result finish_background_request_locked() noexcept {
+        while (active_background_flights != 0) {
+            auto result = reap_background_locked(nullptr);
+            if (!result.is_ready()) return result;
+            background_promotion_record * earliest = nullptr;
+            for (auto & record : background_promotions) {
+                if (record.active && (earliest == nullptr ||
+                    record.origin_operation_ordinal < earliest->origin_operation_ordinal)) {
+                    earliest = &record;
+                }
+            }
+            if (earliest == nullptr) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+            result = transfer_ring->cancel_after_h2d(earliest->lane);
+            if (!result.is_ready()) return result;
+            earliest->state = background_promotion_record::lifecycle::cancelled;
+            discard_background_slot_locked(*earliest, false);
+            background_dropped++;
         }
-        int32_t victim = -1;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result select_optional_hot_slot_locked(
+            const llm_expert_key & key,
+            llm_expert_cache_policy_admission admission,
+            int32_t & selected_slot) noexcept {
+        auto capacity = cache_policy_result(hot_policy.validate_event_capacity(5));
+        if (!capacity.is_ready()) return capacity;
         for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
             const auto & entry = directory_slots[slot];
-            if (entry.state != hot_slot_state::ready || entry.refcount != 0 || slot_selected[slot]) continue;
-            if (victim < 0 || entry.last_use < directory_slots[victim].last_use ||
-                (entry.last_use == directory_slots[victim].last_use && slot < uint32_t(victim))) {
-                victim = int32_t(slot);
-            }
+            policy_candidate_slots[slot] = {
+                slot,
+                entry.generation,
+                { entry.key.layer, entry.key.expert },
+                hot_logical_bundle_bytes,
+                hot_physical_slot_footprint_bytes,
+                entry.state == hot_slot_state::free,
+                entry.state == hot_slot_state::ready && entry.refcount == 0 && !slot_selected[slot],
+            };
         }
-        return victim;
+        llm_expert_cache_policy_decision decision;
+        auto result = cache_policy_result(hot_policy.optional_admission(
+            { key.layer, key.expert }, admission,
+            policy_candidate_slots.data(), policy_candidate_slots.size(), decision));
+        if (!result.is_ready() || !decision.accept) {
+            selected_slot = -1;
+            return result;
+        }
+        if (decision.slot >= directory_slots.size()) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        const auto & entry = directory_slots[decision.slot];
+        const bool valid = decision.free ?
+            entry.state == hot_slot_state::free && entry.generation == decision.generation :
+            policy_candidate_slots[decision.slot].eligible && entry.generation == decision.generation &&
+                hot_policy.validate_resident(decision.slot, decision.generation,
+                    { entry.key.layer, entry.key.expert });
+        if (!valid) {
+            metadata_mismatches++;
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        selected_slot = int32_t(decision.slot);
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result select_hot_slot_locked(
+            const llm_expert_key & key,
+            const uint32_t * selected_candidates,
+            size_t selected_candidate_count,
+            int32_t & selected_slot) noexcept {
+        auto capacity = cache_policy_result(hot_policy.validate_event_capacity(5));
+        if (!capacity.is_ready()) return capacity;
+        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+            const auto & entry = directory_slots[slot];
+            bool already_candidate = false;
+            for (size_t index = 0; index < selected_candidate_count; ++index) {
+                already_candidate = already_candidate || selected_candidates[index] == slot;
+            }
+            const bool excluded = slot_selected[slot] || already_candidate;
+            const bool free = !excluded && entry.state == hot_slot_state::free;
+            const bool eligible = !excluded && entry.state == hot_slot_state::ready && entry.refcount == 0;
+            policy_candidate_slots[slot] = {
+                slot,
+                entry.generation,
+                { entry.key.layer, entry.key.expert },
+                hot_logical_bundle_bytes,
+                hot_physical_slot_footprint_bytes,
+                free,
+                eligible,
+            };
+        }
+        llm_expert_cache_policy_decision decision;
+        auto result = cache_policy_result(hot_policy.optional_admission(
+            { key.layer, key.expert }, llm_expert_cache_policy_admission::mandatory_current_output,
+            policy_candidate_slots.data(), policy_candidate_slots.size(), decision));
+        if (!result.is_ready()) return result;
+        if (decision.slot >= directory_slots.size()) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        const auto & entry = directory_slots[decision.slot];
+        const bool valid = decision.free ?
+            entry.state == hot_slot_state::free && entry.generation == decision.generation :
+            policy_candidate_slots[decision.slot].eligible && entry.generation == decision.generation &&
+                hot_policy.validate_resident(decision.slot, decision.generation,
+                    { entry.key.layer, entry.key.expert });
+        if (!valid) {
+            metadata_mismatches++;
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        selected_slot = int32_t(decision.slot);
+        return llm_expert_provider_result::success();
     }
 
     llm_expert_provider_result prepare_hot_slot_locked(
             uint32_t slot,
             const llm_expert_key & key,
-            llm_cold_reference cold) noexcept {
+            llm_cold_reference cold,
+            bool demand_caused = true) noexcept {
         auto & entry = directory_slots[slot];
         if (entry.state != hot_slot_state::free) {
+            const auto policy_valid = cache_policy_result(hot_policy.validate_evictable(slot, entry.generation));
+            if (!policy_valid.is_ready()) return policy_valid;
             if (entry.background_origin && !entry.background_useful) background_wasted++;
             auto retired = transfer_ring->retire_hot(slot, entry.generation);
             if (!retired.is_ready()) return retired;
@@ -4080,6 +4392,8 @@ private:
             auto released = cold_cache->release(
                 { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
             if (!released.is_ready()) return released;
+            const auto removed = cache_policy_result(hot_policy.evict(slot, entry.generation));
+            if (!removed.is_ready()) return removed;
             clear_forward_locked(entry.key, slot, entry.generation);
             evictions++;
             no_writeback_evictions++;
@@ -4092,8 +4406,15 @@ private:
         entry.key = key;
         entry.generation = next_generation;
         entry.state = hot_slot_state::loading;
+        auto policy_loading = cache_policy_result(hot_policy.load_begin(
+            slot, entry.generation, { key.layer, key.expert },
+            hot_logical_bundle_bytes, hot_physical_slot_footprint_bytes, demand_caused));
+        if (!policy_loading.is_ready()) return policy_loading;
         auto acquired = cold_cache->acquire(cold, llm_cold_reference_kind::hot);
-        if (!acquired.is_ready()) return acquired;
+        if (!acquired.is_ready()) {
+            (void) hot_policy.load_failed(slot, entry.generation);
+            return acquired;
+        }
         entry.cold_slot = cold.slot;
         entry.cold_generation = cold.generation;
         entry.has_cold_backing = true;
@@ -4114,11 +4435,11 @@ private:
             return;
         }
         int32_t selected_slot = -1;
-        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
-            if (directory_slots[slot].state == hot_slot_state::free) {
-                selected_slot = int32_t(slot);
-                break;
-            }
+        const auto admitted = select_optional_hot_slot_locked(
+            key, llm_expert_cache_policy_admission::optional_background, selected_slot);
+        if (!admitted.is_ready()) {
+            background_dropped++;
+            return;
         }
         if (selected_slot < 0) {
             background_busy++;
@@ -4149,9 +4470,10 @@ private:
         } else {
             record.scheduler_state = llm_expert_request_state::submitting;
         }
-        if (result.is_ready()) result = prepare_hot_slot_locked(record.hot_slot, key, cold);
+        if (result.is_ready()) result = prepare_hot_slot_locked(record.hot_slot, key, cold, false);
         if (result.is_ready()) {
             record.hot_generation = directory_slots[record.hot_slot].generation;
+            record.origin_operation_ordinal = hot_policy.diagnostics().operation_ordinal;
             if (config.scheduler->transition(record.scheduler_handle,
                     llm_expert_request_state::submitting, llm_expert_request_state::host_ready) !=
                     llm_expert_schedule_disposition::admitted) {
@@ -4240,10 +4562,13 @@ private:
         return true;
     }
 
-    void release_request_pins_locked() noexcept {
+    llm_expert_provider_result release_request_pins_locked() noexcept {
         for (size_t index = 0; index < request_pin_count; ++index) {
             auto & entry = directory_slots[request_pins[index].slot];
             GGML_ASSERT(entry.generation == request_pins[index].generation && entry.refcount > 0);
+            const auto unpinned = cache_policy_result(hot_policy.unpin(
+                request_pins[index].slot, request_pins[index].generation));
+            if (!unpinned.is_ready()) return unpinned;
             entry.refcount--;
             if (entry.refcount == 0) {
                 entry.state = hot_slot_state::ready;
@@ -4255,15 +4580,26 @@ private:
         for (size_t index = 0; index < cpu_execution_pin_count; ++index) {
             const auto released = cold_cache->release(
                 cpu_execution_pins[index], llm_cold_reference_kind::cpu_execution);
-            GGML_ASSERT(released.is_ready());
+            if (!released.is_ready()) return released;
         }
         cpu_execution_pin_count = 0;
+        return llm_expert_provider_result::success();
     }
 
-    void pin_slot_locked(uint32_t slot) noexcept {
+    llm_expert_provider_result end_policy_request_locked(bool success, bool cancelled) noexcept {
+        auto result = cache_policy_result(hot_policy.request_end(success, cancelled));
+        if (result.is_ready() && cold_cache) {
+            result = cold_cache->policy_request_end(success, cancelled);
+        }
+        return result;
+    }
+
+    llm_expert_provider_result pin_slot_locked(uint32_t slot) noexcept {
         auto & entry = directory_slots[slot];
         GGML_ASSERT(request_pin_count < request_pins.size());
         GGML_ASSERT(entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned);
+        const auto pinned = cache_policy_result(hot_policy.pin(slot, entry.generation));
+        if (!pinned.is_ready()) return pinned;
         entry.refcount++;
         entry.state = hot_slot_state::pinned;
         entry.last_use = ++use_clock;
@@ -4271,6 +4607,7 @@ private:
         pin_acquires++;
         current_pins++;
         peak_pins = std::max(peak_pins, current_pins);
+        return llm_expert_provider_result::success();
     }
 
     uint32_t required_capacity(uint64_t extent) const noexcept {
@@ -4285,6 +4622,18 @@ private:
     }
 
     llm_expert_provider_result validate_inclusive_locked() noexcept {
+        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+            const auto & entry = directory_slots[slot];
+            const llm_expert_cache_policy_key key = { entry.key.layer, entry.key.expert };
+            const bool policy_matches = entry.state == hot_slot_state::loading ?
+                hot_policy.validate_loading(slot, entry.generation, key) :
+                (entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned) ?
+                    hot_policy.validate_resident(slot, entry.generation, key) : true;
+            if (!policy_matches) {
+                metadata_mismatches++;
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+        }
         if (!config.cold_mode || !cold_cache || !transfer_ring) {
             return config.cold_mode ?
                 llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed) :
@@ -4392,7 +4741,7 @@ private:
 
     llm_hot_cache_config config;
     llm_expert_provider_faults faults;
-    deterministic_lru_policy lru_policy;
+    llm_expert_cache_policy hot_policy;
     uint32_t n_expert = 0;
     mutable std::mutex mutex;
     mutable llm_expert_provider_stats counters;
@@ -4421,6 +4770,7 @@ private:
     uint64_t generation = 0;
     uint32_t last_context_n_ctx = 0;
     uint32_t last_context_n_ubatch = 0;
+    uint64_t request_ubatch_ordinal = 0;
     uint32_t last_context_extent = 0;
     uint32_t last_required_capacity = 0;
     uint64_t context_validations = 0;
@@ -4435,8 +4785,9 @@ private:
     std::vector<uint32_t> gpu_unique_indices;
     std::vector<uint32_t> miss_unique_indices;
     std::vector<uint32_t> candidate_slots;
+    std::vector<llm_expert_cache_policy_candidate> policy_candidate_slots;
+    std::vector<uint32_t> policy_unique_indices;
     std::vector<uint8_t> slot_selected;
-    std::vector<uint32_t> slot_releasable;
     std::vector<llm_cold_reference> cold_references;
     std::vector<llm_transfer_lane_reference> transfer_lanes;
     std::vector<storage_async_flight> async_flights;
@@ -4463,6 +4814,9 @@ private:
     uint64_t active_request_id = 0;
     uint64_t next_request_id = 0;
     uint64_t use_clock = 0;
+    llm_expert_cache_policy_phase hot_policy_phase = llm_expert_cache_policy_phase::prefill;
+    uint64_t hot_logical_bundle_bytes = 0;
+    uint64_t hot_physical_slot_footprint_bytes = 0;
     uint64_t requests = 0;
     uint64_t exclusive_busy_failures = 0;
     uint64_t remap_checkpoints = 0;

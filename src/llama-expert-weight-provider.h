@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-expert-cache-policy.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -524,6 +525,10 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_h2d_bytes = 0;
     uint64_t ring_h2d_time_us = 0;
     uint64_t ring_failed_cleanup = 0;
+    llm_expert_cache_policy_diagnostics policy;
+    std::vector<llm_expert_cache_policy_domain_diagnostics> policy_domains;
+    llm_expert_cache_policy_diagnostics cold_policy;
+    std::vector<llm_expert_cache_policy_domain_diagnostics> cold_policy_domains;
 };
 
 enum class llm_expert_execution_backend : uint8_t {
@@ -859,6 +864,9 @@ struct llm_hot_cache_config {
     llm_expert_phase8_test_control * phase8_test_control = nullptr;
     llm_expert_phase8_closeout_witness * phase8_closeout_witness = nullptr;
     bool descriptor_only_source_for_testing = false;
+    llm_expert_cache_policy_config_internal hot_cache_policy_config = {};
+    llm_expert_cache_policy_config_internal cold_cache_policy_config = {};
+    std::vector<int32_t> routed_layers;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(

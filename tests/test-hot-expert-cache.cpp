@@ -172,15 +172,15 @@ llm_hot_cache_config test_config(
         uint32_t total_keys = 4,
         uint32_t n_expert_used = 2,
         uint64_t initial_generation = 0) {
-    return {
-        capacity,
-        n_expert_used,
-        routed_layers,
-        total_keys,
-        ggml_backend_cpu_buffer_type(),
-        true,
-        initial_generation,
-    };
+    llm_hot_cache_config result;
+    result.capacity = capacity;
+    result.n_expert_used = n_expert_used;
+    result.routed_layer_count = routed_layers;
+    result.total_expert_keys = total_keys;
+    result.target_buffer_type = ggml_backend_cpu_buffer_type();
+    result.allow_non_cuda_target_for_testing = true;
+    result.initial_slot_generation_for_testing = initial_generation;
+    return result;
 }
 
 llm_hot_cache_config cold_test_config(uint32_t capacity = 2) {
@@ -226,6 +226,51 @@ llm_expert_graph_binding initialize_hot_binding(
     GGML_ASSERT(provider.bind(tensors.bundle(layer), tensors.selection(layer), binding).is_ready());
     GGML_ASSERT(!binding.bootstrap);
     return binding;
+}
+
+void test_runtime_policy_adapters_and_bounded_metadata() {
+    tensor_fixture tensors;
+    for (const auto policy_name : { LLAMA_EXPERT_CACHE_POLICY_LRU, LLAMA_EXPERT_CACHE_POLICY_LFRU,
+            LLAMA_EXPERT_CACHE_POLICY_SLRU, LLAMA_EXPERT_CACHE_POLICY_LFU_AGING }) {
+        auto config = test_config();
+        const llama_expert_cache_policy_config public_config = {
+            LLAMA_EXPERT_CACHE_POLICY_VERSION_1,
+            sizeof(llama_expert_cache_policy_config),
+            policy_name,
+            LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL,
+            policy_name == LLAMA_EXPERT_CACHE_POLICY_SLRU ? 7500u : 0u,
+            LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS,
+            0,
+            policy_name == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING ? 64u : 0u,
+            {},
+        };
+        GGML_ASSERT(llm_expert_cache_policy_copy_config(&public_config,
+            llm_expert_cache_policy_tier::hot, config.hot_cache_policy_config).is_ready());
+        auto provider = llm_create_hot_cache_expert_weight_provider(config);
+        auto binding = initialize_hot_binding(*provider, tensors);
+        llm_expert_execution_plan plan;
+        int32_t execution_ids[] = { -1, -1 };
+        const int32_t first[] = { 0, 1 };
+        GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+        GGML_ASSERT(provider->remap_checkpoint(binding, first, 2, execution_ids).is_ready());
+        plan.reset();
+        const int32_t second[] = { 0, 2 };
+        GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+        const uint64_t allocations_before = allocation_count.load(std::memory_order_relaxed);
+        GGML_ASSERT(provider->remap_checkpoint(binding, second, 2, execution_ids).is_ready());
+        GGML_ASSERT(allocation_count.load(std::memory_order_relaxed) == allocations_before);
+        plan.reset();
+        const auto diagnostics = provider->hot_cache_diagnostics();
+        GGML_ASSERT(diagnostics.policy.config.policy == policy_name);
+        GGML_ASSERT(diagnostics.policy.config.supplied);
+        GGML_ASSERT(diagnostics.policy.events > 0);
+        GGML_ASSERT(diagnostics.policy.administration_requested_bytes > 0);
+        GGML_ASSERT(diagnostics.policy.administration_actual_bytes >=
+            diagnostics.policy.administration_requested_bytes);
+        GGML_ASSERT(provider->trim().is_ready());
+        binding = {};
+        GGML_ASSERT(provider->surrender().is_ready());
+    }
 }
 
 int source_expert_axis(const ggml_tensor * tensor, int64_t n_expert, bool weight) {
@@ -1256,6 +1301,7 @@ void test_cuda_directory_copy() {
 } // namespace
 
 int main(int argc, char ** argv) {
+    test_runtime_policy_adapters_and_bounded_metadata();
     test_initialization_stage_and_descriptor_only_scale();
     test_configuration_matrix();
     test_context_extent_matrix_and_prepare_revalidation();

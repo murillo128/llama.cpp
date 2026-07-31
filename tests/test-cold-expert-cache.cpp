@@ -57,7 +57,13 @@ struct fixture {
 };
 
 llm_cold_cache_config config(uint64_t bytes, uint32_t minimum = 1, uint64_t generation = 0) {
-    return { bytes, minimum, 1, 4, generation };
+    llm_cold_cache_config result;
+    result.byte_budget = bytes;
+    result.minimum_slots = minimum;
+    result.routed_layer_count = 1;
+    result.total_expert_keys = 4;
+    result.initial_slot_generation_for_testing = generation;
+    return result;
 }
 
 template<class F> void expect_invalid(F fn) {
@@ -110,8 +116,12 @@ void assert_tensor_slot(
 void test_configuration_and_budget_edges() {
     fixture tensors;
     expect_invalid([] { llm_cold_expert_cache cache(config(0)); });
-    expect_invalid([] { llm_cold_expert_cache cache({ 1024, 0, 1, 4, 0 }); });
-    expect_invalid([] { llm_cold_expert_cache cache({ 1024, 1, 3, 4, 0 }); });
+    expect_invalid([] { llm_cold_expert_cache cache(config(1024, 0)); });
+    expect_invalid([] {
+        auto invalid = config(1024);
+        invalid.routed_layer_count = 3;
+        llm_cold_expert_cache cache(std::move(invalid));
+    });
 
     const uint64_t full_budget = discover_budget(tensors, 4);
     llm_cold_expert_cache exact(config(full_budget, 4));
@@ -152,6 +162,41 @@ void test_publication_hits_and_copy_failure() {
     GGML_ASSERT(cache.cleanup_failed_slots().is_ready());
     diagnostics = cache.diagnostics();
     GGML_ASSERT(diagnostics.failed_cleanups == 1);
+}
+
+void test_runtime_policy_adapters() {
+    fixture tensors;
+    const uint64_t budget = budget_for_slots(tensors, 2);
+    for (const auto policy_name : { LLAMA_EXPERT_CACHE_POLICY_LRU, LLAMA_EXPERT_CACHE_POLICY_LFRU,
+            LLAMA_EXPERT_CACHE_POLICY_SLRU, LLAMA_EXPERT_CACHE_POLICY_LFU_AGING }) {
+        auto cache_config = config(budget, 2);
+        const llama_expert_cache_policy_config public_config = {
+            LLAMA_EXPERT_CACHE_POLICY_VERSION_1,
+            sizeof(llama_expert_cache_policy_config),
+            policy_name,
+            LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL,
+            policy_name == LLAMA_EXPERT_CACHE_POLICY_SLRU ? 7500u : 0u,
+            LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS,
+            0,
+            policy_name == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING ? 64u : 0u,
+            {},
+        };
+        GGML_ASSERT(llm_expert_cache_policy_copy_config(&public_config,
+            llm_expert_cache_policy_tier::cold, cache_config.cache_policy_config).is_ready());
+        llm_cold_expert_cache cache(cache_config);
+        GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+        llm_cold_reference reference;
+        GGML_ASSERT(cache.find_or_admit({ 0, 0 }, tensors.bundle(), reference).is_ready());
+        GGML_ASSERT(cache.find_or_admit({ 0, 1 }, tensors.bundle(), reference).is_ready());
+        GGML_ASSERT(cache.find_or_admit({ 0, 0 }, tensors.bundle(), reference).is_ready());
+        GGML_ASSERT(cache.find_or_admit({ 0, 2 }, tensors.bundle(), reference).is_ready());
+        const auto diagnostics = cache.diagnostics();
+        GGML_ASSERT(diagnostics.policy.config.policy == policy_name);
+        GGML_ASSERT(diagnostics.policy.config.supplied);
+        GGML_ASSERT(diagnostics.policy.events > 0);
+        GGML_ASSERT(cache.validate_invariants().is_ready());
+        GGML_ASSERT(cache.surrender().is_ready());
+    }
 }
 
 void test_two_phase_publication_and_failure() {
@@ -304,6 +349,7 @@ void test_loader_publication_failure_cleanup_and_reread() {
 } // namespace
 
 int main() {
+    test_runtime_policy_adapters();
     test_configuration_and_budget_edges();
     test_publication_hits_and_copy_failure();
     test_two_phase_publication_and_failure();

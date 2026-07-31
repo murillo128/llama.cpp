@@ -18,6 +18,7 @@ add_library(llama
             llama-context.cpp
             llama-cparams.cpp
             llama-cold-expert-cache.cpp
+            llama-expert-cache-policy.cpp
             llama-expert-async-io.cpp
             llama-expert-scheduler.cpp
             llama-expert-transfer-ring.cpp

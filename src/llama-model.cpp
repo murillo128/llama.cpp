@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-expert-weight-provider.h"
+#include "llama-expert-cache-policy.h"
 #include "llama-expert-storage.h"
 #include "llama-expert-async-io.h"
 #include "llama-expert-scheduler.h"
@@ -1057,6 +1058,10 @@ struct llama_model::impl {
     std::vector<float> tensor_split_owned;
     std::optional<llama_expert_auto_cost_model> expert_auto_cost_model_owned;
     uint64_t expert_auto_cost_model_digest = 0;
+    std::optional<llama_expert_cache_policy_config> expert_hot_cache_policy_owned;
+    std::optional<llama_expert_cache_policy_config> expert_cold_cache_policy_owned;
+    llm_expert_cache_policy_config_internal expert_hot_cache_policy_config;
+    llm_expert_cache_policy_config_internal expert_cold_cache_policy_config;
 
     struct source_file_storage {
         std::string identity;
@@ -1093,6 +1098,30 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         throw std::invalid_argument("invalid expert weights mode");
     }
     const bool cold_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+    const bool cached_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE || cold_mode;
+    if (!cached_mode && params.expert_hot_cache_policy != nullptr) {
+        throw std::invalid_argument("expert hot-cache policy requires hot-cache or cold-cache mode");
+    }
+    if (!cold_mode && params.expert_cold_cache_policy != nullptr) {
+        throw std::invalid_argument("expert cold-cache policy requires cold-cache mode");
+    }
+    const auto hot_policy_result = llm_expert_cache_policy_copy_config(
+        params.expert_hot_cache_policy, llm_expert_cache_policy_tier::hot,
+        pimpl->expert_hot_cache_policy_config);
+    const auto cold_policy_result = llm_expert_cache_policy_copy_config(
+        params.expert_cold_cache_policy, llm_expert_cache_policy_tier::cold,
+        pimpl->expert_cold_cache_policy_config);
+    if (!hot_policy_result.is_ready() || !cold_policy_result.is_ready()) {
+        throw std::invalid_argument("invalid expert cache-policy configuration");
+    }
+    if (params.expert_hot_cache_policy != nullptr) {
+        pimpl->expert_hot_cache_policy_owned = *params.expert_hot_cache_policy;
+        this->params.expert_hot_cache_policy = &*pimpl->expert_hot_cache_policy_owned;
+    }
+    if (params.expert_cold_cache_policy != nullptr) {
+        pimpl->expert_cold_cache_policy_owned = *params.expert_cold_cache_policy;
+        this->params.expert_cold_cache_policy = &*pimpl->expert_cold_cache_policy_owned;
+    }
     if (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU &&
         params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK &&
         params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_AUTO) {
@@ -1161,6 +1190,7 @@ void llama_model::init_expert_weight_provider() {
         case LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE: {
             ggml_backend_dev_t target = nullptr;
             uint32_t routed_layer_count = 0;
+            std::vector<int32_t> routed_layers;
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
                 if (layer.ffn_down_exps == nullptr) {
@@ -1173,9 +1203,14 @@ void llama_model::init_expert_weight_provider() {
                     throw std::invalid_argument("hot-cache routed layers must target one device");
                 }
                 routed_layer_count++;
+                routed_layers.push_back(int32_t(il));
             }
             if (target == nullptr || hparams.n_expert <= 0 || hparams.n_expert_used <= 0) {
                 throw std::invalid_argument("hot-cache mode requires routed experts and a CUDA target");
+            }
+            if (pimpl->expert_hot_cache_policy_config.scope == LLAMA_EXPERT_CACHE_POLICY_SCOPE_PER_LAYER &&
+                params.expert_hot_cache_capacity < uint64_t(routed_layer_count)*uint32_t(hparams.n_expert_used)) {
+                throw std::invalid_argument("per-layer hot-cache policy cannot satisfy simultaneous demand width");
             }
             const bool hybrid_policy = params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
                 params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
@@ -1217,14 +1252,15 @@ void llama_model::init_expert_weight_provider() {
             if (directory_entries > UINT32_MAX) {
                 throw std::overflow_error("hot-cache expert directory exceeds uint32_t capacity");
             }
-            llm_hot_cache_config config = {
-                params.expert_hot_cache_capacity,
-                uint32_t(hparams.n_expert_used),
-                routed_layer_count,
-                uint32_t(directory_entries),
-                ggml_backend_dev_buffer_type(target),
-                false,
-            };
+            llm_hot_cache_config config;
+            config.capacity = params.expert_hot_cache_capacity;
+            config.n_expert_used = uint32_t(hparams.n_expert_used);
+            config.routed_layer_count = routed_layer_count;
+            config.total_expert_keys = uint32_t(directory_entries);
+            config.target_buffer_type = ggml_backend_dev_buffer_type(target);
+            config.hot_cache_policy_config = pimpl->expert_hot_cache_policy_config;
+            config.cold_cache_policy_config = pimpl->expert_cold_cache_policy_config;
+            config.routed_layers = std::move(routed_layers);
             if (params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
                 config.cold_mode = true;
                 config.cold_cache_bytes = params.expert_cold_cache_bytes;
@@ -2898,6 +2934,8 @@ llama_model_params llama_model_default_params() {
         /*.expert_miss_policy          =*/ LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU,
         /*.expert_background_promotion =*/ false,
         /*.expert_auto_cost_model      =*/ nullptr,
+        /*.expert_hot_cache_policy     =*/ nullptr,
+        /*.expert_cold_cache_policy    =*/ nullptr,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
