@@ -335,7 +335,24 @@ struct llm_expert_transfer_ring::impl {
                 if (counters.live_h2d_events > 0) counters.live_h2d_events--;
                 refresh_total_event_counters();
                 counters.last_h2d_event_complete_us = completed_us;
-                finish_lane_if_ready(completed);
+                const auto gate_key = completed.flight.key;
+                const uint64_t gate_generation = completed.hot_generation;
+                const bool gate_background = completed.hold_after_h2d;
+                lock.unlock();
+                if (gate_background && config.phase8_test_control != nullptr) {
+                    config.phase8_test_control->observe(
+                        llm_expert_phase8_test_gate::background_h2d_complete_before_provider_publication,
+                        gate_key, gate_generation);
+                    (void) config.phase8_test_control->pause_if_armed(
+                        llm_expert_phase8_test_gate::background_h2d_complete_before_provider_publication,
+                        gate_key, gate_generation);
+                }
+                lock.lock();
+                auto & revalidated = lanes[selected];
+                if (revalidated.generation == generation &&
+                    revalidated.state == llm_transfer_lane_state::in_flight) {
+                    finish_lane_if_ready(revalidated);
+                }
             }
             condition.notify_all();
         }
@@ -570,6 +587,15 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
                     lane.background_running = true;
                     lock.unlock();
 
+                    if (pimpl->config.phase8_test_control != nullptr) {
+                        pimpl->config.phase8_test_control->observe(
+                            llm_expert_phase8_test_gate::background_queued_before_stage,
+                            lane.flight.key, lane.hot_generation);
+                        (void) pimpl->config.phase8_test_control->pause_if_armed(
+                            llm_expert_phase8_test_gate::background_queued_before_stage,
+                            lane.flight.key, lane.hot_generation);
+                    }
+
                     if (pimpl->config.delay_background_stage_ms_for_testing != 0) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(
                             pimpl->config.delay_background_stage_ms_for_testing));
@@ -579,6 +605,14 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
                         pimpl->background_bindings.clear();
                         pimpl->background_bindings.push_back({ reference, destination, hot_slot });
                         result = transfer_wave(pimpl->transfer_backend.get(), pimpl->background_bindings);
+                    }
+                    if (result.is_ready() && pimpl->config.phase8_test_control != nullptr) {
+                        pimpl->config.phase8_test_control->observe(
+                            llm_expert_phase8_test_gate::background_h2d_in_flight,
+                            lane.flight.key, lane.hot_generation);
+                        (void) pimpl->config.phase8_test_control->pause_if_armed(
+                            llm_expert_phase8_test_gate::background_h2d_in_flight,
+                            lane.flight.key, lane.hot_generation);
                     }
                     if (result.is_ready()) result = monitor_h2d(reference);
 
@@ -679,6 +713,15 @@ llm_expert_provider_result llm_expert_transfer_ring::stage(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
+    const auto fault_key = lane.flight.key;
+    const uint64_t fault_generation = lane.hot_generation;
+    if (pimpl->config.phase8_test_control != nullptr &&
+        pimpl->config.phase8_test_control->consume_fault(
+            llm_expert_phase8_test_fault::stage_copy_failed, fault_key, fault_generation)) {
+        lane.state = llm_transfer_lane_state::failed;
+        pimpl->condition.notify_all();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+    }
     size_t copied = 0;
     uint64_t copied_bytes = 0;
     const int64_t start = ggml_time_us();
@@ -724,6 +767,17 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
             }
         }
     };
+    if (pimpl->config.phase8_test_control != nullptr) {
+        for (const auto & binding : bindings) {
+            const auto & lane = pimpl->lanes[binding.lane.lane];
+            if (pimpl->config.phase8_test_control->consume_fault(
+                    llm_expert_phase8_test_fault::h2d_failed,
+                    lane.flight.key, lane.hot_generation)) {
+                fail_bindings();
+                return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+            }
+        }
+    }
     for (const auto & binding : bindings) {
         if (!pimpl->valid_lane(binding.lane) ||
             pimpl->lanes[binding.lane.lane].state != llm_transfer_lane_state::staging ||
@@ -878,6 +932,12 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
         if (lane.state == llm_transfer_lane_state::free) return llm_expert_provider_result::success();
         if (lane.state != llm_transfer_lane_state::in_flight) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+        }
+        if (pimpl->config.phase8_test_control != nullptr &&
+            pimpl->config.phase8_test_control->consume_fault(
+                llm_expert_phase8_test_fault::wait_failed,
+                lane.flight.key, lane.hot_generation)) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
         }
         if (compute_backend == nullptr || ggml_backend_get_device(compute_backend) != pimpl->config.target_device ||
             lane.event == nullptr || lane.compute_event == nullptr) {
@@ -1072,6 +1132,16 @@ llm_expert_provider_result llm_expert_transfer_ring::set_h2d_gate_event_for_test
         }
     }
     pimpl->config.h2d_gate_event_for_testing = event;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::set_phase8_test_control_for_testing(
+        llm_expert_phase8_test_control * control) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (pimpl->has_running_background_work()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+    }
+    pimpl->config.phase8_test_control = control;
     return llm_expert_provider_result::success();
 }
 
@@ -1273,5 +1343,19 @@ llm_transfer_ring_diagnostics llm_expert_transfer_ring::diagnostics() const {
         }
     }
     result.h2d_compute_overlap_flights = participating_flights.size();
+    return result;
+}
+
+llm_transfer_ring_closeout_diagnostics llm_expert_transfer_ring::closeout_diagnostics() const noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    llm_transfer_ring_closeout_diagnostics result;
+    result.live_events = pimpl->counters.live_events;
+    for (const auto & lane : pimpl->lanes) {
+        result.queued_workers += lane.background_queued;
+        result.running_workers += lane.background_running;
+        result.non_free_lanes += lane.state != llm_transfer_lane_state::free;
+    }
+    result.invariants_ok = result.queued_workers == 0 && result.running_workers == 0 &&
+        result.non_free_lanes == 0 && result.live_events == 0;
     return result;
 }

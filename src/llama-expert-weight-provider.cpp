@@ -22,6 +22,174 @@
 #include <string>
 #include <utility>
 
+llm_expert_provider_result llm_expert_phase8_test_control::arm_gate(
+        llm_expert_phase8_test_gate requested_gate,
+        llm_expert_key requested_key,
+        uint64_t requested_generation) noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kind != directive_kind::none || requested_gate == llm_expert_phase8_test_gate::none ||
+        requested_key.layer < 0 || requested_key.expert < 0 || requested_generation == 0) {
+        return llm_expert_provider_result::failure(kind != directive_kind::none ?
+            llm_expert_provider_error::busy : llm_expert_provider_error::invalid_key);
+    }
+    kind = directive_kind::gate;
+    gate = requested_gate;
+    fault = llm_expert_phase8_test_fault::none;
+    key = requested_key;
+    generation = requested_generation;
+    reached = false;
+    released = false;
+    last_observed_gate = llm_expert_phase8_test_gate::none;
+    directive_epoch++;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_phase8_test_control::arm_fault(
+        llm_expert_phase8_test_fault requested_fault,
+        llm_expert_key requested_key,
+        uint64_t requested_generation) noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kind != directive_kind::none || requested_fault == llm_expert_phase8_test_fault::none ||
+        requested_key.layer < 0 || requested_key.expert < 0 || requested_generation == 0) {
+        return llm_expert_provider_result::failure(kind != directive_kind::none ?
+            llm_expert_provider_error::busy : llm_expert_provider_error::invalid_key);
+    }
+    kind = directive_kind::fault;
+    gate = llm_expert_phase8_test_gate::none;
+    fault = requested_fault;
+    key = requested_key;
+    generation = requested_generation;
+    reached = false;
+    released = false;
+    last_observed_gate = llm_expert_phase8_test_gate::none;
+    directive_epoch++;
+    return llm_expert_provider_result::success();
+}
+
+void llm_expert_phase8_test_control::wait_until_reached() noexcept {
+    std::unique_lock<std::mutex> lock(mutex);
+    condition.wait(lock, [&] { return reached; });
+}
+
+llm_expert_provider_result llm_expert_phase8_test_control::release_gate() noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kind != directive_kind::gate || !reached || released) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    }
+    released = true;
+    released_epoch = directive_epoch;
+    condition.notify_all();
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_phase8_test_control::release_gate_and_arm_gate(
+        llm_expert_phase8_test_gate next_gate) noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kind != directive_kind::gate || !reached || released ||
+        next_gate == llm_expert_phase8_test_gate::none || directive_epoch == UINT64_MAX) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    }
+    released_epoch = directive_epoch;
+    directive_epoch++;
+    gate = next_gate;
+    reached = false;
+    released = false;
+    condition.notify_all();
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_phase8_test_control::release_gate_and_arm_fault(
+        llm_expert_phase8_test_fault next_fault) noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kind != directive_kind::gate || !reached || released ||
+        next_fault == llm_expert_phase8_test_fault::none) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    }
+    released_epoch = directive_epoch;
+    kind = directive_kind::fault;
+    gate = llm_expert_phase8_test_gate::none;
+    fault = next_fault;
+    reached = false;
+    released = false;
+    condition.notify_all();
+    return llm_expert_provider_result::success();
+}
+
+bool llm_expert_phase8_test_control::gate_reached() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    return reached;
+}
+
+uint64_t llm_expert_phase8_test_control::observations() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    return observation_count;
+}
+
+void llm_expert_phase8_test_control::observe(
+        llm_expert_phase8_test_gate observed_gate,
+        llm_expert_key observed_key,
+        uint64_t observed_generation) noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kind == directive_kind::none || key.layer != observed_key.layer ||
+        key.expert != observed_key.expert || generation != observed_generation) {
+        return;
+    }
+    last_observed_gate = observed_gate;
+    condition.notify_all();
+}
+
+void llm_expert_phase8_test_control::wait_until_observed(
+        llm_expert_phase8_test_gate observed_gate) noexcept {
+    std::unique_lock<std::mutex> lock(mutex);
+    condition.wait(lock, [&] { return last_observed_gate == observed_gate; });
+}
+
+bool llm_expert_phase8_test_control::pause_if_armed(
+        llm_expert_phase8_test_gate observed_gate,
+        llm_expert_key observed_key,
+        uint64_t observed_generation) noexcept {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (kind != directive_kind::gate || gate != observed_gate ||
+        key.layer != observed_key.layer || key.expert != observed_key.expert ||
+        generation != observed_generation) {
+        return false;
+    }
+    reached = true;
+    observation_count++;
+    last_observed_gate = observed_gate;
+    const uint64_t observed_epoch = directive_epoch;
+    condition.notify_all();
+    condition.wait(lock, [&] { return released_epoch >= observed_epoch; });
+    if (kind == directive_kind::gate && directive_epoch == observed_epoch && gate == observed_gate) {
+        kind = directive_kind::none;
+        gate = llm_expert_phase8_test_gate::none;
+        key = { -1, -1 };
+        generation = 0;
+    }
+    condition.notify_all();
+    return true;
+}
+
+bool llm_expert_phase8_test_control::consume_fault(
+        llm_expert_phase8_test_fault observed_fault,
+        llm_expert_key observed_key,
+        uint64_t observed_generation) noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kind != directive_kind::fault || fault != observed_fault ||
+        key.layer != observed_key.layer || key.expert != observed_key.expert ||
+        generation != observed_generation) {
+        return false;
+    }
+    reached = true;
+    observation_count++;
+    kind = directive_kind::none;
+    fault = llm_expert_phase8_test_fault::none;
+    key = { -1, -1 };
+    generation = 0;
+    condition.notify_all();
+    return true;
+}
+
 llm_expert_auto_result llm_evaluate_expert_auto(const llm_expert_auto_input & input) noexcept {
     llm_expert_auto_result result;
     bool overflow = false;
@@ -1255,11 +1423,15 @@ public:
             throw std::invalid_argument("hot-cache target must be one CUDA device");
         }
         if (config.cold_mode && (config.cold_cache_bytes == 0 || config.transfer_ring_bytes == 0 ||
-            config.target_device == nullptr || (!config.allow_non_cuda_target_for_testing && config.storage == nullptr))) {
+            config.target_device == nullptr || (!config.allow_non_cuda_target_for_testing &&
+                config.storage == nullptr && config.phase8_test_control == nullptr))) {
             throw std::invalid_argument("cold-cache mode requires byte budgets and a target device");
         }
-        if ((config.async_transport == nullptr) != (config.scheduler == nullptr) ||
-            (config.async_transport != nullptr && config.storage == nullptr)) {
+        const bool controlled_in_memory_scheduler = config.phase8_test_control != nullptr &&
+            config.scheduler != nullptr && config.async_transport == nullptr && config.storage == nullptr;
+        if (!controlled_in_memory_scheduler &&
+            ((config.async_transport == nullptr) != (config.scheduler == nullptr) ||
+             (config.async_transport != nullptr && config.storage == nullptr))) {
             throw std::invalid_argument("incomplete cold-cache async configuration");
         }
         if (!config.cold_mode && (config.cold_cache_bytes != 0 || config.transfer_ring_bytes != 0 ||
@@ -1295,15 +1467,18 @@ public:
     ~llm_hot_cache_expert_weight_provider() override {
         std::lock_guard<std::mutex> lock(mutex);
         if (!transfer_ring) return;
-        if (active_background_flights != 0) (void) transfer_ring->surrender();
+        const auto ring_surrendered = transfer_ring->surrender();
+        release_request_pins_locked();
         for (auto & record : background_promotions) {
             if (!record.active) continue;
             record.state = background_promotion_record::lifecycle::cancelled;
             discard_background_slot_locked(record, false);
             background_dropped++;
         }
-        for (auto & entry : directory_slots) {
+        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+            auto & entry = directory_slots[slot];
             if (entry.background_origin && !entry.background_useful) background_wasted++;
+            clear_forward_locked(entry.key, slot, entry.generation);
             if (entry.has_cold_backing) {
                 (void) cold_cache->release(
                     { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
@@ -1311,6 +1486,45 @@ public:
             }
         }
         active_background_flights = 0;
+        const auto cold_surrendered = cold_cache ? cold_cache->surrender() :
+            llm_expert_provider_result::success();
+        if (config.phase8_closeout_witness != nullptr && !config.phase8_closeout_witness->written) {
+            auto & witness = *config.phase8_closeout_witness;
+            witness.background_submitted = background_submitted;
+            witness.background_published_completed = background_completed;
+            witness.background_dropped = background_dropped;
+            witness.background_useful = background_useful;
+            witness.background_wasted = background_wasted;
+            witness.background_busy = background_busy;
+            for (const auto & record : background_promotions) {
+                if (record.active) witness.background_lifecycle[size_t(record.state)]++;
+            }
+            if (config.scheduler != nullptr) {
+                const auto scheduler = config.scheduler->diagnostics();
+                witness.scheduler_active = scheduler.active_requests;
+                witness.scheduler_queued = scheduler.queued_requests;
+                witness.scheduler_terminal_complete = scheduler.terminal_complete;
+                witness.scheduler_terminal_failed = scheduler.terminal_failed;
+                witness.scheduler_terminal_cancelled = scheduler.terminal_cancelled;
+                witness.scheduler_terminal_releases = scheduler.terminal_releases;
+            }
+            const auto ring = transfer_ring->closeout_diagnostics();
+            witness.ring_queued_workers = ring.queued_workers;
+            witness.ring_running_workers = ring.running_workers;
+            witness.ring_non_free_lanes = ring.non_free_lanes;
+            witness.ring_live_events = ring.live_events;
+            witness.cold_hot_refs = cold_surrendered.is_ready() ? 0 : UINT64_MAX;
+            witness.cold_transfer_refs = cold_surrendered.is_ready() ? 0 : UINT64_MAX;
+            witness.cold_request_refs = cold_surrendered.is_ready() ? 0 : UINT64_MAX;
+            witness.cold_cpu_execution_refs = cold_surrendered.is_ready() ? 0 : UINT64_MAX;
+            witness.hot_pins = current_pins;
+            for (const auto & forward : directory_forward) witness.published_forward_mappings += forward.slot >= 0;
+            witness.final_invariants_ok = ring_surrendered.is_ready() && cold_surrendered.is_ready() &&
+                ring.invariants_ok && witness.scheduler_active == 0 && witness.scheduler_queued == 0 &&
+                witness.hot_pins == 0 && witness.published_forward_mappings == 0;
+            witness.write_count = 1;
+            witness.written = true;
+        }
     }
 
     llm_expert_provider_result bind(
@@ -1648,8 +1862,29 @@ public:
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation));
         }
         if (config.cold_mode && config.background_promotion) {
-            const auto normalized = reap_background_locked();
+            const auto normalized = reap_background_locked(provider_lock);
             if (!normalized.is_ready()) return fail(normalized);
+            if (config.phase8_test_control != nullptr) {
+                for (const auto & record : background_promotions) {
+                    if (!record.active) continue;
+                    config.phase8_test_control->observe(
+                        llm_expert_phase8_test_gate::auto_after_normalization_before_background_snapshot,
+                        record.key, record.hot_generation);
+                    if (provider_lock != nullptr) provider_lock->unlock();
+                    const bool paused = config.phase8_test_control->pause_if_armed(
+                        llm_expert_phase8_test_gate::auto_after_normalization_before_background_snapshot,
+                        record.key, record.hot_generation);
+                    if (provider_lock != nullptr) provider_lock->lock();
+                    if (paused) {
+                        const auto * revalidated = find_background_locked(record.key);
+                        if (revalidated == nullptr || revalidated->hot_generation != record.hot_generation) {
+                            return fail(llm_expert_provider_result::failure(
+                                llm_expert_provider_error::stale_generation));
+                        }
+                        break;
+                    }
+                }
+            }
         }
 
         size_t unique_count = 0;
@@ -1832,6 +2067,25 @@ public:
                     record_auto_decision_locked({ active_request_id, binding.layer,
                         unique_keys[unique_index].expert, input, decision });
                     use_gpu = decision.backend == llm_expert_execution_backend::gpu;
+                    if (use_gpu && background != nullptr && config.phase8_test_control != nullptr) {
+                        const auto gated_key = background->key;
+                        const uint64_t gated_generation = background->hot_generation;
+                        config.phase8_test_control->observe(
+                            llm_expert_phase8_test_gate::auto_after_decision_before_same_key_join,
+                            gated_key, gated_generation);
+                        if (provider_lock != nullptr) provider_lock->unlock();
+                        const bool paused = config.phase8_test_control->pause_if_armed(
+                            llm_expert_phase8_test_gate::auto_after_decision_before_same_key_join,
+                            gated_key, gated_generation);
+                        if (provider_lock != nullptr) provider_lock->lock();
+                        if (paused) {
+                            background = find_background_locked(gated_key);
+                            if (background == nullptr || background->hot_generation != gated_generation) {
+                                result = llm_expert_provider_result::failure(
+                                    llm_expert_provider_error::stale_generation);
+                            }
+                        }
+                    }
                     if (use_gpu) {
                         auto_gpu_decisions++;
                         if (background == nullptr) {
@@ -1853,7 +2107,11 @@ public:
                         const auto joined = config.scheduler->enqueue(
                             unique_keys[unique_index], llm_expert_priority::demand_current_layer,
                             llm_expert_readiness::device_ready);
-                        if (joined.disposition != llm_expert_schedule_disposition::joined ||
+                        const bool injected_join_mismatch = config.phase8_test_control != nullptr &&
+                            config.phase8_test_control->consume_fault(
+                                llm_expert_phase8_test_fault::scheduler_join_mismatch,
+                                background->key, background->hot_generation);
+                        if (injected_join_mismatch || joined.disposition != llm_expert_schedule_disposition::joined ||
                             joined.handle.slot != background->scheduler_handle.slot ||
                             joined.handle.generation != background->scheduler_handle.generation) {
                             result = llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
@@ -1881,7 +2139,11 @@ public:
                         }
                         if (result.is_ready() && background != nullptr) {
                             const auto & entry = directory_slots[background->hot_slot];
-                            if (entry.state != hot_slot_state::loading ||
+                            const bool injected_metadata = config.phase8_test_control != nullptr &&
+                                config.phase8_test_control->consume_fault(
+                                    llm_expert_phase8_test_fault::metadata_mismatch,
+                                    background->key, background->hot_generation);
+                            if (injected_metadata || entry.state != hot_slot_state::loading ||
                                 entry.generation != background->hot_generation ||
                                 !expert_key_matches(entry.key, background->key) ||
                                 !entry.has_cold_backing || entry.cold_slot != background->cold.slot ||
@@ -1889,6 +2151,29 @@ public:
                                 result = llm_expert_provider_result::failure(
                                     llm_expert_provider_error::metadata_mismatch);
                             }
+                        }
+                        if (result.is_ready() && background != nullptr && config.phase8_test_control != nullptr) {
+                            const auto gated_key = background->key;
+                            const uint64_t gated_generation = background->hot_generation;
+                            if (provider_lock != nullptr) provider_lock->unlock();
+                            const bool paused = config.phase8_test_control->pause_if_armed(
+                                llm_expert_phase8_test_gate::background_before_provider_publication,
+                                gated_key, gated_generation);
+                            if (provider_lock != nullptr) provider_lock->lock();
+                            if (paused) {
+                                background = find_background_locked(gated_key);
+                                if (background == nullptr || background->hot_generation != gated_generation) {
+                                    result = llm_expert_provider_result::failure(
+                                        llm_expert_provider_error::stale_generation);
+                                }
+                            }
+                        }
+                        if (result.is_ready() && background != nullptr && config.phase8_test_control != nullptr &&
+                            config.phase8_test_control->consume_fault(
+                                llm_expert_phase8_test_fault::publication_failed,
+                                background->key, background->hot_generation)) {
+                            result = llm_expert_provider_result::failure(
+                                llm_expert_provider_error::metadata_mismatch);
                         }
                         if (!result.is_ready() && background != nullptr && background_h2d_complete) {
                             const auto terminalized =
@@ -2788,6 +3073,11 @@ public:
                 if (!initialized.is_ready()) {
                     return fail(initialized);
                 }
+                if (config.phase8_test_control != nullptr) {
+                    initialized = ring_candidate->set_phase8_test_control_for_testing(
+                        config.phase8_test_control);
+                    if (!initialized.is_ready()) return fail(initialized);
+                }
                 const auto cold_diagnostics = cold_candidate->diagnostics();
                 const auto ring_diagnostics = ring_candidate->diagnostics();
                 cold_bundle_payload = cold_diagnostics.bundle_payload_bytes;
@@ -3330,6 +3620,28 @@ public:
         return transfer_ring->set_h2d_gate_event_for_testing(event);
     }
 
+    llm_expert_provider_result set_phase8_test_control_for_testing(
+            llm_expert_phase8_test_control * control) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!config.cold_mode || !transfer_ring || active_request) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+        }
+        const auto installed = transfer_ring->set_phase8_test_control_for_testing(control);
+        if (installed.is_ready()) config.phase8_test_control = control;
+        return installed;
+    }
+
+    llm_expert_provider_result set_phase8_closeout_witness_for_testing(
+            llm_expert_phase8_closeout_witness * witness) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!config.cold_mode || witness == nullptr || witness->written ||
+            config.phase8_closeout_witness != nullptr) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+        }
+        config.phase8_closeout_witness = witness;
+        return llm_expert_provider_result::success();
+    }
+
     llm_expert_provider_result debug_copy_hot_bundle(
             llm_expert_key key,
             std::vector<uint8_t> & bytes) const noexcept override {
@@ -3502,10 +3814,22 @@ private:
         record = {};
     }
 
-    llm_expert_provider_result reap_background_locked() noexcept {
+    llm_expert_provider_result reap_background_locked(
+            std::unique_lock<std::mutex> * provider_lock) noexcept {
         if (!transfer_ring) return llm_expert_provider_result::success();
         for (auto & record : background_promotions) {
             if (!record.active) continue;
+            if (config.phase8_test_control != nullptr &&
+                config.phase8_test_control->consume_fault(
+                    llm_expert_phase8_test_fault::stale_generation,
+                    record.key, record.hot_generation)) {
+                const auto cancelled = transfer_ring->cancel_after_h2d(record.lane);
+                if (!cancelled.is_ready()) return cancelled;
+                record.state = background_promotion_record::lifecycle::failed;
+                discard_background_slot_locked(record, false);
+                background_dropped++;
+                continue;
+            }
             llm_expert_same_key_h2d_state state = llm_expert_same_key_h2d_state::none;
             uint64_t remaining = 0;
             const auto polled = transfer_ring->poll_h2d(record.lane, state, remaining);
@@ -3528,9 +3852,37 @@ private:
             }
             record.state = background_promotion_record::lifecycle::h2d_complete_unpublished;
             auto & entry = directory_slots[record.hot_slot];
-            if (entry.state != hot_slot_state::loading || entry.generation != record.hot_generation ||
+            const bool injected_metadata = config.phase8_test_control != nullptr &&
+                config.phase8_test_control->consume_fault(
+                    llm_expert_phase8_test_fault::metadata_mismatch,
+                    record.key, record.hot_generation);
+            if (injected_metadata || entry.state != hot_slot_state::loading || entry.generation != record.hot_generation ||
                 !expert_key_matches(entry.key, record.key) || !entry.has_cold_backing ||
                 entry.cold_slot != record.cold.slot || entry.cold_generation != record.cold.generation) {
+                const auto released = transfer_ring->release_terminal_background(record.lane);
+                if (!released.is_ready()) return released;
+                record.state = background_promotion_record::lifecycle::failed;
+                discard_background_slot_locked(record, false);
+                background_dropped++;
+                continue;
+            }
+            if (config.phase8_test_control != nullptr) {
+                const auto gated_key = record.key;
+                const uint64_t gated_generation = record.hot_generation;
+                if (provider_lock != nullptr) provider_lock->unlock();
+                const bool paused = config.phase8_test_control->pause_if_armed(
+                    llm_expert_phase8_test_gate::background_before_provider_publication,
+                    gated_key, gated_generation);
+                if (provider_lock != nullptr) provider_lock->lock();
+                if (paused && (!record.active || record.hot_generation != gated_generation ||
+                    !expert_key_matches(record.key, gated_key))) {
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+                }
+            }
+            if (config.phase8_test_control != nullptr &&
+                config.phase8_test_control->consume_fault(
+                    llm_expert_phase8_test_fault::publication_failed,
+                    record.key, record.hot_generation)) {
                 const auto released = transfer_ring->release_terminal_background(record.lane);
                 if (!released.is_ready()) return released;
                 record.state = background_promotion_record::lifecycle::failed;

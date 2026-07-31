@@ -6,7 +6,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -54,6 +57,113 @@ struct llm_expert_key {
     int32_t expert;
 
     bool is_valid(int32_t n_layer, int32_t n_expert) const;
+};
+
+// Internal, caller-owned Phase 8 evidence controller. Model-facing production
+// construction leaves this absent. It can hold exactly one key/generation-bound
+// directive and is deliberately not part of llama.h or the public ABI.
+enum class llm_expert_phase8_test_gate : uint8_t {
+    none,
+    background_queued_before_stage,
+    background_h2d_in_flight,
+    background_h2d_complete_before_provider_publication,
+    auto_after_normalization_before_background_snapshot,
+    auto_after_decision_before_same_key_join,
+    background_before_provider_publication,
+};
+
+enum class llm_expert_phase8_test_fault : uint8_t {
+    none,
+    stage_copy_failed,
+    h2d_failed,
+    metadata_mismatch,
+    stale_generation,
+    scheduler_join_mismatch,
+    wait_failed,
+    publication_failed,
+};
+
+class llm_expert_phase8_test_control {
+public:
+    llm_expert_provider_result arm_gate(
+            llm_expert_phase8_test_gate gate,
+            llm_expert_key key,
+            uint64_t generation) noexcept;
+    llm_expert_provider_result arm_fault(
+            llm_expert_phase8_test_fault fault,
+            llm_expert_key key,
+            uint64_t generation) noexcept;
+    void wait_until_reached() noexcept;
+    llm_expert_provider_result release_gate() noexcept;
+    llm_expert_provider_result release_gate_and_arm_gate(
+            llm_expert_phase8_test_gate next_gate) noexcept;
+    llm_expert_provider_result release_gate_and_arm_fault(
+            llm_expert_phase8_test_fault next_fault) noexcept;
+    bool gate_reached() const noexcept;
+    uint64_t observations() const noexcept;
+    void observe(
+            llm_expert_phase8_test_gate observed_gate,
+            llm_expert_key observed_key,
+            uint64_t observed_generation) noexcept;
+    void wait_until_observed(llm_expert_phase8_test_gate observed_gate) noexcept;
+
+    // Runtime-side internal operations. Both are no-ops unless a matching
+    // one-shot directive was explicitly armed by a focused test.
+    bool pause_if_armed(
+            llm_expert_phase8_test_gate gate,
+            llm_expert_key key,
+            uint64_t generation) noexcept;
+    bool consume_fault(
+            llm_expert_phase8_test_fault fault,
+            llm_expert_key key,
+            uint64_t generation) noexcept;
+
+private:
+    enum class directive_kind : uint8_t { none, gate, fault };
+    mutable std::mutex mutex;
+    std::condition_variable condition;
+    directive_kind kind = directive_kind::none;
+    llm_expert_phase8_test_gate gate = llm_expert_phase8_test_gate::none;
+    llm_expert_phase8_test_fault fault = llm_expert_phase8_test_fault::none;
+    llm_expert_key key = { -1, -1 };
+    uint64_t generation = 0;
+    bool reached = false;
+    bool released = false;
+    uint64_t directive_epoch = 0;
+    uint64_t released_epoch = 0;
+    uint64_t observation_count = 0;
+    llm_expert_phase8_test_gate last_observed_gate = llm_expert_phase8_test_gate::none;
+};
+
+struct llm_expert_phase8_closeout_witness {
+    bool written = false;
+    uint32_t write_count = 0;
+    uint64_t background_submitted = 0;
+    uint64_t background_published_completed = 0;
+    uint64_t background_dropped = 0;
+    uint64_t background_useful = 0;
+    uint64_t background_wasted = 0;
+    uint64_t background_busy = 0;
+    // empty, queued/staging, H2D-in-flight, complete-unpublished, published,
+    // failed, and cancelled, in that order.
+    std::array<uint32_t, 7> background_lifecycle = {};
+    uint32_t scheduler_active = 0;
+    uint32_t scheduler_queued = 0;
+    uint64_t scheduler_terminal_complete = 0;
+    uint64_t scheduler_terminal_failed = 0;
+    uint64_t scheduler_terminal_cancelled = 0;
+    uint64_t scheduler_terminal_releases = 0;
+    uint32_t ring_queued_workers = 0;
+    uint32_t ring_running_workers = 0;
+    uint32_t ring_non_free_lanes = 0;
+    uint32_t ring_live_events = 0;
+    uint64_t cold_hot_refs = 0;
+    uint64_t cold_transfer_refs = 0;
+    uint64_t cold_request_refs = 0;
+    uint64_t cold_cpu_execution_refs = 0;
+    uint64_t hot_pins = 0;
+    uint32_t published_forward_mappings = 0;
+    bool final_invariants_ok = false;
 };
 
 struct llm_expert_flight_id {
@@ -619,6 +729,16 @@ public:
         (void) event;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
+    virtual llm_expert_provider_result set_phase8_test_control_for_testing(
+            llm_expert_phase8_test_control * control) noexcept {
+        (void) control;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual llm_expert_provider_result set_phase8_closeout_witness_for_testing(
+            llm_expert_phase8_closeout_witness * witness) noexcept {
+        (void) witness;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
     virtual bool debug_hot_mapping(
             llm_expert_key key,
             uint64_t * generation = nullptr,
@@ -676,6 +796,10 @@ struct llm_hot_cache_config {
     bool background_promotion = false;
     llama_expert_auto_cost_model auto_cost_model = {};
     uint64_t auto_cost_model_digest = 0;
+    // Internal evidence seams. Model-facing construction always leaves these
+    // null; focused tests may install them on a live provider.
+    llm_expert_phase8_test_control * phase8_test_control = nullptr;
+    llm_expert_phase8_closeout_witness * phase8_closeout_witness = nullptr;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(

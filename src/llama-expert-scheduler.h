@@ -92,6 +92,10 @@ struct llm_expert_scheduler_diagnostics {
     uint64_t queued_preemptions = 0;
     uint64_t stale_completions = 0;
     uint64_t generation_exhaustions = 0;
+    uint64_t terminal_complete = 0;
+    uint64_t terminal_failed = 0;
+    uint64_t terminal_cancelled = 0;
+    uint64_t terminal_releases = 0;
     bool admission_closed = false;
 };
 

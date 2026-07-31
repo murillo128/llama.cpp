@@ -279,6 +279,9 @@ llm_expert_schedule_disposition llm_expert_scheduler::finish(
         return llm_expert_schedule_disposition::invalid;
     }
     request->state = terminal;
+    if (terminal == llm_expert_request_state::complete) pimpl->counters.terminal_complete++;
+    if (terminal == llm_expert_request_state::failed) pimpl->counters.terminal_failed++;
+    if (terminal == llm_expert_request_state::cancelled) pimpl->counters.terminal_cancelled++;
     pimpl->update_occupancy();
     return llm_expert_schedule_disposition::admitted;
 }
@@ -297,6 +300,7 @@ llm_expert_schedule_disposition llm_expert_scheduler::release_terminal(llm_exper
     request->enqueue_ordinal = 0;
     request->state = llm_expert_request_state::free;
     request->waiters = 0;
+    pimpl->counters.terminal_releases++;
     pimpl->update_occupancy();
     return llm_expert_schedule_disposition::admitted;
 }

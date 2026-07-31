@@ -33,6 +33,7 @@ struct llm_transfer_ring_config {
     bool allow_controlled_compute_for_testing = false;
     ggml_backend_event_t h2d_gate_event_for_testing = nullptr;
     uint32_t delay_background_stage_ms_for_testing = 0;
+    llm_expert_phase8_test_control * phase8_test_control = nullptr;
 };
 
 struct llm_transfer_interval {
@@ -135,6 +136,14 @@ struct llm_transfer_ring_diagnostics {
     std::vector<lane> lanes;
 };
 
+struct llm_transfer_ring_closeout_diagnostics {
+    uint32_t queued_workers = 0;
+    uint32_t running_workers = 0;
+    uint32_t non_free_lanes = 0;
+    uint32_t live_events = 0;
+    bool invariants_ok = false;
+};
+
 class llm_expert_transfer_ring {
 public:
     explicit llm_expert_transfer_ring(
@@ -194,11 +203,14 @@ public:
     // transfer submitted while it is installed.
     llm_expert_provider_result set_h2d_gate_event_for_testing(
         ggml_backend_event_t event) noexcept;
+    llm_expert_provider_result set_phase8_test_control_for_testing(
+        llm_expert_phase8_test_control * control) noexcept;
     llm_expert_provider_result retire_hot(uint32_t hot_slot, uint64_t hot_generation) noexcept;
     llm_expert_provider_result cleanup_failed_lanes() noexcept;
     llm_expert_provider_result surrender() noexcept;
     llm_expert_provider_result validate_invariants() noexcept;
     llm_transfer_ring_diagnostics diagnostics() const;
+    llm_transfer_ring_closeout_diagnostics closeout_diagnostics() const noexcept;
     std::vector<llm_transfer_interval> completed_intervals() const;
 
 private:

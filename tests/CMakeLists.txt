@@ -278,6 +278,11 @@ set(LLAMA_TEST_NAME phase8-miss-execution-probe)
 llama_build(phase8-miss-execution-probe.cpp)
 unset(LLAMA_TEST_NAME)
 
+set(LLAMA_TEST_NAME phase8-checkpoint-b-probe)
+llama_build(phase8-checkpoint-b-probe.cpp)
+unset(LLAMA_TEST_NAME)
+target_include_directories(phase8-checkpoint-b-probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-hot-expert-cache.cpp LABEL "model")
 target_include_directories(test-hot-expert-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
