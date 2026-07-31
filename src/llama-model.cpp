@@ -1433,10 +1433,10 @@ void llm_shutdown_expert_runtime(
     if (transport) {
         GGML_ASSERT(transport->shutdown());
     }
+    provider.reset();
     if (scheduler) {
         GGML_ASSERT(scheduler->shutdown());
     }
-    provider.reset();
     scheduler.reset();
     transport.reset();
     storage.reset();

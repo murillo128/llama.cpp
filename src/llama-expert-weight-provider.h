@@ -173,6 +173,28 @@ struct llm_expert_provider_stats {
 };
 
 struct llm_hot_cache_diagnostics {
+    struct auto_decision {
+        uint64_t request = 0;
+        int32_t layer = -1;
+        int32_t expert = -1;
+        llama_expert_auto_cost_model cost = {};
+        bool prefill = false;
+        uint64_t lanes = 0;
+        uint64_t bundle_bytes = 0;
+        uint64_t queued_cpu_work_ns = 0;
+        uint64_t queued_h2d_work_ns = 0;
+        uint64_t queued_gpu_work_ns = 0;
+        uint64_t same_key_submitted_bytes = 0;
+        uint64_t cpu_work_ns = 0;
+        uint64_t h2d_work_ns = 0;
+        uint64_t gpu_work_ns = 0;
+        uint64_t cpu_finish_ns = UINT64_MAX;
+        uint64_t gpu_finish_ns = UINT64_MAX;
+        uint8_t backend = 1;
+        uint8_t reason = 3;
+        bool overflow = true;
+    };
+
     llama_expert_miss_policy configured_miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
     bool background_promotion_configured = false;
     uint32_t auto_cost_model_version = 0;
@@ -183,6 +205,24 @@ struct llm_hot_cache_diagnostics {
     uint64_t mixed_execution_layers = 0;
     uint64_t cpu_fallback_unique_keys = 0;
     uint64_t h2d_bytes_avoided_for_current_output = 0;
+    uint64_t auto_cpu_decisions = 0;
+    uint64_t auto_gpu_decisions = 0;
+    uint64_t auto_tie_decisions = 0;
+    uint64_t auto_overflow_decisions = 0;
+    uint64_t auto_decision_records = 0;
+    uint64_t auto_decision_records_dropped = 0;
+    uint64_t auto_decision_digest = 0;
+    std::vector<auto_decision> auto_decisions;
+    uint64_t background_submitted = 0;
+    uint64_t background_completed = 0;
+    uint64_t background_useful = 0;
+    uint64_t background_wasted = 0;
+    uint64_t background_dropped = 0;
+    uint64_t background_busy = 0;
+    uint64_t background_later_joins = 0;
+    uint64_t background_h2d_bytes = 0;
+    uint32_t active_background_flights = 0;
+    uint32_t peak_background_flights = 0;
     uint32_t requested_capacity = 0;
     uint32_t effective_capacity = 0;
     uint64_t pool_bytes = 0;
@@ -362,6 +402,42 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_failed_cleanup = 0;
 };
 
+enum class llm_expert_execution_backend : uint8_t {
+    cpu,
+    gpu,
+};
+
+enum class llm_expert_auto_reason : uint8_t {
+    cpu_faster,
+    gpu_faster_or_hysteresis,
+    tie,
+    overflow,
+};
+
+struct llm_expert_auto_input {
+    llama_expert_auto_cost_model cost = {};
+    bool prefill = false;
+    uint64_t lanes = 0;
+    uint64_t bundle_bytes = 0;
+    uint64_t queued_cpu_work_ns = 0;
+    uint64_t queued_h2d_work_ns = 0;
+    uint64_t queued_gpu_work_ns = 0;
+    uint64_t same_key_submitted_bytes = 0;
+};
+
+struct llm_expert_auto_result {
+    llm_expert_execution_backend backend = llm_expert_execution_backend::gpu;
+    llm_expert_auto_reason reason = llm_expert_auto_reason::overflow;
+    uint64_t cpu_work_ns = 0;
+    uint64_t h2d_work_ns = 0;
+    uint64_t gpu_work_ns = 0;
+    uint64_t cpu_finish_ns = UINT64_MAX;
+    uint64_t gpu_finish_ns = UINT64_MAX;
+    bool overflow = true;
+};
+
+llm_expert_auto_result llm_evaluate_expert_auto(const llm_expert_auto_input & input) noexcept;
+
 struct llm_expert_graph_diagnostics {
     uint64_t operation_hash = 0;
     int32_t node_count = 0;
@@ -519,6 +595,11 @@ public:
     virtual llm_expert_provider_result debug_set_miss_policy_for_testing(
             llama_expert_miss_policy policy) noexcept {
         (void) policy;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual llm_expert_provider_result debug_set_auto_cost_model_for_testing(
+            const llama_expert_auto_cost_model & cost) noexcept {
+        (void) cost;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     // Internal focused-test seams. Production execution never calls these.

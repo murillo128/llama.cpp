@@ -1876,33 +1876,37 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
 
-    // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (!allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    const auto try_fast_path = [&]() {
+        // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
+                    return true;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
+                    return true;
                 }
             }
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
-            return;
+            return true;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
-            return;
+            return true;
         }
+        return false;
+    };
+    if (!allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && try_fast_path()) {
+        return;
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
@@ -1944,6 +1948,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             GGML_ASSERT((expert >= 0 && expert < ne02) || (allow_inactive && expert == -1));
             inactive[lane] = expert == -1;
         }
+    }
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        std::none_of(inactive.begin(), inactive.end(), [](uint8_t value) { return value != 0; }) &&
+        try_fast_path()) {
+        return;
     }
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
@@ -2543,7 +2552,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            const bool allow_inactive =
+                node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
+            if (allow_inactive || !ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958

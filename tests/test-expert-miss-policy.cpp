@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -125,6 +127,62 @@ void test_defaults_and_lane_validation() {
     GGML_ASSERT(!llm_validate_hybrid_execution_ids(gpu, cpu, 0, 2, 3).is_ready());
 }
 
+void test_auto_evaluator() {
+    auto cost = valid_cost_model();
+    cost.cpu_fixed_decode_ns = 1;
+    cost.cpu_per_lane_decode_ns = 1;
+    cost.gpu_fixed_decode_ns = 1000;
+    cost.gpu_per_lane_decode_ns = 1000;
+    cost.h2d_fixed_ns = 1000;
+    cost.h2d_bytes_per_second = 1000000000ULL;
+    cost.decision_hysteresis_ns = 1;
+    llm_expert_auto_input input = { cost, false, 2, 100, 0, 0, 0, 0 };
+    auto result = llm_evaluate_expert_auto(input);
+    GGML_ASSERT(result.backend == llm_expert_execution_backend::cpu);
+    GGML_ASSERT(result.reason == llm_expert_auto_reason::cpu_faster && !result.overflow);
+
+    input.cost.cpu_fixed_decode_ns = 10000;
+    input.cost.cpu_per_lane_decode_ns = 10000;
+    input.cost.gpu_fixed_decode_ns = 1;
+    input.cost.gpu_per_lane_decode_ns = 1;
+    input.cost.h2d_fixed_ns = 1;
+    result = llm_evaluate_expert_auto(input);
+    GGML_ASSERT(result.backend == llm_expert_execution_backend::gpu);
+    GGML_ASSERT(result.reason == llm_expert_auto_reason::gpu_faster_or_hysteresis);
+
+    input = {};
+    input.cost = valid_cost_model();
+    input.cost.cpu_fixed_decode_ns = 2;
+    input.cost.cpu_per_lane_decode_ns = 1;
+    input.cost.gpu_fixed_decode_ns = 1;
+    input.cost.gpu_per_lane_decode_ns = 1;
+    input.cost.h2d_fixed_ns = 1;
+    input.cost.h2d_bytes_per_second = 1000000000ULL;
+    input.cost.decision_hysteresis_ns = 1;
+    input.lanes = 1;
+    result = llm_evaluate_expert_auto(input);
+    GGML_ASSERT(result.cpu_finish_ns == 3 && result.gpu_finish_ns == 3);
+    GGML_ASSERT(result.backend == llm_expert_execution_backend::gpu);
+    GGML_ASSERT(result.reason == llm_expert_auto_reason::tie);
+
+    input.lanes = std::numeric_limits<uint64_t>::max();
+    result = llm_evaluate_expert_auto(input);
+    GGML_ASSERT(result.backend == llm_expert_execution_backend::gpu && result.overflow);
+    GGML_ASSERT(result.reason == llm_expert_auto_reason::overflow);
+
+    input.lanes = 2;
+    input.bundle_bytes = 100;
+    input.same_key_submitted_bytes = 7;
+    input.queued_cpu_work_ns = 11;
+    input.queued_h2d_work_ns = 13;
+    input.queued_gpu_work_ns = 17;
+    const auto first = llm_evaluate_expert_auto(input);
+    const auto second = llm_evaluate_expert_auto(input);
+    GGML_ASSERT(first.backend == second.backend && first.reason == second.reason &&
+        first.cpu_finish_ns == second.cpu_finish_ns && first.gpu_finish_ns == second.gpu_finish_ns);
+    GGML_ASSERT(first.h2d_work_ns == input.cost.h2d_fixed_ns + 7);
+}
+
 struct graph_fixture {
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr buffer;
@@ -198,6 +256,7 @@ std::vector<float> run_case(ggml_backend_dev_t device, const std::vector<int32_t
     ggml_build_forward_expand(graph, fixture.output);
     GGML_ASSERT((fixture.matmul->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0) == allow_inactive);
     GGML_ASSERT(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(backend.get());
     std::vector<float> result(size_t(n_tokens)*6);
     ggml_backend_tensor_get(fixture.output, result.data(), 0, result.size()*sizeof(float));
     return result;
@@ -273,6 +332,11 @@ void assert_logit_gate(const std::vector<float> & expected, const float * actual
     };
     std::partial_sort(expected_order.begin(), expected_order.begin() + 10, expected_order.end(), expected_compare);
     std::partial_sort(actual_order.begin(), actual_order.begin() + 10, actual_order.end(), actual_compare);
+    if (!std::equal(expected_order.begin(), expected_order.begin() + 10, actual_order.begin())) {
+        std::fprintf(stderr, "LOGIT_MISMATCH max_abs=%.9f expected_top=%d,%d,%d actual_top=%d,%d,%d\n",
+            max_abs, expected_order[0], expected_order[1], expected_order[2],
+            actual_order[0], actual_order[1], actual_order[2]);
+    }
     GGML_ASSERT(std::equal(expected_order.begin(), expected_order.begin() + 10, actual_order.begin()));
     mean_abs /= expected.size();
     const double cosine = dot/std::sqrt(expected_norm*actual_norm);
@@ -338,7 +402,7 @@ void test_hybrid_binding() {
     GGML_ASSERT(!binding.bootstrap && binding.hybrid);
     GGML_ASSERT(binding.execution_ids != selection.logical_ids);
     GGML_ASSERT(binding.cpu_execution_ids != nullptr && binding.cpu_execution_ids != binding.execution_ids);
-    GGML_ASSERT(binding.checkpoint_ids == binding.execution_ids);
+    GGML_ASSERT(binding.checkpoint_ids != binding.execution_ids);
     GGML_ASSERT(binding.cpu_up.weight != nullptr && binding.cpu_gate.weight != nullptr && binding.cpu_down.weight != nullptr);
     ggml_backend_buffer_ptr graph_buffer(
         ggml_backend_alloc_ctx_tensors_from_buft(graph_ctx.get(), ggml_backend_cpu_buffer_type()));
@@ -363,7 +427,7 @@ void test_hybrid_binding() {
     GGML_ASSERT(provider->remap_checkpoint_tensor(binding, backend.get()).is_ready());
     int32_t gpu_ids[2] = {};
     int32_t cpu_ids[2] = {};
-    ggml_backend_tensor_get(binding.execution_ids, gpu_ids, 0, sizeof(gpu_ids));
+    ggml_backend_tensor_get(binding.checkpoint_ids, gpu_ids, 0, sizeof(gpu_ids));
     ggml_backend_tensor_get(binding.cpu_execution_ids, cpu_ids, 0, sizeof(cpu_ids));
     GGML_ASSERT(gpu_ids[0] >= 0 && gpu_ids[1] == -1);
     GGML_ASSERT(cpu_ids[0] == -1 && cpu_ids[1] >= 0);
@@ -442,6 +506,7 @@ void test_hybrid_model_graph(const char * model_path) {
     GGML_ASSERT(diagnostics.mixed_execution_layers > 0);
     GGML_ASSERT(diagnostics.cold_current_cpu_execution_refs == 0);
     GGML_ASSERT(diagnostics.h2d_bytes_avoided_for_current_output > 0);
+    GGML_ASSERT(diagnostics.background_submitted == 0 && diagnostics.background_h2d_bytes == 0);
 
     context.reset();
     GGML_ASSERT(provider->trim().is_ready());
@@ -478,12 +543,200 @@ void test_hybrid_model_graph(const char * model_path) {
     GGML_ASSERT(llama_decode(context.get(), llama_batch_get_one(prefill_tokens, 4)) == 0);
     llama_synchronize(context.get());
     assert_logit_gate(promote_prefill, llama_get_logits_ith(context.get(), -1));
+
+    context.reset();
+    model.reset();
+
+    const auto run_auto = [&](llama_expert_auto_cost_model cost, bool expect_cpu) {
+        auto automatic_params = params;
+        automatic_params.expert_miss_policy = LLAMA_EXPERT_MISS_POLICY_AUTO;
+        automatic_params.expert_auto_cost_model = &cost;
+        llama_model_ptr automatic_model(llama_model_load_from_file(model_path, automatic_params));
+        GGML_ASSERT(automatic_model);
+        llama_context_ptr automatic_context(llama_init_from_model(automatic_model.get(), context_params));
+        GGML_ASSERT(automatic_context);
+        llama_token automatic_token = 1;
+        GGML_ASSERT(llama_decode(
+            automatic_context.get(), llama_batch_get_one(&automatic_token, 1)) == 0);
+        llama_synchronize(automatic_context.get());
+        const auto automatic_diagnostics =
+            automatic_model->expert_weight_provider()->hot_cache_diagnostics();
+        if (!expect_cpu) {
+            for (const auto & slot : automatic_diagnostics.slots) {
+                if (slot.state != llm_hot_cache_diagnostics::slot::ready || slot.layer < 0) continue;
+                std::vector<uint8_t> cold_bytes;
+                std::vector<uint8_t> hot_bytes;
+                const llm_expert_key key = { slot.layer, slot.expert };
+                GGML_ASSERT(automatic_model->expert_weight_provider()->debug_copy_cold_bundle(
+                    key, cold_bytes).is_ready());
+                GGML_ASSERT(automatic_model->expert_weight_provider()->debug_copy_hot_bundle(
+                    key, hot_bytes).is_ready());
+                GGML_ASSERT(cold_bytes == hot_bytes);
+            }
+        }
+        assert_logit_gate(promote_logits, llama_get_logits_ith(automatic_context.get(), -1));
+        GGML_ASSERT(automatic_diagnostics.auto_decision_records > 0);
+        GGML_ASSERT(automatic_diagnostics.auto_decision_digest != 1469598103934665603ULL);
+        GGML_ASSERT(!automatic_diagnostics.auto_decisions.empty());
+        for (size_t index = 0; index < automatic_diagnostics.auto_decisions.size(); ++index) {
+            const auto & record = automatic_diagnostics.auto_decisions[index];
+            const llm_expert_auto_input input = {
+                record.cost,
+                record.prefill,
+                record.lanes,
+                record.bundle_bytes,
+                record.queued_cpu_work_ns,
+                record.queued_h2d_work_ns,
+                record.queued_gpu_work_ns,
+                record.same_key_submitted_bytes,
+            };
+            const auto replay = llm_evaluate_expert_auto(input);
+            GGML_ASSERT(uint8_t(replay.backend) == record.backend);
+            GGML_ASSERT(uint8_t(replay.reason) == record.reason);
+            GGML_ASSERT(replay.cpu_work_ns == record.cpu_work_ns);
+            GGML_ASSERT(replay.h2d_work_ns == record.h2d_work_ns);
+            GGML_ASSERT(replay.gpu_work_ns == record.gpu_work_ns);
+            GGML_ASSERT(replay.cpu_finish_ns == record.cpu_finish_ns);
+            GGML_ASSERT(replay.gpu_finish_ns == record.gpu_finish_ns);
+            GGML_ASSERT(replay.overflow == record.overflow);
+            if (index != 0) {
+                const auto & previous = automatic_diagnostics.auto_decisions[index - 1];
+                if (previous.request == record.request && previous.layer == record.layer) {
+                    GGML_ASSERT(previous.expert < record.expert);
+                }
+            }
+        }
+        if (expect_cpu) {
+            GGML_ASSERT(automatic_diagnostics.auto_cpu_decisions > 0);
+            GGML_ASSERT(automatic_diagnostics.auto_gpu_decisions == 0);
+        } else {
+            GGML_ASSERT(automatic_diagnostics.auto_gpu_decisions > 0);
+            GGML_ASSERT(automatic_diagnostics.auto_cpu_decisions == 0);
+        }
+    };
+
+    auto cpu_cost = valid_cost_model();
+    cpu_cost.cpu_fixed_decode_ns = 1;
+    cpu_cost.cpu_per_lane_decode_ns = 1;
+    cpu_cost.gpu_fixed_decode_ns = 1000000000ULL;
+    cpu_cost.gpu_per_lane_decode_ns = 1000000000ULL;
+    cpu_cost.h2d_fixed_ns = 1000000000ULL;
+    cpu_cost.h2d_bytes_per_second = 1;
+    cpu_cost.decision_hysteresis_ns = 1;
+    run_auto(cpu_cost, true);
+
+    auto gpu_cost = valid_cost_model();
+    gpu_cost.cpu_fixed_decode_ns = 1000000000000ULL;
+    gpu_cost.cpu_per_lane_decode_ns = 1000000000000ULL;
+    gpu_cost.gpu_fixed_decode_ns = 1;
+    gpu_cost.gpu_per_lane_decode_ns = 1;
+    gpu_cost.h2d_fixed_ns = 1;
+    gpu_cost.h2d_bytes_per_second = UINT64_MAX;
+    gpu_cost.decision_hysteresis_ns = 1;
+    run_auto(gpu_cost, false);
+
+    auto background_params = params;
+    background_params.expert_background_promotion = true;
+    llama_model_ptr background_model(llama_model_load_from_file(model_path, background_params));
+    GGML_ASSERT(background_model);
+    llama_context_ptr background_context(llama_init_from_model(background_model.get(), context_params));
+    GGML_ASSERT(background_context);
+    llama_token background_token = 1;
+    GGML_ASSERT(llama_decode(
+        background_context.get(), llama_batch_get_one(&background_token, 1)) == 0);
+    llama_synchronize(background_context.get());
+    GGML_ASSERT(background_model->expert_weight_provider()->hot_cache_diagnostics().background_submitted > 0);
+    background_context.reset();
+    background_context.reset(llama_init_from_model(background_model.get(), context_params));
+    GGML_ASSERT(background_context);
+    for (background_token = 1; background_token <= 3; ++background_token) {
+        GGML_ASSERT(llama_decode(
+            background_context.get(), llama_batch_get_one(&background_token, 1)) == 0);
+        llama_synchronize(background_context.get());
+    }
+    const auto background_diagnostics =
+        background_model->expert_weight_provider()->hot_cache_diagnostics();
+    GGML_ASSERT(background_diagnostics.background_submitted > 0);
+    GGML_ASSERT(background_diagnostics.background_h2d_bytes > 0);
+    GGML_ASSERT(background_diagnostics.active_background_flights <=
+        background_diagnostics.effective_capacity);
+    GGML_ASSERT(background_diagnostics.background_useful +
+        background_diagnostics.background_later_joins > 0);
+
+    background_context.reset();
+    background_model.reset();
+
+    // A blocked background transfer must neither delay the CPU-served output nor
+    // grow beyond the configured cache/ring bounds.  The unrecorded event holds
+    // the transfer stream while llama_synchronize() completes the current token.
+    auto * gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    GGML_ASSERT(gpu_device != nullptr);
+    ggml_backend_ptr gate_backend(ggml_backend_dev_init(gpu_device, nullptr));
+    GGML_ASSERT(gate_backend);
+    ggml_backend_event_t gate_event = ggml_backend_event_new(gpu_device);
+    GGML_ASSERT(gate_event != nullptr);
+    constexpr size_t gate_copy_bytes = 256U*1024U*1024U;
+    ggml_init_params gate_params = { ggml_tensor_overhead()*2, nullptr, true };
+    ggml_context_ptr gate_ctx(ggml_init(gate_params));
+    GGML_ASSERT(gate_ctx);
+    ggml_tensor * gate_tensor = ggml_new_tensor_1d(gate_ctx.get(), GGML_TYPE_I8, gate_copy_bytes);
+    ggml_backend_buffer_ptr gate_buffer(
+        ggml_backend_alloc_ctx_tensors_from_buft(gate_ctx.get(), ggml_backend_dev_buffer_type(gpu_device)));
+    GGML_ASSERT(gate_buffer);
+    ggml_backend_buffer_ptr gate_source(ggml_backend_buft_alloc_buffer(
+        ggml_backend_dev_host_buffer_type(gpu_device), gate_copy_bytes));
+    GGML_ASSERT(gate_source && ggml_backend_buffer_is_host(gate_source.get()));
+    ggml_backend_buffer_clear(gate_source.get(), 0);
+    llama_model_ptr gated_model(llama_model_load_from_file(model_path, background_params));
+    GGML_ASSERT(gated_model);
+    auto * gated_provider = gated_model->expert_weight_provider();
+    GGML_ASSERT(gated_provider != nullptr);
+    llama_context_ptr gated_context(llama_init_from_model(gated_model.get(), prefill_params));
+    GGML_ASSERT(gated_context);
+    for (int repetition = 0; repetition < 64; ++repetition) {
+        ggml_backend_tensor_set_async(gate_backend.get(), gate_tensor,
+            ggml_backend_buffer_get_base(gate_source.get()), 0, gate_copy_bytes);
+    }
+    ggml_backend_event_record(gate_event, gate_backend.get());
+    GGML_ASSERT(gated_provider->set_h2d_gate_event_for_testing(gate_event).is_ready());
+    llama_token gated_tokens[] = { 1, 2, 3, 4 };
+    GGML_ASSERT(llama_decode(gated_context.get(), llama_batch_get_one(gated_tokens, 4)) == 0);
+    llama_synchronize(gated_context.get());
+    const auto gated_diagnostics = gated_provider->hot_cache_diagnostics();
+    GGML_ASSERT(gated_diagnostics.background_submitted > 0);
+    GGML_ASSERT(gated_diagnostics.active_background_flights > 0);
+    GGML_ASSERT(gated_diagnostics.active_background_flights <= gated_diagnostics.effective_capacity);
+    GGML_ASSERT(gated_diagnostics.peak_background_flights <= gated_diagnostics.effective_capacity);
+    GGML_ASSERT(gated_diagnostics.background_busy + gated_diagnostics.background_dropped > 0);
+    GGML_ASSERT(gated_diagnostics.ring_h2d_event_waits == 0);
+
+    GGML_ASSERT(gated_provider->debug_set_auto_cost_model_for_testing(gpu_cost).is_ready());
+    llama_memory_clear(llama_get_memory(gated_context.get()), true);
+    llama_token joined_token = 1;
+    GGML_ASSERT(llama_decode(gated_context.get(), llama_batch_get_one(&joined_token, 1)) == 0);
+    llama_synchronize(gated_context.get());
+    const auto joined_diagnostics = gated_provider->hot_cache_diagnostics();
+    GGML_ASSERT(joined_diagnostics.background_later_joins > 0);
+    GGML_ASSERT(joined_diagnostics.active_background_flights == 0);
+    GGML_ASSERT(joined_diagnostics.background_completed == gated_diagnostics.background_submitted);
+
+    ggml_backend_synchronize(gate_backend.get());
+    gated_context.reset();
+    GGML_ASSERT(gated_provider->trim().is_ready());
+    const auto wasted_diagnostics = gated_provider->hot_cache_diagnostics();
+    GGML_ASSERT(wasted_diagnostics.background_useful + wasted_diagnostics.background_wasted ==
+        gated_diagnostics.background_submitted);
+    GGML_ASSERT(wasted_diagnostics.background_useful > 0);
+    GGML_ASSERT(wasted_diagnostics.background_wasted > 0);
+    gated_model.reset();
+    ggml_backend_event_free(gate_event);
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
     test_defaults_and_lane_validation();
+    test_auto_evaluator();
     test_model_parameter_validation_and_copy();
     ggml_backend_load_all();
     const std::vector<int32_t> mixed = { 0, -1, 2, 1, 1, -1 };

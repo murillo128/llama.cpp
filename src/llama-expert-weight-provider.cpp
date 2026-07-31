@@ -22,6 +22,70 @@
 #include <string>
 #include <utility>
 
+llm_expert_auto_result llm_evaluate_expert_auto(const llm_expert_auto_input & input) noexcept {
+    llm_expert_auto_result result;
+    bool overflow = false;
+    const auto add = [&](uint64_t lhs, uint64_t rhs) {
+        if (rhs > UINT64_MAX - lhs) {
+            overflow = true;
+            return UINT64_MAX;
+        }
+        return lhs + rhs;
+    };
+    const auto multiply = [&](uint64_t lhs, uint64_t rhs) {
+        if (lhs != 0 && rhs > UINT64_MAX/lhs) {
+            overflow = true;
+            return UINT64_MAX;
+        }
+        return lhs*rhs;
+    };
+    const auto transfer = [&](uint64_t bytes) {
+        if (input.cost.h2d_bytes_per_second == 0) {
+            overflow = true;
+            return UINT64_MAX;
+        }
+        const __uint128_t numerator = __uint128_t(bytes)*1000000000ULL +
+            input.cost.h2d_bytes_per_second - 1;
+        const __uint128_t value = numerator/input.cost.h2d_bytes_per_second;
+        if (value > UINT64_MAX) {
+            overflow = true;
+            return UINT64_MAX;
+        }
+        return uint64_t(value);
+    };
+
+    const uint64_t cpu_fixed = input.prefill ? input.cost.cpu_fixed_prefill_ns : input.cost.cpu_fixed_decode_ns;
+    const uint64_t cpu_per_lane = input.prefill ? input.cost.cpu_per_lane_prefill_ns :
+        input.cost.cpu_per_lane_decode_ns;
+    const uint64_t gpu_fixed = input.prefill ? input.cost.gpu_fixed_prefill_ns : input.cost.gpu_fixed_decode_ns;
+    const uint64_t gpu_per_lane = input.prefill ? input.cost.gpu_per_lane_prefill_ns :
+        input.cost.gpu_per_lane_decode_ns;
+    result.cpu_work_ns = add(cpu_fixed, multiply(cpu_per_lane, input.lanes));
+    const uint64_t transfer_bytes = input.same_key_submitted_bytes != 0 ?
+        input.same_key_submitted_bytes : input.bundle_bytes;
+    result.h2d_work_ns = add(input.cost.h2d_fixed_ns, transfer(transfer_bytes));
+    result.gpu_work_ns = add(gpu_fixed, multiply(gpu_per_lane, input.lanes));
+    result.cpu_finish_ns = add(input.queued_cpu_work_ns, result.cpu_work_ns);
+    result.gpu_finish_ns = add(add(input.queued_h2d_work_ns, result.h2d_work_ns),
+        add(input.queued_gpu_work_ns, result.gpu_work_ns));
+    const uint64_t cpu_with_hysteresis = add(result.cpu_finish_ns, input.cost.decision_hysteresis_ns);
+    result.overflow = overflow;
+    if (overflow) {
+        result.backend = llm_expert_execution_backend::gpu;
+        result.reason = llm_expert_auto_reason::overflow;
+    } else if (result.cpu_finish_ns == result.gpu_finish_ns) {
+        result.backend = llm_expert_execution_backend::gpu;
+        result.reason = llm_expert_auto_reason::tie;
+    } else if (cpu_with_hysteresis < result.gpu_finish_ns) {
+        result.backend = llm_expert_execution_backend::cpu;
+        result.reason = llm_expert_auto_reason::cpu_faster;
+    } else {
+        result.backend = llm_expert_execution_backend::gpu;
+        result.reason = llm_expert_auto_reason::gpu_faster_or_hysteresis;
+    }
+    return result;
+}
+
 namespace {
 
 bool same_flight(const llm_expert_flight_id & lhs, const llm_expert_flight_id & rhs) {
@@ -598,7 +662,8 @@ llm_expert_provider_result llm_expert_graph_binding::validate(const llm_expert_s
     }
     if (hybrid) {
         const bool cpu_merged = cpu_gate_up.weight != nullptr;
-        if (checkpoint_ids == nullptr || checkpoint_ids != execution_ids || checkpoint_ids == cpu_execution_ids ||
+        if (checkpoint_ids == nullptr || checkpoint_ids == execution_ids || checkpoint_ids == cpu_execution_ids ||
+            checkpoint_ids == logical_ids ||
             checkpoint_ids->type != GGML_TYPE_I32 || checkpoint_ids->ne[0] != selection.n_expert_used ||
             checkpoint_ids->ne[1] != selection.n_tokens ||
             cpu_execution_ids == nullptr || cpu_execution_ids == execution_ids ||
@@ -939,7 +1004,28 @@ struct hot_slot_entry {
     uint32_t cold_slot = 0;
     uint64_t cold_generation = 0;
     bool has_cold_backing = false;
+    bool background_origin = false;
+    bool background_useful = false;
     hot_slot_state state = hot_slot_state::free;
+};
+
+struct background_promotion_record {
+    bool active = false;
+    llm_expert_key key = { -1, -1 };
+    llm_cold_reference cold;
+    llm_transfer_lane_reference lane;
+    llm_expert_request_handle scheduler_handle;
+    llm_expert_request_state scheduler_state = llm_expert_request_state::free;
+    uint32_t hot_slot = UINT32_MAX;
+    uint64_t hot_generation = 0;
+};
+
+struct auto_decision_record {
+    uint64_t request = 0;
+    int32_t layer = -1;
+    int32_t expert = -1;
+    llm_expert_auto_input input;
+    llm_expert_auto_result result;
 };
 
 struct hot_request_pin {
@@ -1154,6 +1240,37 @@ public:
         }
     }
 
+    ~llm_hot_cache_expert_weight_provider() override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!transfer_ring) return;
+        if (active_background_flights != 0) (void) transfer_ring->surrender();
+        for (auto & record : background_promotions) {
+            if (!record.active) continue;
+            finish_background_scheduler_locked(record, true);
+            if (record.hot_slot < directory_slots.size()) {
+                auto & entry = directory_slots[record.hot_slot];
+                if (entry.has_cold_backing) {
+                    (void) cold_cache->release(
+                        { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                }
+                const uint64_t generation = entry.generation;
+                entry = {};
+                entry.generation = generation;
+            }
+            background_wasted++;
+            record = {};
+        }
+        for (auto & entry : directory_slots) {
+            if (entry.background_origin && !entry.background_useful) background_wasted++;
+            if (entry.has_cold_backing) {
+                (void) cold_cache->release(
+                    { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                entry.has_cold_backing = false;
+            }
+        }
+        active_background_flights = 0;
+    }
+
     llm_expert_provider_result bind(
             const llm_expert_bundle_descriptor & bundle,
             const llm_expert_selection & selection,
@@ -1228,9 +1345,10 @@ public:
             ggml_tensor * cpu_execution_ids = nullptr;
             if (graph_ctx != nullptr) {
                 if (config.cold_mode && config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
-                    execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                    checkpoint_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                    ggml_format_name(checkpoint_ids, "expert_checkpoint_ids-%d", bundle.layer);
+                    execution_ids = ggml_dup(graph_ctx, checkpoint_ids);
                     ggml_format_name(execution_ids, "expert_execution_ids-%d", bundle.layer);
-                    checkpoint_ids = execution_ids;
                     cpu_execution_ids = ggml_new_tensor_2d(graph_ctx, GGML_TYPE_I32,
                         selection.n_expert_used, selection.n_tokens);
                     ggml_set_input(cpu_execution_ids);
@@ -1434,7 +1552,7 @@ public:
             return result;
         }
         if (binding.hybrid) {
-            ggml_backend_tensor_set(binding.execution_ids, execution_id_scratch.data(), 0, bytes);
+            ggml_backend_tensor_set(binding.checkpoint_ids, execution_id_scratch.data(), 0, bytes);
             ggml_backend_tensor_set(binding.cpu_execution_ids, cpu_execution_id_scratch.data(), 0, bytes);
             execution_id_write_bytes += 2*bytes;
         } else {
@@ -1487,6 +1605,9 @@ public:
         if (!validate_request_pins_locked()) {
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation));
         }
+        if (config.cold_mode && config.background_promotion) {
+            reap_background_locked();
+        }
 
         size_t unique_count = 0;
         for (size_t index = 0; index < logical_id_count; ++index) {
@@ -1505,9 +1626,12 @@ public:
                 }
                 unique_keys[unique_count] = key;
                 unique_slots[unique_count] = -1;
+                unique_lane_counts[unique_count] = 0;
+                unique_gpu_assignment[unique_count] = 0;
                 unique_index = unique_count++;
             }
             element_unique[index] = int32_t(unique_index);
+            unique_lane_counts[unique_index]++;
         }
 
         std::fill(slot_selected.begin(), slot_selected.end(), uint8_t(0));
@@ -1530,6 +1654,16 @@ public:
             }
             unique_slots[index] = forward.slot;
             slot_selected[forward.slot] = 1;
+        }
+
+        if (binding.hybrid && config.miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO) {
+            std::sort(miss_unique_indices.begin(), miss_unique_indices.begin() + miss_count,
+                [&](uint32_t lhs, uint32_t rhs) {
+                    const auto & lhs_key = unique_keys[lhs];
+                    const auto & rhs_key = unique_keys[rhs];
+                    return lhs_key.layer != rhs_key.layer ? lhs_key.layer < rhs_key.layer :
+                        lhs_key.expert < rhs_key.expert;
+                });
         }
 
         if (binding.hybrid && config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
@@ -1560,6 +1694,10 @@ public:
                 touched = transfer_ring->wait_for_hot(execution_backend, uint32_t(unique_slots[index]), entry.generation);
                 if (!touched.is_ready()) return fail(touched);
                 pin_slot_locked(uint32_t(unique_slots[index]));
+                if (entry.background_origin && !entry.background_useful) {
+                    entry.background_useful = true;
+                    background_useful++;
+                }
                 hit_count++;
             }
 
@@ -1568,6 +1706,10 @@ public:
                 abort_callback, abort_callback_data,
             };
             auto result = llm_expert_provider_result::success();
+            uint64_t queued_cpu_work = 0;
+            uint64_t queued_h2d_work = 0;
+            uint64_t queued_gpu_work = 0;
+            size_t cpu_miss_count = 0;
             for (size_t index = 0; index < miss_count && result.is_ready(); ++index) {
                 const uint32_t unique_index = miss_unique_indices[index];
                 llm_cold_reference reference;
@@ -1576,13 +1718,82 @@ public:
                     cold_cache->find_or_admit(
                         unique_keys[unique_index], registration->second, reference,
                         faults.fail_copy_after_tensors);
-                if (result.is_ready()) {
-                    result = cold_cache->acquire(reference, llm_cold_reference_kind::cpu_execution);
+                if (!result.is_ready()) break;
+                cold_references[unique_index] = reference;
+
+                bool use_gpu = false;
+                if (config.miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO) {
+                    const auto * background = find_background_locked(unique_keys[unique_index]);
+                    const llm_expert_auto_input input = {
+                        config.auto_cost_model,
+                        binding.execution_ids->ne[1] > 1,
+                        unique_lane_counts[unique_index],
+                        cold_bundle_payload,
+                        queued_cpu_work,
+                        queued_h2d_work,
+                        queued_gpu_work,
+                        background == nullptr ? 0 : cold_bundle_payload,
+                    };
+                    const auto decision = llm_evaluate_expert_auto(input);
+                    record_auto_decision_locked({ active_request_id, binding.layer,
+                        unique_keys[unique_index].expert, input, decision });
+                    use_gpu = decision.backend == llm_expert_execution_backend::gpu;
+                    if (use_gpu) {
+                        auto_gpu_decisions++;
+                        queued_h2d_work = decision.h2d_work_ns > UINT64_MAX - queued_h2d_work ?
+                            UINT64_MAX : queued_h2d_work + decision.h2d_work_ns;
+                        queued_gpu_work = decision.gpu_work_ns > UINT64_MAX - queued_gpu_work ?
+                            UINT64_MAX : queued_gpu_work + decision.gpu_work_ns;
+                    } else {
+                        auto_cpu_decisions++;
+                        queued_cpu_work = decision.cpu_finish_ns;
+                    }
+                    auto_tie_decisions += decision.reason == llm_expert_auto_reason::tie;
+                    auto_overflow_decisions += decision.reason == llm_expert_auto_reason::overflow;
                 }
-                if (result.is_ready()) {
-                    GGML_ASSERT(cpu_execution_pin_count < cpu_execution_pins.size());
-                    cpu_execution_pins[cpu_execution_pin_count++] = reference;
-                    unique_cpu_slots[unique_index] = int32_t(reference.slot);
+
+                if (use_gpu) {
+                    auto * background = find_background_locked(unique_keys[unique_index]);
+                    if (background != nullptr) {
+                        const auto joined = config.scheduler->enqueue(
+                            unique_keys[unique_index], llm_expert_priority::demand_current_layer,
+                            llm_expert_readiness::device_ready);
+                        if (joined.disposition != llm_expert_schedule_disposition::joined ||
+                            joined.handle.slot != background->scheduler_handle.slot ||
+                            joined.handle.generation != background->scheduler_handle.generation) {
+                            result = llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+                        }
+                        if (result.is_ready()) result = transfer_ring->wait_for_hot(
+                            execution_backend, background->hot_slot, background->hot_generation);
+                        if (result.is_ready()) {
+                            auto & entry = directory_slots[background->hot_slot];
+                            entry.state = hot_slot_state::ready;
+                            entry.background_origin = true;
+                            entry.background_useful = true;
+                            entry.last_use = ++use_clock;
+                            directory_forward[forward_index(entry.key)] = {
+                                int32_t(background->hot_slot), entry.generation };
+                            unique_slots[unique_index] = int32_t(background->hot_slot);
+                            pin_slot_locked(background->hot_slot);
+                            finish_background_scheduler_locked(*background, true);
+                            background->active = false;
+                            if (active_background_flights > 0) active_background_flights--;
+                            background_completed++;
+                            background_useful++;
+                            background_later_joins++;
+                            admissions++;
+                        }
+                    } else {
+                        unique_gpu_assignment[unique_index] = 1;
+                    }
+                } else {
+                    result = cold_cache->acquire(reference, llm_cold_reference_kind::cpu_execution);
+                    if (result.is_ready()) {
+                        GGML_ASSERT(cpu_execution_pin_count < cpu_execution_pins.size());
+                        cpu_execution_pins[cpu_execution_pin_count++] = reference;
+                        unique_cpu_slots[unique_index] = int32_t(reference.slot);
+                        cpu_miss_count++;
+                    }
                 }
                 if (result.is_ready() && abort_requested()) {
                     result = llm_expert_provider_result::failure(llm_expert_provider_error::cancelled);
@@ -1592,6 +1803,83 @@ public:
                 release_request_pins_locked();
                 last_remap_error = result.error;
                 return fail(result);
+            }
+
+            size_t gpu_promotion_count = 0;
+            transfer_bindings.clear();
+            for (size_t index = 0; index < miss_count && result.is_ready(); ++index) {
+                const uint32_t unique_index = miss_unique_indices[index];
+                if (!unique_gpu_assignment[unique_index] || unique_slots[unique_index] >= 0) continue;
+                const int32_t selected = select_unpinned_hot_slot_locked();
+                if (selected < 0) {
+                    result = llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+                    break;
+                }
+                const uint32_t hot_slot = uint32_t(selected);
+                result = prepare_hot_slot_locked(
+                    hot_slot, unique_keys[unique_index], cold_references[unique_index]);
+                if (result.is_ready()) result = transfer_ring->reserve(
+                    *cold_cache, cold_references[unique_index], hot_slot,
+                    directory_slots[hot_slot].generation, transfer_lanes[unique_index]);
+                if (result.is_ready()) result = transfer_ring->stage(
+                    transfer_lanes[unique_index], cold_cache->bundle());
+                if (result.is_ready()) {
+                    gpu_unique_indices[gpu_promotion_count++] = unique_index;
+                    unique_slots[unique_index] = int32_t(hot_slot);
+                    transfer_bindings.push_back({ transfer_lanes[unique_index], pool->bundle, hot_slot });
+                }
+            }
+            if (result.is_ready() && !transfer_bindings.empty()) {
+                const uint64_t started_us = uint64_t(ggml_time_us());
+                result = transfer_ring->transfer_wave(execution_backend, transfer_bindings);
+                for (size_t index = 0; index < gpu_promotion_count && result.is_ready(); ++index) {
+                    const uint32_t unique_index = gpu_unique_indices[index];
+                    const uint32_t hot_slot = uint32_t(unique_slots[unique_index]);
+                    result = transfer_ring->wait_for_hot(
+                        execution_backend, hot_slot, directory_slots[hot_slot].generation);
+                }
+                if (result.is_ready()) {
+                    for (size_t index = 0; index < gpu_promotion_count; ++index) {
+                        const uint32_t unique_index = gpu_unique_indices[index];
+                        const uint32_t hot_slot = uint32_t(unique_slots[unique_index]);
+                        auto & entry = directory_slots[hot_slot];
+                        entry.state = hot_slot_state::ready;
+                        entry.last_use = ++use_clock;
+                        directory_forward[forward_index(entry.key)] = { int32_t(hot_slot), entry.generation };
+                        admissions++;
+                        pin_slot_locked(hot_slot);
+                    }
+                    const uint64_t bytes = cold_bundle_payload > UINT64_MAX/gpu_promotion_count ? UINT64_MAX :
+                        cold_bundle_payload*gpu_promotion_count;
+                    h2d_bytes = bytes > UINT64_MAX - h2d_bytes ? UINT64_MAX : h2d_bytes + bytes;
+                    h2d_time_us += uint64_t(ggml_time_us()) - started_us;
+                }
+            }
+            if (!result.is_ready()) {
+                (void) transfer_ring->cleanup_failed_lanes();
+                for (size_t index = 0; index < gpu_promotion_count; ++index) {
+                    const uint32_t unique_index = gpu_unique_indices[index];
+                    auto & entry = directory_slots[uint32_t(unique_slots[unique_index])];
+                    if (entry.has_cold_backing) {
+                        (void) cold_cache->release(
+                            { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                    }
+                    const uint64_t generation = entry.generation;
+                    entry = {};
+                    entry.generation = generation;
+                    unique_slots[unique_index] = -1;
+                }
+                release_request_pins_locked();
+                last_remap_error = result.error;
+                return fail(result);
+            }
+
+            for (size_t index = 0; index < miss_count; ++index) {
+                const uint32_t unique_index = miss_unique_indices[index];
+                if (unique_slots[unique_index] < 0) {
+                    enqueue_background_locked(
+                        unique_keys[unique_index], cold_references[unique_index], execution_backend);
+                }
             }
 
             size_t gpu_lanes = 0;
@@ -1613,7 +1901,6 @@ public:
                 release_request_pins_locked();
                 return fail(result);
             }
-
             last_id_count = logical_id_count;
             last_remap_layer = binding.layer;
             remap_checkpoints++;
@@ -1623,12 +1910,12 @@ public:
             misses += miss_count;
             gpu_execution_lanes += gpu_lanes;
             cpu_execution_lanes += cpu_lanes;
-            cpu_fallback_unique_keys += miss_count;
+            cpu_fallback_unique_keys += cpu_miss_count;
             if (gpu_lanes != 0 && cpu_lanes != 0) mixed_execution_layers++;
             const uint64_t remaining = UINT64_MAX - h2d_bytes_avoided_for_current_output;
             h2d_bytes_avoided_for_current_output =
-                miss_count > remaining/cold_bundle_payload ? UINT64_MAX :
-                h2d_bytes_avoided_for_current_output + cold_bundle_payload*miss_count;
+                cpu_miss_count > remaining/cold_bundle_payload ? UINT64_MAX :
+                h2d_bytes_avoided_for_current_output + cold_bundle_payload*cpu_miss_count;
             return llm_expert_provider_result::success();
         }
 
@@ -2242,6 +2529,31 @@ public:
         return llm_expert_provider_result::success();
     }
 
+    llm_expert_provider_result debug_set_auto_cost_model_for_testing(
+            const llama_expert_auto_cost_model & cost) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!config.cold_mode || active_request ||
+            cost.version != LLAMA_EXPERT_AUTO_COST_MODEL_VERSION_1 ||
+            cost.struct_size != sizeof(llama_expert_auto_cost_model) ||
+            cost.cpu_fixed_decode_ns == 0 || cost.cpu_fixed_prefill_ns == 0 ||
+            cost.cpu_per_lane_decode_ns == 0 || cost.cpu_per_lane_prefill_ns == 0 ||
+            cost.gpu_fixed_decode_ns == 0 || cost.gpu_fixed_prefill_ns == 0 ||
+            cost.gpu_per_lane_decode_ns == 0 || cost.gpu_per_lane_prefill_ns == 0 ||
+            cost.h2d_fixed_ns == 0 || cost.h2d_bytes_per_second == 0 ||
+            cost.decision_hysteresis_ns == 0) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
+        config.auto_cost_model = cost;
+        const auto * bytes = reinterpret_cast<const uint8_t *>(&cost);
+        config.auto_cost_model_digest = UINT64_C(1469598103934665603);
+        for (size_t index = 0; index < sizeof(cost); ++index) {
+            config.auto_cost_model_digest ^= bytes[index];
+            config.auto_cost_model_digest *= UINT64_C(1099511628211);
+        }
+        config.miss_policy = LLAMA_EXPERT_MISS_POLICY_AUTO;
+        return llm_expert_provider_result::success();
+    }
+
     llm_expert_provider_result validate_slot_generation(
             uint32_t slot,
             uint64_t generation) noexcept override {
@@ -2358,6 +2670,9 @@ public:
             unique_keys.resize(config.capacity);
             unique_slots.resize(config.capacity);
             unique_cpu_slots.resize(config.capacity);
+            unique_lane_counts.resize(config.capacity);
+            unique_gpu_assignment.resize(config.capacity);
+            gpu_unique_indices.resize(config.capacity);
             miss_unique_indices.resize(config.capacity);
             candidate_slots.resize(config.capacity);
             slot_selected.resize(config.capacity);
@@ -2372,6 +2687,9 @@ public:
             hot_backing_scratch.reserve(config.capacity);
             request_pins.resize(config.capacity);
             cpu_execution_pins.resize(config.capacity);
+            background_promotions.assign(config.capacity, {});
+            auto_decisions.assign(config.trace_capacity, {});
+            auto_decision_write = 0;
             element_unique.clear();
             logical_id_scratch.clear();
             execution_id_scratch.clear();
@@ -2406,7 +2724,7 @@ public:
             counters.trims++;
             return llm_expert_provider_result::success();
         }
-        if (config.cold_mode && active_request) {
+        if (config.cold_mode && (active_request || active_background_flights != 0)) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         }
         if (config.cold_mode) {
@@ -2416,6 +2734,7 @@ public:
         for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
             auto & entry = directory_slots[slot];
             if (entry.state == hot_slot_state::ready && entry.refcount == 0) {
+                if (entry.background_origin && !entry.background_useful) background_wasted++;
                 if (config.cold_mode && entry.has_cold_backing) {
                     auto retired = transfer_ring->retire_hot(slot, entry.generation);
                     if (!retired.is_ready()) return fail(retired);
@@ -2445,7 +2764,7 @@ public:
         if (!pool) {
             return llm_expert_provider_result::success();
         }
-        if (active_request || pool.use_count() != 1) {
+        if (active_request || active_background_flights != 0 || pool.use_count() != 1) {
             counters.surrender_busy++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         }
@@ -2458,6 +2777,7 @@ public:
                 return result;
             }
             for (auto & entry : directory_slots) {
+                if (entry.background_origin && !entry.background_useful) background_wasted++;
                 if (entry.has_cold_backing) {
                     result = cold_cache->release(
                         { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
@@ -2475,6 +2795,10 @@ public:
         directory_slots.clear();
         unique_keys.clear();
         unique_slots.clear();
+        unique_cpu_slots.clear();
+        unique_lane_counts.clear();
+        unique_gpu_assignment.clear();
+        gpu_unique_indices.clear();
         miss_unique_indices.clear();
         candidate_slots.clear();
         slot_selected.clear();
@@ -2496,6 +2820,8 @@ public:
         last_remap_layer = -1;
         request_pins.clear();
         cpu_execution_pins.clear();
+        background_promotions.clear();
+        auto_decisions.clear();
         request_pin_count = 0;
         cpu_execution_pin_count = 0;
         cold_bundle_payload = 0;
@@ -2523,6 +2849,51 @@ public:
         result.mixed_execution_layers = mixed_execution_layers;
         result.cpu_fallback_unique_keys = cpu_fallback_unique_keys;
         result.h2d_bytes_avoided_for_current_output = h2d_bytes_avoided_for_current_output;
+        result.auto_cpu_decisions = auto_cpu_decisions;
+        result.auto_gpu_decisions = auto_gpu_decisions;
+        result.auto_tie_decisions = auto_tie_decisions;
+        result.auto_overflow_decisions = auto_overflow_decisions;
+        result.auto_decision_records = auto_decision_records;
+        result.auto_decision_records_dropped = auto_decision_records_dropped;
+        result.auto_decision_digest = auto_decision_digest;
+        const size_t retained_auto_decisions = std::min<size_t>(auto_decision_records, auto_decisions.size());
+        result.auto_decisions.reserve(retained_auto_decisions);
+        const size_t oldest_auto_decision = retained_auto_decisions == 0 ||
+            auto_decision_records <= auto_decisions.size() ? 0 : auto_decision_write%auto_decisions.size();
+        for (size_t offset = 0; offset < retained_auto_decisions; ++offset) {
+            const auto & record = auto_decisions[(oldest_auto_decision + offset)%auto_decisions.size()];
+            result.auto_decisions.push_back({
+                record.request,
+                record.layer,
+                record.expert,
+                record.input.cost,
+                record.input.prefill,
+                record.input.lanes,
+                record.input.bundle_bytes,
+                record.input.queued_cpu_work_ns,
+                record.input.queued_h2d_work_ns,
+                record.input.queued_gpu_work_ns,
+                record.input.same_key_submitted_bytes,
+                record.result.cpu_work_ns,
+                record.result.h2d_work_ns,
+                record.result.gpu_work_ns,
+                record.result.cpu_finish_ns,
+                record.result.gpu_finish_ns,
+                uint8_t(record.result.backend),
+                uint8_t(record.result.reason),
+                record.result.overflow,
+            });
+        }
+        result.background_submitted = background_submitted;
+        result.background_completed = background_completed;
+        result.background_useful = background_useful;
+        result.background_wasted = background_wasted;
+        result.background_dropped = background_dropped;
+        result.background_busy = background_busy;
+        result.background_later_joins = background_later_joins;
+        result.background_h2d_bytes = background_h2d_bytes;
+        result.active_background_flights = active_background_flights;
+        result.peak_background_flights = peak_background_flights;
         result.requested_capacity = config.capacity;
         result.effective_capacity = pool ? config.capacity : 0;
         result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
@@ -2951,6 +3322,245 @@ private:
         }
     }
 
+    background_promotion_record * find_background_locked(const llm_expert_key & key) noexcept {
+        for (auto & record : background_promotions) {
+            if (record.active && expert_key_matches(record.key, key)) return &record;
+        }
+        return nullptr;
+    }
+
+    void finish_background_scheduler_locked(background_promotion_record & record, bool success) noexcept {
+        if (!record.scheduler_handle.valid() || config.scheduler == nullptr) return;
+        if (success) {
+            (void) config.scheduler->transition(record.scheduler_handle,
+                record.scheduler_state, llm_expert_request_state::device_ready);
+            (void) config.scheduler->finish(record.scheduler_handle, llm_expert_request_state::complete);
+        } else {
+            (void) config.scheduler->transition(record.scheduler_handle,
+                record.scheduler_state, llm_expert_request_state::draining);
+            (void) config.scheduler->finish(record.scheduler_handle, llm_expert_request_state::failed);
+        }
+        (void) config.scheduler->release_terminal(record.scheduler_handle);
+        record.scheduler_handle = {};
+    }
+
+    void discard_background_slot_locked(background_promotion_record & record, bool count_wasted) noexcept {
+        if (record.hot_slot < directory_slots.size()) {
+            auto & entry = directory_slots[record.hot_slot];
+            if (entry.generation == record.hot_generation && expert_key_matches(entry.key, record.key)) {
+                clear_forward_locked(entry.key, record.hot_slot, entry.generation);
+                if (entry.has_cold_backing) {
+                    (void) cold_cache->release(
+                        { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+                }
+                const uint64_t generation = entry.generation;
+                entry = {};
+                entry.generation = generation;
+            }
+        }
+        finish_background_scheduler_locked(record, false);
+        if (record.active && active_background_flights > 0) active_background_flights--;
+        if (count_wasted) background_wasted++;
+        record = {};
+    }
+
+    void reap_background_locked() noexcept {
+        if (!transfer_ring) return;
+        for (auto & record : background_promotions) {
+            if (!record.active) continue;
+            bool complete = false;
+            const auto polled = transfer_ring->poll_h2d(record.lane, complete);
+            if (!polled.is_ready()) {
+                discard_background_slot_locked(record, true);
+                background_dropped++;
+                continue;
+            }
+            if (!complete) continue;
+            auto & entry = directory_slots[record.hot_slot];
+            if (entry.state != hot_slot_state::loading || entry.generation != record.hot_generation ||
+                !expert_key_matches(entry.key, record.key) || !entry.has_cold_backing) {
+                discard_background_slot_locked(record, true);
+                background_dropped++;
+                continue;
+            }
+            entry.state = hot_slot_state::ready;
+            entry.background_origin = true;
+            entry.background_useful = false;
+            directory_forward[forward_index(entry.key)] = { int32_t(record.hot_slot), entry.generation };
+            admissions++;
+            finish_background_scheduler_locked(record, true);
+            record.active = false;
+            record.scheduler_handle = {};
+            if (active_background_flights > 0) active_background_flights--;
+            background_completed++;
+        }
+    }
+
+    int32_t select_unpinned_hot_slot_locked() const noexcept {
+        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+            if (directory_slots[slot].state == hot_slot_state::free) return int32_t(slot);
+        }
+        int32_t victim = -1;
+        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+            const auto & entry = directory_slots[slot];
+            if (entry.state != hot_slot_state::ready || entry.refcount != 0 || slot_selected[slot]) continue;
+            if (victim < 0 || entry.last_use < directory_slots[victim].last_use ||
+                (entry.last_use == directory_slots[victim].last_use && slot < uint32_t(victim))) {
+                victim = int32_t(slot);
+            }
+        }
+        return victim;
+    }
+
+    llm_expert_provider_result prepare_hot_slot_locked(
+            uint32_t slot,
+            const llm_expert_key & key,
+            llm_cold_reference cold) noexcept {
+        auto & entry = directory_slots[slot];
+        if (entry.state != hot_slot_state::free) {
+            if (entry.background_origin && !entry.background_useful) background_wasted++;
+            auto retired = transfer_ring->retire_hot(slot, entry.generation);
+            if (!retired.is_ready()) return retired;
+            if (!entry.has_cold_backing) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+            auto released = cold_cache->release(
+                { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
+            if (!released.is_ready()) return released;
+            clear_forward_locked(entry.key, slot, entry.generation);
+            evictions++;
+            no_writeback_evictions++;
+        }
+        if (entry.generation == UINT64_MAX) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
+        }
+        const uint64_t next_generation = entry.generation + 1;
+        entry = {};
+        entry.key = key;
+        entry.generation = next_generation;
+        entry.state = hot_slot_state::loading;
+        auto acquired = cold_cache->acquire(cold, llm_cold_reference_kind::hot);
+        if (!acquired.is_ready()) return acquired;
+        entry.cold_slot = cold.slot;
+        entry.cold_generation = cold.generation;
+        entry.has_cold_backing = true;
+        generation_changes++;
+        return llm_expert_provider_result::success();
+    }
+
+    void enqueue_background_locked(
+            const llm_expert_key & key,
+            llm_cold_reference cold,
+            ggml_backend_t execution_backend) noexcept {
+        if (!config.background_promotion) return;
+        if (find_background_locked(key) != nullptr) {
+            return;
+        }
+        const auto ring = transfer_ring->diagnostics();
+        if (!ring.event_capable || config.scheduler == nullptr) {
+            background_dropped++;
+            return;
+        }
+        const int32_t selected_slot = select_unpinned_hot_slot_locked();
+        if (selected_slot < 0) {
+            background_busy++;
+            return;
+        }
+        const auto scheduled = config.scheduler->enqueue(
+            key, llm_expert_priority::demand_future_dependency, llm_expert_readiness::device_ready);
+        if (scheduled.disposition != llm_expert_schedule_disposition::admitted) {
+            if (scheduled.disposition == llm_expert_schedule_disposition::busy) background_busy++;
+            else background_dropped++;
+            return;
+        }
+        background_promotion_record record;
+        record.active = true;
+        record.key = key;
+        record.cold = cold;
+        record.scheduler_handle = scheduled.handle;
+        record.scheduler_state = llm_expert_request_state::queued;
+        record.hot_slot = uint32_t(selected_slot);
+
+        llm_expert_request_snapshot selected;
+        auto result = llm_expert_provider_result::success();
+        const auto taken = config.scheduler->take_next(selected);
+        if (taken.disposition != llm_expert_schedule_disposition::admitted ||
+            selected.handle.slot != scheduled.handle.slot || selected.handle.generation != scheduled.handle.generation) {
+            result = llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        } else {
+            record.scheduler_state = llm_expert_request_state::submitting;
+        }
+        if (result.is_ready()) result = prepare_hot_slot_locked(record.hot_slot, key, cold);
+        if (result.is_ready()) {
+            record.hot_generation = directory_slots[record.hot_slot].generation;
+            if (config.scheduler->transition(record.scheduler_handle,
+                    llm_expert_request_state::submitting, llm_expert_request_state::host_ready) !=
+                    llm_expert_schedule_disposition::admitted) {
+                result = llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            } else {
+                record.scheduler_state = llm_expert_request_state::host_ready;
+            }
+        }
+        if (result.is_ready()) result = transfer_ring->reserve(
+            *cold_cache, cold, record.hot_slot, record.hot_generation, record.lane,
+            { config.async_transport ? config.async_transport->diagnostics().transport_epoch : 1,
+              record.scheduler_handle.slot,
+              record.scheduler_handle.generation, key });
+        if (result.is_ready()) result = transfer_ring->stage(record.lane, cold_cache->bundle());
+        if (result.is_ready()) {
+            transfer_bindings.clear();
+            transfer_bindings.push_back({ record.lane, pool->bundle, record.hot_slot });
+            result = transfer_ring->transfer_wave(execution_backend, transfer_bindings);
+        }
+        if (result.is_ready() && config.scheduler->transition(record.scheduler_handle,
+                llm_expert_request_state::host_ready, llm_expert_request_state::h2d_in_flight) !=
+                llm_expert_schedule_disposition::admitted) {
+            result = llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        } else if (result.is_ready()) {
+            record.scheduler_state = llm_expert_request_state::h2d_in_flight;
+        }
+        if (result.is_ready()) result = transfer_ring->monitor_h2d(record.lane);
+        if (!result.is_ready()) {
+            (void) transfer_ring->cleanup_failed_lanes();
+            discard_background_slot_locked(record, false);
+            background_dropped++;
+            return;
+        }
+        auto & slot_record = background_promotions[record.hot_slot];
+        GGML_ASSERT(!slot_record.active);
+        slot_record = record;
+        background_submitted++;
+        background_h2d_bytes = cold_bundle_payload > UINT64_MAX - background_h2d_bytes ?
+            UINT64_MAX : background_h2d_bytes + cold_bundle_payload;
+        h2d_bytes = cold_bundle_payload > UINT64_MAX - h2d_bytes ?
+            UINT64_MAX : h2d_bytes + cold_bundle_payload;
+        active_background_flights++;
+        peak_background_flights = std::max(peak_background_flights, active_background_flights);
+    }
+
+    void record_auto_decision_locked(const auto_decision_record & record) noexcept {
+        const auto append = [&](uint64_t value) {
+            for (size_t byte = 0; byte < sizeof(value); ++byte) {
+                auto_decision_digest ^= (value >> (byte*8)) & 0xffU;
+                auto_decision_digest *= 1099511628211ULL;
+            }
+        };
+        append(record.request);
+        append(uint32_t(record.layer)); append(uint32_t(record.expert));
+        append(record.input.prefill); append(record.input.lanes); append(record.input.bundle_bytes);
+        append(record.input.queued_cpu_work_ns); append(record.input.queued_h2d_work_ns);
+        append(record.input.queued_gpu_work_ns); append(record.input.same_key_submitted_bytes);
+        append(record.result.cpu_work_ns); append(record.result.h2d_work_ns);
+        append(record.result.gpu_work_ns); append(record.result.cpu_finish_ns);
+        append(record.result.gpu_finish_ns); append(uint8_t(record.result.backend));
+        append(uint8_t(record.result.reason)); append(record.result.overflow);
+        if (!auto_decisions.empty()) {
+            auto_decisions[auto_decision_write++%auto_decisions.size()] = record;
+            if (auto_decision_records >= auto_decisions.size()) auto_decision_records_dropped++;
+        }
+        auto_decision_records++;
+    }
+
     bool validate_request_pins_locked() noexcept {
         for (size_t index = 0; index < request_pin_count; ++index) {
             const auto & pin = request_pins[index];
@@ -3147,6 +3757,9 @@ private:
     std::vector<llm_expert_key> unique_keys;
     std::vector<int32_t> unique_slots;
     std::vector<int32_t> unique_cpu_slots;
+    std::vector<uint64_t> unique_lane_counts;
+    std::vector<uint8_t> unique_gpu_assignment;
+    std::vector<uint32_t> gpu_unique_indices;
     std::vector<uint32_t> miss_unique_indices;
     std::vector<uint32_t> candidate_slots;
     std::vector<uint8_t> slot_selected;
@@ -3168,6 +3781,9 @@ private:
     int32_t last_remap_layer = -1;
     std::vector<hot_request_pin> request_pins;
     std::vector<llm_cold_reference> cpu_execution_pins;
+    std::vector<background_promotion_record> background_promotions;
+    std::vector<auto_decision_record> auto_decisions;
+    size_t auto_decision_write = 0;
     size_t request_pin_count = 0;
     size_t cpu_execution_pin_count = 0;
     bool active_request = false;
@@ -3186,6 +3802,23 @@ private:
     uint64_t mixed_execution_layers = 0;
     uint64_t cpu_fallback_unique_keys = 0;
     uint64_t h2d_bytes_avoided_for_current_output = 0;
+    uint64_t auto_cpu_decisions = 0;
+    uint64_t auto_gpu_decisions = 0;
+    uint64_t auto_tie_decisions = 0;
+    uint64_t auto_overflow_decisions = 0;
+    uint64_t auto_decision_records = 0;
+    uint64_t auto_decision_records_dropped = 0;
+    uint64_t auto_decision_digest = 1469598103934665603ULL;
+    uint64_t background_submitted = 0;
+    uint64_t background_completed = 0;
+    uint64_t background_useful = 0;
+    uint64_t background_wasted = 0;
+    uint64_t background_dropped = 0;
+    uint64_t background_busy = 0;
+    uint64_t background_later_joins = 0;
+    uint64_t background_h2d_bytes = 0;
+    uint32_t active_background_flights = 0;
+    uint32_t peak_background_flights = 0;
     uint64_t admissions = 0;
     uint64_t evictions = 0;
     uint64_t no_writeback_evictions = 0;

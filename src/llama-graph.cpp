@@ -2087,7 +2087,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // The remap checkpoint reads only the compact expert-id tensor. Keep
                 // that checkpoint on the CPU scheduler backend so observing it never
                 // host-synchronizes the CUDA compute backend.
-                ggml_backend_sched_set_tensor_backend(sched, execution_ids, backend_cpu);
+                ggml_backend_sched_set_tensor_backend(
+                    sched, hybrid_execution ? binding.checkpoint_ids : execution_ids, backend_cpu);
                 if (cpu_execution_ids != nullptr) {
                     ggml_backend_sched_set_tensor_backend(sched, cpu_execution_ids, backend_cpu);
                 }
@@ -2108,6 +2109,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
+    }
+
+    ggml_backend_t hybrid_gpu_backend = nullptr;
+    if (hybrid_execution) {
+        GGML_ASSERT(execution_down_exps != nullptr && execution_down_exps->buffer != nullptr);
+        const auto target_device = ggml_backend_buft_get_device(
+            ggml_backend_buffer_get_type(execution_down_exps->buffer));
+        for (int backend_index = 0; backend_index < ggml_backend_sched_get_n_backends(sched); ++backend_index) {
+            ggml_backend_t candidate = ggml_backend_sched_get_backend(sched, backend_index);
+            if (ggml_backend_get_device(candidate) == target_device) {
+                hybrid_gpu_backend = candidate;
+                break;
+            }
+        }
+        GGML_ASSERT(hybrid_gpu_backend != nullptr && hybrid_gpu_backend != backend_cpu);
     }
 
     auto build_expert_branch = [&](ggml_tensor * branch_up_exps,
@@ -2136,6 +2152,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cb(tensor, tagged, il);
                 if (strcmp(branch_name, "cpu") == 0) {
                     ggml_backend_sched_set_tensor_backend(sched, tensor, backend_cpu);
+                } else if (strcmp(branch_name, "gpu") == 0) {
+                    ggml_backend_sched_set_tensor_backend(sched, tensor, hybrid_gpu_backend);
                 }
             }
         };

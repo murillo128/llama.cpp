@@ -152,6 +152,7 @@ struct llm_expert_transfer_ring::impl {
         bool wait_enqueued = false;
         bool event_complete = false;
         bool monitoring = false;
+        bool hold_after_h2d = false;
         bool compute_pending = false;
         bool compute_complete = false;
         bool compute_monitoring = false;
@@ -191,6 +192,7 @@ struct llm_expert_transfer_ring::impl {
         lane.wait_enqueued = false;
         lane.event_complete = false;
         lane.monitoring = false;
+        lane.hold_after_h2d = false;
         lane.compute_pending = false;
         lane.compute_complete = false;
         lane.compute_monitoring = false;
@@ -223,7 +225,8 @@ struct llm_expert_transfer_ring::impl {
     }
 
     void finish_lane_if_ready(lane_state & lane) {
-        if (!lane.event_complete || (lane.compute_pending && !lane.compute_complete)) return;
+        if (!lane.event_complete || lane.hold_after_h2d ||
+            (lane.compute_pending && !lane.compute_complete)) return;
         if (traces.size() != 0) {
             if (counters.trace_records < traces.size()) {
                 traces[counters.trace_records++] = { lane.flight, lane.cold,
@@ -733,6 +736,7 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
             pimpl->refresh_total_event_counters();
         }
         ggml_backend_event_wait(compute_backend, lane.event);
+        lane.hold_after_h2d = false;
         lane.wait_enqueued = true;
         pimpl->counters.compute_waits++;
         pimpl->counters.h2d_event_waits++;
@@ -740,6 +744,7 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
         pimpl->compute_work = 0;
         pimpl->compute_work_id = 0;
         pimpl->compute_device = nullptr;
+        pimpl->finish_lane_if_ready(lane);
         pimpl->condition.notify_all();
         return llm_expert_provider_result::success();
     }
@@ -747,6 +752,53 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::monitor_h2d(
+        llm_transfer_lane_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (reference.lane >= pimpl->lanes.size() ||
+        pimpl->lanes[reference.lane].generation != reference.generation) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & lane = pimpl->lanes[reference.lane];
+    if (lane.state == llm_transfer_lane_state::free) {
+        return llm_expert_provider_result::success();
+    }
+    if (lane.state != llm_transfer_lane_state::in_flight || lane.event == nullptr) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    }
+    lane.hold_after_h2d = true;
+    lane.wait_enqueued = true;
+    pimpl->condition.notify_all();
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::poll_h2d(
+        llm_transfer_lane_reference reference,
+        bool & complete) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    complete = false;
+    if (reference.lane >= pimpl->lanes.size() ||
+        pimpl->lanes[reference.lane].generation != reference.generation) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & lane = pimpl->lanes[reference.lane];
+    const auto state = lane.state;
+    if (state == llm_transfer_lane_state::free) {
+        complete = true;
+        return llm_expert_provider_result::success();
+    }
+    if (state == llm_transfer_lane_state::in_flight) {
+        if (lane.event_complete) {
+            complete = true;
+            lane.hold_after_h2d = false;
+            pimpl->finish_lane_if_ready(lane);
+            pimpl->condition.notify_all();
+        }
+        return llm_expert_provider_result::success();
+    }
+    return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
 }
 
 llm_expert_provider_result llm_expert_transfer_ring::begin_compute_work(

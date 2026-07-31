@@ -162,6 +162,12 @@ public:
         ggml_backend_t compute_backend,
         uint32_t hot_slot,
         uint64_t hot_generation) noexcept;
+    // Arm event completion monitoring without adding a dependency to the
+    // current compute stream. Used only by same-key background promotion.
+    llm_expert_provider_result monitor_h2d(llm_transfer_lane_reference lane) noexcept;
+    llm_expert_provider_result poll_h2d(
+        llm_transfer_lane_reference lane,
+        bool & complete) noexcept;
     llm_expert_provider_result begin_compute_work(
         ggml_backend_t compute_backend,
         uint64_t work) noexcept;
