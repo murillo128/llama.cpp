@@ -137,6 +137,7 @@ struct llm_expert_graph_binding {
     llm_expert_projection_descriptor cpu_gate;
     llm_expert_projection_descriptor cpu_gate_up;
     llm_expert_projection_descriptor cpu_down;
+    ggml_tensor * checkpoint_ids = nullptr;
     ggml_tensor * cpu_execution_ids = nullptr;
     bool hybrid = false;
 
@@ -177,6 +178,11 @@ struct llm_hot_cache_diagnostics {
     uint32_t auto_cost_model_version = 0;
     uint64_t auto_cost_model_digest = 0;
     uint64_t hybrid_bindings = 0;
+    uint64_t gpu_execution_lanes = 0;
+    uint64_t cpu_execution_lanes = 0;
+    uint64_t mixed_execution_layers = 0;
+    uint64_t cpu_fallback_unique_keys = 0;
+    uint64_t h2d_bytes_avoided_for_current_output = 0;
     uint32_t requested_capacity = 0;
     uint32_t effective_capacity = 0;
     uint64_t pool_bytes = 0;
@@ -508,6 +514,11 @@ public:
             std::vector<uint8_t> & bytes) const noexcept {
         (void) key;
         bytes.clear();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual llm_expert_provider_result debug_set_miss_policy_for_testing(
+            llama_expert_miss_policy policy) noexcept {
+        (void) policy;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     // Internal focused-test seams. Production execution never calls these.

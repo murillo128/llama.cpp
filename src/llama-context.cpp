@@ -1653,7 +1653,8 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
     if (ctx->expert_eval_bindings != nullptr) {
         for (const auto & binding : *ctx->expert_eval_bindings) {
             if (!binding.bootstrap && binding.logical_ids != nullptr &&
-                binding.execution_ids != binding.logical_ids && binding.execution_ids == tensor) {
+                binding.execution_ids != binding.logical_ids &&
+                (binding.hybrid ? binding.checkpoint_ids : binding.execution_ids) == tensor) {
                 checkpoint = &binding;
                 break;
             }

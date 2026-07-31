@@ -2134,6 +2134,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 char tagged[96];
                 snprintf(tagged, sizeof(tagged), "%s_%s", name, branch_name);
                 cb(tensor, tagged, il);
+                if (strcmp(branch_name, "cpu") == 0) {
+                    ggml_backend_sched_set_tensor_backend(sched, tensor, backend_cpu);
+                }
             }
         };
 

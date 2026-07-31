@@ -102,6 +102,10 @@ void mark_inactive_capable(ggml_tensor * tensor) {
     tensor->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 1;
 }
 
+bool abort_immediately(void *) {
+    return true;
+}
+
 void test_defaults_and_lane_validation() {
     const auto params = llama_model_default_params();
     GGML_ASSERT(params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU);
@@ -240,6 +244,43 @@ void assert_case(ggml_backend_dev_t device, const std::vector<int32_t> & ids, bo
     }
 }
 
+void assert_logit_gate(const std::vector<float> & expected, const float * actual) {
+    GGML_ASSERT(actual != nullptr && !expected.empty());
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    double dot = 0.0;
+    double expected_norm = 0.0;
+    double actual_norm = 0.0;
+    std::vector<int32_t> expected_order(expected.size());
+    std::vector<int32_t> actual_order(expected.size());
+    for (size_t index = 0; index < expected.size(); ++index) {
+        expected_order[index] = int32_t(index);
+        actual_order[index] = int32_t(index);
+        const double lhs = expected[index];
+        const double rhs = actual[index];
+        const double difference = std::fabs(lhs - rhs);
+        max_abs = std::max(max_abs, difference);
+        mean_abs += difference;
+        dot += lhs*rhs;
+        expected_norm += lhs*lhs;
+        actual_norm += rhs*rhs;
+    }
+    const auto expected_compare = [&](int32_t lhs, int32_t rhs) {
+        return expected[lhs] != expected[rhs] ? expected[lhs] > expected[rhs] : lhs < rhs;
+    };
+    const auto actual_compare = [&](int32_t lhs, int32_t rhs) {
+        return actual[lhs] != actual[rhs] ? actual[lhs] > actual[rhs] : lhs < rhs;
+    };
+    std::partial_sort(expected_order.begin(), expected_order.begin() + 10, expected_order.end(), expected_compare);
+    std::partial_sort(actual_order.begin(), actual_order.begin() + 10, actual_order.end(), actual_compare);
+    GGML_ASSERT(std::equal(expected_order.begin(), expected_order.begin() + 10, actual_order.begin()));
+    mean_abs /= expected.size();
+    const double cosine = dot/std::sqrt(expected_norm*actual_norm);
+    GGML_ASSERT(max_abs <= 0.10);
+    GGML_ASSERT(mean_abs <= 0.02);
+    GGML_ASSERT(cosine >= 0.999);
+}
+
 struct provider_fixture {
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr buffer;
@@ -297,7 +338,54 @@ void test_hybrid_binding() {
     GGML_ASSERT(!binding.bootstrap && binding.hybrid);
     GGML_ASSERT(binding.execution_ids != selection.logical_ids);
     GGML_ASSERT(binding.cpu_execution_ids != nullptr && binding.cpu_execution_ids != binding.execution_ids);
+    GGML_ASSERT(binding.checkpoint_ids == binding.execution_ids);
     GGML_ASSERT(binding.cpu_up.weight != nullptr && binding.cpu_gate.weight != nullptr && binding.cpu_down.weight != nullptr);
+    ggml_backend_buffer_ptr graph_buffer(
+        ggml_backend_alloc_ctx_tensors_from_buft(graph_ctx.get(), ggml_backend_cpu_buffer_type()));
+    GGML_ASSERT(graph_buffer);
+
+    ggml_backend_ptr backend(ggml_backend_dev_init(config.target_device, nullptr));
+    GGML_ASSERT(backend);
+    const int32_t prime_ids[] = { 0, 0 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, prime_ids, 0, sizeof(prime_ids));
+    GGML_ASSERT(provider->debug_set_miss_policy_for_testing(
+        LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU).is_ready());
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint_tensor(binding, backend.get()).is_ready());
+    plan.reset();
+
+    const int32_t mixed_ids[] = { 0, 1 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, mixed_ids, 0, sizeof(mixed_ids));
+    GGML_ASSERT(provider->debug_set_miss_policy_for_testing(
+        LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK).is_ready());
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint_tensor(binding, backend.get()).is_ready());
+    int32_t gpu_ids[2] = {};
+    int32_t cpu_ids[2] = {};
+    ggml_backend_tensor_get(binding.execution_ids, gpu_ids, 0, sizeof(gpu_ids));
+    ggml_backend_tensor_get(binding.cpu_execution_ids, cpu_ids, 0, sizeof(cpu_ids));
+    GGML_ASSERT(gpu_ids[0] >= 0 && gpu_ids[1] == -1);
+    GGML_ASSERT(cpu_ids[0] == -1 && cpu_ids[1] >= 0);
+    GGML_ASSERT(llm_validate_hybrid_execution_ids(gpu_ids, cpu_ids, 2, 2, 2).is_ready());
+    auto live = provider->hot_cache_diagnostics();
+    GGML_ASSERT(live.cold_current_cpu_execution_refs == 1);
+    GGML_ASSERT(live.mixed_execution_layers == 1);
+    GGML_ASSERT(provider->trim().error == llm_expert_provider_error::busy);
+    GGML_ASSERT(provider->surrender().error == llm_expert_provider_error::busy);
+    plan.reset();
+    live = provider->hot_cache_diagnostics();
+    GGML_ASSERT(live.cold_current_cpu_execution_refs == 0);
+
+    const int32_t cancelled_ids[] = { 2, 3 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, cancelled_ids, 0, sizeof(cancelled_ids));
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const auto cancelled = provider->remap_checkpoint_tensor(
+        binding, backend.get(), abort_immediately, nullptr);
+    GGML_ASSERT(cancelled.status == llm_expert_provider_status::cancelled);
+    plan.reset();
+    GGML_ASSERT(provider->hot_cache_diagnostics().cold_current_cpu_execution_refs == 0);
+    GGML_ASSERT(provider->trim().is_ready());
     const auto diagnostics = provider->hot_cache_diagnostics();
     GGML_ASSERT(diagnostics.configured_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK);
     GGML_ASSERT(diagnostics.hybrid_bindings == 1);
@@ -333,6 +421,63 @@ void test_hybrid_model_graph(const char * model_path) {
     GGML_ASSERT(context);
     diagnostics = provider->hot_cache_diagnostics();
     GGML_ASSERT(diagnostics.hybrid_bindings > 0);
+
+    GGML_ASSERT(provider->debug_set_miss_policy_for_testing(
+        LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU).is_ready());
+    llama_token token = 1;
+    GGML_ASSERT(llama_decode(context.get(), llama_batch_get_one(&token, 1)) == 0);
+    llama_synchronize(context.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const float * promote_logits_ptr = llama_get_logits_ith(context.get(), -1);
+    GGML_ASSERT(promote_logits_ptr != nullptr && n_vocab > 0);
+    const std::vector<float> promote_logits(promote_logits_ptr, promote_logits_ptr + n_vocab);
+    GGML_ASSERT(provider->debug_set_miss_policy_for_testing(
+        LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK).is_ready());
+    token = 2;
+    GGML_ASSERT(llama_decode(context.get(), llama_batch_get_one(&token, 1)) == 0);
+    llama_synchronize(context.get());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.cpu_execution_lanes > 0);
+    GGML_ASSERT(diagnostics.gpu_execution_lanes > 0);
+    GGML_ASSERT(diagnostics.mixed_execution_layers > 0);
+    GGML_ASSERT(diagnostics.cold_current_cpu_execution_refs == 0);
+    GGML_ASSERT(diagnostics.h2d_bytes_avoided_for_current_output > 0);
+
+    context.reset();
+    GGML_ASSERT(provider->trim().is_ready());
+    context.reset(llama_init_from_model(model.get(), context_params));
+    GGML_ASSERT(context);
+    token = 1;
+    GGML_ASSERT(llama_decode(context.get(), llama_batch_get_one(&token, 1)) == 0);
+    llama_synchronize(context.get());
+    const float * cpu_logits = llama_get_logits_ith(context.get(), -1);
+    GGML_ASSERT(cpu_logits != nullptr);
+    assert_logit_gate(promote_logits, cpu_logits);
+
+    context.reset();
+    GGML_ASSERT(provider->trim().is_ready());
+    auto prefill_params = context_params;
+    prefill_params.n_batch = 4;
+    prefill_params.n_ubatch = 4;
+    GGML_ASSERT(provider->debug_set_miss_policy_for_testing(
+        LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU).is_ready());
+    context.reset(llama_init_from_model(model.get(), prefill_params));
+    GGML_ASSERT(context);
+    llama_token prefill_tokens[] = { 1, 2, 3, 4 };
+    GGML_ASSERT(llama_decode(context.get(), llama_batch_get_one(prefill_tokens, 4)) == 0);
+    llama_synchronize(context.get());
+    const float * promote_prefill_ptr = llama_get_logits_ith(context.get(), -1);
+    GGML_ASSERT(promote_prefill_ptr != nullptr);
+    const std::vector<float> promote_prefill(promote_prefill_ptr, promote_prefill_ptr + n_vocab);
+    context.reset();
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->debug_set_miss_policy_for_testing(
+        LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK).is_ready());
+    context.reset(llama_init_from_model(model.get(), prefill_params));
+    GGML_ASSERT(context);
+    GGML_ASSERT(llama_decode(context.get(), llama_batch_get_one(prefill_tokens, 4)) == 0);
+    llama_synchronize(context.get());
+    assert_logit_gate(promote_prefill, llama_get_logits_ith(context.get(), -1));
 }
 
 } // namespace

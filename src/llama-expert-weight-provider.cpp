@@ -598,7 +598,10 @@ llm_expert_provider_result llm_expert_graph_binding::validate(const llm_expert_s
     }
     if (hybrid) {
         const bool cpu_merged = cpu_gate_up.weight != nullptr;
-        if (cpu_execution_ids == nullptr || cpu_execution_ids == execution_ids ||
+        if (checkpoint_ids == nullptr || checkpoint_ids != execution_ids || checkpoint_ids == cpu_execution_ids ||
+            checkpoint_ids->type != GGML_TYPE_I32 || checkpoint_ids->ne[0] != selection.n_expert_used ||
+            checkpoint_ids->ne[1] != selection.n_tokens ||
+            cpu_execution_ids == nullptr || cpu_execution_ids == execution_ids ||
             cpu_execution_ids == logical_ids || cpu_execution_ids->type != GGML_TYPE_I32 ||
             cpu_execution_ids->ne[0] != selection.n_expert_used ||
             cpu_execution_ids->ne[1] != selection.n_tokens || cpu_down.weight == nullptr ||
@@ -606,7 +609,7 @@ llm_expert_provider_result llm_expert_graph_binding::validate(const llm_expert_s
             (cpu_merged ? (cpu_up.weight != nullptr || cpu_gate.weight != nullptr) : cpu_up.weight == nullptr)) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
         }
-    } else if (cpu_execution_ids != nullptr || cpu_up.weight != nullptr || cpu_gate.weight != nullptr ||
+    } else if (checkpoint_ids != nullptr || cpu_execution_ids != nullptr || cpu_up.weight != nullptr || cpu_gate.weight != nullptr ||
                cpu_gate_up.weight != nullptr || cpu_down.weight != nullptr) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
     }
@@ -1221,13 +1224,20 @@ public:
             counters.bootstrap_bindings++;
         } else {
             ggml_tensor * execution_ids = selection.logical_ids;
+            ggml_tensor * checkpoint_ids = nullptr;
             ggml_tensor * cpu_execution_ids = nullptr;
             if (graph_ctx != nullptr) {
-                execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
-                ggml_format_name(execution_ids, "expert_execution_ids-%d", bundle.layer);
                 if (config.cold_mode && config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
-                    cpu_execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                    execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                    ggml_format_name(execution_ids, "expert_execution_ids-%d", bundle.layer);
+                    checkpoint_ids = execution_ids;
+                    cpu_execution_ids = ggml_new_tensor_2d(graph_ctx, GGML_TYPE_I32,
+                        selection.n_expert_used, selection.n_tokens);
+                    ggml_set_input(cpu_execution_ids);
                     ggml_format_name(cpu_execution_ids, "expert_cpu_execution_ids-%d", bundle.layer);
+                } else {
+                    execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                    ggml_format_name(execution_ids, "expert_execution_ids-%d", bundle.layer);
                 }
             }
             binding = {};
@@ -1247,6 +1257,7 @@ public:
                 binding.cpu_gate = cpu.gate;
                 binding.cpu_gate_up = cpu.gate_up;
                 binding.cpu_down = cpu.down;
+                binding.checkpoint_ids = checkpoint_ids;
                 binding.cpu_execution_ids = cpu_execution_ids;
                 binding.hybrid = true;
                 hybrid_bindings++;
@@ -1324,13 +1335,16 @@ public:
 
         try {
             if (element_unique.size() < max_elements || logical_id_scratch.size() < max_elements ||
-                execution_id_scratch.size() < max_elements || last_logical_ids.size() < max_elements ||
-                last_execution_ids.size() < max_elements) {
+                execution_id_scratch.size() < max_elements || cpu_execution_id_scratch.size() < max_elements ||
+                last_logical_ids.size() < max_elements || last_execution_ids.size() < max_elements ||
+                last_cpu_execution_ids.size() < max_elements) {
                 element_unique.resize(max_elements);
                 logical_id_scratch.resize(max_elements);
                 execution_id_scratch.resize(max_elements);
+                cpu_execution_id_scratch.resize(max_elements);
                 last_logical_ids.resize(max_elements);
                 last_execution_ids.resize(max_elements);
+                last_cpu_execution_ids.resize(max_elements);
                 scratch_reservations++;
             }
         } catch (const std::bad_alloc &) {
@@ -1342,6 +1356,7 @@ public:
         active_request = true;
         active_request_id = ++next_request_id;
         request_pin_count = 0;
+        cpu_execution_pin_count = 0;
         requests++;
         counters.handles_acquired++;
         plan.add_handle({ this, active_request_id });
@@ -1385,7 +1400,7 @@ public:
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
         std::unique_lock<std::mutex> lock(mutex);
-        return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr,
+        return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr, nullptr,
             abort_callback, abort_callback_data, &lock);
     }
 
@@ -1396,9 +1411,11 @@ public:
             void * abort_callback_data) noexcept override {
         std::unique_lock<std::mutex> lock(mutex);
         (void) execution_backend;
-        if (binding.execution_ids == nullptr || binding.execution_ids == binding.logical_ids ||
-            binding.execution_ids->type != GGML_TYPE_I32 || binding.execution_ids->ne[0] < 0 ||
-            binding.execution_ids->ne[1] < 0) {
+        ggml_tensor * checkpoint_ids = binding.hybrid ? binding.checkpoint_ids : binding.execution_ids;
+        if (checkpoint_ids == nullptr || binding.execution_ids == nullptr ||
+            binding.execution_ids == binding.logical_ids || binding.execution_ids->type != GGML_TYPE_I32 ||
+            binding.execution_ids->ne[0] < 0 || binding.execution_ids->ne[1] < 0 ||
+            (binding.hybrid && binding.cpu_execution_ids == nullptr)) {
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
         }
         const uint64_t count64 = uint64_t(binding.execution_ids->ne[0])*uint64_t(binding.execution_ids->ne[1]);
@@ -1407,16 +1424,23 @@ public:
         }
         const size_t count = size_t(count64);
         const size_t bytes = count*sizeof(int32_t);
-        ggml_backend_tensor_get(binding.execution_ids, logical_id_scratch.data(), 0, bytes);
+        ggml_backend_tensor_get(checkpoint_ids, logical_id_scratch.data(), 0, bytes);
         execution_id_read_bytes += bytes;
         auto result = remap_checkpoint_locked(
-            binding, logical_id_scratch.data(), count, execution_id_scratch.data(), execution_backend,
+            binding, logical_id_scratch.data(), count, execution_id_scratch.data(),
+            binding.hybrid ? cpu_execution_id_scratch.data() : nullptr, execution_backend,
             abort_callback, abort_callback_data, &lock);
         if (!result.is_ready()) {
             return result;
         }
-        ggml_backend_tensor_set(binding.execution_ids, execution_id_scratch.data(), 0, bytes);
-        execution_id_write_bytes += bytes;
+        if (binding.hybrid) {
+            ggml_backend_tensor_set(binding.execution_ids, execution_id_scratch.data(), 0, bytes);
+            ggml_backend_tensor_set(binding.cpu_execution_ids, cpu_execution_id_scratch.data(), 0, bytes);
+            execution_id_write_bytes += 2*bytes;
+        } else {
+            ggml_backend_tensor_set(checkpoint_ids, execution_id_scratch.data(), 0, bytes);
+            execution_id_write_bytes += bytes;
+        }
         counters.callbacks++;
         counters.synchronizations++;
         synchronization_checkpoints++;
@@ -1428,6 +1452,7 @@ public:
             const int32_t * logical_ids,
             size_t logical_id_count,
             int32_t * execution_ids,
+            int32_t * cpu_execution_ids,
             ggml_backend_t execution_backend,
             bool (*abort_callback)(void *),
             void * abort_callback_data,
@@ -1439,10 +1464,8 @@ public:
             binding.execution_ids->ne[1] < 0) {
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
         }
-        if (binding.hybrid) {
-            // Phase 8.1 establishes the graph/operator seam only. Phase 8.2
-            // replaces this explicit failure with one frozen two-branch plan.
-            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration));
+        if (binding.hybrid && cpu_execution_ids == nullptr) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
         }
 
         const auto execution_device = execution_backend == nullptr ? nullptr :
@@ -1507,6 +1530,106 @@ public:
             }
             unique_slots[index] = forward.slot;
             slot_selected[forward.slot] = 1;
+        }
+
+        if (binding.hybrid && config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
+            release_request_pins_locked();
+            const auto abort_requested = [&]() {
+                if (abort_callback == nullptr) return false;
+                if (provider_lock != nullptr) provider_lock->unlock();
+                const bool requested = abort_callback(abort_callback_data);
+                if (provider_lock != nullptr) provider_lock->lock();
+                return requested;
+            };
+            if (abort_requested()) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::cancelled));
+            }
+            size_t hit_count = 0;
+            for (size_t index = 0; index < unique_count; ++index) {
+                unique_cpu_slots[index] = -1;
+                if (unique_slots[index] < 0) continue;
+                auto & entry = directory_slots[unique_slots[index]];
+                if (!entry.has_cold_backing) {
+                    metadata_mismatches++;
+                    return fail(llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch));
+                }
+                const llm_cold_reference backing = { entry.cold_slot, entry.cold_generation };
+                auto touched = cold_cache->acquire(backing, llm_cold_reference_kind::request);
+                if (touched.is_ready()) touched = cold_cache->release(backing, llm_cold_reference_kind::request);
+                if (!touched.is_ready()) return fail(touched);
+                touched = transfer_ring->wait_for_hot(execution_backend, uint32_t(unique_slots[index]), entry.generation);
+                if (!touched.is_ready()) return fail(touched);
+                pin_slot_locked(uint32_t(unique_slots[index]));
+                hit_count++;
+            }
+
+            storage_load_context storage_context = {
+                config.storage, nullptr, nullptr, provider_lock, {}, false,
+                abort_callback, abort_callback_data,
+            };
+            auto result = llm_expert_provider_result::success();
+            for (size_t index = 0; index < miss_count && result.is_ready(); ++index) {
+                const uint32_t unique_index = miss_unique_indices[index];
+                llm_cold_reference reference;
+                result = config.storage ? cold_cache->find_or_admit_with_loader(
+                    unique_keys[unique_index], reference, load_storage_bundle, &storage_context) :
+                    cold_cache->find_or_admit(
+                        unique_keys[unique_index], registration->second, reference,
+                        faults.fail_copy_after_tensors);
+                if (result.is_ready()) {
+                    result = cold_cache->acquire(reference, llm_cold_reference_kind::cpu_execution);
+                }
+                if (result.is_ready()) {
+                    GGML_ASSERT(cpu_execution_pin_count < cpu_execution_pins.size());
+                    cpu_execution_pins[cpu_execution_pin_count++] = reference;
+                    unique_cpu_slots[unique_index] = int32_t(reference.slot);
+                }
+                if (result.is_ready() && abort_requested()) {
+                    result = llm_expert_provider_result::failure(llm_expert_provider_error::cancelled);
+                }
+            }
+            if (!result.is_ready()) {
+                release_request_pins_locked();
+                last_remap_error = result.error;
+                return fail(result);
+            }
+
+            size_t gpu_lanes = 0;
+            size_t cpu_lanes = 0;
+            for (size_t index = 0; index < logical_id_count; ++index) {
+                const size_t unique_index = size_t(element_unique[index]);
+                const bool gpu = unique_slots[unique_index] >= 0;
+                execution_ids[index] = gpu ? unique_slots[unique_index] : -1;
+                cpu_execution_ids[index] = gpu ? -1 : unique_cpu_slots[unique_index];
+                last_logical_ids[index] = logical_ids[index];
+                last_execution_ids[index] = execution_ids[index];
+                last_cpu_execution_ids[index] = cpu_execution_ids[index];
+                gpu_lanes += gpu;
+                cpu_lanes += !gpu;
+            }
+            result = llm_validate_hybrid_execution_ids(execution_ids, cpu_execution_ids, logical_id_count,
+                int32_t(config.capacity), int32_t(cold_cache->diagnostics().effective_slots));
+            if (!result.is_ready()) {
+                release_request_pins_locked();
+                return fail(result);
+            }
+
+            last_id_count = logical_id_count;
+            last_remap_layer = binding.layer;
+            remap_checkpoints++;
+            logical_id_total += logical_id_count;
+            unique_id_total += unique_count;
+            hits += hit_count;
+            misses += miss_count;
+            gpu_execution_lanes += gpu_lanes;
+            cpu_execution_lanes += cpu_lanes;
+            cpu_fallback_unique_keys += miss_count;
+            if (gpu_lanes != 0 && cpu_lanes != 0) mixed_execution_layers++;
+            const uint64_t remaining = UINT64_MAX - h2d_bytes_avoided_for_current_output;
+            h2d_bytes_avoided_for_current_output =
+                miss_count > remaining/cold_bundle_payload ? UINT64_MAX :
+                h2d_bytes_avoided_for_current_output + cold_bundle_payload*miss_count;
+            return llm_expert_provider_result::success();
         }
 
         size_t candidate_count = 0;
@@ -2056,6 +2179,17 @@ public:
             execution_ids[index] = unique_slots[element_unique[index]];
             last_logical_ids[index] = logical_ids[index];
             last_execution_ids[index] = execution_ids[index];
+            if (binding.hybrid) {
+                cpu_execution_ids[index] = -1;
+                last_cpu_execution_ids[index] = -1;
+            }
+        }
+        if (binding.hybrid) {
+            const auto hybrid_ids = llm_validate_hybrid_execution_ids(
+                execution_ids, cpu_execution_ids, logical_id_count,
+                int32_t(config.capacity), int32_t(cold_cache->diagnostics().effective_slots));
+            if (!hybrid_ids.is_ready()) return fail(hybrid_ids);
+            gpu_execution_lanes += logical_id_count;
         }
         last_id_count = logical_id_count;
         last_remap_layer = binding.layer;
@@ -2093,6 +2227,18 @@ public:
             if (result.is_ready()) result = validate_inclusive_locked();
             if (!result.is_ready()) return fail(result);
         }
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result debug_set_miss_policy_for_testing(
+            llama_expert_miss_policy policy) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!config.cold_mode || active_request ||
+            (policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU &&
+             policy != LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK)) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
+        config.miss_policy = policy;
         return llm_expert_provider_result::success();
     }
 
@@ -2211,6 +2357,7 @@ public:
             }
             unique_keys.resize(config.capacity);
             unique_slots.resize(config.capacity);
+            unique_cpu_slots.resize(config.capacity);
             miss_unique_indices.resize(config.capacity);
             candidate_slots.resize(config.capacity);
             slot_selected.resize(config.capacity);
@@ -2224,14 +2371,18 @@ public:
             hot_backing_scratch.clear();
             hot_backing_scratch.reserve(config.capacity);
             request_pins.resize(config.capacity);
+            cpu_execution_pins.resize(config.capacity);
             element_unique.clear();
             logical_id_scratch.clear();
             execution_id_scratch.clear();
+            cpu_execution_id_scratch.clear();
             last_logical_ids.clear();
             last_execution_ids.clear();
+            last_cpu_execution_ids.clear();
             last_id_count = 0;
             last_remap_layer = -1;
             request_pin_count = 0;
+            cpu_execution_pin_count = 0;
             active_request = false;
 
             candidate->id = ++generation;
@@ -2337,12 +2488,16 @@ public:
         element_unique.clear();
         logical_id_scratch.clear();
         execution_id_scratch.clear();
+        cpu_execution_id_scratch.clear();
         last_logical_ids.clear();
         last_execution_ids.clear();
+        last_cpu_execution_ids.clear();
         last_id_count = 0;
         last_remap_layer = -1;
         request_pins.clear();
+        cpu_execution_pins.clear();
         request_pin_count = 0;
+        cpu_execution_pin_count = 0;
         cold_bundle_payload = 0;
         transfer_lane_capacity = 0;
         epoch++;
@@ -2363,6 +2518,11 @@ public:
         result.auto_cost_model_version = config.auto_cost_model.version;
         result.auto_cost_model_digest = config.auto_cost_model_digest;
         result.hybrid_bindings = hybrid_bindings;
+        result.gpu_execution_lanes = gpu_execution_lanes;
+        result.cpu_execution_lanes = cpu_execution_lanes;
+        result.mixed_execution_layers = mixed_execution_layers;
+        result.cpu_fallback_unique_keys = cpu_fallback_unique_keys;
+        result.h2d_bytes_avoided_for_current_output = h2d_bytes_avoided_for_current_output;
         result.requested_capacity = config.capacity;
         result.effective_capacity = pool ? config.capacity : 0;
         result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
@@ -2800,6 +2960,18 @@ private:
                 return false;
             }
         }
+        for (size_t index = 0; index < cpu_execution_pin_count; ++index) {
+            auto result = cold_cache->acquire(
+                cpu_execution_pins[index], llm_cold_reference_kind::cpu_execution);
+            if (result.is_ready()) {
+                result = cold_cache->release(
+                    cpu_execution_pins[index], llm_cold_reference_kind::cpu_execution);
+            }
+            if (!result.is_ready()) {
+                stale_generation_failures++;
+                return false;
+            }
+        }
         return true;
     }
 
@@ -2815,6 +2987,12 @@ private:
             current_pins--;
         }
         request_pin_count = 0;
+        for (size_t index = 0; index < cpu_execution_pin_count; ++index) {
+            const auto released = cold_cache->release(
+                cpu_execution_pins[index], llm_cold_reference_kind::cpu_execution);
+            GGML_ASSERT(released.is_ready());
+        }
+        cpu_execution_pin_count = 0;
     }
 
     void pin_slot_locked(uint32_t slot) noexcept {
@@ -2968,6 +3146,7 @@ private:
     std::vector<hot_slot_entry> directory_slots;
     std::vector<llm_expert_key> unique_keys;
     std::vector<int32_t> unique_slots;
+    std::vector<int32_t> unique_cpu_slots;
     std::vector<uint32_t> miss_unique_indices;
     std::vector<uint32_t> candidate_slots;
     std::vector<uint8_t> slot_selected;
@@ -2981,12 +3160,16 @@ private:
     std::vector<int32_t> element_unique;
     std::vector<int32_t> logical_id_scratch;
     std::vector<int32_t> execution_id_scratch;
+    std::vector<int32_t> cpu_execution_id_scratch;
     std::vector<int32_t> last_logical_ids;
     std::vector<int32_t> last_execution_ids;
+    std::vector<int32_t> last_cpu_execution_ids;
     size_t last_id_count = 0;
     int32_t last_remap_layer = -1;
     std::vector<hot_request_pin> request_pins;
+    std::vector<llm_cold_reference> cpu_execution_pins;
     size_t request_pin_count = 0;
+    size_t cpu_execution_pin_count = 0;
     bool active_request = false;
     uint64_t active_request_id = 0;
     uint64_t next_request_id = 0;
@@ -2998,6 +3181,11 @@ private:
     uint64_t unique_id_total = 0;
     uint64_t hits = 0;
     uint64_t misses = 0;
+    uint64_t gpu_execution_lanes = 0;
+    uint64_t cpu_execution_lanes = 0;
+    uint64_t mixed_execution_layers = 0;
+    uint64_t cpu_fallback_unique_keys = 0;
+    uint64_t h2d_bytes_avoided_for_current_output = 0;
     uint64_t admissions = 0;
     uint64_t evictions = 0;
     uint64_t no_writeback_evictions = 0;
