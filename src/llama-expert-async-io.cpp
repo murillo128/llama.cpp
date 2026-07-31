@@ -1048,7 +1048,9 @@ struct llm_expert_async_transport::impl {
             uint32_t selected = UINT32_MAX;
             for (uint32_t slot = 0; slot < read_requests.size(); ++slot) {
                 if (read_requests[slot].state == read_state::queued &&
-                    (selected == UINT32_MAX || read_requests[slot].ordinal < read_requests[selected].ordinal)) {
+                    (selected == UINT32_MAX || (config.reverse_queued_requests_for_testing ?
+                        read_requests[slot].ordinal > read_requests[selected].ordinal :
+                        read_requests[slot].ordinal < read_requests[selected].ordinal))) {
                     selected = slot;
                 }
             }

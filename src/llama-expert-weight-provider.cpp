@@ -536,6 +536,7 @@ struct storage_async_flight {
     bool reserved = false;
     bool submitted = false;
     bool read_active = false;
+    bool read_completed = false;
     bool scheduler_active = false;
     bool processed = false;
     llm_expert_request_state scheduler_state = llm_expert_request_state::free;
@@ -2685,27 +2686,41 @@ public:
                 }
                 if (submitted_count != 0) config.async_transport->start_deferred_reads();
 
-                for (size_t completed_count = 0;
-                        completed_count < miss_count && copy_result.is_ready(); ++completed_count) {
+                size_t completed_count = 0;
+                while (completed_count < miss_count && copy_result.is_ready()) {
                     size_t index = miss_count;
                     for (size_t candidate = 0; candidate < miss_count; ++candidate) {
-                        if (async_flights[candidate].cold_hit && !async_flights[candidate].processed) {
+                        const auto & candidate_flight = async_flights[candidate];
+                        if (!candidate_flight.processed && (candidate_flight.cold_hit ||
+                                (candidate_flight.read_completed && cold_cache->ready(candidate_flight.cold)))) {
                             index = candidate;
                             break;
                         }
                     }
-                    llm_expert_async_read_completion completion;
-                    llm_expert_async_result waited = llm_expert_async_result::ready;
                     if (index == miss_count) {
+                        size_t pending_count = 0;
+                        for (size_t candidate = 0; candidate < miss_count; ++candidate) {
+                            const auto & candidate_flight = async_flights[candidate];
+                            if (candidate_flight.submitted && !candidate_flight.read_completed) {
+                                async_handles[pending_count++] = candidate_flight.handle;
+                            }
+                        }
+                        if (pending_count == 0) {
+                            copy_result = llm_expert_provider_result::failure(
+                                llm_expert_provider_error::metadata_mismatch);
+                            break;
+                        }
+                        llm_expert_async_read_completion completion;
                         llm_expert_request_handle completed_handle;
                         if (provider_lock != nullptr) provider_lock->unlock();
-                        waited = config.async_transport->wait_any_read(
-                            async_handles.data(), submitted_count, completed_handle, completion,
+                        const auto waited = config.async_transport->wait_any_read(
+                            async_handles.data(), pending_count, completed_handle, completion,
                             abort_callback, abort_callback_data);
                         if (provider_lock != nullptr) provider_lock->lock();
                         for (size_t candidate = 0; candidate < miss_count; ++candidate) {
                             const auto & candidate_flight = async_flights[candidate];
-                            if (!candidate_flight.processed && candidate_flight.handle.slot == completed_handle.slot &&
+                            if (!candidate_flight.read_completed &&
+                                candidate_flight.handle.slot == completed_handle.slot &&
                                 candidate_flight.handle.generation == completed_handle.generation) {
                                 index = candidate;
                                 break;
@@ -2718,10 +2733,7 @@ public:
                                     llm_expert_provider_error::stale_generation);
                             break;
                         }
-                    }
-                    auto & flight = async_flights[index];
-                    flight.processed = true;
-                    if (flight.submitted) {
+                        auto & flight = async_flights[index];
                         const auto released = config.async_transport->release_read(flight.handle);
                         if (released == llm_expert_async_result::ready) flight.read_active = false;
                         const auto storage_error = waited == llm_expert_async_result::ready ?
@@ -2751,15 +2763,23 @@ public:
                                 llm_expert_provider_error::copy_failed);
                             break;
                         }
+                        flight.read_completed = true;
                         copy_result = cold_cache->publish_ready(flight.key, flight.cold);
                         if (copy_result.is_ready()) flight.reserved = false;
-                        if (copy_result.is_ready() && config.scheduler->transition(flight.handle,
-                                llm_expert_request_state::io_in_flight,
-                                llm_expert_request_state::host_ready) != llm_expert_schedule_disposition::admitted) {
-                            copy_result = llm_expert_provider_result::failure(
-                                llm_expert_provider_error::metadata_mismatch);
-                        }
-                        if (copy_result.is_ready()) flight.scheduler_state = llm_expert_request_state::host_ready;
+                        continue;
+                    }
+
+                    auto & flight = async_flights[index];
+                    flight.processed = true;
+                    completed_count++;
+                    if (flight.submitted && config.scheduler->transition(flight.handle,
+                            llm_expert_request_state::io_in_flight,
+                            llm_expert_request_state::host_ready) != llm_expert_schedule_disposition::admitted) {
+                        copy_result = llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch);
+                    }
+                    if (copy_result.is_ready() && flight.submitted) {
+                        flight.scheduler_state = llm_expert_request_state::host_ready;
                     }
                     if (!copy_result.is_ready()) break;
 

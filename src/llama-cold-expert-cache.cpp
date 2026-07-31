@@ -313,6 +313,42 @@ struct llm_cold_expert_cache::impl {
     bool policy_request_active = false;
     llm_expert_cache_policy_phase policy_phase = llm_expert_cache_policy_phase::prefill;
 
+    llm_expert_provider_result commit_ready_policy_slots() {
+        while (true) {
+            int32_t selected = -1;
+            for (uint32_t index = 0; index < slots.size(); ++index) {
+                const auto & candidate = slots[index];
+                if (candidate.state != llm_cold_slot_state::loading ||
+                    !policy.validate_resident(index, candidate.generation,
+                        { candidate.key.layer, candidate.key.expert })) {
+                    continue;
+                }
+                if (candidate.origin_operation_ordinal == 0) {
+                    counters.invariant_failures++;
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+                }
+                if (selected < 0 || candidate.origin_operation_ordinal <
+                        slots[uint32_t(selected)].origin_operation_ordinal) {
+                    selected = int32_t(index);
+                }
+            }
+            if (selected < 0) break;
+            const uint32_t index = uint32_t(selected);
+            auto & slot = slots[index];
+            auto & forward = directory[forward_index(slot.key)];
+            if (forward.slot >= 0) {
+                counters.invariant_failures++;
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+            slot.state = llm_cold_slot_state::ready;
+            slot.last_use = ++use_clock;
+            forward = { int32_t(index), slot.generation };
+            counters.admissions++;
+            counters.publications++;
+        }
+        return llm_expert_provider_result::success();
+    }
+
     llm_expert_provider_result ensure_policy_request() {
         if (policy_request_active) return llm_expert_provider_result::success();
         const auto result = policy_result(policy.request_begin());
@@ -533,6 +569,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
         { key.layer, key.expert }, pimpl->counters.bundle_payload_bytes,
         pimpl->counters.aligned_slot_footprint));
     if (!loading.is_ready()) return loading;
+    slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
     reference = { uint32_t(victim), slot.generation };
     pimpl->counters.reservations++;
     return llm_expert_provider_result::success();
@@ -556,12 +593,7 @@ llm_expert_provider_result llm_cold_expert_cache::publish_ready(
     }
     const auto completed = policy_result(pimpl->policy.load_complete(reference.slot, reference.generation));
     if (!completed.is_ready()) return completed;
-    slot.state = llm_cold_slot_state::ready;
-    slot.last_use = ++pimpl->use_clock;
-    forward = { int32_t(reference.slot), reference.generation };
-    pimpl->counters.admissions++;
-    pimpl->counters.publications++;
-    return llm_expert_provider_result::success();
+    return pimpl->commit_ready_policy_slots();
 }
 
 llm_expert_provider_result llm_cold_expert_cache::fail_reservation(
@@ -580,7 +612,7 @@ llm_expert_provider_result llm_cold_expert_cache::fail_reservation(
     pimpl->counters.failed_reservations++;
     const auto failed = policy_result(pimpl->policy.load_failed(reference.slot, reference.generation));
     if (!failed.is_ready()) return failed;
-    return llm_expert_provider_result::success();
+    return pimpl->commit_ready_policy_slots();
 }
 
 llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
@@ -642,6 +674,7 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
         { key.layer, key.expert }, pimpl->counters.bundle_payload_bytes,
         pimpl->counters.aligned_slot_footprint));
     if (!loading.is_ready()) return loading;
+    slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
     reference = { uint32_t(victim), slot.generation };
 
     size_t bytes = 0;
@@ -792,6 +825,11 @@ llm_expert_provider_result llm_cold_expert_cache::release_many(
         (*current)--;
     }
     return llm_expert_provider_result::success();
+}
+
+bool llm_cold_expert_cache::ready(llm_cold_reference reference) const noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    return pimpl->valid_reference(reference);
 }
 
 llm_expert_provider_result llm_cold_expert_cache::cleanup_failed_slots() noexcept {

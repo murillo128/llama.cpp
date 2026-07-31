@@ -90,6 +90,7 @@ struct llm_cold_cache_diagnostics {
     struct slot {
         llm_expert_key key = { -1, -1 };
         uint64_t generation = 0;
+        uint64_t origin_operation_ordinal = 0;
         uint64_t last_use = 0;
         uint32_t hot_refs = 0;
         uint32_t transfer_refs = 0;
@@ -137,6 +138,7 @@ public:
             const llm_cold_reference * references,
             size_t reference_count,
             llm_cold_reference_kind kind) noexcept;
+    bool ready(llm_cold_reference reference) const noexcept;
     llm_expert_provider_result cleanup_failed_slots() noexcept;
     llm_expert_provider_result policy_request_begin() noexcept;
     llm_expert_provider_result policy_set_ubatch_ordinal(uint64_t ordinal) noexcept;

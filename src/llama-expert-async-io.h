@@ -40,6 +40,7 @@ struct llm_expert_async_config {
     int32_t first_read_cqe_result_for_testing = 0;
     uint32_t hide_cqes_after_cancel_polls_for_testing = 0;
     uint32_t delay_cq_drain_ms_for_testing = 0;
+    bool reverse_queued_requests_for_testing = false;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {

@@ -1005,6 +1005,9 @@ llm_expert_cache_policy_result llm_expert_cache_policy::unpin(uint32_t slot, uin
     const auto capacity = preflight_events();
     if (!capacity.is_ready()) return capacity;
     slots[slot].pin_count--;
+    if (config.policy == LLAMA_EXPERT_CACHE_POLICY_SLRU) {
+        enforce_protected_capacity(slots[slot].domain);
+    }
     const auto result = append_event(llm_expert_cache_policy_event_type::unpin, slots[slot].key, 0,
         slots[slot].logical_bundle_bytes, slots[slot].physical_slot_footprint_bytes, slot, generation);
     if (!result.is_ready()) slots[slot].pin_count++;

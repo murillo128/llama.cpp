@@ -1,7 +1,9 @@
 #include "llama-cold-expert-cache.h"
+#include "llama-expert-async-io.h"
 
 #include "ggml-cpp.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -247,6 +249,88 @@ void test_two_phase_publication_and_failure() {
     GGML_ASSERT(cache.cleanup_failed_slots().is_ready());
 }
 
+void test_reversed_two_phase_publication() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    llm_cold_reference first, second;
+    bool hit = true;
+    GGML_ASSERT(cache.reserve_or_find({ 0, 0 }, first, hit).is_ready() && !hit);
+    GGML_ASSERT(cache.reserve_or_find({ 0, 1 }, second, hit).is_ready() && !hit);
+    GGML_ASSERT(cache.publish_ready({ 0, 1 }, second).is_ready());
+    GGML_ASSERT(!cache.ready(second));
+    auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.publications == 0 &&
+        diagnostics.slots[second.slot].state == llm_cold_slot_state::loading);
+    GGML_ASSERT(cache.publish_ready({ 0, 0 }, first).is_ready());
+    GGML_ASSERT(cache.ready(first) && cache.ready(second));
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.publications == 2 && diagnostics.admissions == 2);
+    GGML_ASSERT(cache.acquire(second, llm_cold_reference_kind::request).is_ready());
+    GGML_ASSERT(cache.release(second, llm_cold_reference_kind::request).is_ready());
+}
+
+struct reversed_read_override : llm_expert_async_read_override {
+    int64_t read_at(intptr_t, void * destination, size_t byte_count, uint64_t file_offset,
+            int & native_error) noexcept override {
+        std::memset(destination, int(file_offset + 1), byte_count);
+        native_error = 0;
+        return int64_t(byte_count);
+    }
+};
+
+void test_wait_any_reversed_publication() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    llm_cold_reference references[2];
+    bool hit = true;
+    GGML_ASSERT(cache.reserve_or_find({ 0, 0 }, references[0], hit).is_ready() && !hit);
+    GGML_ASSERT(cache.reserve_or_find({ 0, 1 }, references[1], hit).is_ready() && !hit);
+
+    reversed_read_override reader;
+    llm_expert_async_config async_config = {
+        8, 2, 2, 16, 1U << 20, 0, 4096, true, 0, &reader,
+    };
+    async_config.reverse_queued_requests_for_testing = true;
+    llm_expert_async_transport transport(async_config);
+    std::array<std::array<uint8_t, 8>, 2> destinations{};
+    std::array<llm_expert_storage_read_operation, 2> reads{};
+    std::array<llm_expert_async_operation_identity, 2> identities{};
+    for (uint32_t index = 0; index < 2; ++index) {
+        reads[index].native_handle = 0;
+        reads[index].source_size = 16;
+        reads[index].file_offset = index*8;
+        reads[index].byte_count = destinations[index].size();
+        reads[index].segment_count = 1;
+        reads[index].segments[0] = { destinations[index].data(), destinations[index].size(),
+            reads[index].file_offset, llm_expert_storage_projection::up,
+            llm_expert_storage_sidecar::weight };
+        identities[index] = { 1, { index, 1 }, 0, { 0, int32_t(index) },
+            llm_expert_readiness::host_ready, llm_expert_priority::demand_current_layer };
+        GGML_ASSERT(transport.submit_read_plan(identities[index], &reads[index], 1, true) ==
+            llm_expert_async_result::ready);
+    }
+    transport.start_deferred_reads();
+    const std::array<llm_expert_request_handle, 2> handles = {
+        identities[1].request, identities[0].request,
+    };
+    llm_expert_request_handle completed;
+    llm_expert_async_read_completion completion;
+    GGML_ASSERT(transport.wait_any_read(handles.data(), handles.size(), completed, completion) ==
+        llm_expert_async_result::ready);
+    GGML_ASSERT(completed.slot == 1);
+    GGML_ASSERT(transport.release_read(completed) == llm_expert_async_result::ready);
+    GGML_ASSERT(cache.publish_ready({ 0, 1 }, references[1]).is_ready());
+    GGML_ASSERT(!cache.ready(references[1]));
+    GGML_ASSERT(transport.wait_any_read(handles.data(), handles.size(), completed, completion) ==
+        llm_expert_async_result::ready);
+    GGML_ASSERT(completed.slot == 0);
+    GGML_ASSERT(transport.release_read(completed) == llm_expert_async_result::ready);
+    GGML_ASSERT(cache.publish_ready({ 0, 0 }, references[0]).is_ready());
+    GGML_ASSERT(cache.ready(references[0]) && cache.ready(references[1]));
+}
+
 void test_lru_references_and_inclusion() {
     fixture tensors;
     llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
@@ -373,6 +457,8 @@ int main() {
     test_configuration_and_budget_edges();
     test_publication_hits_and_copy_failure();
     test_two_phase_publication_and_failure();
+    test_reversed_two_phase_publication();
+    test_wait_any_reversed_publication();
     test_lru_references_and_inclusion();
     test_cpu_execution_reference_lifetime();
     test_generation_wrap_and_reinitialize();

@@ -578,6 +578,17 @@ void test_slru_pinned_blocked_demotion() {
     }
     require(policy.diagnostics().pinned_blocked_demotions == 1,
         "pinned protected overflow is counted without illegal demotion");
+    require(policy.unpin(0, 1).is_ready(), "release first protected pin");
+    require(policy.domain_diagnostics()[0].protected_occupancy_bytes == 128,
+        "unpin reconciles protected occupancy to its byte budget");
+    require(policy.unpin(1, 1).is_ready(), "release second protected pin");
+    demand(policy, 0, 2);
+    const llm_expert_cache_policy_candidate candidates[] = {
+        candidate(0, 1, 0, 0, false, true), candidate(1, 1, 0, 1, false, true),
+    };
+    llm_expert_cache_policy_decision decision;
+    require(policy.select({ 0, 2 }, candidates, 2, decision).is_ready() && decision.slot == 0,
+        "post-unpin victim selection observes the reconciled probationary segment");
 }
 
 void test_lfu_aging_and_per_layer() {
