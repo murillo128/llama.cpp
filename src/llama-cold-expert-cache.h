@@ -20,6 +20,7 @@ enum class llm_cold_reference_kind {
     hot,
     transfer,
     request,
+    cpu_execution,
 };
 
 struct llm_cold_reference {
@@ -77,6 +78,8 @@ struct llm_cold_cache_diagnostics {
     uint64_t peak_transfer_refs = 0;
     uint64_t current_request_refs = 0;
     uint64_t peak_request_refs = 0;
+    uint64_t current_cpu_execution_refs = 0;
+    uint64_t peak_cpu_execution_refs = 0;
 
     struct slot {
         llm_expert_key key = { -1, -1 };
@@ -85,6 +88,7 @@ struct llm_cold_cache_diagnostics {
         uint32_t hot_refs = 0;
         uint32_t transfer_refs = 0;
         uint32_t request_refs = 0;
+        uint32_t cpu_execution_refs = 0;
         llm_cold_slot_state state = llm_cold_slot_state::free;
     };
     std::vector<slot> slots;

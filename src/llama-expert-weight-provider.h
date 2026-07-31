@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "llama.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -102,6 +103,15 @@ struct llm_expert_selection {
     llm_expert_provider_result validate() const;
 };
 
+// Validates the internal Phase 8 two-branch representation. Logical/public
+// routes are validated separately and never permit negative IDs.
+llm_expert_provider_result llm_validate_hybrid_execution_ids(
+        const int32_t * gpu_ids,
+        const int32_t * cpu_ids,
+        size_t count,
+        int32_t gpu_capacity,
+        int32_t cpu_capacity) noexcept;
+
 struct llm_expert_graph_binding {
     const void * provider_identity = nullptr;
     int32_t layer = -1;
@@ -119,6 +129,16 @@ struct llm_expert_graph_binding {
     uint64_t graph_epoch = 0;
     bool bootstrap = false;
     ggml_tensor * logical_ids = nullptr;
+
+    // Present only for the Phase 8 hybrid graph. The existing fields above
+    // remain the GPU/default branch so PROMOTE_AND_GPU retains its Phase 7
+    // aggregate layout and graph shape.
+    llm_expert_projection_descriptor cpu_up;
+    llm_expert_projection_descriptor cpu_gate;
+    llm_expert_projection_descriptor cpu_gate_up;
+    llm_expert_projection_descriptor cpu_down;
+    ggml_tensor * cpu_execution_ids = nullptr;
+    bool hybrid = false;
 
     bool uses_merged_gate_up() const;
     llm_expert_provider_result validate(const llm_expert_selection & selection) const;
@@ -152,6 +172,11 @@ struct llm_expert_provider_stats {
 };
 
 struct llm_hot_cache_diagnostics {
+    llama_expert_miss_policy configured_miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
+    bool background_promotion_configured = false;
+    uint32_t auto_cost_model_version = 0;
+    uint64_t auto_cost_model_digest = 0;
+    uint64_t hybrid_bindings = 0;
     uint32_t requested_capacity = 0;
     uint32_t effective_capacity = 0;
     uint64_t pool_bytes = 0;
@@ -243,6 +268,8 @@ struct llm_hot_cache_diagnostics {
     uint64_t cold_peak_transfer_refs = 0;
     uint64_t cold_current_request_refs = 0;
     uint64_t cold_peak_request_refs = 0;
+    uint64_t cold_current_cpu_execution_refs = 0;
+    uint64_t cold_peak_cpu_execution_refs = 0;
     uint64_t ring_requested_bytes = 0;
     uint64_t ring_actual_bytes = 0;
     uint64_t ring_lane_footprint = 0;
@@ -456,6 +483,7 @@ public:
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     virtual bool needs_post_reserve_initialization() const noexcept { return false; }
+    virtual bool uses_hybrid_graph() const noexcept { return false; }
     virtual llm_expert_provider_result initialize_after_reserve() noexcept {
         return llm_expert_provider_result::success();
     }
@@ -541,6 +569,10 @@ struct llm_hot_cache_config {
     llm_expert_async_transport * async_transport = nullptr;
     llm_expert_scheduler * scheduler = nullptr;
     uint32_t trace_capacity = 256;
+    llama_expert_miss_policy miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
+    bool background_promotion = false;
+    llama_expert_auto_cost_model auto_cost_model = {};
+    uint64_t auto_cost_model_digest = 0;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(

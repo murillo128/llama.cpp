@@ -317,6 +317,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!ok) {
             return {-1, nullptr};
         }
+        const bool hybrid_expert_policy =
+            params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
+            params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
+        if (hybrid_expert_policy &&
+            (model_ptr->devices.size() != 1 ||
+             (model_ptr->devices.front().is_meta && model_ptr->get_split_state_ud.n_devices > 1))) {
+            throw std::invalid_argument("hybrid expert miss policies require exactly one accelerator device");
+        }
 
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
         if (model == nullptr) {

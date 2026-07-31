@@ -561,6 +561,26 @@ llm_expert_provider_result llm_expert_selection::validate() const {
     return llm_expert_provider_result::success();
 }
 
+llm_expert_provider_result llm_validate_hybrid_execution_ids(
+        const int32_t * gpu_ids,
+        const int32_t * cpu_ids,
+        size_t count,
+        int32_t gpu_capacity,
+        int32_t cpu_capacity) noexcept {
+    if (gpu_ids == nullptr || cpu_ids == nullptr || count == 0 || gpu_capacity <= 0 || cpu_capacity <= 0) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_selection);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const bool gpu_active = gpu_ids[i] >= 0 && gpu_ids[i] < gpu_capacity;
+        const bool cpu_active = cpu_ids[i] >= 0 && cpu_ids[i] < cpu_capacity;
+        if (gpu_ids[i] < -1 || cpu_ids[i] < -1 || gpu_ids[i] >= gpu_capacity || cpu_ids[i] >= cpu_capacity ||
+            gpu_active == cpu_active) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_selection);
+        }
+    }
+    return llm_expert_provider_result::success();
+}
+
 bool llm_expert_graph_binding::uses_merged_gate_up() const {
     return gate_up.weight != nullptr;
 }
@@ -574,6 +594,20 @@ llm_expert_provider_result llm_expert_graph_binding::validate(const llm_expert_s
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
     }
     if (down.weight == nullptr || (uses_merged_gate_up() ? (up.weight != nullptr || gate.weight != nullptr) : up.weight == nullptr)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    }
+    if (hybrid) {
+        const bool cpu_merged = cpu_gate_up.weight != nullptr;
+        if (cpu_execution_ids == nullptr || cpu_execution_ids == execution_ids ||
+            cpu_execution_ids == logical_ids || cpu_execution_ids->type != GGML_TYPE_I32 ||
+            cpu_execution_ids->ne[0] != selection.n_expert_used ||
+            cpu_execution_ids->ne[1] != selection.n_tokens || cpu_down.weight == nullptr ||
+            cpu_merged != uses_merged_gate_up() ||
+            (cpu_merged ? (cpu_up.weight != nullptr || cpu_gate.weight != nullptr) : cpu_up.weight == nullptr)) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+        }
+    } else if (cpu_execution_ids != nullptr || cpu_up.weight != nullptr || cpu_gate.weight != nullptr ||
+               cpu_gate_up.weight != nullptr || cpu_down.weight != nullptr) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
     }
     return llm_expert_provider_result::success();
@@ -771,18 +805,14 @@ public:
             return result;
         }
 
-        binding = {
-            this,
-            bundle.layer,
-            bundle.up,
-            bundle.gate,
-            bundle.gate_up,
-            bundle.down,
-            selection.logical_ids,
-            {},
-            0,
-            false,
-        };
+        binding = {};
+        binding.provider_identity = this;
+        binding.layer = bundle.layer;
+        binding.up = bundle.up;
+        binding.gate = bundle.gate;
+        binding.gate_up = bundle.gate_up;
+        binding.down = bundle.down;
+        binding.execution_ids = selection.logical_ids;
         binding.logical_ids = selection.logical_ids;
         result = binding.validate(selection);
         if (result.is_ready()) {
@@ -1095,6 +1125,30 @@ public:
             config.force_pageable_transfer_for_testing || config.async_transport != nullptr || config.scheduler != nullptr)) {
             throw std::invalid_argument("cold-cache configuration outside cold mode");
         }
+        const bool hybrid_policy = config.miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
+            config.miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
+        if (config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU && !hybrid_policy) {
+            throw std::invalid_argument("invalid expert miss policy");
+        }
+        if (!config.cold_mode && (hybrid_policy || config.background_promotion ||
+                                  config.auto_cost_model.version != 0 || config.auto_cost_model_digest != 0)) {
+            throw std::invalid_argument("miss-policy configuration outside cold mode");
+        }
+        if (config.miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO) {
+            const auto & cost = config.auto_cost_model;
+            if (cost.version != LLAMA_EXPERT_AUTO_COST_MODEL_VERSION_1 ||
+                cost.struct_size != sizeof(llama_expert_auto_cost_model) || config.auto_cost_model_digest == 0 ||
+                cost.cpu_fixed_decode_ns == 0 || cost.cpu_fixed_prefill_ns == 0 ||
+                cost.cpu_per_lane_decode_ns == 0 || cost.cpu_per_lane_prefill_ns == 0 ||
+                cost.gpu_fixed_decode_ns == 0 || cost.gpu_fixed_prefill_ns == 0 ||
+                cost.gpu_per_lane_decode_ns == 0 || cost.gpu_per_lane_prefill_ns == 0 ||
+                cost.h2d_fixed_ns == 0 || cost.h2d_bytes_per_second == 0 ||
+                cost.decision_hysteresis_ns == 0) {
+                throw std::invalid_argument("invalid expert AUTO cost model");
+            }
+        } else if (config.auto_cost_model.version != 0 || config.auto_cost_model_digest != 0) {
+            throw std::invalid_argument("expert AUTO cost model supplied for a non-AUTO policy");
+        }
     }
 
     llm_expert_provider_result bind(
@@ -1154,43 +1208,58 @@ public:
         }
 
         if (!pool) {
-            binding = {
-                this,
-                bundle.layer,
-                bundle.up,
-                bundle.gate,
-                bundle.gate_up,
-                bundle.down,
-                selection.logical_ids,
-                {},
-                epoch,
-                true,
-            };
+            binding = {};
+            binding.provider_identity = this;
+            binding.layer = bundle.layer;
+            binding.up = bundle.up;
+            binding.gate = bundle.gate;
+            binding.gate_up = bundle.gate_up;
+            binding.down = bundle.down;
+            binding.execution_ids = selection.logical_ids;
+            binding.graph_epoch = epoch;
+            binding.bootstrap = true;
             counters.bootstrap_bindings++;
         } else {
             ggml_tensor * execution_ids = selection.logical_ids;
+            ggml_tensor * cpu_execution_ids = nullptr;
             if (graph_ctx != nullptr) {
                 execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
                 ggml_format_name(execution_ids, "expert_execution_ids-%d", bundle.layer);
+                if (config.cold_mode && config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
+                    cpu_execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                    ggml_format_name(cpu_execution_ids, "expert_cpu_execution_ids-%d", bundle.layer);
+                }
             }
-            binding = {
-                this,
-                bundle.layer,
-                pool->bundle.up,
-                pool->bundle.gate,
-                pool->bundle.gate_up,
-                pool->bundle.down,
-                execution_ids,
-                std::static_pointer_cast<void>(pool),
-                epoch,
-                false,
-            };
+            binding = {};
+            binding.provider_identity = this;
+            binding.layer = bundle.layer;
+            binding.up = pool->bundle.up;
+            binding.gate = pool->bundle.gate;
+            binding.gate_up = pool->bundle.gate_up;
+            binding.down = pool->bundle.down;
+            binding.execution_ids = execution_ids;
+            binding.generation_lease = std::static_pointer_cast<void>(pool);
+            binding.graph_epoch = epoch;
             counters.hot_bindings++;
+            if (cpu_execution_ids != nullptr) {
+                const auto & cpu = cold_cache->bundle();
+                binding.cpu_up = cpu.up;
+                binding.cpu_gate = cpu.gate;
+                binding.cpu_gate_up = cpu.gate_up;
+                binding.cpu_down = cpu.down;
+                binding.cpu_execution_ids = cpu_execution_ids;
+                binding.hybrid = true;
+                hybrid_bindings++;
+            }
         }
         binding.logical_ids = selection.logical_ids;
         successful_bindings++;
         result = binding.validate(selection);
         return result.is_ready() ? result : fail(result);
+    }
+
+    bool uses_hybrid_graph() const noexcept override {
+        return config.cold_mode && config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
     }
 
     llm_expert_provider_result prepare(
@@ -1369,6 +1438,11 @@ public:
             binding.execution_ids == nullptr || binding.execution_ids->ne[0] != int64_t(config.n_expert_used) ||
             binding.execution_ids->ne[1] < 0) {
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding));
+        }
+        if (binding.hybrid) {
+            // Phase 8.1 establishes the graph/operator seam only. Phase 8.2
+            // replaces this explicit failure with one frozen two-branch plan.
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration));
         }
 
         const auto execution_device = execution_backend == nullptr ? nullptr :
@@ -2284,6 +2358,11 @@ public:
     llm_hot_cache_diagnostics hot_cache_diagnostics() const override {
         std::lock_guard<std::mutex> lock(mutex);
         llm_hot_cache_diagnostics result;
+        result.configured_miss_policy = config.miss_policy;
+        result.background_promotion_configured = config.background_promotion;
+        result.auto_cost_model_version = config.auto_cost_model.version;
+        result.auto_cost_model_digest = config.auto_cost_model_digest;
+        result.hybrid_bindings = hybrid_bindings;
         result.requested_capacity = config.capacity;
         result.effective_capacity = pool ? config.capacity : 0;
         result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
@@ -2390,6 +2469,8 @@ public:
             result.cold_peak_transfer_refs = cold.peak_transfer_refs;
             result.cold_current_request_refs = cold.current_request_refs;
             result.cold_peak_request_refs = cold.peak_request_refs;
+            result.cold_current_cpu_execution_refs = cold.current_cpu_execution_refs;
+            result.cold_peak_cpu_execution_refs = cold.peak_cpu_execution_refs;
         }
         if (transfer_ring) {
             const auto ring = transfer_ring->diagnostics();
@@ -2787,6 +2868,15 @@ private:
         if (!result.is_ready()) {
             return result;
         }
+        if (config.cold_mode && config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU &&
+            !config.allow_non_cuda_target_for_testing) {
+            for (const auto * projection : { &bundle.up, &bundle.gate, &bundle.gate_up, &bundle.down }) {
+                if (projection->weight != nullptr && projection->weight->type != GGML_TYPE_F16 &&
+                    projection->weight->type != GGML_TYPE_MXFP4) {
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+                }
+            }
+        }
         if (config.cold_mode && config.storage != nullptr) {
             return result;
         }
@@ -2945,6 +3035,7 @@ private:
     uint64_t execution_id_write_bytes = 0;
     uint64_t scratch_reservations = 0;
     uint64_t synchronization_checkpoints = 0;
+    uint64_t hybrid_bindings = 0;
     uint64_t cold_bundle_payload = 0;
     uint32_t transfer_lane_capacity = 0;
 };

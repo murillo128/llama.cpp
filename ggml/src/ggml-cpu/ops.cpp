@@ -721,6 +721,7 @@ static void ggml_compute_forward_add_id_f32(
     const int nth = params->nth;
 
     const int nr  = ggml_nrows(src0);
+    const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
 
     GGML_TENSOR_TERNARY_OP_LOCALS
 
@@ -743,6 +744,12 @@ static void ggml_compute_forward_add_id_f32(
         // src1 indices
         const int i11 = *(int32_t *) ((char *) src2->data + i1*nb20 + i2*nb21);
 
+        if (allow_inactive && i11 == -1) {
+            ggml_vec_cpy_f32(ne0,
+                    (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1),
+                    (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01));
+            continue;
+        }
         GGML_ASSERT(i11 >= 0 && i11 < ne11);
 
         ggml_vec_add_f32(ne0,
@@ -4984,6 +4991,7 @@ static void ggml_compute_forward_get_rows_f32(
 
     const int64_t nc = ne00;
     const int64_t nr = ggml_nelements(src1);
+    const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
 
     assert(ne0  == nc);
     assert(ne02 == ne11);
@@ -5006,6 +5014,10 @@ static void ggml_compute_forward_get_rows_f32(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+        if (allow_inactive && i01 == -1) {
+            ggml_vec_set_f32(nc, (float *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3), 0.0f);
+            continue;
+        }
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_vec_cpy_f32(nc,
@@ -5019,6 +5031,8 @@ void ggml_compute_forward_get_rows(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+    const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
+    GGML_ASSERT(!allow_inactive || src0->type == GGML_TYPE_F32);
 
     switch (src0->type) {
         case GGML_TYPE_Q1_0:

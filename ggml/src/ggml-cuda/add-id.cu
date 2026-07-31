@@ -2,10 +2,11 @@
 
 static __global__ void add_id_kernel(
         const float * src0, const float * src1, const int32_t * src2, float * dst,
-        int64_t ne0, int64_t ne1,
+        int64_t ne0, int64_t ne1, int64_t n_bias_rows,
         size_t nb01, size_t nb02,
         size_t nb11,
-        size_t nb21
+        size_t nb21,
+        bool allow_inactive
     ) {
 
     const int64_t i1 = blockIdx.x;
@@ -18,10 +19,13 @@ static __global__ void add_id_kernel(
 
     float * dst_row = (float *)((char *)dst + i1*nb1 + i2*nb2);
     const float * src0_row = (const float *)((const char *)src0 +  i1*nb01 + i2*nb02);
-    const float * src1_row = (const float *)((const char *)src1 + i11*nb11);
+    if (!((i11 >= 0 && i11 < n_bias_rows) || (allow_inactive && i11 == -1))) {
+        __trap();
+    }
+    const float * src1_row = i11 >= 0 ? (const float *)((const char *)src1 + i11*nb11) : nullptr;
 
     for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
-        dst_row[i0] = src0_row[i0] + src1_row[i0];
+        dst_row[i0] = i11 == -1 ? src0_row[i0] : src0_row[i0] + src1_row[i0];
     }
 }
 
@@ -45,14 +49,16 @@ void ggml_cuda_op_add_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float * src1_d = (const float *)src1->data;
     const int32_t * src2_d = (const int32_t *)src2->data;
     float * dst_d = (float *)dst->data;
+    const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
 
     int threads = std::min((int)ne00, 768); // cols
     dim3 blocks(ne01, ne02); // n_experts_used, n_tokens
     add_id_kernel<<<blocks, threads, 0, ctx.stream()>>>(
         src0_d, src1_d, src2_d, dst_d,
-        ne0, ne1,
+        ne0, ne1, ne11,
         nb01, nb02,
         nb11,
-        nb21
+        nb21,
+        allow_inactive
     );
 }

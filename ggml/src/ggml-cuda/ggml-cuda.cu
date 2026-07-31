@@ -1679,6 +1679,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     const bool is_mul_mat     = ffn_up->op == GGML_OP_MUL_MAT     && ffn_gate->op == GGML_OP_MUL_MAT     && glu->op == GGML_OP_GLU;
     const bool is_mul_mat_id  = ffn_up->op == GGML_OP_MUL_MAT_ID  && ffn_gate->op == GGML_OP_MUL_MAT_ID  && glu->op == GGML_OP_GLU;
 
+    if (is_mul_mat_id && (ffn_up->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0 ||
+                          ffn_gate->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0)) {
+        return false;
+    }
+
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
@@ -1759,6 +1764,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const ggml_tensor * dst  = tensor;
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+    if (is_mul_mat_id && tensor->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0) {
+        return false;
+    }
 
     bool use_mul_mat_vec_f =
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
@@ -1784,6 +1792,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+    if (tensor->op == GGML_OP_MUL_MAT_ID &&
+        tensor->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0) {
+        return false;
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -1862,9 +1874,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (!allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -1909,7 +1922,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
     std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
+    ids_to_sorted_host.reserve(ne_get_rows);
     std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
@@ -1923,35 +1936,56 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    std::vector<uint8_t> inactive(ne_get_rows, 0);
+    for (int64_t i12 = 0; i12 < ne12; ++i12) {
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int64_t lane = i12*n_expert_used + iex;
+            const int32_t expert = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+            GGML_ASSERT((expert >= 0 && expert < ne02) || (allow_inactive && expert == -1));
+            inactive[lane] = expert == -1;
+        }
+    }
+
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
                 }
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    const int32_t zero_row = int32_t(ids_to_sorted_host.size());
+    for (int64_t lane = 0; lane < ne_get_rows; ++lane) {
+        if (inactive[lane]) {
+            ids_from_sorted_host[lane] = zero_row;
+        }
+    }
+    GGML_ASSERT(ids_to_sorted_host.size() + std::count(inactive.begin(), inactive.end(), uint8_t(1)) ==
+        size_t(ne_get_rows));
 
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
+    std::vector<int32_t> ids_combined(2*ne_get_rows, 0);
+    std::copy(ids_to_sorted_host.begin(), ids_to_sorted_host.end(), ids_combined.begin());
+    std::copy(ids_from_sorted_host.begin(), ids_from_sorted_host.end(), ids_combined.begin() + ne_get_rows);
 
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_combined.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
 
-    get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
-        ne10, nb11, nb12, nb13,
-        ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
-        ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
-    CUDA_CHECK(cudaGetLastError());
+    const int64_t active_rows = ids_to_sorted_host.size();
+    CUDA_CHECK(cudaMemsetAsync(dst_sorted.ptr, 0, ne2*n_expert_used*ne0*ts_dst_sorted, stream));
+    if (active_rows > 0) {
+        get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
+            ne10, nb11, nb12, nb13,
+            active_rows, 1, 1, sizeof(int32_t), active_rows*sizeof(int32_t), active_rows*sizeof(int32_t),
+            ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;

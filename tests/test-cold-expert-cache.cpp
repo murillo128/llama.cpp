@@ -205,6 +205,32 @@ void test_lru_references_and_inclusion() {
     GGML_ASSERT(cache.surrender().is_ready());
 }
 
+void test_cpu_execution_reference_lifetime() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 1), 1));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    llm_cold_reference executing;
+    GGML_ASSERT(cache.find_or_admit({ 0, 0 }, tensors.bundle(), executing).is_ready());
+    GGML_ASSERT(cache.acquire(executing, llm_cold_reference_kind::cpu_execution).is_ready());
+    auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.current_cpu_execution_refs == 1);
+    GGML_ASSERT(diagnostics.peak_cpu_execution_refs == 1);
+
+    llm_cold_reference blocked;
+    GGML_ASSERT(cache.find_or_admit({ 0, 1 }, tensors.bundle(), blocked).error ==
+        llm_expert_provider_error::busy);
+    GGML_ASSERT(cache.trim().is_ready());
+    GGML_ASSERT(cache.diagnostics().slots[executing.slot].state == llm_cold_slot_state::ready);
+    GGML_ASSERT(cache.surrender().error == llm_expert_provider_error::busy);
+
+    GGML_ASSERT(cache.release(executing, llm_cold_reference_kind::cpu_execution).is_ready());
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.current_cpu_execution_refs == 0);
+    GGML_ASSERT(diagnostics.peak_cpu_execution_refs == 1);
+    GGML_ASSERT(cache.trim().is_ready());
+    GGML_ASSERT(cache.surrender().is_ready());
+}
+
 void test_generation_wrap_and_reinitialize() {
     fixture tensors;
     llm_cold_expert_cache exhausted(config(discover_budget(tensors), 1,
@@ -282,6 +308,7 @@ int main() {
     test_publication_hits_and_copy_failure();
     test_two_phase_publication_and_failure();
     test_lru_references_and_inclusion();
+    test_cpu_execution_reference_lifetime();
     test_generation_wrap_and_reinitialize();
     test_loader_publication_failure_cleanup_and_reread();
     std::cout << "cold expert cache tests passed\n";

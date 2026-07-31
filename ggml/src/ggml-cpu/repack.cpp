@@ -4789,6 +4789,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             //}
             // may be possible if Q8_0 packed...
         } else if (op->op == GGML_OP_MUL_MAT_ID
+                && op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == 0
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
                 && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()

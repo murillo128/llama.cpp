@@ -2,6 +2,35 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+static __global__ void k_get_rows_inactive_f32(
+        const float * __restrict__ src0, const int32_t * __restrict__ src1, float * __restrict__ dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_sync();
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm = fast_div_modulo((uint32_t) z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        if (i01 < -1 || i01 >= ne01) {
+            __trap();
+        }
+        float * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
+            if (i01 == -1) {
+                dst_row[i00] = 0.0f;
+            } else {
+                const float * src0_row = (const float *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+                dst_row[i00] = src0_row[i00];
+            }
+        }
+    }
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -449,6 +478,23 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
+    if (allow_inactive) {
+        GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+        const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+        const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+        const uint3 ne12_fdv = init_fastdiv_values(ne12);
+        const ggml_cuda_kernel_launch_params launch_params = { block_nums, block_dims, 0, stream };
+        ggml_cuda_kernel_launch(k_get_rows_inactive_f32, launch_params,
+            (const float *) src0->data, (const int32_t *) src1->data, (float *) dst->data,
+            ne00, ne01, ne11, ne12_fdv,
+            nb1/sizeof(float), nb2/sizeof(float), nb3/sizeof(float),
+            nb01, nb02, nb03,
+            nb10/sizeof(int32_t), nb11/sizeof(int32_t), nb12/sizeof(int32_t));
+        return;
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

@@ -357,6 +357,36 @@ extern "C" {
         LLAMA_EXPERT_WEIGHTS_MODE_COUNT = 4,
     };
 
+    enum llama_expert_miss_policy {
+        LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU = 0,
+        LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK    = 1,
+        LLAMA_EXPERT_MISS_POLICY_AUTO            = 2,
+        LLAMA_EXPERT_MISS_POLICY_COUNT           = 3,
+    };
+
+    enum {
+        LLAMA_EXPERT_AUTO_COST_MODEL_VERSION_1 = 1,
+    };
+
+    // Immutable caller-supplied inputs for the experimental v1 miss-policy
+    // evaluator. The model copies this structure during load and never retains
+    // the caller's pointer.
+    struct llama_expert_auto_cost_model {
+        uint32_t version;
+        uint32_t struct_size;
+        uint64_t cpu_fixed_decode_ns;
+        uint64_t cpu_fixed_prefill_ns;
+        uint64_t cpu_per_lane_decode_ns;
+        uint64_t cpu_per_lane_prefill_ns;
+        uint64_t gpu_fixed_decode_ns;
+        uint64_t gpu_fixed_prefill_ns;
+        uint64_t gpu_per_lane_decode_ns;
+        uint64_t gpu_per_lane_prefill_ns;
+        uint64_t h2d_fixed_ns;
+        uint64_t h2d_bytes_per_second;
+        uint64_t decision_hysteresis_ns;
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -373,6 +403,9 @@ extern "C" {
         uint64_t expert_transfer_ring_bytes; // bounded transfer staging budget [EXPERIMENTAL]
         uint32_t expert_io_queue_depth; // bounded asynchronous I/O queue depth [EXPERIMENTAL]
         uint64_t expert_io_staging_bytes; // bounded direct-I/O staging budget [EXPERIMENTAL]
+        enum llama_expert_miss_policy expert_miss_policy; // explicit demand-miss execution policy [EXPERIMENTAL]
+        bool expert_background_promotion; // promote CPU-served demand keys for later use [EXPERIMENTAL]
+        const struct llama_expert_auto_cost_model * expert_auto_cost_model; // copied at model load [EXPERIMENTAL]
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

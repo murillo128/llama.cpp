@@ -1564,6 +1564,7 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+    const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
 
     void * wdata_cur = params->wdata;
 
@@ -1628,7 +1629,11 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (allow_inactive && i02 == -1) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
+                GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;

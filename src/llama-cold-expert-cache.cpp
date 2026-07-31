@@ -249,7 +249,8 @@ struct llm_cold_expert_cache::impl {
     }
 
     bool no_refs(const llm_cold_cache_diagnostics::slot & slot) const {
-        return slot.hot_refs == 0 && slot.transfer_refs == 0 && slot.request_refs == 0;
+        return slot.hot_refs == 0 && slot.transfer_refs == 0 && slot.request_refs == 0 &&
+            slot.cpu_execution_refs == 0;
     }
 
     void clear_forward(uint32_t slot) {
@@ -424,7 +425,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
     slot.key = key;
     slot.generation++;
     slot.last_use = 0;
-    slot.hot_refs = slot.transfer_refs = slot.request_refs = 0;
+    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     reference = { uint32_t(victim), slot.generation };
@@ -532,7 +533,7 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
     slot.key = key;
     slot.generation++;
     slot.last_use = 0;
-    slot.hot_refs = slot.transfer_refs = slot.request_refs = 0;
+    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     reference = { uint32_t(victim), slot.generation };
@@ -580,8 +581,12 @@ llm_expert_provider_result llm_cold_expert_cache::acquire(
         counter = &slot.hot_refs; current = &pimpl->counters.current_hot_refs; peak = &pimpl->counters.peak_hot_refs;
     } else if (kind == llm_cold_reference_kind::transfer) {
         counter = &slot.transfer_refs; current = &pimpl->counters.current_transfer_refs; peak = &pimpl->counters.peak_transfer_refs;
-    } else {
+    } else if (kind == llm_cold_reference_kind::request) {
         counter = &slot.request_refs; current = &pimpl->counters.current_request_refs; peak = &pimpl->counters.peak_request_refs;
+    } else {
+        counter = &slot.cpu_execution_refs;
+        current = &pimpl->counters.current_cpu_execution_refs;
+        peak = &pimpl->counters.peak_cpu_execution_refs;
     }
     if (*counter == std::numeric_limits<uint32_t>::max()) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
@@ -604,8 +609,10 @@ llm_expert_provider_result llm_cold_expert_cache::release(
         counter = &slot.hot_refs; current = &pimpl->counters.current_hot_refs;
     } else if (kind == llm_cold_reference_kind::transfer) {
         counter = &slot.transfer_refs; current = &pimpl->counters.current_transfer_refs;
-    } else {
+    } else if (kind == llm_cold_reference_kind::request) {
         counter = &slot.request_refs; current = &pimpl->counters.current_request_refs;
+    } else {
+        counter = &slot.cpu_execution_refs; current = &pimpl->counters.current_cpu_execution_refs;
     }
     if (*counter == 0 || *current == 0) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);

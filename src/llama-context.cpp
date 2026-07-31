@@ -736,7 +736,7 @@ void llama_context::sched_reserve() {
             const size_t final_size = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
             LLAMA_LOG_DEBUG("%s: hot-cache workspace %s bootstrap=%zu final=%zu\n", __func__,
                 ggml_backend_name(backend_ptrs[i]), bootstrap_sizes[i], final_size);
-            if (final_size > bootstrap_sizes[i]) {
+            if (final_size > bootstrap_sizes[i] && !expert_weight_provider->uses_hybrid_graph()) {
                 abandon_pool();
                 throw std::runtime_error("persistent expert hot cache increased reserved compute workspace");
             }

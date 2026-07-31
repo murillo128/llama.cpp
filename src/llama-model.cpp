@@ -36,6 +36,7 @@
 #include <functional>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -1054,6 +1055,8 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    std::optional<llama_expert_auto_cost_model> expert_auto_cost_model_owned;
+    uint64_t expert_auto_cost_model_digest = 0;
 
     struct source_file_storage {
         std::string identity;
@@ -1090,6 +1093,46 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         throw std::invalid_argument("invalid expert weights mode");
     }
     const bool cold_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+    if (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU &&
+        params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK &&
+        params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_AUTO) {
+        throw std::invalid_argument("invalid expert miss policy");
+    }
+    const bool hybrid_policy = params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
+        params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
+    if (!cold_mode && (hybrid_policy || params.expert_background_promotion ||
+                       params.expert_auto_cost_model != nullptr)) {
+        throw std::invalid_argument("non-default expert miss configuration requires cold-cache mode");
+    }
+    if (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_AUTO &&
+        params.expert_auto_cost_model != nullptr) {
+        throw std::invalid_argument("expert AUTO cost model supplied for a non-AUTO policy");
+    }
+    if (params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO) {
+        if (params.expert_auto_cost_model == nullptr) {
+            throw std::invalid_argument("expert AUTO policy requires a cost model");
+        }
+        const auto & cost = *params.expert_auto_cost_model;
+        if (cost.version != LLAMA_EXPERT_AUTO_COST_MODEL_VERSION_1 ||
+            cost.struct_size != sizeof(llama_expert_auto_cost_model) ||
+            cost.cpu_fixed_decode_ns == 0 || cost.cpu_fixed_prefill_ns == 0 ||
+            cost.cpu_per_lane_decode_ns == 0 || cost.cpu_per_lane_prefill_ns == 0 ||
+            cost.gpu_fixed_decode_ns == 0 || cost.gpu_fixed_prefill_ns == 0 ||
+            cost.gpu_per_lane_decode_ns == 0 || cost.gpu_per_lane_prefill_ns == 0 ||
+            cost.h2d_fixed_ns == 0 || cost.h2d_bytes_per_second == 0 ||
+            cost.decision_hysteresis_ns == 0) {
+            throw std::invalid_argument("invalid expert AUTO cost model");
+        }
+        pimpl->expert_auto_cost_model_owned = cost;
+        this->params.expert_auto_cost_model = &*pimpl->expert_auto_cost_model_owned;
+        const auto * bytes = reinterpret_cast<const uint8_t *>(&cost);
+        uint64_t digest = UINT64_C(1469598103934665603);
+        for (size_t i = 0; i < sizeof(cost); ++i) {
+            digest ^= bytes[i];
+            digest *= UINT64_C(1099511628211);
+        }
+        pimpl->expert_auto_cost_model_digest = digest;
+    }
     if ((!cold_mode && (params.expert_cold_cache_bytes != 0 || params.expert_transfer_ring_bytes != 0)) ||
         (cold_mode && (params.expert_hot_cache_capacity == 0 || params.expert_cold_cache_bytes == 0 ||
                        params.expert_transfer_ring_bytes == 0))) {
@@ -1134,6 +1177,42 @@ void llama_model::init_expert_weight_provider() {
             if (target == nullptr || hparams.n_expert <= 0 || hparams.n_expert_used <= 0) {
                 throw std::invalid_argument("hot-cache mode requires routed experts and a CUDA target");
             }
+            const bool hybrid_policy = params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
+                params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
+            if (hybrid_policy) {
+                ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (cpu == nullptr) {
+                    throw std::invalid_argument("hybrid expert miss policies require a CPU backend");
+                }
+                auto cpu_supports = [&](const ggml_tensor * weight) {
+                    if (weight == nullptr) return true;
+                    if (weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_MXFP4) return false;
+                    ggml_init_params probe_params = {
+                        /*.mem_size   =*/ ggml_tensor_overhead()*5,
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    ggml_context_ptr probe(ggml_init(probe_params));
+                    if (!probe) throw std::runtime_error("failed to create CPU expert capability probe");
+                    ggml_tensor * probe_weight = ggml_new_tensor_3d(
+                        probe.get(), weight->type, weight->ne[0], weight->ne[1], weight->ne[2]);
+                    ggml_tensor * probe_input = ggml_new_tensor_3d(
+                        probe.get(), GGML_TYPE_F32, weight->ne[0], hparams.n_expert_used, 1);
+                    ggml_tensor * probe_ids = ggml_new_tensor_2d(
+                        probe.get(), GGML_TYPE_I32, hparams.n_expert_used, 1);
+                    ggml_tensor * op = ggml_mul_mat_id(probe.get(), probe_weight, probe_input, probe_ids);
+                    return ggml_backend_dev_supports_op(cpu, op);
+                };
+                for (const auto & layer : layers) {
+                    if (layer.ffn_down_exps == nullptr) continue;
+                    for (const ggml_tensor * weight : { layer.ffn_up_exps, layer.ffn_gate_exps,
+                            layer.ffn_gate_up_exps, layer.ffn_down_exps }) {
+                        if (!cpu_supports(weight)) {
+                            throw std::invalid_argument("hybrid expert miss policy routed type/layout lacks CPU mul_mat_id support");
+                        }
+                    }
+                }
+            }
             const uint64_t directory_entries = uint64_t(routed_layer_count)*uint32_t(hparams.n_expert);
             if (directory_entries > UINT32_MAX) {
                 throw std::overflow_error("hot-cache expert directory exceeds uint32_t capacity");
@@ -1155,6 +1234,12 @@ void llama_model::init_expert_weight_provider() {
                 config.async_transport = pimpl->expert_async_transport.get();
                 config.scheduler = pimpl->expert_scheduler.get();
                 config.trace_capacity = pimpl->expert_async_transport->diagnostics().trace_capacity;
+                config.miss_policy = params.expert_miss_policy;
+                config.background_promotion = params.expert_background_promotion;
+                if (params.expert_auto_cost_model != nullptr) {
+                    config.auto_cost_model = *params.expert_auto_cost_model;
+                    config.auto_cost_model_digest = pimpl->expert_auto_cost_model_digest;
+                }
                 pimpl->expert_weight_provider = llm_create_cold_cache_expert_weight_provider(config);
             } else {
                 pimpl->expert_weight_provider = llm_create_hot_cache_expert_weight_provider(config);
@@ -2810,6 +2895,9 @@ llama_model_params llama_model_default_params() {
         /*.expert_transfer_ring_bytes  =*/ 0,
         /*.expert_io_queue_depth       =*/ 0,
         /*.expert_io_staging_bytes     =*/ 0,
+        /*.expert_miss_policy          =*/ LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU,
+        /*.expert_background_promotion =*/ false,
+        /*.expert_auto_cost_model      =*/ nullptr,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

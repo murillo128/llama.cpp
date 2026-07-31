@@ -21,18 +21,14 @@ public:
             const llm_expert_selection & selection,
             llm_expert_graph_binding & binding) noexcept override {
         stats.bind_calls++;
-        binding = {
-            this,
-            bundle.layer,
-            bundle.up,
-            bundle.gate,
-            bundle.gate_up,
-            bundle.down,
-            selection.logical_ids,
-            {},
-            0,
-            false,
-        };
+        binding = {};
+        binding.provider_identity = this;
+        binding.layer = bundle.layer;
+        binding.up = bundle.up;
+        binding.gate = bundle.gate;
+        binding.gate_up = bundle.gate_up;
+        binding.down = bundle.down;
+        binding.execution_ids = selection.logical_ids;
         return llm_expert_provider_result::success();
     }
 
