@@ -187,6 +187,21 @@ void test_free_pin_failure_and_exhaustion() {
         active_load.request_end(false, true).is_ready(),
         "failed terminal precedes cancelled request end");
 
+    llm_expert_cache_policy multi_pin;
+    require(multi_pin.initialize(make_config(LLAMA_EXPERT_CACHE_POLICY_LRU),
+        llm_expert_cache_policy_tier::hot, layers, 1, 4, 1, 1, 128, 7).is_ready(),
+        "initialize multi-pin capacity fixture");
+    begin(multi_pin);
+    demand(multi_pin, 0, 0);
+    load(multi_pin, 0, 1, 0, 0);
+    require(multi_pin.pin(0, 1).is_ready() && multi_pin.pin(0, 1).is_ready(),
+        "acquire two policy pins");
+    const uint64_t pin_digest = multi_pin.diagnostics().state_digest;
+    require(multi_pin.validate_event_capacity(2).error ==
+            llm_expert_cache_policy_error::transcript_full &&
+            multi_pin.diagnostics().state_digest == pin_digest,
+        "multi-pin release preflight fails before any ownership mutation");
+
     llm_expert_cache_policy exhausted;
     require(exhausted.initialize(make_config(LLAMA_EXPERT_CACHE_POLICY_LRU),
         llm_expert_cache_policy_tier::hot, layers, 1, 4, 1, 1, 128, 8).is_ready(),
@@ -377,6 +392,91 @@ void test_lfru() {
     require(decision.slot == 1, "LFRU protects frequent recent key");
 }
 
+void test_batched_lfru_origin_demand() {
+    const int32_t layers[] = { 0 };
+    llm_expert_cache_policy policy;
+    require(policy.initialize(make_config(LLAMA_EXPERT_CACHE_POLICY_LFRU),
+        llm_expert_cache_policy_tier::hot, layers, 1, 4, 1, 2, 128, 128).is_ready(),
+        "initialize batched LFRU fixture");
+    begin(policy);
+    demand(policy, 0, 0);
+    load(policy, 0, 1, 0, 0);
+    demand(policy, 0, 1);
+    load(policy, 1, 1, 0, 1);
+    require(policy.set_resident_frequency_for_testing(0, 2, 0) &&
+        policy.set_resident_frequency_for_testing(1, 1, 0),
+        "seed discriminating LFRU frequencies");
+    demand(policy, 0, 0);
+    demand(policy, 0, 1);
+    demand(policy, 0, 2);
+    require(policy.hit(0, 1).is_ready() && policy.hit(1, 1).is_ready(),
+        "observe batched LFRU hits");
+    const llm_expert_cache_policy_candidate candidates[] = {
+        candidate(0, 1, 0, 0, false, true), candidate(1, 1, 0, 1, false, true),
+    };
+    llm_expert_cache_policy_decision decision;
+    require(policy.select({ 0, 2 }, candidates, 2, decision).is_ready() && decision.slot == 0,
+        "LFRU uses each key origin demand rather than the final batch ordinal");
+}
+
+void test_shuffled_terminal_order() {
+    const int32_t layers[] = { 0 };
+    auto run = [&](bool shuffled) {
+        llm_expert_cache_policy policy;
+        require(policy.initialize(make_config(LLAMA_EXPERT_CACHE_POLICY_LRU),
+            llm_expert_cache_policy_tier::hot, layers, 1, 4, 1, 2, 128, 64).is_ready(),
+            "initialize terminal-order fixture");
+        begin(policy);
+        demand(policy, 0, 0);
+        require(policy.load_begin(0, 1, { 0, 0 }, 64, 128).is_ready(), "begin terminal op one");
+        demand(policy, 0, 1);
+        require(policy.load_begin(1, 1, { 0, 1 }, 64, 128).is_ready(), "begin terminal op two");
+        if (shuffled) {
+            const size_t before = policy.transcript_size();
+            require(policy.load_complete(1, 1).is_ready() && policy.transcript_size() == before,
+                "later terminal waits for its operation ordinal");
+            require(policy.load_complete(0, 1).is_ready(), "earlier terminal flushes ordered queue");
+        } else {
+            require(policy.load_complete(0, 1).is_ready() && policy.load_complete(1, 1).is_ready(),
+                "serial terminals complete");
+        }
+        return policy;
+    };
+    const auto serial = run(false);
+    const auto shuffled = run(true);
+    require(serial.transcript_size() == shuffled.transcript_size() &&
+        serial.diagnostics().state_digest == shuffled.diagnostics().state_digest,
+        "shuffled terminals preserve transcript length and final digest");
+    for (size_t index = 0; index < serial.transcript_size(); ++index) {
+        const auto & lhs = serial.transcript()[index];
+        const auto & rhs = shuffled.transcript()[index];
+        require(lhs.type == rhs.type && lhs.event_sequence == rhs.event_sequence &&
+            lhs.origin_operation_ordinal == rhs.origin_operation_ordinal &&
+            lhs.slot == rhs.slot && lhs.generation == rhs.generation &&
+            lhs.state_digest == rhs.state_digest,
+            "shuffled terminals produce identical canonical events");
+    }
+}
+
+void test_frequency_window_digest_order() {
+    const int32_t layers[] = { 0 };
+    auto run = [&](const int32_t * sequence) {
+        llm_expert_cache_policy policy;
+        require(policy.initialize(make_config(LLAMA_EXPERT_CACHE_POLICY_SLRU,
+            LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL, 5000,
+            LLAMA_EXPERT_CACHE_ADMISSION_FREQUENCY_WINDOW, 64),
+            llm_expert_cache_policy_tier::hot, layers, 1, 8, 1, 1, 128, 64).is_ready(),
+            "initialize window-digest fixture");
+        begin(policy);
+        for (size_t index = 0; index < 6; ++index) demand(policy, 0, sequence[index]);
+        return policy.diagnostics().state_digest;
+    };
+    const int32_t first[] = { 0, 1, 0, 1, 2, 3 };
+    const int32_t second[] = { 1, 0, 0, 1, 2, 3 };
+    require(run(first) != run(second),
+        "digest distinguishes equal counts and last touches with different ring order");
+}
+
 void test_slru_and_optional_admission() {
     const int32_t layers[] = { 0 };
     llm_expert_cache_policy policy;
@@ -403,6 +503,12 @@ void test_slru_and_optional_admission() {
     require(policy.optional_admission({ 0, 2 }, llm_expert_cache_policy_admission::optional_background,
         candidates, 2, decision).is_ready(), "optional admission");
     require(decision.accept && decision.slot == 1, "higher window frequency replaces probationary incumbent");
+    const size_t event_count = policy.transcript_size();
+    require(event_count >= 2 && policy.transcript()[event_count - 2].type ==
+            llm_expert_cache_policy_event_type::victim_selected &&
+            policy.transcript()[event_count - 1].type ==
+            llm_expert_cache_policy_event_type::optional_admission,
+        "frequency-gated acceptance emits victim selection before admission");
 }
 
 void test_slru_prefill_and_rejection() {
@@ -541,6 +647,9 @@ int main() {
     test_always_optional_admission_event();
     test_heterogeneous_multi_victim_planning();
     test_lfru();
+    test_batched_lfru_origin_demand();
+    test_shuffled_terminal_order();
+    test_frequency_window_digest_order();
     test_slru_and_optional_admission();
     test_slru_prefill_and_rejection();
     test_slru_pinned_blocked_demotion();

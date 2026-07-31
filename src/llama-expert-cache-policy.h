@@ -263,6 +263,8 @@ private:
         uint32_t domain = UINT32_MAX;
         uint32_t pin_count = 0;
         segment current_segment = segment::none;
+        bool terminal_pending = false;
+        bool terminal_success = false;
         bool loading = false;
         bool resident = false;
     };
@@ -284,8 +286,9 @@ private:
     int64_t key_index(llm_expert_cache_policy_key key) const noexcept;
     uint32_t key_domain(llm_expert_cache_policy_key key) const noexcept;
     bool key_matches(llm_expert_cache_policy_key lhs, llm_expert_cache_policy_key rhs) const noexcept;
-    bool normalize_aging(slot_state & slot) noexcept;
+    bool normalize_aging(slot_state & slot, uint64_t current_demand_ordinal) noexcept;
     bool candidate_precedes(uint32_t lhs_slot, uint32_t rhs_slot) noexcept;
+    llm_expert_cache_policy_result flush_terminal_events() noexcept;
     void touch_slot(slot_state & slot) noexcept;
     void enforce_protected_capacity(uint32_t domain) noexcept;
     uint64_t hash_state() const noexcept;
@@ -307,5 +310,7 @@ private:
     std::vector<llm_expert_cache_policy_event> events;
     size_t event_write = 0;
     size_t reserved_terminal_events = 0;
+    uint64_t terminal_operation_ordinal = 0;
+    uint64_t frequency_window_state_digest = 0;
     llm_expert_cache_policy_diagnostics counters;
 };

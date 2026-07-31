@@ -2108,6 +2108,11 @@ public:
                     uint64_t remaining = 0;
                     const auto polled = transfer_ring->poll_h2d(record.lane, state, remaining);
                     if (!polled.is_ready()) {
+                        const auto ordered = finish_background_before_locked(record.origin_operation_ordinal);
+                        if (!ordered.is_ready()) {
+                            result = ordered;
+                            break;
+                        }
                         const auto released = transfer_ring->release_terminal_background(record.lane);
                         if (!released.is_ready()) {
                             result = released;
@@ -2224,15 +2229,21 @@ public:
                             execution_backend, background->hot_slot, background->hot_generation);
                         background_h2d_complete = result.is_ready();
                         if (!result.is_ready() && result.error == llm_expert_provider_error::copy_failed) {
-                            const auto terminalized =
-                                transfer_ring->release_terminal_background(background->lane);
-                            if (terminalized.is_ready()) {
-                                background->state = background_promotion_record::lifecycle::failed;
-                                discard_background_slot_locked(*background, false);
-                                background_dropped++;
-                                background = nullptr;
+                            const auto ordered = finish_background_before_locked(
+                                background->origin_operation_ordinal);
+                            if (ordered.is_ready()) {
+                                const auto terminalized =
+                                    transfer_ring->release_terminal_background(background->lane);
+                                if (terminalized.is_ready()) {
+                                    background->state = background_promotion_record::lifecycle::failed;
+                                    discard_background_slot_locked(*background, false);
+                                    background_dropped++;
+                                    background = nullptr;
+                                } else {
+                                    result = terminalized;
+                                }
                             } else {
-                                result = terminalized;
+                                result = ordered;
                             }
                         }
                         if (result.is_ready() && background != nullptr) {
@@ -2280,15 +2291,24 @@ public:
                                 llm_expert_provider_error::metadata_mismatch);
                         }
                         if (!result.is_ready() && background != nullptr && background_h2d_complete) {
-                            const auto terminalized =
-                                transfer_ring->release_terminal_background(background->lane);
-                            if (terminalized.is_ready()) {
-                                background->state = background_promotion_record::lifecycle::failed;
-                                discard_background_slot_locked(*background, false);
-                                background_dropped++;
+                            const auto ordered = finish_background_before_locked(
+                                background->origin_operation_ordinal);
+                            if (ordered.is_ready()) {
+                                const auto terminalized =
+                                    transfer_ring->release_terminal_background(background->lane);
+                                if (terminalized.is_ready()) {
+                                    background->state = background_promotion_record::lifecycle::failed;
+                                    discard_background_slot_locked(*background, false);
+                                    background_dropped++;
+                                } else {
+                                    result = terminalized;
+                                }
                             } else {
-                                result = terminalized;
+                                result = ordered;
                             }
+                        }
+                        if (result.is_ready() && background != nullptr) {
+                            result = finish_background_before_locked(background->origin_operation_ordinal);
                         }
                         if (result.is_ready() && background != nullptr) {
                             auto & entry = directory_slots[background->hot_slot];
@@ -2339,6 +2359,15 @@ public:
 
             size_t gpu_promotion_count = 0;
             transfer_bindings.clear();
+            bool needs_new_gpu_promotion = false;
+            for (size_t index = 0; index < miss_count; ++index) {
+                const uint32_t unique_index = miss_unique_indices[index];
+                needs_new_gpu_promotion = needs_new_gpu_promotion ||
+                    (unique_gpu_assignment[unique_index] && unique_slots[unique_index] < 0);
+            }
+            if (result.is_ready() && needs_new_gpu_promotion) {
+                result = finish_background_request_locked();
+            }
             for (size_t index = 0; index < miss_count && result.is_ready(); ++index) {
                 const uint32_t unique_index = miss_unique_indices[index];
                 if (!unique_gpu_assignment[unique_index] || unique_slots[unique_index] >= 0) continue;
@@ -2502,6 +2531,10 @@ public:
             }
         }
 
+        if (miss_count != 0 && config.background_promotion) {
+            const auto ordered = finish_background_request_locked();
+            if (!ordered.is_ready()) return fail(ordered);
+        }
         for (size_t index = 0; index < miss_count; ++index) {
             const uint32_t unique_index = miss_unique_indices[index];
             const uint32_t slot = candidate_slots[index];
@@ -4161,109 +4194,132 @@ private:
     llm_expert_provider_result reap_background_locked(
             std::unique_lock<std::mutex> * provider_lock) noexcept {
         if (!transfer_ring) return llm_expert_provider_result::success();
-        for (auto & record : background_promotions) {
-            if (!record.active) continue;
-            if (config.phase8_test_control != nullptr &&
-                config.phase8_test_control->consume_fault(
-                    llm_expert_phase8_test_fault::stale_generation,
-                    record.key, record.hot_generation)) {
-                const auto cancelled = transfer_ring->cancel_after_h2d(record.lane);
-                if (!cancelled.is_ready()) return cancelled;
-                record.state = background_promotion_record::lifecycle::failed;
-                discard_background_slot_locked(record, false);
-                background_dropped++;
-                continue;
+        background_promotion_record * earliest = nullptr;
+        for (auto & candidate : background_promotions) {
+            if (candidate.active && (earliest == nullptr ||
+                    candidate.origin_operation_ordinal < earliest->origin_operation_ordinal)) {
+                earliest = &candidate;
             }
-            llm_expert_same_key_h2d_state state = llm_expert_same_key_h2d_state::none;
-            uint64_t remaining = 0;
-            const auto polled = transfer_ring->poll_h2d(record.lane, state, remaining);
-            if (!polled.is_ready()) {
-                const auto released = transfer_ring->release_terminal_background(record.lane);
-                if (!released.is_ready()) return released;
-                record.state = background_promotion_record::lifecycle::failed;
-                discard_background_slot_locked(record, false);
-                background_dropped++;
-                continue;
-            }
-            record.remaining_bytes = remaining;
-            if (state == llm_expert_same_key_h2d_state::queued_or_staging) {
-                record.state = background_promotion_record::lifecycle::queued_or_staging;
-                continue;
-            }
-            if (state == llm_expert_same_key_h2d_state::h2d_in_flight) {
-                record.state = background_promotion_record::lifecycle::h2d_in_flight;
-                continue;
-            }
-            record.state = background_promotion_record::lifecycle::h2d_complete_unpublished;
-            bool earlier_active = false;
-            for (const auto & candidate : background_promotions) {
-                earlier_active = earlier_active || (candidate.active &&
-                    candidate.origin_operation_ordinal < record.origin_operation_ordinal);
-            }
-            if (earlier_active) continue;
-            auto & entry = directory_slots[record.hot_slot];
-            const bool injected_metadata = config.phase8_test_control != nullptr &&
-                config.phase8_test_control->consume_fault(
-                    llm_expert_phase8_test_fault::metadata_mismatch,
-                    record.key, record.hot_generation);
-            if (injected_metadata || entry.state != hot_slot_state::loading || entry.generation != record.hot_generation ||
-                !expert_key_matches(entry.key, record.key) || !entry.has_cold_backing ||
-                entry.cold_slot != record.cold.slot || entry.cold_generation != record.cold.generation) {
-                const auto released = transfer_ring->release_terminal_background(record.lane);
-                if (!released.is_ready()) return released;
-                record.state = background_promotion_record::lifecycle::failed;
-                discard_background_slot_locked(record, false);
-                background_dropped++;
-                continue;
-            }
-            if (config.phase8_test_control != nullptr) {
-                const auto gated_key = record.key;
-                const uint64_t gated_generation = record.hot_generation;
-                if (provider_lock != nullptr) provider_lock->unlock();
-                const bool paused = config.phase8_test_control->pause_if_armed(
-                    llm_expert_phase8_test_gate::background_before_provider_publication,
-                    gated_key, gated_generation);
-                if (provider_lock != nullptr) provider_lock->lock();
-                if (paused && (!record.active || record.hot_generation != gated_generation ||
-                    !expert_key_matches(record.key, gated_key))) {
-                    return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
-                }
-            }
-            if (config.phase8_test_control != nullptr &&
-                config.phase8_test_control->consume_fault(
-                    llm_expert_phase8_test_fault::publication_failed,
-                    record.key, record.hot_generation)) {
-                const auto released = transfer_ring->release_terminal_background(record.lane);
-                if (!released.is_ready()) return released;
-                record.state = background_promotion_record::lifecycle::failed;
-                discard_background_slot_locked(record, false);
-                background_dropped++;
-                continue;
-            }
+        }
+        if (earliest == nullptr) return llm_expert_provider_result::success();
+        auto & record = *earliest;
+        if (config.phase8_test_control != nullptr &&
+            config.phase8_test_control->consume_fault(
+                llm_expert_phase8_test_fault::stale_generation,
+                record.key, record.hot_generation)) {
+            const auto cancelled = transfer_ring->cancel_after_h2d(record.lane);
+            if (!cancelled.is_ready()) return cancelled;
+            record.state = background_promotion_record::lifecycle::failed;
+            discard_background_slot_locked(record, false);
+            background_dropped++;
+            return llm_expert_provider_result::success();
+        }
+        llm_expert_same_key_h2d_state state = llm_expert_same_key_h2d_state::none;
+        uint64_t remaining = 0;
+        const auto polled = transfer_ring->poll_h2d(record.lane, state, remaining);
+        if (!polled.is_ready()) {
             const auto released = transfer_ring->release_terminal_background(record.lane);
             if (!released.is_ready()) return released;
-            const auto completed = cache_policy_result(hot_policy.load_complete(
-                record.hot_slot, entry.generation));
-            if (!completed.is_ready()) return completed;
-            entry.state = hot_slot_state::ready;
-            entry.background_origin = true;
-            entry.background_useful = false;
-            directory_forward[forward_index(entry.key)] = { int32_t(record.hot_slot), entry.generation };
-            admissions++;
-            record.state = background_promotion_record::lifecycle::published;
-            finish_background_scheduler_locked(record, true);
-            record.active = false;
-            record.scheduler_handle = {};
-            if (active_background_flights > 0) active_background_flights--;
-            background_completed++;
+            record.state = background_promotion_record::lifecycle::failed;
+            discard_background_slot_locked(record, false);
+            background_dropped++;
+            return llm_expert_provider_result::success();
         }
+        record.remaining_bytes = remaining;
+        if (state == llm_expert_same_key_h2d_state::queued_or_staging) {
+            record.state = background_promotion_record::lifecycle::queued_or_staging;
+            return llm_expert_provider_result::success();
+        }
+        if (state == llm_expert_same_key_h2d_state::h2d_in_flight) {
+            record.state = background_promotion_record::lifecycle::h2d_in_flight;
+            return llm_expert_provider_result::success();
+        }
+        record.state = background_promotion_record::lifecycle::h2d_complete_unpublished;
+        auto & entry = directory_slots[record.hot_slot];
+        const bool injected_metadata = config.phase8_test_control != nullptr &&
+            config.phase8_test_control->consume_fault(
+                llm_expert_phase8_test_fault::metadata_mismatch,
+                record.key, record.hot_generation);
+        if (injected_metadata || entry.state != hot_slot_state::loading || entry.generation != record.hot_generation ||
+            !expert_key_matches(entry.key, record.key) || !entry.has_cold_backing ||
+            entry.cold_slot != record.cold.slot || entry.cold_generation != record.cold.generation) {
+            const auto released = transfer_ring->release_terminal_background(record.lane);
+            if (!released.is_ready()) return released;
+            record.state = background_promotion_record::lifecycle::failed;
+            discard_background_slot_locked(record, false);
+            background_dropped++;
+            return llm_expert_provider_result::success();
+        }
+        if (config.phase8_test_control != nullptr) {
+            const auto gated_key = record.key;
+            const uint64_t gated_generation = record.hot_generation;
+            if (provider_lock != nullptr) provider_lock->unlock();
+            const bool paused = config.phase8_test_control->pause_if_armed(
+                llm_expert_phase8_test_gate::background_before_provider_publication,
+                gated_key, gated_generation);
+            if (provider_lock != nullptr) provider_lock->lock();
+            if (paused && (!record.active || record.hot_generation != gated_generation ||
+                !expert_key_matches(record.key, gated_key))) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+            }
+        }
+        if (config.phase8_test_control != nullptr &&
+            config.phase8_test_control->consume_fault(
+                llm_expert_phase8_test_fault::publication_failed,
+                record.key, record.hot_generation)) {
+            const auto released = transfer_ring->release_terminal_background(record.lane);
+            if (!released.is_ready()) return released;
+            record.state = background_promotion_record::lifecycle::failed;
+            discard_background_slot_locked(record, false);
+            background_dropped++;
+            return llm_expert_provider_result::success();
+        }
+        const auto released = transfer_ring->release_terminal_background(record.lane);
+        if (!released.is_ready()) return released;
+        const auto completed = cache_policy_result(hot_policy.load_complete(
+            record.hot_slot, entry.generation));
+        if (!completed.is_ready()) return completed;
+        entry.state = hot_slot_state::ready;
+        entry.background_origin = true;
+        entry.background_useful = false;
+        directory_forward[forward_index(entry.key)] = { int32_t(record.hot_slot), entry.generation };
+        admissions++;
+        record.state = background_promotion_record::lifecycle::published;
+        finish_background_scheduler_locked(record, true);
+        record.active = false;
+        record.scheduler_handle = {};
+        if (active_background_flights > 0) active_background_flights--;
+        background_completed++;
         return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result finish_background_before_locked(uint64_t operation_ordinal) noexcept {
+        while (true) {
+            background_promotion_record * earliest = nullptr;
+            for (auto & record : background_promotions) {
+                if (record.active && record.origin_operation_ordinal < operation_ordinal &&
+                        (earliest == nullptr ||
+                            record.origin_operation_ordinal < earliest->origin_operation_ordinal)) {
+                    earliest = &record;
+                }
+            }
+            if (earliest == nullptr) return llm_expert_provider_result::success();
+            auto result = reap_background_locked(nullptr);
+            if (!result.is_ready()) return result;
+            if (!earliest->active) continue;
+            result = transfer_ring->cancel_after_h2d(earliest->lane);
+            if (!result.is_ready()) return result;
+            earliest->state = background_promotion_record::lifecycle::cancelled;
+            discard_background_slot_locked(*earliest, false);
+            background_dropped++;
+        }
     }
 
     llm_expert_provider_result finish_background_request_locked() noexcept {
         while (active_background_flights != 0) {
             auto result = reap_background_locked(nullptr);
             if (!result.is_ready()) return result;
+            if (active_background_flights == 0) return llm_expert_provider_result::success();
             background_promotion_record * earliest = nullptr;
             for (auto & record : background_promotions) {
                 if (record.active && (earliest == nullptr ||
@@ -4412,7 +4468,13 @@ private:
         if (!policy_loading.is_ready()) return policy_loading;
         auto acquired = cold_cache->acquire(cold, llm_cold_reference_kind::hot);
         if (!acquired.is_ready()) {
-            (void) hot_policy.load_failed(slot, entry.generation);
+            auto ordered = finish_background_before_locked(hot_policy.diagnostics().operation_ordinal);
+            if (!ordered.is_ready()) return ordered;
+            ordered = cache_policy_result(hot_policy.load_failed(slot, entry.generation));
+            if (!ordered.is_ready()) return ordered;
+            const uint64_t generation = entry.generation;
+            entry = {};
+            entry.generation = generation;
             return acquired;
         }
         entry.cold_slot = cold.slot;
@@ -4496,6 +4558,10 @@ private:
               record.scheduler_handle.slot,
               record.scheduler_handle.generation, key });
         if (!result.is_ready()) {
+            if (record.hot_generation != 0) {
+                const auto ordered = finish_background_before_locked(record.origin_operation_ordinal);
+                if (!ordered.is_ready()) result = ordered;
+            }
             discard_background_slot_locked(record, false);
             if (result.error == llm_expert_provider_error::busy) background_busy++;
             else background_dropped++;
@@ -4563,6 +4629,15 @@ private:
     }
 
     llm_expert_provider_result release_request_pins_locked() noexcept {
+        auto capacity = cache_policy_result(hot_policy.validate_event_capacity(request_pin_count));
+        if (!capacity.is_ready()) return capacity;
+        if (cold_cache && cpu_execution_pin_count != 0) {
+            const auto released = cold_cache->release_many(
+                cpu_execution_pins.data(), cpu_execution_pin_count,
+                llm_cold_reference_kind::cpu_execution);
+            if (!released.is_ready()) return released;
+            cpu_execution_pin_count = 0;
+        }
         for (size_t index = 0; index < request_pin_count; ++index) {
             auto & entry = directory_slots[request_pins[index].slot];
             GGML_ASSERT(entry.generation == request_pins[index].generation && entry.refcount > 0);
@@ -4577,12 +4652,6 @@ private:
             current_pins--;
         }
         request_pin_count = 0;
-        for (size_t index = 0; index < cpu_execution_pin_count; ++index) {
-            const auto released = cold_cache->release(
-                cpu_execution_pins[index], llm_cold_reference_kind::cpu_execution);
-            if (!released.is_ready()) return released;
-        }
-        cpu_execution_pin_count = 0;
         return llm_expert_provider_result::success();
     }
 

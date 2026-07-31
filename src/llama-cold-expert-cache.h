@@ -133,6 +133,10 @@ public:
     llm_expert_provider_result release(
             llm_cold_reference reference,
             llm_cold_reference_kind kind) noexcept;
+    llm_expert_provider_result release_many(
+            const llm_cold_reference * references,
+            size_t reference_count,
+            llm_cold_reference_kind kind) noexcept;
     llm_expert_provider_result cleanup_failed_slots() noexcept;
     llm_expert_provider_result policy_request_begin() noexcept;
     llm_expert_provider_result policy_set_ubatch_ordinal(uint64_t ordinal) noexcept;

@@ -199,6 +199,25 @@ void test_runtime_policy_adapters() {
     }
 }
 
+void test_transactional_multi_release_exhaustion() {
+    fixture tensors;
+    auto cache_config = config(budget_for_slots(tensors, 1), 1);
+    cache_config.policy_trace_capacity = 8;
+    llm_cold_expert_cache cache(cache_config);
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    llm_cold_reference reference;
+    GGML_ASSERT(cache.find_or_admit({ 0, 0 }, tensors.bundle(), reference).is_ready());
+    GGML_ASSERT(cache.acquire(reference, llm_cold_reference_kind::cpu_execution).is_ready());
+    GGML_ASSERT(cache.acquire(reference, llm_cold_reference_kind::cpu_execution).is_ready());
+    const llm_cold_reference references[] = { reference, reference };
+    GGML_ASSERT(!cache.release_many(references, 2,
+        llm_cold_reference_kind::cpu_execution).is_ready());
+    const auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.current_cpu_execution_refs == 2);
+    GGML_ASSERT(diagnostics.slots[reference.slot].cpu_execution_refs == 2);
+    GGML_ASSERT(diagnostics.policy.transcript_records == 7);
+}
+
 void test_two_phase_publication_and_failure() {
     fixture tensors;
     llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
@@ -350,6 +369,7 @@ void test_loader_publication_failure_cleanup_and_reread() {
 
 int main() {
     test_runtime_policy_adapters();
+    test_transactional_multi_release_exhaustion();
     test_configuration_and_budget_edges();
     test_publication_hits_and_copy_failure();
     test_two_phase_publication_and_failure();

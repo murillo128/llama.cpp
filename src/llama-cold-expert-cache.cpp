@@ -735,6 +735,65 @@ llm_expert_provider_result llm_cold_expert_cache::release(
     return llm_expert_provider_result::success();
 }
 
+llm_expert_provider_result llm_cold_expert_cache::release_many(
+        const llm_cold_reference * references,
+        size_t reference_count,
+        llm_cold_reference_kind kind) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (reference_count != 0 && references == nullptr) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+    }
+    auto capacity = policy_result(pimpl->policy.validate_event_capacity(reference_count));
+    if (!capacity.is_ready()) return capacity;
+    const uint64_t current_references = kind == llm_cold_reference_kind::hot ?
+        pimpl->counters.current_hot_refs : kind == llm_cold_reference_kind::transfer ?
+        pimpl->counters.current_transfer_refs : kind == llm_cold_reference_kind::request ?
+        pimpl->counters.current_request_refs : pimpl->counters.current_cpu_execution_refs;
+    if (reference_count > current_references) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    for (size_t index = 0; index < reference_count; ++index) {
+        if (!pimpl->valid_reference(references[index])) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+        }
+        const auto & slot = pimpl->slots[references[index].slot];
+        const uint32_t counter = kind == llm_cold_reference_kind::hot ? slot.hot_refs :
+            kind == llm_cold_reference_kind::transfer ? slot.transfer_refs :
+            kind == llm_cold_reference_kind::request ? slot.request_refs : slot.cpu_execution_refs;
+        size_t occurrences = 0;
+        for (size_t prior = 0; prior <= index; ++prior) {
+            occurrences += references[prior].slot == references[index].slot &&
+                references[prior].generation == references[index].generation;
+        }
+        if (occurrences > counter) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+    }
+    for (size_t index = 0; index < reference_count; ++index) {
+        auto & slot = pimpl->slots[references[index].slot];
+        uint32_t * counter = nullptr;
+        uint64_t * current = nullptr;
+        if (kind == llm_cold_reference_kind::hot) {
+            counter = &slot.hot_refs; current = &pimpl->counters.current_hot_refs;
+        } else if (kind == llm_cold_reference_kind::transfer) {
+            counter = &slot.transfer_refs; current = &pimpl->counters.current_transfer_refs;
+        } else if (kind == llm_cold_reference_kind::request) {
+            counter = &slot.request_refs; current = &pimpl->counters.current_request_refs;
+        } else {
+            counter = &slot.cpu_execution_refs; current = &pimpl->counters.current_cpu_execution_refs;
+        }
+        if (*counter == 0 || *current == 0) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        const auto unpinned = policy_result(
+            pimpl->policy.unpin(references[index].slot, references[index].generation));
+        if (!unpinned.is_ready()) return unpinned;
+        (*counter)--;
+        (*current)--;
+    }
+    return llm_expert_provider_result::success();
+}
+
 llm_expert_provider_result llm_cold_expert_cache::cleanup_failed_slots() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     for (auto & slot : pimpl->slots) {

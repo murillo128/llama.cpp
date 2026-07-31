@@ -59,6 +59,13 @@ int compare_products(uint64_t lhs_a, uint64_t lhs_b, uint64_t rhs_a, uint64_t rh
     return 0;
 }
 
+uint64_t window_contribution(uint64_t position, uint64_t key) noexcept {
+    uint64_t hash = fnv_offset;
+    hash_append(hash, position);
+    hash_append(hash, key);
+    return hash;
+}
+
 } // namespace
 
 llm_expert_cache_policy_result llm_expert_cache_policy_copy_config(
@@ -229,6 +236,11 @@ llm_expert_cache_policy_result llm_expert_cache_policy::initialize(
         frequency_window_size = 0;
         event_write = 0;
         reserved_terminal_events = 0;
+        terminal_operation_ordinal = 0;
+        frequency_window_state_digest = 0;
+        for (size_t index = 0; index < frequency_window.size(); ++index) {
+            frequency_window_state_digest ^= window_contribution(index, frequency_window[index]);
+        }
         request_active = false;
         phase = llm_expert_cache_policy_phase::prefill;
         counters = {};
@@ -374,8 +386,9 @@ llm_expert_cache_policy_result llm_expert_cache_policy::phase_transition(
     return append_event(llm_expert_cache_policy_event_type::phase_transition);
 }
 
-bool llm_expert_cache_policy::normalize_aging(slot_state & slot) noexcept {
-    const uint64_t epoch = counters.demand_ordinal/config.lfu_aging_interval_events;
+bool llm_expert_cache_policy::normalize_aging(
+        slot_state & slot, uint64_t current_demand_ordinal) noexcept {
+    const uint64_t epoch = current_demand_ordinal/config.lfu_aging_interval_events;
     if (epoch < slot.aging_epoch) return false;
     const uint64_t elapsed = std::min<uint64_t>(63, epoch - slot.aging_epoch);
     if (elapsed != 0 && slot.resident_frequency != 0) {
@@ -454,7 +467,11 @@ llm_expert_cache_policy_result llm_expert_cache_policy::demand(
         } else {
             frequency_window_size++;
         }
+        frequency_window_state_digest ^=
+            window_contribution(frequency_window_write, frequency_window[frequency_window_write]);
         frequency_window[frequency_window_write] = uint64_t(index);
+        frequency_window_state_digest ^=
+            window_contribution(frequency_window_write, frequency_window[frequency_window_write]);
         frequency_window_write = (frequency_window_write + 1) & (frequency_window.size() - 1);
         if (state.window_frequency != UINT64_MAX) state.window_frequency++;
         else counters.frequency_saturations++;
@@ -466,8 +483,9 @@ llm_expert_cache_policy_result llm_expert_cache_policy::demand(
 }
 
 void llm_expert_cache_policy::touch_slot(slot_state & slot) noexcept {
-    slot.last_touch_sequence = counters.event_sequence + 1;
-    slot.last_touch_demand = counters.demand_ordinal;
+    const auto & key = keys[size_t(key_index(slot.key))];
+    slot.last_touch_sequence = key.last_demand_sequence;
+    slot.last_touch_demand = key.last_touch_demand;
 }
 
 void llm_expert_cache_policy::enforce_protected_capacity(uint32_t domain) noexcept {
@@ -509,7 +527,9 @@ llm_expert_cache_policy_result llm_expert_cache_policy::hit(uint32_t slot, uint6
     }
     const auto capacity = preflight_events();
     if (!capacity.is_ready()) return capacity;
-    if (config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING && !normalize_aging(state)) {
+    const auto & key = keys[size_t(key_index(state.key))];
+    if (config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING &&
+        !normalize_aging(state, key.last_touch_demand)) {
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::invalid_event);
     }
     if (state.resident_frequency != UINT64_MAX) state.resident_frequency++;
@@ -745,18 +765,37 @@ llm_expert_cache_policy_result llm_expert_cache_policy::optional_admission(
             decision.slot, decision.generation, 1, 0, true, decision.free ? 1 : 2);
     }
     const int64_t candidate_key = key_index(key);
-    if (candidate_key < 0 || candidates == nullptr) {
+    if (candidate_key < 0 || candidates == nullptr || candidate_count == 0) {
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::invalid_key);
     }
-    const auto capacity = preflight_events();
+    const auto capacity = preflight_events(2);
     if (!capacity.is_ready()) return capacity;
     const uint32_t domain = key_domain(key);
     int32_t incumbent = -1;
     for (size_t index = 0; index < candidate_count; ++index) {
         const auto & candidate = candidates[index];
-        if (candidate.slot >= slots.size() || slots[candidate.slot].domain != domain) continue;
+        if (candidate.slot >= slots.size() || candidate.logical_bundle_bytes == 0 ||
+            candidate.physical_slot_footprint_bytes != slot_footprint ||
+            (candidate.free && candidate.eligible)) {
+            counters.metadata_mismatches++;
+            return llm_expert_cache_policy_result::failure(
+                llm_expert_cache_policy_error::metadata_mismatch);
+        }
+        for (size_t prior = 0; prior < index; ++prior) {
+            if (candidates[prior].slot == candidate.slot) {
+                counters.metadata_mismatches++;
+                return llm_expert_cache_policy_result::failure(
+                    llm_expert_cache_policy_error::metadata_mismatch);
+            }
+        }
+        if (slots[candidate.slot].domain != domain) continue;
         if (candidate.free) {
             decision = { candidate.slot, candidate.generation, true, true };
+            counters.free_selections++;
+            auto selected = append_event(llm_expert_cache_policy_event_type::victim_selected,
+                key, 0, candidate.logical_bundle_bytes, candidate.physical_slot_footprint_bytes,
+                candidate.slot, candidate.generation, 1, 0, true, 1);
+            if (!selected.is_ready()) return selected;
             counters.optional_admission_accepts++;
             return append_event(llm_expert_cache_policy_event_type::optional_admission, key, 0,
                 candidate.logical_bundle_bytes, candidate.physical_slot_footprint_bytes,
@@ -764,6 +803,12 @@ llm_expert_cache_policy_result llm_expert_cache_policy::optional_admission(
         }
         const auto & state = slots[candidate.slot];
         if (!candidate.eligible || state.current_segment != segment::probationary) continue;
+        if (!state.resident || state.generation != candidate.generation ||
+            !key_matches(state.key, candidate.key)) {
+            counters.metadata_mismatches++;
+            return llm_expert_cache_policy_result::failure(
+                llm_expert_cache_policy_error::metadata_mismatch);
+        }
         if (incumbent < 0) incumbent = int32_t(index);
         else {
             const auto & best = slots[candidates[incumbent].slot];
@@ -781,6 +826,11 @@ llm_expert_cache_policy_result llm_expert_cache_policy::optional_admission(
         const auto & state = slots[selected.slot];
         if (keys[size_t(candidate_key)].window_frequency > keys[size_t(key_index(state.key))].window_frequency) {
             decision = { selected.slot, selected.generation, false, true };
+            counters.victim_selections++;
+            auto selected_event = append_event(llm_expert_cache_policy_event_type::victim_selected,
+                key, 0, selected.logical_bundle_bytes, selected.physical_slot_footprint_bytes,
+                selected.slot, selected.generation, 2, 0, true, 2);
+            if (!selected_event.is_ready()) return selected_event;
             counters.optional_admission_accepts++;
             return append_event(llm_expert_cache_policy_event_type::optional_admission, key, 0,
                 selected.logical_bundle_bytes, selected.physical_slot_footprint_bytes,
@@ -839,11 +889,11 @@ llm_expert_cache_policy_result llm_expert_cache_policy::load_begin(
     counters.operation_ordinal++;
     const uint32_t domain = slots[slot].domain;
     const auto & key_state = keys[size_t(key_index(key))];
-    slots[slot] = { key, generation, key_state.last_demand_sequence, counters.demand_ordinal,
+    slots[slot] = { key, generation, key_state.last_demand_sequence, key_state.last_touch_demand,
         logical_bundle_bytes, physical_slot_footprint_bytes, demand_caused ? 1u : 0u,
         config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING ?
-            counters.demand_ordinal/config.lfu_aging_interval_events : 0,
-        counters.operation_ordinal, domain, 0, segment::none, true, false };
+            key_state.last_touch_demand/config.lfu_aging_interval_events : 0,
+        counters.operation_ordinal, domain, 0, segment::none, false, false, true, false };
     domains[domain].occupancy_bytes += physical_slot_footprint_bytes;
     reserved_terminal_events++;
     const auto result = append_event(llm_expert_cache_policy_event_type::load_begin, key, 0,
@@ -854,48 +904,76 @@ llm_expert_cache_policy_result llm_expert_cache_policy::load_begin(
 }
 
 llm_expert_cache_policy_result llm_expert_cache_policy::load_complete(uint32_t slot, uint64_t generation) noexcept {
-    if (slot >= slots.size() || !slots[slot].loading || slots[slot].generation != generation) {
+    if (slot >= slots.size() || !slots[slot].loading || slots[slot].terminal_pending ||
+        slots[slot].generation != generation) {
         counters.metadata_mismatches++;
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::metadata_mismatch);
     }
-    if (reserved_terminal_events == 0 || event_write >= events.size() ||
-        counters.event_sequence == UINT64_MAX) {
-        return llm_expert_cache_policy_result::failure(
-            reserved_terminal_events == 0 ? llm_expert_cache_policy_error::metadata_mismatch :
-            event_write >= events.size() ? llm_expert_cache_policy_error::transcript_full :
-            llm_expert_cache_policy_error::sequence_exhausted);
-    }
-    auto & state = slots[slot];
-    state.loading = false;
-    state.resident = true;
-    state.current_segment = segment::probationary;
-    reserved_terminal_events--;
-    return append_event(llm_expert_cache_policy_event_type::load_complete, state.key, 0,
-        state.logical_bundle_bytes, state.physical_slot_footprint_bytes, slot, generation, 0,
-        state.origin_operation_ordinal);
+    slots[slot].terminal_pending = true;
+    slots[slot].terminal_success = true;
+    return flush_terminal_events();
 }
 
 llm_expert_cache_policy_result llm_expert_cache_policy::load_failed(uint32_t slot, uint64_t generation) noexcept {
-    if (slot >= slots.size() || !slots[slot].loading || slots[slot].generation != generation) {
+    if (slot >= slots.size() || !slots[slot].loading || slots[slot].terminal_pending ||
+        slots[slot].generation != generation) {
         counters.metadata_mismatches++;
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::metadata_mismatch);
     }
-    if (reserved_terminal_events == 0 || event_write >= events.size() ||
-        counters.event_sequence == UINT64_MAX) {
-        return llm_expert_cache_policy_result::failure(
-            reserved_terminal_events == 0 ? llm_expert_cache_policy_error::metadata_mismatch :
-            event_write >= events.size() ? llm_expert_cache_policy_error::transcript_full :
-            llm_expert_cache_policy_error::sequence_exhausted);
+    slots[slot].terminal_pending = true;
+    slots[slot].terminal_success = false;
+    return flush_terminal_events();
+}
+
+llm_expert_cache_policy_result llm_expert_cache_policy::flush_terminal_events() noexcept {
+    while (terminal_operation_ordinal < counters.operation_ordinal) {
+        const uint64_t expected = terminal_operation_ordinal + 1;
+        int32_t selected = -1;
+        for (uint32_t slot = 0; slot < slots.size(); ++slot) {
+            if (slots[slot].loading && slots[slot].origin_operation_ordinal == expected) {
+                selected = int32_t(slot);
+                break;
+            }
+        }
+        if (selected < 0) {
+            counters.metadata_mismatches++;
+            return llm_expert_cache_policy_result::failure(
+                llm_expert_cache_policy_error::metadata_mismatch);
+        }
+        auto & pending = slots[uint32_t(selected)];
+        if (!pending.terminal_pending) return llm_expert_cache_policy_result::success();
+        if (reserved_terminal_events == 0 || event_write >= events.size() ||
+            counters.event_sequence == UINT64_MAX) {
+            return llm_expert_cache_policy_result::failure(
+                reserved_terminal_events == 0 ? llm_expert_cache_policy_error::metadata_mismatch :
+                event_write >= events.size() ? llm_expert_cache_policy_error::transcript_full :
+                llm_expert_cache_policy_error::sequence_exhausted);
+        }
+        const auto state = pending;
+        terminal_operation_ordinal = expected;
+        reserved_terminal_events--;
+        if (state.terminal_success) {
+            pending.terminal_pending = false;
+            pending.terminal_success = false;
+            pending.loading = false;
+            pending.resident = true;
+            pending.current_segment = segment::probationary;
+            const auto event = append_event(llm_expert_cache_policy_event_type::load_complete,
+                state.key, 0, state.logical_bundle_bytes, state.physical_slot_footprint_bytes,
+                uint32_t(selected), state.generation, 0, state.origin_operation_ordinal);
+            if (!event.is_ready()) return event;
+        } else {
+            const uint32_t domain = state.domain;
+            pending = {};
+            pending.domain = domain;
+            domains[domain].occupancy_bytes -= state.physical_slot_footprint_bytes;
+            const auto event = append_event(llm_expert_cache_policy_event_type::load_failed,
+                state.key, 0, state.logical_bundle_bytes, state.physical_slot_footprint_bytes,
+                uint32_t(selected), state.generation, 0, state.origin_operation_ordinal);
+            if (!event.is_ready()) return event;
+        }
     }
-    const auto state = slots[slot];
-    const uint32_t domain = state.domain;
-    slots[slot] = {};
-    slots[slot].domain = domain;
-    domains[domain].occupancy_bytes -= state.physical_slot_footprint_bytes;
-    reserved_terminal_events--;
-    return append_event(llm_expert_cache_policy_event_type::load_failed, state.key, 0,
-        state.logical_bundle_bytes, state.physical_slot_footprint_bytes, slot, generation, 0,
-        state.origin_operation_ordinal);
+    return llm_expert_cache_policy_result::success();
 }
 
 llm_expert_cache_policy_result llm_expert_cache_policy::pin(uint32_t slot, uint64_t generation) noexcept {
@@ -968,6 +1046,10 @@ llm_expert_cache_policy_result llm_expert_cache_policy::reset() noexcept {
     std::fill(frequency_window.begin(), frequency_window.end(), UINT64_MAX);
     frequency_window_write = 0;
     frequency_window_size = 0;
+    frequency_window_state_digest = 0;
+    for (size_t index = 0; index < frequency_window.size(); ++index) {
+        frequency_window_state_digest ^= window_contribution(index, frequency_window[index]);
+    }
     for (auto & domain : domains) {
         domain.occupancy_bytes = 0;
         domain.protected_occupancy_bytes = 0;
@@ -1041,6 +1123,10 @@ uint64_t llm_expert_cache_policy::hash_state() const noexcept {
     hash_append(hash, counters.demand_ordinal);
     hash_append(hash, counters.operation_ordinal);
     hash_append(hash, reserved_terminal_events);
+    hash_append(hash, terminal_operation_ordinal);
+    hash_append(hash, frequency_window_write);
+    hash_append(hash, frequency_window_size);
+    hash_append(hash, frequency_window_state_digest);
     hash_append(hash, uint8_t(phase));
     for (const auto & key : keys) {
         hash_append(hash, key.window_frequency);
