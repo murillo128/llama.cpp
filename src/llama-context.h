@@ -56,6 +56,11 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    ggml_cgraph * graph_discover(
+            uint32_t n_tokens,
+            uint32_t n_seqs,
+            uint32_t n_outputs,
+            const llama_memory_context_i * mctx);
 
     void synchronize();
 

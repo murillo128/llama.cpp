@@ -1424,7 +1424,8 @@ public:
         }
         if (config.cold_mode && (config.cold_cache_bytes == 0 || config.transfer_ring_bytes == 0 ||
             config.target_device == nullptr || (!config.allow_non_cuda_target_for_testing &&
-                config.storage == nullptr && config.phase8_test_control == nullptr))) {
+                config.storage == nullptr && config.phase8_test_control == nullptr) ||
+            (config.descriptor_only_source_for_testing && !config.allow_non_cuda_target_for_testing))) {
             throw std::invalid_argument("cold-cache mode requires byte budgets and a target device");
         }
         const bool controlled_in_memory_scheduler = config.phase8_test_control != nullptr &&
@@ -2988,15 +2989,131 @@ public:
         return llm_expert_provider_result::success();
     }
 
-    bool needs_post_reserve_initialization() const noexcept override {
+    llm_expert_provider_initialization_stage initialization_stage() const noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
-        return pool == nullptr;
+        if (pool != nullptr) {
+            return llm_expert_provider_initialization_stage::none;
+        }
+        return config.cold_mode
+            ? llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve
+            : llm_expert_provider_initialization_stage::workspace_before_persistent_pool;
+    }
+
+    llm_expert_provider_result begin_initialization(
+            llm_expert_provider_initialization_stage stage,
+            bool & owner) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        owner = false;
+        if (pool != nullptr) {
+            return llm_expert_provider_result::success();
+        }
+        if (initialization_failed) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+        }
+        if (initialization_in_progress) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+        }
+        const auto expected = config.cold_mode
+            ? llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve
+            : llm_expert_provider_initialization_stage::workspace_before_persistent_pool;
+        if (stage != expected) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor));
+        }
+        initialization_in_progress = true;
+        owner = true;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result complete_descriptor_discovery(
+            uint64_t graph_count,
+            uint64_t binding_count,
+            uint64_t scheduler_reserve_calls,
+            const std::vector<uint64_t> & backend_bytes_before,
+            const std::vector<uint64_t> & backend_bytes_after) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!config.cold_mode || !initialization_in_progress || pool != nullptr ||
+            descriptor_discovery_complete || graph_count < 2 ||
+            registrations.size() != config.routed_layer_count || !prototype.has_value() ||
+            backend_bytes_before.size() != backend_bytes_after.size()) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+        }
+        uint64_t before = 0;
+        uint64_t after = 0;
+        for (size_t index = 0; index < backend_bytes_before.size(); ++index) {
+            if (backend_bytes_before[index] > UINT64_MAX - before ||
+                backend_bytes_after[index] > UINT64_MAX - after) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
+            }
+            before += backend_bytes_before[index];
+            after += backend_bytes_after[index];
+        }
+        if (graph_count > UINT64_MAX/config.routed_layer_count ||
+            scheduler_reserve_calls != 0 || before != 0 || after != 0 ||
+            binding_count != graph_count*config.routed_layer_count) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+        }
+        descriptor_discovery_graphs = graph_count;
+        descriptor_discovery_bindings = binding_count;
+        descriptor_discovery_scheduler_reserve_calls = scheduler_reserve_calls;
+        descriptor_discovery_backend_bytes_before = before;
+        descriptor_discovery_backend_bytes_after = after;
+        scheduler_backend_bytes_before_discovery = backend_bytes_before;
+        scheduler_backend_bytes_after_discovery = backend_bytes_after;
+        descriptor_discovery_complete = true;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result record_initialization_telemetry(
+            const std::vector<uint64_t> & backend_bytes_after_hierarchy,
+            const std::vector<uint64_t> & backend_bytes_after_final_reserve,
+            uint64_t final_source_bindings,
+            uint64_t deferred_payload_bytes) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!config.cold_mode || pool == nullptr || !descriptor_discovery_complete ||
+            backend_bytes_after_hierarchy.size() != backend_bytes_after_final_reserve.size() ||
+            backend_bytes_after_hierarchy.size() != scheduler_backend_bytes_after_discovery.size() ||
+            final_source_bindings != 0 || deferred_payload_bytes == 0) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+        }
+        if (cold_cache == nullptr || transfer_ring == nullptr) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+        }
+        const auto cold = cold_cache->diagnostics();
+        const auto ring = transfer_ring->diagnostics();
+        if (cold.actual_bytes > config.cold_cache_bytes || ring.actual_bytes > config.transfer_ring_bytes ||
+            pool->bundle.n_expert != int32_t(config.capacity)) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
+        }
+        for (uint64_t bytes : backend_bytes_after_hierarchy) {
+            if (bytes != 0) {
+                return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+            }
+        }
+        scheduler_backend_bytes_after_hierarchy = backend_bytes_after_hierarchy;
+        scheduler_backend_bytes_after_final_reserve = backend_bytes_after_final_reserve;
+        final_bootstrap_source_bindings = final_source_bindings;
+        complete_deferred_payload_bytes = deferred_payload_bytes;
+        complete_deferred_payload_in_compute_workspace = false;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result finish_initialization(bool success) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!initialization_in_progress || (success && pool == nullptr) || (!success && pool != nullptr)) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
+        }
+        initialization_in_progress = false;
+        initialization_failed = !success;
+        return llm_expert_provider_result::success();
     }
 
     llm_expert_provider_result initialize_after_reserve() noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
         if (pool) {
             return llm_expert_provider_result::success();
+        }
+        if (config.cold_mode && initialization_in_progress && !descriptor_discovery_complete) {
+            return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
         }
         if (!prototype.has_value() || registrations.size() != config.routed_layer_count) {
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
@@ -3252,6 +3369,19 @@ public:
         cpu_execution_pin_count = 0;
         cold_bundle_payload = 0;
         transfer_lane_capacity = 0;
+        descriptor_discovery_complete = false;
+        descriptor_discovery_graphs = 0;
+        descriptor_discovery_bindings = 0;
+        descriptor_discovery_scheduler_reserve_calls = 0;
+        descriptor_discovery_backend_bytes_before = 0;
+        descriptor_discovery_backend_bytes_after = 0;
+        final_bootstrap_source_bindings = 0;
+        complete_deferred_payload_bytes = 0;
+        complete_deferred_payload_in_compute_workspace = false;
+        scheduler_backend_bytes_before_discovery.clear();
+        scheduler_backend_bytes_after_discovery.clear();
+        scheduler_backend_bytes_after_hierarchy.clear();
+        scheduler_backend_bytes_after_final_reserve.clear();
         epoch++;
         counters.surrender_successes++;
         return llm_expert_provider_result::success();
@@ -3325,6 +3455,18 @@ public:
         result.requested_capacity = config.capacity;
         result.effective_capacity = pool ? config.capacity : 0;
         result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
+        result.descriptor_discovery_graphs = descriptor_discovery_graphs;
+        result.descriptor_discovery_bindings = descriptor_discovery_bindings;
+        result.descriptor_discovery_scheduler_reserve_calls = descriptor_discovery_scheduler_reserve_calls;
+        result.descriptor_discovery_backend_bytes_before = descriptor_discovery_backend_bytes_before;
+        result.descriptor_discovery_backend_bytes_after = descriptor_discovery_backend_bytes_after;
+        result.final_bootstrap_source_bindings = final_bootstrap_source_bindings;
+        result.complete_deferred_payload_bytes = complete_deferred_payload_bytes;
+        result.complete_deferred_payload_in_compute_workspace = complete_deferred_payload_in_compute_workspace;
+        result.scheduler_backend_bytes_before_discovery = scheduler_backend_bytes_before_discovery;
+        result.scheduler_backend_bytes_after_discovery = scheduler_backend_bytes_after_discovery;
+        result.scheduler_backend_bytes_after_hierarchy = scheduler_backend_bytes_after_hierarchy;
+        result.scheduler_backend_bytes_after_final_reserve = scheduler_backend_bytes_after_final_reserve;
         result.graph_epoch = epoch;
         result.generation = pool ? pool->id : 0;
         result.n_expert = n_expert;
@@ -4181,6 +4323,9 @@ private:
         if (config.cold_mode && config.storage != nullptr) {
             return result;
         }
+        if (config.cold_mode && config.descriptor_only_source_for_testing) {
+            return result;
+        }
         for (const auto * projection : { &bundle.up, &bundle.gate, &bundle.gate_up, &bundle.down }) {
             if (!projection_is_host_accessible(*projection) ||
                 (config.cold_mode && !projection_is_pageable_cpu(*projection))) {
@@ -4257,6 +4402,21 @@ private:
     std::unique_ptr<llm_cold_expert_cache> cold_cache;
     std::unique_ptr<llm_expert_transfer_ring> transfer_ring;
     uint64_t successful_bindings = 0;
+    bool initialization_in_progress = false;
+    bool initialization_failed = false;
+    bool descriptor_discovery_complete = false;
+    uint64_t descriptor_discovery_graphs = 0;
+    uint64_t descriptor_discovery_bindings = 0;
+    uint64_t descriptor_discovery_scheduler_reserve_calls = 0;
+    uint64_t descriptor_discovery_backend_bytes_before = 0;
+    uint64_t descriptor_discovery_backend_bytes_after = 0;
+    uint64_t final_bootstrap_source_bindings = 0;
+    uint64_t complete_deferred_payload_bytes = 0;
+    bool complete_deferred_payload_in_compute_workspace = false;
+    std::vector<uint64_t> scheduler_backend_bytes_before_discovery;
+    std::vector<uint64_t> scheduler_backend_bytes_after_discovery;
+    std::vector<uint64_t> scheduler_backend_bytes_after_hierarchy;
+    std::vector<uint64_t> scheduler_backend_bytes_after_final_reserve;
     uint64_t epoch = 0;
     uint64_t generation = 0;
     uint32_t last_context_n_ctx = 0;

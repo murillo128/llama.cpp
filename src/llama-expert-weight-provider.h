@@ -338,6 +338,18 @@ struct llm_hot_cache_diagnostics {
     uint32_t requested_capacity = 0;
     uint32_t effective_capacity = 0;
     uint64_t pool_bytes = 0;
+    uint64_t descriptor_discovery_graphs = 0;
+    uint64_t descriptor_discovery_bindings = 0;
+    uint64_t descriptor_discovery_scheduler_reserve_calls = 0;
+    uint64_t descriptor_discovery_backend_bytes_before = 0;
+    uint64_t descriptor_discovery_backend_bytes_after = 0;
+    uint64_t final_bootstrap_source_bindings = 0;
+    uint64_t complete_deferred_payload_bytes = 0;
+    bool complete_deferred_payload_in_compute_workspace = false;
+    std::vector<uint64_t> scheduler_backend_bytes_before_discovery;
+    std::vector<uint64_t> scheduler_backend_bytes_after_discovery;
+    std::vector<uint64_t> scheduler_backend_bytes_after_hierarchy;
+    std::vector<uint64_t> scheduler_backend_bytes_after_final_reserve;
     uint64_t graph_epoch = 0;
     uint64_t generation = 0;
     uint32_t n_expert = 0;
@@ -570,6 +582,12 @@ struct llm_expert_graph_diagnostics {
 
 class llm_expert_weight_provider;
 
+enum class llm_expert_provider_initialization_stage : uint8_t {
+    none,
+    descriptors_before_scheduler_reserve,
+    workspace_before_persistent_pool,
+};
+
 class llm_expert_handle {
 public:
     llm_expert_handle() = default;
@@ -685,7 +703,47 @@ public:
         (void) generation;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
-    virtual bool needs_post_reserve_initialization() const noexcept { return false; }
+    virtual llm_expert_provider_initialization_stage initialization_stage() const noexcept {
+        return llm_expert_provider_initialization_stage::none;
+    }
+    virtual llm_expert_provider_result begin_initialization(
+            llm_expert_provider_initialization_stage stage,
+            bool & owner) noexcept {
+        (void) stage;
+        owner = false;
+        return llm_expert_provider_result::success();
+    }
+    virtual llm_expert_provider_result complete_descriptor_discovery(
+            uint64_t graph_count,
+            uint64_t binding_count,
+            uint64_t scheduler_reserve_calls,
+            const std::vector<uint64_t> & backend_bytes_before,
+            const std::vector<uint64_t> & backend_bytes_after) noexcept {
+        (void) graph_count;
+        (void) binding_count;
+        (void) scheduler_reserve_calls;
+        (void) backend_bytes_before;
+        (void) backend_bytes_after;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual llm_expert_provider_result record_initialization_telemetry(
+            const std::vector<uint64_t> & backend_bytes_after_hierarchy,
+            const std::vector<uint64_t> & backend_bytes_after_final_reserve,
+            uint64_t final_bootstrap_source_bindings,
+            uint64_t complete_deferred_payload_bytes) noexcept {
+        (void) backend_bytes_after_hierarchy;
+        (void) backend_bytes_after_final_reserve;
+        (void) final_bootstrap_source_bindings;
+        (void) complete_deferred_payload_bytes;
+        return llm_expert_provider_result::success();
+    }
+    virtual llm_expert_provider_result finish_initialization(bool success) noexcept {
+        (void) success;
+        return llm_expert_provider_result::success();
+    }
+    virtual bool needs_post_reserve_initialization() const noexcept {
+        return initialization_stage() != llm_expert_provider_initialization_stage::none;
+    }
     virtual bool uses_hybrid_graph() const noexcept { return false; }
     virtual llm_expert_provider_result initialize_after_reserve() noexcept {
         return llm_expert_provider_result::success();
@@ -800,6 +858,7 @@ struct llm_hot_cache_config {
     // null; focused tests may install them on a live provider.
     llm_expert_phase8_test_control * phase8_test_control = nullptr;
     llm_expert_phase8_closeout_witness * phase8_closeout_witness = nullptr;
+    bool descriptor_only_source_for_testing = false;
 };
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(

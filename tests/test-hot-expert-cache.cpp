@@ -120,6 +120,52 @@ struct tensor_fixture {
     }
 };
 
+struct metadata_only_tensor_fixture {
+    ggml_context_ptr ctx;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * down = nullptr;
+    ggml_tensor * ids = nullptr;
+    int64_t n_expert = 4;
+    int64_t n_expert_used = 2;
+
+    metadata_only_tensor_fixture(int64_t n_in = 8, int64_t n_hidden = 16) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*8,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx.reset(ggml_init(params));
+        GGML_ASSERT(ctx);
+        up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, n_in, n_hidden, n_expert);
+        gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, n_in, n_hidden, n_expert);
+        down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, n_hidden, n_in, n_expert);
+        ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, 1);
+        GGML_ASSERT(up->data == nullptr && up->buffer == nullptr);
+        GGML_ASSERT(gate->data == nullptr && gate->buffer == nullptr);
+        GGML_ASSERT(down->data == nullptr && down->buffer == nullptr);
+    }
+
+    llm_expert_bundle_descriptor bundle(int32_t layer) const {
+        return {
+            layer,
+            int32_t(n_expert),
+            llm_expert_projection_descriptor::from(up, nullptr, nullptr),
+            llm_expert_projection_descriptor::from(gate, nullptr, nullptr),
+            {},
+            llm_expert_projection_descriptor::from(down, nullptr, nullptr),
+        };
+    }
+
+    llm_expert_selection selection(int32_t layer) const {
+        return { layer, int32_t(n_expert), int32_t(n_expert_used), 1, ids };
+    }
+
+    uint64_t payload_bytes() const {
+        return ggml_nbytes(up) + ggml_nbytes(gate) + ggml_nbytes(down);
+    }
+};
+
 llm_hot_cache_config test_config(
         uint32_t capacity = 2,
         uint32_t routed_layers = 1,
@@ -147,6 +193,14 @@ llm_hot_cache_config cold_test_config(uint32_t capacity = 2) {
     result.target_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     result.force_pageable_transfer_for_testing = true;
     GGML_ASSERT(result.target_device);
+    return result;
+}
+
+llm_hot_cache_config descriptor_only_cold_test_config(uint32_t routed_layers = 1) {
+    auto result = cold_test_config();
+    result.routed_layer_count = routed_layers;
+    result.total_expert_keys = routed_layers*4;
+    result.descriptor_only_source_for_testing = true;
     return result;
 }
 
@@ -271,6 +325,157 @@ bool count_execution_id_callbacks(ggml_tensor * tensor, bool ask, void * user_da
     }
     counts->observations++;
     return true;
+}
+
+void test_initialization_stage_and_descriptor_only_scale() {
+    auto hot = llm_create_hot_cache_expert_weight_provider(test_config());
+    GGML_ASSERT(hot->initialization_stage() ==
+        llm_expert_provider_initialization_stage::workspace_before_persistent_pool);
+
+    {
+        auto concurrent = llm_create_cold_cache_expert_weight_provider(descriptor_only_cold_test_config());
+        GGML_ASSERT(concurrent->initialization_stage() ==
+            llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve);
+        bool owner = false;
+        GGML_ASSERT(concurrent->begin_initialization(
+            llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve, owner).is_ready());
+        GGML_ASSERT(owner);
+        bool second_owner = false;
+        GGML_ASSERT(concurrent->begin_initialization(
+            llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve,
+            second_owner).error == llm_expert_provider_error::busy);
+        GGML_ASSERT(!second_owner);
+        GGML_ASSERT(concurrent->finish_initialization(false).is_ready());
+    }
+
+    // These tensors describe 6 GiB of routed payload but own no data or backend
+    // buffer.  Two graph variants register the same descriptors without any
+    // scheduler reservation or backend allocation.
+    metadata_only_tensor_fixture large(16384, 16384);
+    GGML_ASSERT(large.payload_bytes() > UINT64_C(4)*1024*1024*1024);
+    auto scale = llm_create_cold_cache_expert_weight_provider(descriptor_only_cold_test_config());
+    bool owner = false;
+    GGML_ASSERT(scale->begin_initialization(
+        llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve, owner).is_ready());
+    GGML_ASSERT(owner);
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(scale->bind(large.bundle(0), large.selection(0), binding).is_ready());
+    GGML_ASSERT(binding.bootstrap && binding.generation_lease == nullptr);
+    binding = {};
+    GGML_ASSERT(scale->bind(large.bundle(0), large.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(scale->complete_descriptor_discovery(2, 2, 0, { 0, 0 }, { 0, 0 }).is_ready());
+    auto scale_diagnostics = scale->hot_cache_diagnostics();
+    GGML_ASSERT(scale_diagnostics.descriptor_discovery_graphs == 2);
+    GGML_ASSERT(scale_diagnostics.descriptor_discovery_backend_bytes_before == 0);
+    GGML_ASSERT(scale_diagnostics.descriptor_discovery_backend_bytes_after == 0);
+    GGML_ASSERT(scale_diagnostics.effective_capacity == 0 && scale_diagnostics.pool_bytes == 0);
+    GGML_ASSERT(scale->finish_initialization(false).is_ready());
+
+    // A small metadata-only source proves the final fixed-capacity hot/cold
+    // bindings are distinct from the all-expert descriptor tensors.
+    metadata_only_tensor_fixture small;
+    auto bounded_config = descriptor_only_cold_test_config();
+    bounded_config.miss_policy = LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
+    auto bounded = llm_create_cold_cache_expert_weight_provider(bounded_config);
+    owner = false;
+    GGML_ASSERT(bounded->begin_initialization(
+        llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve, owner).is_ready());
+    GGML_ASSERT(owner);
+    GGML_ASSERT(bounded->bind(small.bundle(0), small.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(bounded->bind(small.bundle(0), small.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(bounded->complete_descriptor_discovery(2, 2, 0, { 0 }, { 0 }).is_ready());
+    GGML_ASSERT(bounded->initialize_after_reserve().is_ready());
+
+    ggml_init_params graph_params = { ggml_tensor_overhead()*16, nullptr, true };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    GGML_ASSERT(graph_ctx);
+    GGML_ASSERT(bounded->bind_graph(
+        graph_ctx.get(), small.bundle(0), small.selection(0), binding).is_ready());
+    GGML_ASSERT(!binding.bootstrap && binding.hybrid && binding.generation_lease != nullptr);
+    GGML_ASSERT(binding.up.weight != small.up && binding.cpu_up.weight != small.up);
+    GGML_ASSERT(bounded->record_initialization_telemetry(
+        { 0 }, { 512 }, 0, small.payload_bytes()).is_ready());
+    GGML_ASSERT(bounded->finish_initialization(true).is_ready());
+    const auto bounded_diagnostics = bounded->hot_cache_diagnostics();
+    GGML_ASSERT(bounded_diagnostics.pool_bytes > 0);
+    GGML_ASSERT(bounded_diagnostics.pool_bytes < small.payload_bytes());
+    GGML_ASSERT(bounded_diagnostics.complete_deferred_payload_bytes == small.payload_bytes());
+    GGML_ASSERT(!bounded_diagnostics.complete_deferred_payload_in_compute_workspace);
+    GGML_ASSERT(bounded->initialization_stage() == llm_expert_provider_initialization_stage::none);
+    binding = {};
+    graph_ctx.reset();
+    GGML_ASSERT(bounded->surrender().is_ready());
+
+    // Incomplete, duplicate-identity, and incompatible-layout discovery all
+    // fail before persistent allocation.
+    auto incomplete = llm_create_cold_cache_expert_weight_provider(descriptor_only_cold_test_config(2));
+    owner = false;
+    GGML_ASSERT(incomplete->begin_initialization(
+        llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve, owner).is_ready());
+    GGML_ASSERT(incomplete->bind(small.bundle(0), small.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(incomplete->complete_descriptor_discovery(2, 2, 0, { 0 }, { 0 }).error ==
+        llm_expert_provider_error::initialization_failed);
+    GGML_ASSERT(incomplete->hot_cache_diagnostics().pool_bytes == 0);
+    GGML_ASSERT(incomplete->finish_initialization(false).is_ready());
+
+    metadata_only_tensor_fixture incompatible_layout(8, 17);
+    auto incompatible = llm_create_cold_cache_expert_weight_provider(descriptor_only_cold_test_config(2));
+    owner = false;
+    GGML_ASSERT(incompatible->begin_initialization(
+        llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve, owner).is_ready());
+    GGML_ASSERT(incompatible->bind(small.bundle(0), small.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(incompatible->bind(
+        incompatible_layout.bundle(1), incompatible_layout.selection(1), binding).error ==
+        llm_expert_provider_error::invalid_descriptor);
+    GGML_ASSERT(incompatible->hot_cache_diagnostics().pool_bytes == 0);
+    GGML_ASSERT(incompatible->finish_initialization(false).is_ready());
+
+    metadata_only_tensor_fixture duplicate_identity(8, 16);
+    auto duplicate = llm_create_cold_cache_expert_weight_provider(descriptor_only_cold_test_config());
+    owner = false;
+    GGML_ASSERT(duplicate->begin_initialization(
+        llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve, owner).is_ready());
+    GGML_ASSERT(duplicate->bind(small.bundle(0), small.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(duplicate->bind(
+        duplicate_identity.bundle(0), duplicate_identity.selection(0), binding).error ==
+        llm_expert_provider_error::invalid_descriptor);
+    GGML_ASSERT(duplicate->hot_cache_diagnostics().pool_bytes == 0);
+    GGML_ASSERT(duplicate->finish_initialization(false).is_ready());
+
+    for (size_t failure_after = 2; failure_after <= 4; ++failure_after) {
+        llm_expert_provider_faults faults;
+        faults.binding = llm_expert_provider_error::invalid_descriptor;
+        faults.binding_successes_before_failure = failure_after;
+        auto failing = llm_create_cold_cache_expert_weight_provider(
+            bounded_config, faults);
+        owner = false;
+        GGML_ASSERT(failing->begin_initialization(
+            llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve, owner).is_ready());
+        GGML_ASSERT(failing->bind(small.bundle(0), small.selection(0), binding).is_ready());
+        binding = {};
+        GGML_ASSERT(failing->bind(small.bundle(0), small.selection(0), binding).is_ready());
+        binding = {};
+        GGML_ASSERT(failing->complete_descriptor_discovery(2, 2, 0, { 0 }, { 0 }).is_ready());
+        GGML_ASSERT(failing->initialize_after_reserve().is_ready());
+        std::vector<llm_expert_graph_binding> leases;
+        for (size_t graph = 2; graph < failure_after; ++graph) {
+            GGML_ASSERT(failing->bind(small.bundle(0), small.selection(0), binding).is_ready());
+            leases.push_back(std::move(binding));
+        }
+        GGML_ASSERT(failing->bind(small.bundle(0), small.selection(0), binding).error ==
+            llm_expert_provider_error::invalid_descriptor);
+        binding = {};
+        leases.clear();
+        GGML_ASSERT(failing->surrender().is_ready());
+        GGML_ASSERT(failing->hot_cache_diagnostics().pool_bytes == 0);
+        GGML_ASSERT(failing->finish_initialization(false).is_ready());
+    }
 }
 
 void test_configuration_matrix() {
@@ -1051,6 +1256,7 @@ void test_cuda_directory_copy() {
 } // namespace
 
 int main(int argc, char ** argv) {
+    test_initialization_stage_and_descriptor_only_scale();
     test_configuration_matrix();
     test_context_extent_matrix_and_prepare_revalidation();
     test_cold_provider_rejects_cuda_host_source();

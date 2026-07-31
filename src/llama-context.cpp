@@ -602,6 +602,27 @@ void llama_context::sched_reserve() {
         }
     }
 
+    auto initialization_stage = llm_expert_provider_initialization_stage::none;
+    bool initialization_owner = false;
+    bool hierarchy_initialized = false;
+    if (expert_weight_provider) {
+        initialization_stage = expert_weight_provider->initialization_stage();
+        if (initialization_stage != llm_expert_provider_initialization_stage::none) {
+            const auto claimed = expert_weight_provider->begin_initialization(
+                initialization_stage, initialization_owner);
+            if (!claimed.is_ready()) {
+                throw std::runtime_error(claimed.error == llm_expert_provider_error::busy
+                    ? "expert provider initialization already in progress"
+                    : "failed to claim expert provider initialization");
+            }
+            if (!initialization_owner) {
+                initialization_stage = llm_expert_provider_initialization_stage::none;
+            }
+        }
+    }
+
+    try {
+
     sched_need_reserve = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
@@ -641,6 +662,72 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
+    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    auto scheduler_backend_bytes = [&] {
+        std::vector<uint64_t> result;
+        result.reserve(backend_ptrs.size());
+        for (auto * backend : backend_ptrs) {
+            result.push_back(ggml_backend_sched_get_buffer_size(sched.get(), backend));
+        }
+        return result;
+    };
+    std::vector<uint64_t> backend_bytes_after_hierarchy;
+    uint64_t final_bootstrap_source_bindings = 0;
+    auto validate_final_expert_bindings = [&] {
+        if (!expert_weight_provider ||
+            initialization_stage != llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve) {
+            return;
+        }
+        const auto current_epoch = expert_weight_provider->graph_epoch();
+        for (const auto & binding : gf_res_reserve->get_expert_bindings()) {
+            final_bootstrap_source_bindings += binding.bootstrap;
+            if (binding.bootstrap || binding.generation_lease == nullptr || binding.graph_epoch != current_epoch) {
+                throw std::runtime_error("cold-cache final graph retained a descriptor-only source binding");
+            }
+        }
+    };
+
+    if (initialization_owner &&
+        initialization_stage == llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve) {
+        const auto backend_bytes_before = scheduler_backend_bytes();
+        uint64_t discovery_graphs = 0;
+        uint64_t discovery_bindings = 0;
+        auto discover = [&](uint32_t tokens, uint32_t seqs, uint32_t outputs) {
+            auto * gf = graph_discover(tokens, seqs, outputs, mctx.get());
+            const auto & provider_result = gf_res_reserve->get_expert_provider_result();
+            if (gf == nullptr || !provider_result.is_ready()) {
+                throw std::runtime_error("cold-cache descriptor discovery failed");
+            }
+            const auto & bindings = gf_res_reserve->get_expert_bindings();
+            if (bindings.empty() || std::any_of(bindings.begin(), bindings.end(), [](const auto & binding) {
+                    return !binding.bootstrap || binding.generation_lease != nullptr;
+                })) {
+                throw std::runtime_error("cold-cache descriptor discovery produced executable bindings");
+            }
+            discovery_graphs++;
+            discovery_bindings += bindings.size();
+            gf_res_prev->reset();
+            gf_res_reserve->reset();
+            ggml_backend_sched_reset(sched.get());
+        };
+        discover(n_tokens, n_seqs, n_outputs_pp);
+        discover(n_seqs, n_seqs, n_seqs);
+        const auto backend_bytes_after = scheduler_backend_bytes();
+        const auto discovered = expert_weight_provider->complete_descriptor_discovery(
+            discovery_graphs, discovery_bindings, 0, backend_bytes_before, backend_bytes_after);
+        if (!discovered.is_ready()) {
+            throw std::runtime_error("cold-cache descriptor discovery invariants failed");
+        }
+        const auto initialized = expert_weight_provider->initialize_after_reserve();
+        if (!initialized.is_ready()) {
+            throw std::runtime_error(initialized.status == llm_expert_provider_status::allocation_failed
+                ? "failed to allocate bounded cold-cache hierarchy"
+                : "failed to initialize bounded cold-cache hierarchy");
+        }
+        hierarchy_initialized = true;
+        backend_bytes_after_hierarchy = scheduler_backend_bytes();
+    }
+
     resolve_fused_ops(mctx.get(), n_seqs);
 
     // reserve worst-case graph
@@ -649,8 +736,6 @@ void llama_context::sched_reserve() {
 
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
-
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -670,6 +755,7 @@ void llama_context::sched_reserve() {
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
+        validate_final_expert_bindings();
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -681,6 +767,7 @@ void llama_context::sched_reserve() {
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
+        validate_final_expert_bindings();
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -693,9 +780,11 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+        validate_final_expert_bindings();
     }
 
-    if (expert_weight_provider && expert_weight_provider->needs_post_reserve_initialization()) {
+    if (initialization_owner &&
+        initialization_stage == llm_expert_provider_initialization_stage::workspace_before_persistent_pool) {
         std::vector<size_t> bootstrap_sizes(backend_ptrs.size());
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             bootstrap_sizes[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
@@ -713,12 +802,14 @@ void llama_context::sched_reserve() {
                 ? "failed to allocate persistent expert hot cache"
                 : "failed to initialize persistent expert hot cache");
         }
+        hierarchy_initialized = true;
 
         auto abandon_pool = [&] {
             gf_res_prev->reset();
             gf_res_reserve->reset();
             const auto surrendered = expert_weight_provider->surrender();
             GGML_ASSERT(surrendered.is_ready());
+            hierarchy_initialized = false;
         };
         auto reserve_hot = [&](uint32_t tokens, uint32_t seqs, uint32_t outputs) {
             auto * gf = graph_reserve(tokens, seqs, outputs, mctx.get(), model.hparams.no_alloc);
@@ -740,6 +831,22 @@ void llama_context::sched_reserve() {
                 abandon_pool();
                 throw std::runtime_error("persistent expert hot cache increased reserved compute workspace");
             }
+        }
+    }
+
+    if (initialization_owner &&
+        initialization_stage == llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve) {
+        const auto deferred = model.deferred_expert_diagnostics();
+        if (deferred.payload_bytes == 0 || deferred.allocated_bytes != 0 ||
+            deferred.mmap_bound_bytes != 0 || deferred.prefetched_bytes != 0 ||
+            !deferred.full_file_prefetch_disabled) {
+            throw std::runtime_error("cold-cache descriptor discovery changed deferred routed residency");
+        }
+        const auto recorded = expert_weight_provider->record_initialization_telemetry(
+            backend_bytes_after_hierarchy, scheduler_backend_bytes(),
+            final_bootstrap_source_bindings, deferred.payload_bytes);
+        if (!recorded.is_ready()) {
+            throw std::runtime_error("cold-cache initialization telemetry invariants failed");
         }
     }
 
@@ -772,6 +879,28 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    if (initialization_owner) {
+        const auto finished = expert_weight_provider->finish_initialization(true);
+        if (!finished.is_ready()) {
+            throw std::runtime_error("failed to finalize expert provider initialization");
+        }
+    }
+    } catch (...) {
+        if (initialization_owner) {
+            if (gf_res_prev) gf_res_prev->reset();
+            if (gf_res_reserve) gf_res_reserve->reset();
+            sched.reset();
+            if (hierarchy_initialized) {
+                const auto surrendered = expert_weight_provider->surrender();
+                GGML_ASSERT(surrendered.is_ready());
+                hierarchy_initialized = false;
+            }
+            const auto finished = expert_weight_provider->finish_initialization(false);
+            GGML_ASSERT(finished.is_ready());
+        }
+        throw;
+    }
 }
 
 void llama_context::synchronize() {
@@ -2852,6 +2981,46 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+}
+
+ggml_cgraph * llama_context::graph_discover(
+        uint32_t n_tokens,
+        uint32_t n_seqs,
+        uint32_t n_outputs,
+        const llama_memory_context_i * mctx) {
+    LLAMA_LOG_DEBUG("%s: building descriptor-only graph with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n",
+        __func__, n_tokens, n_seqs, n_outputs);
+    GGML_ASSERT(n_outputs >= 1);
+
+    if (n_tokens % n_seqs != 0) {
+        n_tokens = ((n_tokens + (n_seqs - 1))/n_seqs)*n_seqs;
+    }
+
+    // Discovery deliberately stops before scheduler splitting or reservation.
+    // The scheduler exists only so ordinary graph construction can assign
+    // tensor backends while registering every routed bundle descriptor.
+    ggml_backend_sched_reset(sched.get());
+    gf_res_prev->reset();
+
+    const auto save_n_outputs = this->n_outputs;
+    this->n_outputs = n_outputs;
+
+    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+    std::vector<llama_seq_id> seq_ids(n_seqs);
+    for (uint32_t i = 0; i < n_seqs; ++i) {
+        seq_ids[i] = i;
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i] = &seq_ids[i];
+        ubatch.output[i] = true;
+    }
+
+    auto * res = gf_res_reserve.get();
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    res->reset();
+    auto * gf = model.build_graph(gparams);
+    this->n_outputs = save_n_outputs;
+    return gf;
 }
 
 ggml_cgraph * llama_context::graph_reserve(
