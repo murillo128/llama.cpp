@@ -419,6 +419,42 @@ void test_hybrid_binding() {
     GGML_ASSERT(provider->remap_checkpoint_tensor(binding, backend.get()).is_ready());
     plan.reset();
 
+    auto cpu_auto_cost = valid_cost_model();
+    cpu_auto_cost.cpu_fixed_decode_ns = 1;
+    cpu_auto_cost.cpu_per_lane_decode_ns = 1;
+    cpu_auto_cost.gpu_fixed_decode_ns = 1000000;
+    cpu_auto_cost.gpu_per_lane_decode_ns = 1000000;
+    cpu_auto_cost.h2d_fixed_ns = 1000000;
+    cpu_auto_cost.h2d_bytes_per_second = 1;
+    const int32_t hot_plus_miss_ids[] = { 0, 1 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, hot_plus_miss_ids, 0, sizeof(hot_plus_miss_ids));
+    GGML_ASSERT(provider->debug_set_auto_cost_model_for_testing(cpu_auto_cost).is_ready());
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint_tensor(binding, backend.get()).is_ready());
+    auto auto_live = provider->hot_cache_diagnostics();
+    GGML_ASSERT(!auto_live.auto_decisions.empty());
+    const auto & hot_queued = auto_live.auto_decisions.back();
+    GGML_ASSERT(hot_queued.expert == 1);
+    GGML_ASSERT(hot_queued.queued_gpu_work_ns ==
+        cpu_auto_cost.gpu_fixed_decode_ns + cpu_auto_cost.gpu_per_lane_decode_ns);
+    plan.reset();
+
+    const int32_t queued_miss_ids[] = { 2, 3 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, queued_miss_ids, 0, sizeof(queued_miss_ids));
+    const uint64_t first_request = auto_live.auto_decisions.back().request + 1;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint_tensor(binding, backend.get()).is_ready());
+    auto_live = provider->hot_cache_diagnostics();
+    std::vector<llm_hot_cache_diagnostics::auto_decision> queued_records;
+    for (const auto & record : auto_live.auto_decisions) {
+        if (record.request == first_request && record.layer == 0) queued_records.push_back(record);
+    }
+    GGML_ASSERT(queued_records.size() == 2);
+    GGML_ASSERT(queued_records[0].expert == 2 && queued_records[1].expert == 3);
+    GGML_ASSERT(queued_records[0].queued_cpu_work_ns == 0);
+    GGML_ASSERT(queued_records[1].queued_cpu_work_ns == queued_records[0].cpu_finish_ns);
+    plan.reset();
+
     const int32_t mixed_ids[] = { 0, 1 };
     ggml_backend_tensor_set(binding.checkpoint_ids, mixed_ids, 0, sizeof(mixed_ids));
     GGML_ASSERT(provider->debug_set_miss_policy_for_testing(
@@ -434,7 +470,7 @@ void test_hybrid_binding() {
     GGML_ASSERT(llm_validate_hybrid_execution_ids(gpu_ids, cpu_ids, 2, 2, 2).is_ready());
     auto live = provider->hot_cache_diagnostics();
     GGML_ASSERT(live.cold_current_cpu_execution_refs == 1);
-    GGML_ASSERT(live.mixed_execution_layers == 1);
+    GGML_ASSERT(live.mixed_execution_layers >= 1);
     GGML_ASSERT(provider->trim().error == llm_expert_provider_error::busy);
     GGML_ASSERT(provider->surrender().error == llm_expert_provider_error::busy);
     plan.reset();
@@ -708,6 +744,7 @@ void test_hybrid_model_graph(const char * model_path) {
     GGML_ASSERT(gated_diagnostics.active_background_flights <= gated_diagnostics.effective_capacity);
     GGML_ASSERT(gated_diagnostics.peak_background_flights <= gated_diagnostics.effective_capacity);
     GGML_ASSERT(gated_diagnostics.background_busy + gated_diagnostics.background_dropped > 0);
+    GGML_ASSERT(gated_diagnostics.background_wasted == 0);
     GGML_ASSERT(gated_diagnostics.ring_h2d_event_waits == 0);
 
     GGML_ASSERT(gated_provider->debug_set_auto_cost_model_for_testing(gpu_cost).is_ready());
@@ -718,6 +755,17 @@ void test_hybrid_model_graph(const char * model_path) {
     const auto joined_diagnostics = gated_provider->hot_cache_diagnostics();
     GGML_ASSERT(joined_diagnostics.background_later_joins > 0);
     GGML_ASSERT(joined_diagnostics.active_background_flights == 0);
+    bool saw_same_key_submitted = false;
+    bool saw_background_backlog = false;
+    bool saw_hot_gpu_queue = false;
+    for (const auto & record : joined_diagnostics.auto_decisions) {
+        saw_same_key_submitted = saw_same_key_submitted || record.same_key_submitted_bytes > 0;
+        saw_background_backlog = saw_background_backlog || record.queued_h2d_work_ns > 0;
+        saw_hot_gpu_queue = saw_hot_gpu_queue || record.queued_gpu_work_ns > 0;
+    }
+    GGML_ASSERT(saw_same_key_submitted);
+    GGML_ASSERT(saw_background_backlog);
+    GGML_ASSERT(saw_hot_gpu_queue);
     GGML_ASSERT(joined_diagnostics.background_completed == gated_diagnostics.background_submitted);
 
     ggml_backend_synchronize(gate_backend.get());

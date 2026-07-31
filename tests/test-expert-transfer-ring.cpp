@@ -248,6 +248,42 @@ void test_native_event_ordering_reuse_and_unload() {
         intervals[0].bytes == diagnostics.lane_payload_bytes);
     GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
 
+    llm_transfer_ring_config background_config = {
+        diagnostics.lane_footprint, 1, device, false, false, false, 0, 32,
+    };
+    background_config.delay_background_stage_ms_for_testing = 250;
+    llm_expert_transfer_ring background(background_config);
+    GGML_ASSERT(background.initialize(source.bundle()).is_ready());
+    llm_transfer_lane_reference background_lane;
+    GGML_ASSERT(background.try_queue_background_transfer(
+        cold, cold_zero, 0, 3, cold.bundle(), hot.bundle(), background_lane).is_ready());
+    bool background_complete = false;
+    uint64_t remaining_submitted = UINT64_MAX;
+    GGML_ASSERT(background.poll_h2d(
+        background_lane, background_complete, &remaining_submitted).is_ready());
+    GGML_ASSERT(!background_complete && remaining_submitted == 0);
+    GGML_ASSERT(background.wait_for_hot(backend.get(), 0, 3).is_ready());
+    GGML_ASSERT(background.retire_hot(0, 3).is_ready());
+    GGML_ASSERT(background.surrender().is_ready());
+    GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+
+    llm_expert_transfer_ring failed_background(background_config, { false, 1, false, false });
+    GGML_ASSERT(failed_background.initialize(source.bundle()).is_ready());
+    llm_transfer_lane_reference failed_lane;
+    GGML_ASSERT(failed_background.try_queue_background_transfer(
+        cold, cold_zero, 0, 4, cold.bundle(), hot.bundle(), failed_lane).is_ready());
+    llm_expert_provider_result failed_poll;
+    const auto failure_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    do {
+        failed_poll = failed_background.poll_h2d(failed_lane, background_complete);
+        if (!failed_poll.is_ready()) break;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < failure_deadline);
+    GGML_ASSERT(failed_poll.error == llm_expert_provider_error::copy_failed);
+    GGML_ASSERT(failed_background.release_failed_background(failed_lane).is_ready());
+    GGML_ASSERT(failed_background.surrender().is_ready());
+    GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+
     {
         ggml_backend_ptr gate_backend(ggml_backend_dev_init(device, nullptr));
         GGML_ASSERT(gate_backend);

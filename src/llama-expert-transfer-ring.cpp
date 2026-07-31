@@ -157,6 +157,13 @@ struct llm_expert_transfer_ring::impl {
         bool compute_complete = false;
         bool compute_monitoring = false;
         bool cancelled = false;
+        bool background_queued = false;
+        bool background_running = false;
+        llm_expert_bundle_descriptor background_cold;
+        llm_expert_bundle_descriptor background_destination;
+        uint64_t failed_generation = 0;
+        uint32_t failed_hot_slot = UINT32_MAX;
+        uint64_t failed_hot_generation = 0;
         uint64_t h2d_enqueue_us = 0;
         uint64_t h2d_complete_us = 0;
         uint64_t compute_begin_us = 0;
@@ -197,6 +204,10 @@ struct llm_expert_transfer_ring::impl {
         lane.compute_complete = false;
         lane.compute_monitoring = false;
         lane.cancelled = false;
+        lane.background_queued = false;
+        lane.background_running = false;
+        lane.background_cold = {};
+        lane.background_destination = {};
         lane.h2d_enqueue_us = 0;
         lane.h2d_complete_us = 0;
         lane.compute_begin_us = 0;
@@ -260,6 +271,20 @@ struct llm_expert_transfer_ring::impl {
         for (const auto & lane : lanes) {
             if (lane.state == llm_transfer_lane_state::in_flight && lane.compute_pending &&
                 !lane.compute_complete && !lane.compute_monitoring) return true;
+        }
+        return false;
+    }
+
+    bool has_background_work() const {
+        for (const auto & lane : lanes) {
+            if (lane.state == llm_transfer_lane_state::staging && lane.background_queued) return true;
+        }
+        return false;
+    }
+
+    bool has_running_background_work() const {
+        for (const auto & lane : lanes) {
+            if (lane.background_queued || lane.background_running) return true;
         }
         return false;
     }
@@ -361,12 +386,15 @@ struct llm_expert_transfer_ring::impl {
     std::condition_variable condition;
     std::thread monitor;
     std::thread compute_monitor;
+    std::thread background_worker;
     bool monitor_stop = false;
+    bool background_stop = false;
     ggml_backend_buffer_ptr arena;
     ggml_backend_ptr transfer_backend;
     uint8_t * base = nullptr;
     std::vector<span_layout> spans;
     std::vector<lane_state> lanes;
+    std::vector<llm_transfer_binding> background_bindings;
     llm_transfer_ring_diagnostics counters;
     std::vector<llm_transfer_interval> traces;
     uint64_t compute_begin_us = 0;
@@ -382,6 +410,12 @@ llm_expert_transfer_ring::llm_expert_transfer_ring(
 
 llm_expert_transfer_ring::~llm_expert_transfer_ring() {
     if (!pimpl) return;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->mutex);
+        pimpl->background_stop = true;
+        pimpl->condition.notify_all();
+    }
+    if (pimpl->background_worker.joinable()) pimpl->background_worker.join();
     {
         std::lock_guard<std::mutex> lock(pimpl->mutex);
         pimpl->monitor_stop = true;
@@ -504,10 +538,70 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
         pimpl->counters.event_capacity = event_capable ? uint32_t(total_event_capacity) : 0;
         pimpl->counters.trace_capacity = pimpl->config.trace_capacity;
         pimpl->traces.assign(pimpl->config.trace_capacity, {});
+        pimpl->background_bindings.reserve(1);
         pimpl->arena = std::move(candidate);
         if (event_capable) {
             pimpl->monitor = std::thread([this] { pimpl->monitor_main(); });
             pimpl->compute_monitor = std::thread([this] { pimpl->compute_monitor_main(); });
+            pimpl->background_worker = std::thread([this] {
+                std::unique_lock<std::mutex> lock(pimpl->mutex);
+                for (;;) {
+                    pimpl->condition.wait(lock, [&] {
+                        return pimpl->background_stop || pimpl->has_background_work();
+                    });
+                    uint32_t selected = UINT32_MAX;
+                    for (uint32_t index = 0; index < pimpl->lanes.size(); ++index) {
+                        const auto & lane = pimpl->lanes[index];
+                        if (lane.state == llm_transfer_lane_state::staging && lane.background_queued) {
+                            selected = index;
+                            break;
+                        }
+                    }
+                    if (selected == UINT32_MAX) {
+                        if (pimpl->background_stop && !pimpl->has_running_background_work()) break;
+                        continue;
+                    }
+                    auto & lane = pimpl->lanes[selected];
+                    const llm_transfer_lane_reference reference = { selected, lane.generation };
+                    const auto cold_bundle = lane.background_cold;
+                    const auto destination = lane.background_destination;
+                    const uint32_t hot_slot = lane.hot_slot;
+                    lane.background_queued = false;
+                    lane.background_running = true;
+                    lock.unlock();
+
+                    if (pimpl->config.delay_background_stage_ms_for_testing != 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(
+                            pimpl->config.delay_background_stage_ms_for_testing));
+                    }
+                    auto result = stage(reference, cold_bundle);
+                    if (result.is_ready()) {
+                        pimpl->background_bindings.clear();
+                        pimpl->background_bindings.push_back({ reference, destination, hot_slot });
+                        result = transfer_wave(pimpl->transfer_backend.get(), pimpl->background_bindings);
+                    }
+                    if (result.is_ready()) result = monitor_h2d(reference);
+
+                    lock.lock();
+                    if (selected < pimpl->lanes.size()) {
+                        auto & completed = pimpl->lanes[selected];
+                        if (completed.generation == reference.generation) {
+                            completed.background_running = false;
+                            if (!result.is_ready() &&
+                                (completed.state == llm_transfer_lane_state::failed ||
+                                 completed.state == llm_transfer_lane_state::staging)) {
+                                const uint32_t failed_hot_slot = completed.hot_slot;
+                                const uint64_t failed_hot_generation = completed.hot_generation;
+                                pimpl->release_lane(completed);
+                                completed.failed_generation = reference.generation;
+                                completed.failed_hot_slot = failed_hot_slot;
+                                completed.failed_hot_generation = failed_hot_generation;
+                            }
+                        }
+                    }
+                    pimpl->condition.notify_all();
+                }
+            });
         }
         return llm_expert_provider_result::success();
     } catch (const std::bad_alloc &) {
@@ -543,7 +637,7 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
             for (const auto & lane : pimpl->lanes) {
                 if (lane.state == llm_transfer_lane_state::free ||
                     (lane.state == llm_transfer_lane_state::in_flight && lane.event_complete &&
-                     (!lane.compute_pending || lane.compute_complete))) return true;
+                     !lane.hold_after_h2d && (!lane.compute_pending || lane.compute_complete))) return true;
             }
             return false;
         });
@@ -551,6 +645,7 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
             if (pimpl->lanes[index].state == llm_transfer_lane_state::free) break;
             if (pimpl->lanes[index].state == llm_transfer_lane_state::in_flight &&
                 pimpl->lanes[index].event_complete &&
+                !pimpl->lanes[index].hold_after_h2d &&
                 (!pimpl->lanes[index].compute_pending || pimpl->lanes[index].compute_complete)) {
                 pimpl->release_lane(pimpl->lanes[index]);
                 break;
@@ -579,27 +674,36 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
 llm_expert_provider_result llm_expert_transfer_ring::stage(
         llm_transfer_lane_reference reference,
         const llm_expert_bundle_descriptor & cold_bundle) noexcept {
-    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
     if (!pimpl->valid_lane(reference) || pimpl->lanes[reference.lane].state != llm_transfer_lane_state::staging) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
     size_t copied = 0;
+    uint64_t copied_bytes = 0;
     const int64_t start = ggml_time_us();
+    lock.unlock();
     for (const auto & span : pimpl->spans) {
         const auto * source = member(cold_bundle, span.projection, span.member);
         const int axis = expert_axis(source, cold_bundle.n_expert, span.member == 0);
         if (copied >= pimpl->faults.fail_stage_after_spans || source == nullptr || axis < 0 ||
             source->nb[axis] != span.bytes || lane.cold.slot >= uint32_t(source->ne[axis]) || source->data == nullptr) {
-            lane.state = llm_transfer_lane_state::failed;
+            lock.lock();
+            if (pimpl->valid_lane(reference)) lane.state = llm_transfer_lane_state::failed;
+            pimpl->condition.notify_all();
             return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
         }
         const auto * source_data = static_cast<const uint8_t *>(source->data) + size_t(lane.cold.slot)*span.bytes;
         std::memcpy(pimpl->base + size_t(reference.lane)*pimpl->counters.lane_footprint + span.offset,
             source_data, span.bytes);
-        pimpl->counters.stage_bytes += span.bytes;
+        copied_bytes += span.bytes;
         copied++;
     }
+    lock.lock();
+    if (!pimpl->valid_lane(reference) || lane.state != llm_transfer_lane_state::staging) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    pimpl->counters.stage_bytes += copied_bytes;
     pimpl->counters.stage_time_us += ggml_time_us() - start;
     return llm_expert_provider_result::success();
 }
@@ -704,17 +808,77 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
     return llm_expert_provider_result::success();
 }
 
+llm_expert_provider_result llm_expert_transfer_ring::try_queue_background_transfer(
+        llm_cold_expert_cache & cold_cache,
+        llm_cold_reference cold,
+        uint32_t hot_slot,
+        uint64_t hot_generation,
+        const llm_expert_bundle_descriptor & cold_bundle,
+        const llm_expert_bundle_descriptor & destination,
+        llm_transfer_lane_reference & reference,
+        llm_expert_flight_id flight) noexcept {
+    std::unique_lock<std::mutex> lock(pimpl->mutex, std::try_to_lock);
+    if (!lock.owns_lock() || pimpl->background_stop || !pimpl->counters.event_capable || !pimpl->arena) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+    }
+    uint32_t index = 0;
+    while (index < pimpl->lanes.size() && pimpl->lanes[index].state != llm_transfer_lane_state::free) index++;
+    if (index == pimpl->lanes.size()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+    }
+    auto & selected = pimpl->lanes[index];
+    if (selected.generation == std::numeric_limits<uint64_t>::max()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
+    }
+    const auto acquired = cold_cache.acquire(cold, llm_cold_reference_kind::transfer);
+    if (!acquired.is_ready()) return acquired;
+    selected.generation++;
+    selected.state = llm_transfer_lane_state::staging;
+    selected.cold = cold;
+    selected.hot_slot = hot_slot;
+    selected.hot_generation = hot_generation;
+    selected.flight = flight;
+    selected.cold_cache = &cold_cache;
+    selected.background_cold = cold_bundle;
+    selected.background_destination = destination;
+    selected.background_queued = true;
+    selected.hold_after_h2d = true;
+    reference = { index, selected.generation };
+    pimpl->counters.lane_reservations++;
+    pimpl->condition.notify_all();
+    return llm_expert_provider_result::success();
+}
+
 llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
         ggml_backend_t compute_backend,
         uint32_t hot_slot,
         uint64_t hot_generation) noexcept {
-    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
     bool conflicting_generation = false;
     for (auto & lane : pimpl->lanes) {
-        if (lane.hot_slot == hot_slot && lane.state == llm_transfer_lane_state::in_flight &&
+        if (lane.failed_hot_slot == hot_slot && lane.failed_hot_generation == hot_generation) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+        }
+        if (lane.hot_slot == hot_slot && lane.state != llm_transfer_lane_state::free &&
             lane.hot_generation != hot_generation) conflicting_generation = true;
         if (lane.hot_slot != hot_slot || lane.hot_generation != hot_generation ||
-            lane.state != llm_transfer_lane_state::in_flight) continue;
+            lane.state == llm_transfer_lane_state::free) continue;
+        const uint64_t generation = lane.generation;
+        if (lane.state == llm_transfer_lane_state::staging) {
+            pimpl->condition.wait(lock, [&] {
+                return lane.generation != generation || lane.state != llm_transfer_lane_state::staging;
+            });
+        }
+        if (lane.failed_generation == generation) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+        }
+        if (lane.generation != generation || lane.state == llm_transfer_lane_state::failed) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+        }
+        if (lane.state == llm_transfer_lane_state::free) return llm_expert_provider_result::success();
+        if (lane.state != llm_transfer_lane_state::in_flight) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+        }
         if (compute_backend == nullptr || ggml_backend_get_device(compute_backend) != pimpl->config.target_device ||
             lane.event == nullptr || lane.compute_event == nullptr) {
             std::fprintf(stderr, "error: expert transfer backend/device mismatch during compute wait\n");
@@ -768,7 +932,6 @@ llm_expert_provider_result llm_expert_transfer_ring::monitor_h2d(
     if (lane.state != llm_transfer_lane_state::in_flight || lane.event == nullptr) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
     }
-    lane.hold_after_h2d = true;
     lane.wait_enqueued = true;
     pimpl->condition.notify_all();
     return llm_expert_provider_result::success();
@@ -776,9 +939,11 @@ llm_expert_provider_result llm_expert_transfer_ring::monitor_h2d(
 
 llm_expert_provider_result llm_expert_transfer_ring::poll_h2d(
         llm_transfer_lane_reference reference,
-        bool & complete) noexcept {
+        bool & complete,
+        uint64_t * remaining_submitted_bytes) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     complete = false;
+    if (remaining_submitted_bytes != nullptr) *remaining_submitted_bytes = 0;
     if (reference.lane >= pimpl->lanes.size() ||
         pimpl->lanes[reference.lane].generation != reference.generation) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
@@ -786,6 +951,9 @@ llm_expert_provider_result llm_expert_transfer_ring::poll_h2d(
     auto & lane = pimpl->lanes[reference.lane];
     const auto state = lane.state;
     if (state == llm_transfer_lane_state::free) {
+        if (lane.failed_generation == reference.generation) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+        }
         complete = true;
         return llm_expert_provider_result::success();
     }
@@ -795,10 +963,34 @@ llm_expert_provider_result llm_expert_transfer_ring::poll_h2d(
             lane.hold_after_h2d = false;
             pimpl->finish_lane_if_ready(lane);
             pimpl->condition.notify_all();
+        } else if (remaining_submitted_bytes != nullptr) {
+            // Event-granularity accounting is deterministic: an incomplete
+            // submitted copy retains its full immutable payload.
+            *remaining_submitted_bytes = pimpl->counters.lane_payload_bytes;
         }
         return llm_expert_provider_result::success();
     }
+    if (state == llm_transfer_lane_state::staging) {
+        return llm_expert_provider_result::success();
+    }
     return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::release_failed_background(
+        llm_transfer_lane_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (reference.lane >= pimpl->lanes.size() ||
+        pimpl->lanes[reference.lane].generation != reference.generation) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & lane = pimpl->lanes[reference.lane];
+    if (lane.state == llm_transfer_lane_state::free) return llm_expert_provider_result::success();
+    if (lane.state != llm_transfer_lane_state::failed || lane.background_running || lane.background_queued) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+    }
+    pimpl->release_lane(lane);
+    pimpl->condition.notify_all();
+    return llm_expert_provider_result::success();
 }
 
 llm_expert_provider_result llm_expert_transfer_ring::begin_compute_work(
@@ -886,6 +1078,7 @@ llm_expert_provider_result llm_expert_transfer_ring::cleanup_failed_lanes() noex
         pimpl->counters.failed_cleanups++;
         return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
     }
+    pimpl->condition.wait(lock, [&] { return !pimpl->has_running_background_work(); });
     for (auto & lane : pimpl->lanes) {
         if (lane.state == llm_transfer_lane_state::in_flight) {
             const uint64_t generation = lane.generation;
@@ -909,6 +1102,11 @@ llm_expert_provider_result llm_expert_transfer_ring::cleanup_failed_lanes() noex
 
 llm_expert_provider_result llm_expert_transfer_ring::surrender() noexcept {
     std::unique_lock<std::mutex> lock(pimpl->mutex);
+    pimpl->background_stop = true;
+    pimpl->condition.notify_all();
+    lock.unlock();
+    if (pimpl->background_worker.joinable()) pimpl->background_worker.join();
+    lock.lock();
     for (auto & lane : pimpl->lanes) {
         if (lane.state == llm_transfer_lane_state::in_flight) {
             const uint64_t generation = lane.generation;
@@ -936,6 +1134,7 @@ llm_expert_provider_result llm_expert_transfer_ring::surrender() noexcept {
     }
     pimpl->transfer_backend.reset();
     pimpl->arena.reset(); pimpl->base = nullptr; pimpl->spans.clear(); pimpl->lanes.clear();
+    pimpl->background_bindings.clear();
     pimpl->counters.actual_bytes = 0;
     pimpl->counters.pinned_or_registered_bytes = 0;
     pimpl->counters.effective_lanes = 0;

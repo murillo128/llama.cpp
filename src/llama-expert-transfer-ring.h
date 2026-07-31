@@ -32,6 +32,7 @@ struct llm_transfer_ring_config {
     uint32_t delay_event_monitor_ms_for_testing = 0;
     bool allow_controlled_compute_for_testing = false;
     ggml_backend_event_t h2d_gate_event_for_testing = nullptr;
+    uint32_t delay_background_stage_ms_for_testing = 0;
 };
 
 struct llm_transfer_interval {
@@ -158,6 +159,17 @@ public:
     llm_expert_provider_result transfer_wave(
         ggml_backend_t backend,
         const std::vector<llm_transfer_binding> & bindings) noexcept;
+    // Atomically reserve and queue a background transfer without waiting for
+    // the ring mutex or a free lane.
+    llm_expert_provider_result try_queue_background_transfer(
+        llm_cold_expert_cache & cold_cache,
+        llm_cold_reference cold,
+        uint32_t hot_slot,
+        uint64_t hot_generation,
+        const llm_expert_bundle_descriptor & cold_bundle,
+        const llm_expert_bundle_descriptor & destination,
+        llm_transfer_lane_reference & lane,
+        llm_expert_flight_id flight = {}) noexcept;
     llm_expert_provider_result wait_for_hot(
         ggml_backend_t compute_backend,
         uint32_t hot_slot,
@@ -167,7 +179,12 @@ public:
     llm_expert_provider_result monitor_h2d(llm_transfer_lane_reference lane) noexcept;
     llm_expert_provider_result poll_h2d(
         llm_transfer_lane_reference lane,
-        bool & complete) noexcept;
+        bool & complete,
+        uint64_t * remaining_submitted_bytes = nullptr) noexcept;
+    // Release only a terminal failed background lane; never waits for or
+    // cancels unrelated current-token work.
+    llm_expert_provider_result release_failed_background(
+        llm_transfer_lane_reference lane) noexcept;
     llm_expert_provider_result begin_compute_work(
         ggml_backend_t compute_backend,
         uint64_t work) noexcept;
