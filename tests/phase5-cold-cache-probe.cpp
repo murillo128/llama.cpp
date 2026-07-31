@@ -79,18 +79,44 @@ struct execution_id_placement {
     llama_context * context = nullptr;
     uint64_t cpu = 0;
     uint64_t non_cpu = 0;
+    int32_t backend_device_type = -1;
+    std::string backend_name;
+    bool backend_consistent = true;
+    uint64_t routing_cpu = 0;
+    uint64_t routing_non_cpu = 0;
+    int32_t routing_backend_device_type = -1;
+    std::string routing_backend_name;
+    bool routing_backend_consistent = true;
 };
 
 bool capture_execution_id_placement(ggml_tensor * tensor, bool ask, void * user_data) {
     auto * placement = static_cast<execution_id_placement *>(user_data);
-    if (std::strncmp(tensor->name, "expert_execution_ids-", 21) != 0) return false;
+    const bool execution_ids = std::strncmp(tensor->name, "expert_execution_ids-", 21) == 0;
+    const bool routing_ids = std::strncmp(tensor->name, "ffn_moe_topk-", 13) == 0;
+    if (!execution_ids && !routing_ids) return false;
     if (!ask) return true;
     if (placement->context == nullptr) return true;
     ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(
         placement->context->get_sched(), tensor);
     ggml_backend_dev_t device = backend == nullptr ? nullptr : ggml_backend_get_device(backend);
-    if (device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) placement->cpu++;
-    else placement->non_cpu++;
+    const int32_t device_type = device == nullptr ? -1 : int32_t(ggml_backend_dev_type(device));
+    const std::string backend_name = backend == nullptr ? "" : ggml_backend_name(backend);
+    uint64_t & cpu = execution_ids ? placement->cpu : placement->routing_cpu;
+    uint64_t & non_cpu = execution_ids ? placement->non_cpu : placement->routing_non_cpu;
+    int32_t & observed_device_type = execution_ids ?
+        placement->backend_device_type : placement->routing_backend_device_type;
+    std::string & observed_backend_name = execution_ids ?
+        placement->backend_name : placement->routing_backend_name;
+    bool & consistent = execution_ids ?
+        placement->backend_consistent : placement->routing_backend_consistent;
+    if (cpu + non_cpu == 0) {
+        observed_device_type = device_type;
+        observed_backend_name = backend_name;
+    } else if (observed_device_type != device_type || observed_backend_name != backend_name) {
+        consistent = false;
+    }
+    if (device_type == GGML_BACKEND_DEVICE_TYPE_CPU) cpu++;
+    else non_cpu++;
     return true;
 }
 
@@ -160,9 +186,10 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
         }
         else return false;
     }
+    const bool cached_mode = result.mode == "hot" || result.mode == "cold";
     return !(result.cancel_on_storage && result.cancel_after_h2d) && !result.model.empty() &&
-        (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold") &&
-        (result.mode == "disabled" || result.capacity > 0) &&
+        (result.mode == "disabled" || result.mode == "resident" || cached_mode) &&
+        (!cached_mode || result.capacity > 0) &&
         (result.mode != "cold" || (result.cold_bytes > 0 && result.ring_bytes > 0));
 }
 
@@ -202,7 +229,9 @@ int run_live(int argc, char ** argv) {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = -1;
     model_params.load_mode = args.load_mode;
-    if (args.mode != "disabled") {
+    if (args.mode == "resident") {
+        model_params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT;
+    } else if (args.mode == "hot" || args.mode == "cold") {
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_hot_cache_capacity = args.capacity;
         model_params.expert_weights_mode = args.mode == "hot" ?
@@ -485,6 +514,26 @@ int run_live(int argc, char ** argv) {
         model->expert_storage()->diagnostics() : llm_expert_storage_diagnostics {};
     const auto async_diagnostics = model->expert_async_diagnostics();
     const auto scheduler_diagnostics = model->expert_scheduler_diagnostics();
+    const bool resident_runtime_quiet = args.mode != "resident" ||
+        (diagnostics.requested_capacity == 0 && diagnostics.effective_capacity == 0 &&
+         diagnostics.pool_bytes == 0 && diagnostics.requests == 0 && diagnostics.hits == 0 &&
+         diagnostics.misses == 0 && diagnostics.admissions == 0 && diagnostics.evictions == 0 &&
+         diagnostics.h2d_bytes == 0 && diagnostics.slots.empty() &&
+         diagnostics.cold_requested_bytes == 0 && diagnostics.cold_actual_bytes == 0 &&
+         diagnostics.cold_effective_slots == 0 && diagnostics.cold_requests == 0 &&
+         diagnostics.cold_hits == 0 && diagnostics.cold_misses == 0 &&
+         diagnostics.cold_admissions == 0 && diagnostics.cold_evictions == 0 &&
+         diagnostics.ring_requested_bytes == 0 && diagnostics.ring_actual_bytes == 0 &&
+         diagnostics.ring_effective_lanes == 0 && diagnostics.ring_async_enqueues == 0 &&
+         diagnostics.ring_synchronous_copies == 0 && diagnostics.ring_waves == 0 &&
+         diagnostics.ring_h2d_bytes == 0 && diagnostics.ring_event_capacity == 0 &&
+         storage_diagnostics.read_requests == 0 && storage_diagnostics.read_bytes == 0 &&
+         !async_diagnostics.io_uring_enabled && async_diagnostics.actual_sq_entries == 0 &&
+         async_diagnostics.actual_cq_entries == 0 && async_diagnostics.registered_file_count == 0 &&
+         async_diagnostics.read_requests_submitted == 0 &&
+         async_diagnostics.read_operations_completed == 0 && async_diagnostics.read_bytes_completed == 0 &&
+         async_diagnostics.active_read_requests == 0 && async_diagnostics.active_operations == 0 &&
+         scheduler_diagnostics.flights_created == 0 && scheduler_diagnostics.active_requests == 0);
     if (!args.dump_cold_bundle.empty()) {
         if (args.mode != "cold" || !model->expert_storage() || !model->expert_weight_provider()) return 29;
         llm_expert_key key = { -1, -1 };
@@ -552,8 +601,13 @@ int run_live(int argc, char ** argv) {
               << "\ttoken_p50_us=" << percentile(50, 100)
               << "\ttoken_p95_us=" << percentile(95, 100)
               << "\ttoken_p99_us=" << percentile(99, 100)
+              << "\thot_requested_capacity=" << diagnostics.requested_capacity
+              << "\thot_effective_capacity=" << diagnostics.effective_capacity
+              << "\thot_slots=" << diagnostics.slots.size()
               << "\thot_hits=" << diagnostics.hits
               << "\thot_misses=" << diagnostics.misses
+              << "\thot_admissions=" << diagnostics.admissions
+              << "\thot_evictions=" << diagnostics.evictions
               << "\tcold_hits=" << diagnostics.cold_hits
               << "\tcold_misses=" << diagnostics.cold_misses
               << "\tcold_evictions=" << diagnostics.cold_evictions
@@ -679,12 +733,26 @@ int run_live(int argc, char ** argv) {
               << "\tdisk_h2d_overlap_pair_digest=" << diagnostics.disk_h2d_overlap_pair_digest
               << "\texecution_ids_cpu=" << placement.cpu
               << "\texecution_ids_non_cpu=" << placement.non_cpu
+              << "\texecution_ids_backend_device_type=" << placement.backend_device_type
+              << "\texecution_ids_backend_name=" << placement.backend_name
+              << "\texecution_ids_backend_consistent=" << placement.backend_consistent
+              << "\trouting_ids_cpu=" << placement.routing_cpu
+              << "\trouting_ids_non_cpu=" << placement.routing_non_cpu
+              << "\trouting_backend_device_type=" << placement.routing_backend_device_type
+              << "\trouting_backend_name=" << placement.routing_backend_name
+              << "\trouting_backend_consistent=" << placement.routing_backend_consistent
               << "\texecution_backend_device_type=" << diagnostics.last_execution_backend_device_type
+              << "\tresident_runtime_quiet=" << resident_runtime_quiet
               << '\n';
-    const bool valid_placement = args.mode == "disabled" ?
-        placement.cpu == 0 && placement.non_cpu == 0 :
-        placement.cpu > 0 && placement.non_cpu == 0 &&
-            diagnostics.last_execution_backend_device_type == GGML_BACKEND_DEVICE_TYPE_GPU;
+    const bool cached_mode = args.mode == "hot" || args.mode == "cold";
+    const bool routing_backend_valid = placement.routing_cpu + placement.routing_non_cpu > 0 &&
+        placement.routing_backend_device_type >= 0 && placement.routing_backend_consistent;
+    const bool valid_placement = cached_mode ?
+        placement.cpu > 0 && placement.non_cpu == 0 && placement.backend_consistent &&
+            placement.backend_device_type == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            placement.routing_cpu == 0 && placement.routing_non_cpu > 0 && routing_backend_valid &&
+            diagnostics.last_execution_backend_device_type == GGML_BACKEND_DEVICE_TYPE_GPU :
+        placement.cpu == 0 && placement.non_cpu == 0 && routing_backend_valid && resident_runtime_quiet;
     bool valid_overlap = true;
     if (args.require_overlap) {
         valid_overlap = args.mode == "cold" && diagnostics.ring_event_capable &&
