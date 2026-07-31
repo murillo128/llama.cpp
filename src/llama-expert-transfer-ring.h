@@ -179,11 +179,11 @@ public:
     llm_expert_provider_result monitor_h2d(llm_transfer_lane_reference lane) noexcept;
     llm_expert_provider_result poll_h2d(
         llm_transfer_lane_reference lane,
-        bool & complete,
-        uint64_t * remaining_submitted_bytes = nullptr) noexcept;
-    // Release only a terminal failed background lane; never waits for or
-    // cancels unrelated current-token work.
-    llm_expert_provider_result release_failed_background(
+        llm_expert_same_key_h2d_state & state,
+        uint64_t & remaining_bytes) noexcept;
+    // Release a terminal failed or event-complete background lane. Never waits
+    // for or cancels unrelated current-token work.
+    llm_expert_provider_result release_terminal_background(
         llm_transfer_lane_reference lane) noexcept;
     llm_expert_provider_result begin_compute_work(
         ggml_backend_t compute_backend,

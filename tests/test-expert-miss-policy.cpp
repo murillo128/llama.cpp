@@ -136,7 +136,8 @@ void test_auto_evaluator() {
     cost.h2d_fixed_ns = 1000;
     cost.h2d_bytes_per_second = 1000000000ULL;
     cost.decision_hysteresis_ns = 1;
-    llm_expert_auto_input input = { cost, false, 2, 100, 0, 0, 0, 0 };
+    llm_expert_auto_input input = { cost, false, 2, 100, 0, 0, 0, false,
+        llm_expert_same_key_h2d_state::none, 0 };
     auto result = llm_evaluate_expert_auto(input);
     GGML_ASSERT(result.backend == llm_expert_execution_backend::cpu);
     GGML_ASSERT(result.reason == llm_expert_auto_reason::cpu_faster && !result.overflow);
@@ -172,7 +173,9 @@ void test_auto_evaluator() {
 
     input.lanes = 2;
     input.bundle_bytes = 100;
-    input.same_key_submitted_bytes = 7;
+    input.same_key_h2d_present = true;
+    input.same_key_h2d_state = llm_expert_same_key_h2d_state::h2d_in_flight;
+    input.same_key_h2d_remaining_bytes = 7;
     input.queued_cpu_work_ns = 11;
     input.queued_h2d_work_ns = 13;
     input.queued_gpu_work_ns = 17;
@@ -181,6 +184,18 @@ void test_auto_evaluator() {
     GGML_ASSERT(first.backend == second.backend && first.reason == second.reason &&
         first.cpu_finish_ns == second.cpu_finish_ns && first.gpu_finish_ns == second.gpu_finish_ns);
     GGML_ASSERT(first.h2d_work_ns == input.cost.h2d_fixed_ns + 7);
+
+    input.same_key_h2d_state = llm_expert_same_key_h2d_state::queued_or_staging;
+    input.same_key_h2d_remaining_bytes = input.bundle_bytes;
+    GGML_ASSERT(llm_evaluate_expert_auto(input).h2d_work_ns == input.cost.h2d_fixed_ns + input.bundle_bytes);
+    input.same_key_h2d_state = llm_expert_same_key_h2d_state::h2d_complete_unpublished;
+    input.same_key_h2d_remaining_bytes = 0;
+    GGML_ASSERT(llm_evaluate_expert_auto(input).h2d_work_ns == 0);
+    input.same_key_h2d_present = false;
+    input.same_key_h2d_state = llm_expert_same_key_h2d_state::none;
+    GGML_ASSERT(llm_evaluate_expert_auto(input).h2d_work_ns == input.cost.h2d_fixed_ns + input.bundle_bytes);
+    input.same_key_h2d_present = true;
+    GGML_ASSERT(llm_evaluate_expert_auto(input).overflow);
 }
 
 struct graph_fixture {
@@ -616,6 +631,9 @@ void test_hybrid_model_graph(const char * model_path) {
         GGML_ASSERT(!automatic_diagnostics.auto_decisions.empty());
         for (size_t index = 0; index < automatic_diagnostics.auto_decisions.size(); ++index) {
             const auto & record = automatic_diagnostics.auto_decisions[index];
+            GGML_ASSERT(!record.same_key_h2d_present &&
+                record.same_key_h2d_state == uint8_t(llm_expert_same_key_h2d_state::none) &&
+                record.same_key_h2d_remaining_bytes == 0);
             const llm_expert_auto_input input = {
                 record.cost,
                 record.prefill,
@@ -624,7 +642,9 @@ void test_hybrid_model_graph(const char * model_path) {
                 record.queued_cpu_work_ns,
                 record.queued_h2d_work_ns,
                 record.queued_gpu_work_ns,
-                record.same_key_submitted_bytes,
+                record.same_key_h2d_present,
+                llm_expert_same_key_h2d_state(record.same_key_h2d_state),
+                record.same_key_h2d_remaining_bytes,
             };
             const auto replay = llm_evaluate_expert_auto(input);
             GGML_ASSERT(uint8_t(replay.backend) == record.backend);
@@ -759,7 +779,10 @@ void test_hybrid_model_graph(const char * model_path) {
     bool saw_background_backlog = false;
     bool saw_hot_gpu_queue = false;
     for (const auto & record : joined_diagnostics.auto_decisions) {
-        saw_same_key_submitted = saw_same_key_submitted || record.same_key_submitted_bytes > 0;
+        saw_same_key_submitted = saw_same_key_submitted ||
+            (record.same_key_h2d_present &&
+             record.same_key_h2d_state == uint8_t(llm_expert_same_key_h2d_state::h2d_in_flight) &&
+             record.same_key_h2d_remaining_bytes == record.bundle_bytes);
         saw_background_backlog = saw_background_backlog || record.queued_h2d_work_ns > 0;
         saw_hot_gpu_queue = saw_hot_gpu_queue || record.queued_gpu_work_ns > 0;
     }

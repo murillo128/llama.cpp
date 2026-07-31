@@ -899,7 +899,19 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
                 pimpl->counters.peak_live_compute_events, pimpl->counters.live_compute_events);
             pimpl->refresh_total_event_counters();
         }
+        const bool background_join = lane.hold_after_h2d;
         ggml_backend_event_wait(compute_backend, lane.event);
+        if (background_join && !lane.event_complete) {
+            lane.wait_enqueued = true;
+            pimpl->condition.notify_all();
+            pimpl->condition.wait(lock, [&] {
+                return lane.generation != generation || lane.state != llm_transfer_lane_state::in_flight ||
+                    lane.event_complete;
+            });
+            if (lane.generation != generation || lane.state != llm_transfer_lane_state::in_flight) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+            }
+        }
         lane.hold_after_h2d = false;
         lane.wait_enqueued = true;
         pimpl->counters.compute_waits++;
@@ -939,44 +951,43 @@ llm_expert_provider_result llm_expert_transfer_ring::monitor_h2d(
 
 llm_expert_provider_result llm_expert_transfer_ring::poll_h2d(
         llm_transfer_lane_reference reference,
-        bool & complete,
-        uint64_t * remaining_submitted_bytes) noexcept {
+        llm_expert_same_key_h2d_state & state,
+        uint64_t & remaining_bytes) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
-    complete = false;
-    if (remaining_submitted_bytes != nullptr) *remaining_submitted_bytes = 0;
+    state = llm_expert_same_key_h2d_state::none;
+    remaining_bytes = 0;
     if (reference.lane >= pimpl->lanes.size() ||
         pimpl->lanes[reference.lane].generation != reference.generation) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
-    const auto state = lane.state;
-    if (state == llm_transfer_lane_state::free) {
+    const auto lane_state = lane.state;
+    if (lane_state == llm_transfer_lane_state::free) {
         if (lane.failed_generation == reference.generation) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
         }
-        complete = true;
-        return llm_expert_provider_result::success();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
-    if (state == llm_transfer_lane_state::in_flight) {
+    if (lane_state == llm_transfer_lane_state::in_flight) {
         if (lane.event_complete) {
-            complete = true;
-            lane.hold_after_h2d = false;
-            pimpl->finish_lane_if_ready(lane);
-            pimpl->condition.notify_all();
-        } else if (remaining_submitted_bytes != nullptr) {
+            state = llm_expert_same_key_h2d_state::h2d_complete_unpublished;
+        } else {
             // Event-granularity accounting is deterministic: an incomplete
             // submitted copy retains its full immutable payload.
-            *remaining_submitted_bytes = pimpl->counters.lane_payload_bytes;
+            state = llm_expert_same_key_h2d_state::h2d_in_flight;
+            remaining_bytes = pimpl->counters.lane_payload_bytes;
         }
         return llm_expert_provider_result::success();
     }
-    if (state == llm_transfer_lane_state::staging) {
+    if (lane_state == llm_transfer_lane_state::staging) {
+        state = llm_expert_same_key_h2d_state::queued_or_staging;
+        remaining_bytes = pimpl->counters.lane_payload_bytes;
         return llm_expert_provider_result::success();
     }
     return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
 }
 
-llm_expert_provider_result llm_expert_transfer_ring::release_failed_background(
+llm_expert_provider_result llm_expert_transfer_ring::release_terminal_background(
         llm_transfer_lane_reference reference) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (reference.lane >= pimpl->lanes.size() ||
@@ -984,10 +995,21 @@ llm_expert_provider_result llm_expert_transfer_ring::release_failed_background(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
-    if (lane.state == llm_transfer_lane_state::free) return llm_expert_provider_result::success();
-    if (lane.state != llm_transfer_lane_state::failed || lane.background_running || lane.background_queued) {
+    if (lane.state == llm_transfer_lane_state::free) {
+        if (lane.failed_generation == reference.generation) {
+            lane.failed_generation = 0;
+            lane.failed_hot_slot = UINT32_MAX;
+            lane.failed_hot_generation = 0;
+        }
+        return llm_expert_provider_result::success();
+    }
+    const bool completed = lane.state == llm_transfer_lane_state::in_flight && lane.event_complete;
+    const bool failed = lane.state == llm_transfer_lane_state::failed;
+    if ((!completed && !failed) || lane.background_running || lane.background_queued ||
+        (lane.compute_pending && !lane.compute_complete)) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
     }
+    lane.hold_after_h2d = false;
     pimpl->release_lane(lane);
     pimpl->condition.notify_all();
     return llm_expert_provider_result::success();

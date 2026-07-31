@@ -61,9 +61,28 @@ llm_expert_auto_result llm_evaluate_expert_auto(const llm_expert_auto_input & in
     const uint64_t gpu_per_lane = input.prefill ? input.cost.gpu_per_lane_prefill_ns :
         input.cost.gpu_per_lane_decode_ns;
     result.cpu_work_ns = add(cpu_fixed, multiply(cpu_per_lane, input.lanes));
-    const uint64_t transfer_bytes = input.same_key_submitted_bytes != 0 ?
-        input.same_key_submitted_bytes : input.bundle_bytes;
-    result.h2d_work_ns = add(input.cost.h2d_fixed_ns, transfer(transfer_bytes));
+    const bool valid_same_key =
+        (!input.same_key_h2d_present &&
+            input.same_key_h2d_state == llm_expert_same_key_h2d_state::none &&
+            input.same_key_h2d_remaining_bytes == 0) ||
+        (input.same_key_h2d_present &&
+            input.same_key_h2d_state == llm_expert_same_key_h2d_state::queued_or_staging &&
+            input.same_key_h2d_remaining_bytes == input.bundle_bytes) ||
+        (input.same_key_h2d_present &&
+            input.same_key_h2d_state == llm_expert_same_key_h2d_state::h2d_in_flight &&
+            input.same_key_h2d_remaining_bytes != 0 &&
+            input.same_key_h2d_remaining_bytes <= input.bundle_bytes) ||
+        (input.same_key_h2d_present &&
+            input.same_key_h2d_state == llm_expert_same_key_h2d_state::h2d_complete_unpublished &&
+            input.same_key_h2d_remaining_bytes == 0);
+    if (!valid_same_key) overflow = true;
+    if (input.same_key_h2d_state == llm_expert_same_key_h2d_state::h2d_complete_unpublished) {
+        result.h2d_work_ns = 0;
+    } else {
+        const uint64_t transfer_bytes = input.same_key_h2d_present ?
+            input.same_key_h2d_remaining_bytes : input.bundle_bytes;
+        result.h2d_work_ns = add(input.cost.h2d_fixed_ns, transfer(transfer_bytes));
+    }
     result.gpu_work_ns = add(gpu_fixed, multiply(gpu_per_lane, input.lanes));
     result.cpu_finish_ns = add(input.queued_cpu_work_ns, result.cpu_work_ns);
     result.gpu_finish_ns = add(add(input.queued_h2d_work_ns, result.h2d_work_ns),
@@ -1032,6 +1051,15 @@ struct hot_slot_entry {
 };
 
 struct background_promotion_record {
+    enum class lifecycle : uint8_t {
+        empty,
+        queued_or_staging,
+        h2d_in_flight,
+        h2d_complete_unpublished,
+        published,
+        failed,
+        cancelled,
+    } state = lifecycle::empty;
     bool active = false;
     llm_expert_key key = { -1, -1 };
     llm_cold_reference cold;
@@ -1040,7 +1068,7 @@ struct background_promotion_record {
     llm_expert_request_state scheduler_state = llm_expert_request_state::free;
     uint32_t hot_slot = UINT32_MAX;
     uint64_t hot_generation = 0;
-    uint64_t remaining_submitted_bytes = 0;
+    uint64_t remaining_bytes = 0;
     uint64_t h2d_work_ns = 0;
 };
 
@@ -1270,19 +1298,9 @@ public:
         if (active_background_flights != 0) (void) transfer_ring->surrender();
         for (auto & record : background_promotions) {
             if (!record.active) continue;
-            finish_background_scheduler_locked(record, true);
-            if (record.hot_slot < directory_slots.size()) {
-                auto & entry = directory_slots[record.hot_slot];
-                if (entry.has_cold_backing) {
-                    (void) cold_cache->release(
-                        { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
-                }
-                const uint64_t generation = entry.generation;
-                entry = {};
-                entry.generation = generation;
-            }
-            background_wasted++;
-            record = {};
+            record.state = background_promotion_record::lifecycle::cancelled;
+            discard_background_slot_locked(record, false);
+            background_dropped++;
         }
         for (auto & entry : directory_slots) {
             if (entry.background_origin && !entry.background_useful) background_wasted++;
@@ -1630,7 +1648,8 @@ public:
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation));
         }
         if (config.cold_mode && config.background_promotion) {
-            reap_background_locked();
+            const auto normalized = reap_background_locked();
+            if (!normalized.is_ready()) return fail(normalized);
         }
 
         size_t unique_count = 0;
@@ -1742,24 +1761,34 @@ public:
                     queued_gpu_work = saturating_add_work(queued_gpu_work,
                         auto_gpu_work(config.auto_cost_model, auto_prefill, unique_lane_counts[index]));
                 }
-                // Snapshot every active background transfer once.  An event-
-                // incomplete submission retains its exact immutable payload;
-                // queued staging work has no submitted bytes but still carries
-                // one full transfer cost in another key's backlog.
+                // Snapshot every live background transfer once. This is the
+                // immutable AUTO operand set for this request.
                 for (auto & record : background_promotions) {
                     if (!record.active) continue;
-                    bool complete = false;
+                    llm_expert_same_key_h2d_state state = llm_expert_same_key_h2d_state::none;
                     uint64_t remaining = 0;
-                    const auto polled = transfer_ring->poll_h2d(record.lane, complete, &remaining);
+                    const auto polled = transfer_ring->poll_h2d(record.lane, state, remaining);
                     if (!polled.is_ready()) {
-                        (void) transfer_ring->release_failed_background(record.lane);
+                        const auto released = transfer_ring->release_terminal_background(record.lane);
+                        if (!released.is_ready()) {
+                            result = released;
+                            break;
+                        }
+                        record.state = background_promotion_record::lifecycle::failed;
                         discard_background_slot_locked(record, false);
                         background_dropped++;
                         continue;
                     }
-                    record.remaining_submitted_bytes = complete ? 0 : remaining;
-                    record.h2d_work_ns = complete ? 0 : auto_h2d_work(config.auto_cost_model,
-                        remaining != 0 ? remaining : cold_bundle_payload);
+                    record.remaining_bytes = remaining;
+                    if (state == llm_expert_same_key_h2d_state::queued_or_staging) {
+                        record.state = background_promotion_record::lifecycle::queued_or_staging;
+                    } else if (state == llm_expert_same_key_h2d_state::h2d_in_flight) {
+                        record.state = background_promotion_record::lifecycle::h2d_in_flight;
+                    } else {
+                        record.state = background_promotion_record::lifecycle::h2d_complete_unpublished;
+                    }
+                    record.h2d_work_ns = state == llm_expert_same_key_h2d_state::h2d_complete_unpublished ?
+                        0 : auto_h2d_work(config.auto_cost_model, remaining);
                 }
             }
             size_t cpu_miss_count = 0;
@@ -1790,7 +1819,14 @@ public:
                         queued_cpu_work,
                         saturating_add_work(queued_h2d_work, background_h2d_work),
                         queued_gpu_work,
-                        background == nullptr ? 0 : background->remaining_submitted_bytes,
+                        background != nullptr,
+                        background == nullptr ? llm_expert_same_key_h2d_state::none :
+                            background->state == background_promotion_record::lifecycle::queued_or_staging ?
+                                llm_expert_same_key_h2d_state::queued_or_staging :
+                            background->state == background_promotion_record::lifecycle::h2d_in_flight ?
+                                llm_expert_same_key_h2d_state::h2d_in_flight :
+                                llm_expert_same_key_h2d_state::h2d_complete_unpublished,
+                        background == nullptr ? 0 : background->remaining_bytes,
                     };
                     const auto decision = llm_evaluate_expert_auto(input);
                     record_auto_decision_locked({ active_request_id, binding.layer,
@@ -1813,6 +1849,7 @@ public:
                 if (use_gpu) {
                     auto * background = find_background_locked(unique_keys[unique_index]);
                     if (background != nullptr) {
+                        bool background_h2d_complete = false;
                         const auto joined = config.scheduler->enqueue(
                             unique_keys[unique_index], llm_expert_priority::demand_current_layer,
                             llm_expert_readiness::device_ready);
@@ -1823,18 +1860,46 @@ public:
                         }
                         if (result.is_ready()) result = transfer_ring->wait_for_hot(
                             execution_backend, background->hot_slot, background->hot_generation);
+                        background_h2d_complete = result.is_ready();
                         if (!result.is_ready() && result.error == llm_expert_provider_error::copy_failed) {
-                            (void) transfer_ring->release_failed_background(background->lane);
-                            discard_background_slot_locked(*background, false);
-                            background_dropped++;
-                            result = cold_cache->acquire(reference, llm_cold_reference_kind::cpu_execution);
-                            if (result.is_ready()) {
-                                GGML_ASSERT(cpu_execution_pin_count < cpu_execution_pins.size());
-                                cpu_execution_pins[cpu_execution_pin_count++] = reference;
-                                unique_cpu_slots[unique_index] = int32_t(reference.slot);
-                                cpu_miss_count++;
+                            const auto terminalized =
+                                transfer_ring->release_terminal_background(background->lane);
+                            if (terminalized.is_ready()) {
+                                background->state = background_promotion_record::lifecycle::failed;
+                                discard_background_slot_locked(*background, false);
+                                background_dropped++;
+                                background = nullptr;
+                            } else {
+                                result = terminalized;
                             }
-                            background = nullptr;
+                        }
+                        if (result.is_ready() && background != nullptr) {
+                            if (background->hot_slot >= directory_slots.size()) {
+                                result = llm_expert_provider_result::failure(
+                                    llm_expert_provider_error::metadata_mismatch);
+                            }
+                        }
+                        if (result.is_ready() && background != nullptr) {
+                            const auto & entry = directory_slots[background->hot_slot];
+                            if (entry.state != hot_slot_state::loading ||
+                                entry.generation != background->hot_generation ||
+                                !expert_key_matches(entry.key, background->key) ||
+                                !entry.has_cold_backing || entry.cold_slot != background->cold.slot ||
+                                entry.cold_generation != background->cold.generation) {
+                                result = llm_expert_provider_result::failure(
+                                    llm_expert_provider_error::metadata_mismatch);
+                            }
+                        }
+                        if (!result.is_ready() && background != nullptr && background_h2d_complete) {
+                            const auto terminalized =
+                                transfer_ring->release_terminal_background(background->lane);
+                            if (terminalized.is_ready()) {
+                                background->state = background_promotion_record::lifecycle::failed;
+                                discard_background_slot_locked(*background, false);
+                                background_dropped++;
+                            } else {
+                                result = terminalized;
+                            }
                         }
                         if (result.is_ready() && background != nullptr) {
                             auto & entry = directory_slots[background->hot_slot];
@@ -1844,6 +1909,7 @@ public:
                             entry.last_use = ++use_clock;
                             directory_forward[forward_index(entry.key)] = {
                                 int32_t(background->hot_slot), entry.generation };
+                            background->state = background_promotion_record::lifecycle::published;
                             unique_slots[unique_index] = int32_t(background->hot_slot);
                             pin_slot_locked(background->hot_slot);
                             finish_background_scheduler_locked(*background, true);
@@ -2943,7 +3009,9 @@ public:
                 record.input.queued_cpu_work_ns,
                 record.input.queued_h2d_work_ns,
                 record.input.queued_gpu_work_ns,
-                record.input.same_key_submitted_bytes,
+                record.input.same_key_h2d_present,
+                uint8_t(record.input.same_key_h2d_state),
+                record.input.same_key_h2d_remaining_bytes,
                 record.result.cpu_work_ns,
                 record.result.h2d_work_ns,
                 record.result.gpu_work_ns,
@@ -3434,37 +3502,57 @@ private:
         record = {};
     }
 
-    void reap_background_locked() noexcept {
-        if (!transfer_ring) return;
+    llm_expert_provider_result reap_background_locked() noexcept {
+        if (!transfer_ring) return llm_expert_provider_result::success();
         for (auto & record : background_promotions) {
             if (!record.active) continue;
-            bool complete = false;
-            const auto polled = transfer_ring->poll_h2d(record.lane, complete);
+            llm_expert_same_key_h2d_state state = llm_expert_same_key_h2d_state::none;
+            uint64_t remaining = 0;
+            const auto polled = transfer_ring->poll_h2d(record.lane, state, remaining);
             if (!polled.is_ready()) {
-                (void) transfer_ring->release_failed_background(record.lane);
+                const auto released = transfer_ring->release_terminal_background(record.lane);
+                if (!released.is_ready()) return released;
+                record.state = background_promotion_record::lifecycle::failed;
                 discard_background_slot_locked(record, false);
                 background_dropped++;
                 continue;
             }
-            if (!complete) continue;
+            record.remaining_bytes = remaining;
+            if (state == llm_expert_same_key_h2d_state::queued_or_staging) {
+                record.state = background_promotion_record::lifecycle::queued_or_staging;
+                continue;
+            }
+            if (state == llm_expert_same_key_h2d_state::h2d_in_flight) {
+                record.state = background_promotion_record::lifecycle::h2d_in_flight;
+                continue;
+            }
+            record.state = background_promotion_record::lifecycle::h2d_complete_unpublished;
             auto & entry = directory_slots[record.hot_slot];
             if (entry.state != hot_slot_state::loading || entry.generation != record.hot_generation ||
-                !expert_key_matches(entry.key, record.key) || !entry.has_cold_backing) {
+                !expert_key_matches(entry.key, record.key) || !entry.has_cold_backing ||
+                entry.cold_slot != record.cold.slot || entry.cold_generation != record.cold.generation) {
+                const auto released = transfer_ring->release_terminal_background(record.lane);
+                if (!released.is_ready()) return released;
+                record.state = background_promotion_record::lifecycle::failed;
                 discard_background_slot_locked(record, false);
                 background_dropped++;
                 continue;
             }
+            const auto released = transfer_ring->release_terminal_background(record.lane);
+            if (!released.is_ready()) return released;
             entry.state = hot_slot_state::ready;
             entry.background_origin = true;
             entry.background_useful = false;
             directory_forward[forward_index(entry.key)] = { int32_t(record.hot_slot), entry.generation };
             admissions++;
+            record.state = background_promotion_record::lifecycle::published;
             finish_background_scheduler_locked(record, true);
             record.active = false;
             record.scheduler_handle = {};
             if (active_background_flights > 0) active_background_flights--;
             background_completed++;
         }
+        return llm_expert_provider_result::success();
     }
 
     int32_t select_unpinned_hot_slot_locked() const noexcept {
@@ -3550,6 +3638,7 @@ private:
             return;
         }
         background_promotion_record record;
+        record.state = background_promotion_record::lifecycle::queued_or_staging;
         record.active = true;
         record.key = key;
         record.cold = cold;
@@ -3619,7 +3708,9 @@ private:
         append(uint32_t(record.layer)); append(uint32_t(record.expert));
         append(record.input.prefill); append(record.input.lanes); append(record.input.bundle_bytes);
         append(record.input.queued_cpu_work_ns); append(record.input.queued_h2d_work_ns);
-        append(record.input.queued_gpu_work_ns); append(record.input.same_key_submitted_bytes);
+        append(record.input.queued_gpu_work_ns); append(record.input.same_key_h2d_present);
+        append(uint8_t(record.input.same_key_h2d_state));
+        append(record.input.same_key_h2d_remaining_bytes);
         append(record.result.cpu_work_ns); append(record.result.h2d_work_ns);
         append(record.result.gpu_work_ns); append(record.result.cpu_finish_ns);
         append(record.result.gpu_finish_ns); append(uint8_t(record.result.backend));

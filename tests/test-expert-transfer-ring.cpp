@@ -257,14 +257,43 @@ void test_native_event_ordering_reuse_and_unload() {
     llm_transfer_lane_reference background_lane;
     GGML_ASSERT(background.try_queue_background_transfer(
         cold, cold_zero, 0, 3, cold.bundle(), hot.bundle(), background_lane).is_ready());
-    bool background_complete = false;
+    llm_expert_same_key_h2d_state background_state = llm_expert_same_key_h2d_state::none;
     uint64_t remaining_submitted = UINT64_MAX;
     GGML_ASSERT(background.poll_h2d(
-        background_lane, background_complete, &remaining_submitted).is_ready());
-    GGML_ASSERT(!background_complete && remaining_submitted == 0);
+        background_lane, background_state, remaining_submitted).is_ready());
+    GGML_ASSERT(background_state == llm_expert_same_key_h2d_state::queued_or_staging &&
+        remaining_submitted == diagnostics.lane_payload_bytes);
     GGML_ASSERT(background.wait_for_hot(backend.get(), 0, 3).is_ready());
     GGML_ASSERT(background.retire_hot(0, 3).is_ready());
     GGML_ASSERT(background.surrender().is_ready());
+    GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+
+    auto state_config = background_config;
+    state_config.delay_background_stage_ms_for_testing = 0;
+    state_config.delay_event_monitor_ms_for_testing = 100;
+    llm_expert_transfer_ring state_ring(state_config);
+    GGML_ASSERT(state_ring.initialize(source.bundle()).is_ready());
+    llm_transfer_lane_reference state_lane;
+    GGML_ASSERT(state_ring.try_queue_background_transfer(
+        cold, cold_zero, 0, 5, cold.bundle(), hot.bundle(), state_lane).is_ready());
+    const auto in_flight_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    do {
+        GGML_ASSERT(state_ring.poll_h2d(state_lane, background_state, remaining_submitted).is_ready());
+        if (background_state == llm_expert_same_key_h2d_state::h2d_in_flight) break;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < in_flight_deadline);
+    GGML_ASSERT(background_state == llm_expert_same_key_h2d_state::h2d_in_flight &&
+        remaining_submitted == diagnostics.lane_payload_bytes);
+    const auto complete_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    do {
+        GGML_ASSERT(state_ring.poll_h2d(state_lane, background_state, remaining_submitted).is_ready());
+        if (background_state == llm_expert_same_key_h2d_state::h2d_complete_unpublished) break;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < complete_deadline);
+    GGML_ASSERT(background_state == llm_expert_same_key_h2d_state::h2d_complete_unpublished &&
+        remaining_submitted == 0);
+    GGML_ASSERT(state_ring.release_terminal_background(state_lane).is_ready());
+    GGML_ASSERT(state_ring.surrender().is_ready());
     GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
 
     llm_expert_transfer_ring failed_background(background_config, { false, 1, false, false });
@@ -275,12 +304,12 @@ void test_native_event_ordering_reuse_and_unload() {
     llm_expert_provider_result failed_poll;
     const auto failure_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     do {
-        failed_poll = failed_background.poll_h2d(failed_lane, background_complete);
+        failed_poll = failed_background.poll_h2d(failed_lane, background_state, remaining_submitted);
         if (!failed_poll.is_ready()) break;
         std::this_thread::yield();
     } while (std::chrono::steady_clock::now() < failure_deadline);
     GGML_ASSERT(failed_poll.error == llm_expert_provider_error::copy_failed);
-    GGML_ASSERT(failed_background.release_failed_background(failed_lane).is_ready());
+    GGML_ASSERT(failed_background.release_terminal_background(failed_lane).is_ready());
     GGML_ASSERT(failed_background.surrender().is_ready());
     GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
 

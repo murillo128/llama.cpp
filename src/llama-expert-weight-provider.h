@@ -184,7 +184,9 @@ struct llm_hot_cache_diagnostics {
         uint64_t queued_cpu_work_ns = 0;
         uint64_t queued_h2d_work_ns = 0;
         uint64_t queued_gpu_work_ns = 0;
-        uint64_t same_key_submitted_bytes = 0;
+        bool same_key_h2d_present = false;
+        uint8_t same_key_h2d_state = 0;
+        uint64_t same_key_h2d_remaining_bytes = 0;
         uint64_t cpu_work_ns = 0;
         uint64_t h2d_work_ns = 0;
         uint64_t gpu_work_ns = 0;
@@ -414,6 +416,13 @@ enum class llm_expert_auto_reason : uint8_t {
     overflow,
 };
 
+enum class llm_expert_same_key_h2d_state : uint8_t {
+    none,
+    queued_or_staging,
+    h2d_in_flight,
+    h2d_complete_unpublished,
+};
+
 struct llm_expert_auto_input {
     llama_expert_auto_cost_model cost = {};
     bool prefill = false;
@@ -422,7 +431,9 @@ struct llm_expert_auto_input {
     uint64_t queued_cpu_work_ns = 0;
     uint64_t queued_h2d_work_ns = 0;
     uint64_t queued_gpu_work_ns = 0;
-    uint64_t same_key_submitted_bytes = 0;
+    bool same_key_h2d_present = false;
+    llm_expert_same_key_h2d_state same_key_h2d_state = llm_expert_same_key_h2d_state::none;
+    uint64_t same_key_h2d_remaining_bytes = 0;
 };
 
 struct llm_expert_auto_result {
