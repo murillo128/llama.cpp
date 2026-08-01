@@ -864,6 +864,32 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
     return llm_expert_provider_result::success();
 }
 
+llm_expert_provider_result llm_expert_transfer_ring::transfer_wave_blocking(
+        const std::vector<llm_transfer_binding> & bindings) noexcept {
+    std::vector<uint64_t> hot_generations;
+    ggml_backend_t backend = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->mutex);
+        hot_generations.reserve(bindings.size());
+        backend = pimpl->counters.event_capable ? pimpl->transfer_backend.get() : nullptr;
+        for (const auto & binding : bindings) {
+            if (!pimpl->valid_lane(binding.lane)) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+            }
+            hot_generations.push_back(pimpl->lanes[binding.lane.lane].hot_generation);
+        }
+    }
+    auto result = transfer_wave(backend, bindings);
+    if (!result.is_ready()) return result;
+    for (size_t index = 0; index < bindings.size(); ++index) {
+        const auto & binding = bindings[index];
+        result = wait_for_hot(backend, binding.hot_slot,
+            hot_generations[index], true);
+        if (!result.is_ready()) return result;
+    }
+    return result;
+}
+
 llm_expert_provider_result llm_expert_transfer_ring::try_queue_background_transfer(
         llm_cold_expert_cache & cold_cache,
         llm_cold_reference cold,

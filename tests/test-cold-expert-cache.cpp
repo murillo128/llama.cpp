@@ -465,6 +465,53 @@ void test_loader_publication_failure_cleanup_and_reread() {
     GGML_ASSERT(diagnostics.evictions >= 2 && diagnostics.source_copy_bytes == 0);
 }
 
+void test_speculative_free_or_speculative_admission_and_reclassification() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    loader_state state;
+
+    llm_cold_reference demand;
+    GGML_ASSERT(cache.find_or_admit({ 0, 0 }, tensors.bundle(), demand).is_ready());
+    llm_cold_reference speculative;
+    GGML_ASSERT(cache.find_or_admit_speculative_with_loader(
+        { 0, 1 }, 5, 40, speculative, fill_slot, &state).is_ready());
+    auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.slots[demand.slot].origin == llm_expert_residency_origin::demand);
+    GGML_ASSERT(diagnostics.slots[speculative.slot].origin == llm_expert_residency_origin::speculative);
+    GGML_ASSERT(diagnostics.speculative_admissions == 1);
+
+    // Full cache: the upstream guard replaces only the unconsumed speculative
+    // entry and preserves the demand-origin slot regardless of LRU order.
+    llm_cold_reference replacement;
+    GGML_ASSERT(cache.find_or_admit_speculative_with_loader(
+        { 0, 2 }, 7, 30, replacement, fill_slot, &state).is_ready());
+    GGML_ASSERT(replacement.slot == speculative.slot && replacement.generation > speculative.generation);
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.slots[demand.slot].key.expert == 0);
+    GGML_ASSERT(diagnostics.speculative_replacements == 1);
+
+    // Exact demand consumes the same generation and permanently removes this
+    // slot from speculative-victim eligibility.
+    llm_cold_reference consumed;
+    GGML_ASSERT(cache.find_or_admit({ 0, 2 }, tensors.bundle(), consumed).is_ready());
+    GGML_ASSERT(consumed.slot == replacement.slot && consumed.generation == replacement.generation);
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.slots[consumed.slot].origin == llm_expert_residency_origin::demand);
+    GGML_ASSERT(diagnostics.slots[consumed.slot].speculative_consumed);
+    GGML_ASSERT(diagnostics.speculative_demand_consumptions == 1);
+
+    llm_cold_reference rejected;
+    GGML_ASSERT(cache.find_or_admit_speculative_with_loader(
+        { 0, 3 }, 9, 20, rejected, fill_slot, &state).error == llm_expert_provider_error::busy);
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.speculative_rejections == 1);
+    GGML_ASSERT(diagnostics.slots[demand.slot].key.expert == 0);
+    GGML_ASSERT(diagnostics.slots[consumed.slot].key.expert == 2);
+    GGML_ASSERT(cache.validate_invariants().is_ready());
+    GGML_ASSERT(cache.surrender().is_ready());
+}
+
 } // namespace
 
 int main() {
@@ -479,6 +526,7 @@ int main() {
     test_cpu_execution_reference_lifetime();
     test_generation_wrap_and_reinitialize();
     test_loader_publication_failure_cleanup_and_reread();
+    test_speculative_free_or_speculative_admission_and_reclassification();
     std::cout << "cold expert cache tests passed\n";
     return 0;
 }

@@ -1,4 +1,7 @@
 #include "llama-expert-weight-provider.h"
+#include "llama-expert-async-io.h"
+#include "llama-expert-scheduler.h"
+#include "llama-expert-storage.h"
 #include "llama-context.h"
 #include "llama-model.h"
 
@@ -6,9 +9,12 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -16,6 +22,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 std::atomic<uint64_t> allocation_count { 0 };
 
@@ -48,6 +58,23 @@ void operator delete[](void * memory, std::size_t) noexcept {
 }
 
 namespace {
+
+struct phase10_provider_evidence {
+    uint64_t seed_entries = 0;
+    uint64_t seed_storage_bytes = 0;
+    uint64_t seed_h2d_bytes = 0;
+    bool seed_ordinary_lru = false;
+    bool seed_failure_rolled_back = false;
+    bool seed_scheduler_drained = false;
+    uint32_t parallel_misses = 0;
+    uint32_t parallel_enqueued_before_take = 0;
+    uint32_t parallel_submitted_before_wait = 0;
+    uint32_t parallel_ready_before_use = 0;
+    uint32_t serial_submitted_before_wait = 0;
+    bool routes_equal = false;
+};
+
+phase10_provider_evidence phase10_evidence;
 
 struct tensor_fixture {
     ggml_context_ptr ctx;
@@ -204,6 +231,180 @@ llm_hot_cache_config descriptor_only_cold_test_config(uint32_t routed_layers = 1
     return result;
 }
 
+uint64_t expert_payload_bytes(const tensor_fixture & tensors) {
+    uint64_t result = 0;
+    const auto bundle = tensors.bundle(0);
+    for (const auto * projection : { &bundle.up, &bundle.gate, &bundle.gate_up, &bundle.down }) {
+        size_t member_index = 0;
+        for (const auto * tensor : { projection->weight, projection->bias, projection->scale }) {
+            if (tensor != nullptr) {
+                const int axis = member_index == 0 ? 2 : 1;
+                result += tensor->nb[axis];
+            }
+            member_index++;
+        }
+    }
+    return result;
+}
+
+struct temporary_expert_storage_file {
+    std::string path;
+    std::vector<uint8_t> bytes;
+    std::vector<std::vector<llm_expert_storage_span>> bundles;
+
+    explicit temporary_expert_storage_file(const tensor_fixture & tensors) : bundles(size_t(tensors.n_expert)) {
+#if defined(_WIN32)
+        char name[L_tmpnam];
+        GGML_ASSERT(std::tmpnam(name) != nullptr);
+        path = name;
+        FILE * file = std::fopen(path.c_str(), "wb");
+#else
+        char name[] = "/tmp/llama-phase10-experts-XXXXXX";
+        const int fd = mkstemp(name);
+        GGML_ASSERT(fd >= 0);
+        path = name;
+        FILE * file = fdopen(fd, "wb");
+#endif
+        GGML_ASSERT(file != nullptr);
+        uint64_t file_offset = 0;
+        const auto source = tensors.bundle(0);
+        for (int32_t expert = 0; expert < tensors.n_expert; ++expert) {
+            uint64_t destination_offset = 0;
+            const auto append_member = [&](const ggml_tensor * tensor,
+                    llm_expert_storage_projection projection,
+                    llm_expert_storage_sidecar sidecar,
+                    bool weight) {
+                if (tensor == nullptr) return;
+                int axis = weight ? 2 : -1;
+                if (!weight) {
+                    for (int candidate = 0; candidate < ggml_n_dims(tensor); ++candidate) {
+                        if (tensor->ne[candidate] == tensors.n_expert) {
+                            GGML_ASSERT(axis == -1);
+                            axis = candidate;
+                        }
+                    }
+                }
+                GGML_ASSERT(axis >= 0);
+                const uint64_t extent = tensor->nb[axis];
+                const auto * source_bytes =
+                    static_cast<const uint8_t *>(tensor->data) + uint64_t(expert)*extent;
+                bytes.insert(bytes.end(), source_bytes, source_bytes + extent);
+                GGML_ASSERT(std::fwrite(source_bytes, 1, size_t(extent), file) == extent);
+                bundles[size_t(expert)].push_back({
+                    0, file_offset, extent, projection, sidecar, destination_offset, extent,
+                });
+                file_offset += extent;
+                destination_offset += extent;
+            };
+            const auto append_projection = [&](const llm_expert_projection_descriptor & projection,
+                    llm_expert_storage_projection identity) {
+                append_member(projection.weight, identity, llm_expert_storage_sidecar::weight, true);
+                append_member(projection.bias, identity, llm_expert_storage_sidecar::bias, false);
+                append_member(projection.scale, identity, llm_expert_storage_sidecar::scale, false);
+            };
+            append_projection(source.up, llm_expert_storage_projection::up);
+            append_projection(source.gate, llm_expert_storage_projection::gate);
+            append_projection(source.gate_up, llm_expert_storage_projection::gate_up);
+            append_projection(source.down, llm_expert_storage_projection::down);
+        }
+        GGML_ASSERT(std::fclose(file) == 0);
+    }
+
+    ~temporary_expert_storage_file() { std::remove(path.c_str()); }
+
+    void populate(llm_expert_storage & storage) const {
+        for (int32_t expert = 0; expert < int32_t(bundles.size()); ++expert) {
+            GGML_ASSERT(storage.add_bundle({ 0, expert }, bundles[size_t(expert)]).is_ready());
+        }
+        GGML_ASSERT(storage.seal().is_ready());
+    }
+};
+
+struct failing_async_reader final : llm_expert_async_read_override {
+    const std::vector<uint8_t> & bytes;
+    size_t successful_reads_before_failure = 0;
+    size_t calls = 0;
+
+    failing_async_reader(const std::vector<uint8_t> & bytes, size_t successful_reads) :
+        bytes(bytes), successful_reads_before_failure(successful_reads) {}
+
+    int64_t read_at(
+            intptr_t,
+            void * data,
+            size_t size,
+            uint64_t offset,
+            int & native_error) noexcept override {
+        if (calls++ >= successful_reads_before_failure) {
+            native_error = EIO;
+            return -1;
+        }
+        if (offset > bytes.size() || size > bytes.size() - size_t(offset)) return 0;
+        std::memcpy(data, bytes.data() + offset, size);
+        return int64_t(size);
+    }
+};
+
+llm_hot_cache_config blocking_seed_config(const tensor_fixture & tensors) {
+    auto result = test_config(2);
+    result.prefetch_config.supplied = true;
+    result.prefetch_config.digest = 0x1234;
+    result.prefetch_config.value.version = LLAMA_EXPERT_PREFETCH_VERSION_1;
+    result.prefetch_config.value.struct_size = sizeof(llama_expert_prefetch_config_v1);
+    result.prefetch_config.value.policy = LLAMA_EXPERT_PREFETCH_POLICY_OFF;
+    result.prefetch_config.value.readiness = LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY;
+    result.prefetch_config.value.seed_mode = LLAMA_EXPERT_PREFETCH_SEED_MODE_BLOCKING_HOT;
+    result.prefetch_config.value.max_profile_bytes = 4096;
+    result.prefetch_profile_loaded = true;
+    result.prefetch_profile.profile_sha256 = std::string(64, 'a');
+    result.prefetch_profile.target.experts_per_layer = uint32_t(tensors.n_expert);
+    result.prefetch_profile.target.routed_layers = { 0 };
+    const uint64_t payload = expert_payload_bytes(tensors);
+    // Runtime loader canonical form is increasing (count, layer, expert).
+    result.prefetch_profile.seed = {
+        { 0, 2, 40, payload, payload },
+        { 0, 0, 100, payload, payload },
+    };
+    return result;
+}
+
+llm_hot_cache_config phase10_issue_ahead_config(
+        llm_expert_storage & storage,
+        llm_expert_async_transport & transport,
+        llm_expert_scheduler & scheduler,
+        bool serial_control) {
+    auto result = cold_test_config(4);
+    result.storage = &storage;
+    result.async_transport = &transport;
+    result.scheduler = &scheduler;
+    result.trace_capacity = 64;
+    result.phase10_lead_trace = true;
+    result.phase10_serial_issue_for_testing = serial_control;
+    result.prefetch_config.supplied = true;
+    result.prefetch_config.digest = 0x5678;
+    auto & prefetch = result.prefetch_config.value;
+    prefetch.version = LLAMA_EXPERT_PREFETCH_VERSION_1;
+    prefetch.struct_size = sizeof(llama_expert_prefetch_config_v1);
+    prefetch.policy = LLAMA_EXPERT_PREFETCH_POLICY_STATIC_LAYER;
+    prefetch.readiness = LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY;
+    prefetch.seed_mode = LLAMA_EXPERT_PREFETCH_SEED_MODE_OFF;
+    prefetch.candidates_per_target = 1;
+    prefetch.max_profile_bytes = 4096;
+    prefetch.max_speculative_flights = 4;
+    prefetch.max_speculative_storage_bytes_in_flight = 1U << 20;
+    prefetch.max_speculative_h2d_bytes_in_flight = 1U << 20;
+    prefetch.max_speculative_storage_bytes_per_token = 1U << 20;
+    prefetch.max_speculative_h2d_bytes_per_token = 1U << 20;
+    prefetch.max_speculative_cold_slots = 4;
+    prefetch.max_speculative_hot_slots = 4;
+    prefetch.utility_window_predictions = 8;
+    prefetch.utility_min_observations = 1;
+    result.prefetch_profile_loaded = true;
+    result.prefetch_profile.profile_sha256 = std::string(64, 'b');
+    result.prefetch_profile.target.experts_per_layer = 4;
+    result.prefetch_profile.target.routed_layers = { 0 };
+    return result;
+}
+
 template<typename F>
 void expect_invalid(F && fn) {
     bool rejected = false;
@@ -267,6 +468,11 @@ void test_runtime_policy_adapters_and_bounded_metadata() {
         GGML_ASSERT(diagnostics.phase10_scheduler_event_capacity == 0);
         GGML_ASSERT(diagnostics.phase10_scheduler_events.empty());
         GGML_ASSERT(diagnostics.phase10_scheduler_events_dropped == 0);
+        GGML_ASSERT(diagnostics.phase10_issue_ahead_trace_capacity == 0);
+        GGML_ASSERT(diagnostics.phase10_issue_ahead_trace.empty());
+        GGML_ASSERT(diagnostics.phase10_issue_ahead_events == 0);
+        GGML_ASSERT(!diagnostics.phase10_prefetch_configured &&
+            !diagnostics.phase10_seed_configured && !diagnostics.phase10_seed_complete);
         GGML_ASSERT(diagnostics.phase10_storage_event_capacity == 0);
         GGML_ASSERT(diagnostics.phase10_storage_events.empty());
         GGML_ASSERT(diagnostics.phase10_storage_events_dropped == 0);
@@ -283,6 +489,249 @@ void test_runtime_policy_adapters_and_bounded_metadata() {
         binding = {};
         GGML_ASSERT(provider->surrender().is_ready());
     }
+}
+
+void assert_bundle_slot_matches(
+        const tensor_fixture & source,
+        const llm_expert_graph_binding & target,
+        int32_t expert,
+        int32_t slot);
+int32_t find_slot(const llm_hot_cache_diagnostics & diagnostics, int32_t expert);
+
+void test_blocking_hot_seed_atomic_publication_and_failure() {
+    tensor_fixture tensors;
+    auto provider = llm_create_hot_cache_expert_weight_provider(blocking_seed_config(tensors));
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(provider->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    GGML_ASSERT(binding.bootstrap);
+    binding = {};
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_seed_configured && diagnostics.phase10_seed_complete);
+    GGML_ASSERT(diagnostics.phase10_seed_attempts == 1 && diagnostics.phase10_seed_failures == 0);
+    GGML_ASSERT(diagnostics.phase10_seed_entries == 2);
+    GGML_ASSERT(diagnostics.phase10_seed_storage_bytes == 0);
+    GGML_ASSERT(diagnostics.phase10_seed_h2d_bytes == 2*expert_payload_bytes(tensors));
+    GGML_ASSERT(diagnostics.phase10_seed_last_touch.layer == 0 &&
+        diagnostics.phase10_seed_last_touch.expert == 0);
+    const int32_t slot_zero = find_slot(diagnostics, 0);
+    const int32_t slot_two = find_slot(diagnostics, 2);
+    GGML_ASSERT(slot_zero >= 0 && slot_two >= 0);
+    GGML_ASSERT(diagnostics.slots[slot_zero].origin == llm_expert_residency_origin::static_seed);
+    GGML_ASSERT(diagnostics.slots[slot_two].origin == llm_expert_residency_origin::static_seed);
+    GGML_ASSERT(diagnostics.slots[slot_zero].refcount == 0 && diagnostics.slots[slot_two].refcount == 0);
+    GGML_ASSERT(diagnostics.slots[slot_zero].last_use > diagnostics.slots[slot_two].last_use);
+    GGML_ASSERT(provider->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    assert_bundle_slot_matches(tensors, binding, 0, slot_zero);
+    assert_bundle_slot_matches(tensors, binding, 2, slot_two);
+    binding = {};
+    GGML_ASSERT(provider->surrender().is_ready());
+
+    llm_expert_provider_faults faults;
+    faults.fail_copy_after_tensors = 2;
+    auto failing = llm_create_hot_cache_expert_weight_provider(blocking_seed_config(tensors), faults);
+    GGML_ASSERT(failing->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(failing->initialize_after_reserve().error == llm_expert_provider_error::copy_failed);
+    diagnostics = failing->hot_cache_diagnostics();
+    GGML_ASSERT(!diagnostics.phase10_seed_complete);
+    GGML_ASSERT(diagnostics.phase10_seed_attempts == 1 && diagnostics.phase10_seed_failures == 1);
+    GGML_ASSERT(diagnostics.effective_capacity == 0 && diagnostics.pool_bytes == 0);
+    GGML_ASSERT(diagnostics.slots.empty());
+    GGML_ASSERT(failing->surrender().is_ready());
+}
+
+void test_blocking_cold_seed_uses_storage_ring_and_ordinary_lru() {
+    tensor_fixture tensors;
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(handle_count == handles.size());
+
+    llm_expert_scheduler scheduler({ 1, 4, 4, 2, 0 });
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 2;
+    async_config.request_capacity = 4;
+    async_config.trace_capacity = 32;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    llm_expert_async_transport transport(async_config);
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) == llm_expert_async_result::ready);
+
+    auto config = cold_test_config(2);
+    const auto seed = blocking_seed_config(tensors);
+    config.prefetch_config = seed.prefetch_config;
+    config.prefetch_profile = seed.prefetch_profile;
+    config.prefetch_profile_loaded = true;
+    config.storage = &storage;
+    config.async_transport = &transport;
+    config.scheduler = &scheduler;
+    auto provider = llm_create_cold_cache_expert_weight_provider(config);
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(provider->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+    auto diagnostics = provider->hot_cache_diagnostics();
+    const uint64_t payload = expert_payload_bytes(tensors);
+    GGML_ASSERT(diagnostics.phase10_seed_complete && diagnostics.phase10_seed_entries == 2);
+    GGML_ASSERT(diagnostics.phase10_seed_storage_bytes == 2*payload);
+    GGML_ASSERT(diagnostics.phase10_seed_h2d_bytes == 2*payload);
+    GGML_ASSERT(diagnostics.cold_admissions == 2 && diagnostics.cold_source_copy_bundles == 0);
+    const int32_t slot_zero = find_slot(diagnostics, 0);
+    const int32_t slot_two = find_slot(diagnostics, 2);
+    GGML_ASSERT(slot_zero >= 0 && slot_two >= 0);
+    GGML_ASSERT(diagnostics.slots[slot_zero].has_cold_backing &&
+        diagnostics.slots[slot_two].has_cold_backing);
+    GGML_ASSERT(diagnostics.slots[slot_zero].origin == llm_expert_residency_origin::static_seed &&
+        diagnostics.slots[slot_two].origin == llm_expert_residency_origin::static_seed);
+    GGML_ASSERT(diagnostics.slots[slot_zero].last_use > diagnostics.slots[slot_two].last_use);
+
+    GGML_ASSERT(provider->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 1, 3 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(binding, logical_ids, 2, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(find_slot(diagnostics, 0) < 0 && find_slot(diagnostics, 2) < 0);
+    GGML_ASSERT(find_slot(diagnostics, 1) >= 0 && find_slot(diagnostics, 3) >= 0);
+    phase10_evidence.seed_entries = 2;
+    phase10_evidence.seed_storage_bytes = 2*payload;
+    phase10_evidence.seed_h2d_bytes = 2*payload;
+    phase10_evidence.seed_ordinary_lru = true;
+    plan.reset();
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.diagnostics().active_requests == 0);
+
+    // The first seed reaches the candidate caches, then the second storage
+    // load fails. The transaction publishes none of the candidate mappings.
+    failing_async_reader failing_reader(
+        source_file.bytes, source_file.bundles[2].size());
+    llm_expert_scheduler failing_scheduler({ 1, 4, 4, 2, 0 });
+    async_config.read_override_for_testing = &failing_reader;
+    llm_expert_async_transport failing_transport(async_config);
+    GGML_ASSERT(failing_transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+    config.async_transport = &failing_transport;
+    config.scheduler = &failing_scheduler;
+    auto failing = llm_create_cold_cache_expert_weight_provider(config);
+    GGML_ASSERT(failing->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(failing->initialize_after_reserve().error == llm_expert_provider_error::copy_failed);
+    diagnostics = failing->hot_cache_diagnostics();
+    GGML_ASSERT(!diagnostics.phase10_seed_complete && diagnostics.phase10_seed_failures == 1);
+    GGML_ASSERT(diagnostics.effective_capacity == 0 && diagnostics.pool_bytes == 0);
+    GGML_ASSERT(diagnostics.slots.empty() && diagnostics.cold_effective_slots == 0);
+    phase10_evidence.seed_failure_rolled_back = true;
+    GGML_ASSERT(failing->surrender().is_ready());
+    failing.reset();
+    GGML_ASSERT(failing_transport.shutdown());
+    GGML_ASSERT(failing_scheduler.diagnostics().active_requests == 0);
+    phase10_evidence.seed_scheduler_drained = true;
+}
+
+struct issue_ahead_case_result {
+    llm_hot_cache_diagnostics diagnostics;
+    std::array<int32_t, 4> execution_ids{};
+};
+
+issue_ahead_case_result run_issue_ahead_case(bool serial_control) {
+    tensor_fixture tensors(8, 16, 4, 2, 2);
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+
+    llm_expert_scheduler scheduler({
+        1, 4, 16, 4, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 4,
+    });
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 4;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(handle_count == handles.size());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) == llm_expert_async_result::ready);
+
+    auto provider = llm_create_cold_cache_expert_weight_provider(
+        phase10_issue_ahead_config(storage, transport, scheduler, serial_control));
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1, 0, 1 };
+    issue_ahead_case_result result;
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 4, result.execution_ids.data()).is_ready());
+    GGML_ASSERT(result.execution_ids[0] == result.execution_ids[2]);
+    GGML_ASSERT(result.execution_ids[1] == result.execution_ids[3]);
+    GGML_ASSERT(result.execution_ids[0] != result.execution_ids[1]);
+    result.diagnostics = provider->hot_cache_diagnostics();
+    plan.reset();
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    return result;
+}
+
+void test_exact_issue_ahead_and_serial_evidence_control() {
+    const auto parallel = run_issue_ahead_case(false);
+    const auto serial = run_issue_ahead_case(true);
+    GGML_ASSERT(parallel.execution_ids == serial.execution_ids);
+    GGML_ASSERT(parallel.diagnostics.phase10_issue_ahead_events == 1);
+    GGML_ASSERT(parallel.diagnostics.phase10_issue_ahead_violations == 0);
+    GGML_ASSERT(parallel.diagnostics.phase10_issue_ahead_trace.size() == 1);
+    GGML_ASSERT(serial.diagnostics.phase10_issue_ahead_trace.size() == 1);
+    const auto & issued = parallel.diagnostics.phase10_issue_ahead_trace.front();
+    const auto & control = serial.diagnostics.phase10_issue_ahead_trace.front();
+    GGML_ASSERT(issued.logical_ids == 4 && issued.unique_ids == 2 && issued.demand_misses == 2);
+    GGML_ASSERT(issued.scheduler_enqueued_before_first_take == 2 &&
+        issued.first_take_after_all_demand_enqueues);
+    GGML_ASSERT(issued.storage_reads == 2 &&
+        issued.storage_reads_submitted_before_first_wait == 2 &&
+        issued.first_wait_after_all_storage_submissions && !issued.serial_control);
+    GGML_ASSERT(issued.demand_ready_before_use == 2 && issued.all_demand_ready_before_use);
+    GGML_ASSERT(issued.first_take_us != 0 && issued.first_wait_us >= issued.first_take_us &&
+        issued.last_demand_ready_us >= issued.first_wait_us &&
+        issued.demand_completion_us >= issued.last_demand_ready_us);
+    GGML_ASSERT(control.logical_ids == issued.logical_ids && control.unique_ids == issued.unique_ids &&
+        control.demand_misses == issued.demand_misses && control.storage_reads == issued.storage_reads);
+    GGML_ASSERT(control.scheduler_enqueued_before_first_take == 2 &&
+        control.first_take_after_all_demand_enqueues);
+    GGML_ASSERT(control.storage_reads_submitted_before_first_wait == 1 &&
+        !control.first_wait_after_all_storage_submissions && control.serial_control);
+    GGML_ASSERT(control.demand_ready_before_use == 2 && control.all_demand_ready_before_use);
+    GGML_ASSERT(parallel.diagnostics.phase10_storage_events.size() >= 2);
+    GGML_ASSERT(serial.diagnostics.phase10_storage_events.size() >= 2);
+    phase10_evidence.parallel_misses = issued.demand_misses;
+    phase10_evidence.parallel_enqueued_before_take = issued.scheduler_enqueued_before_first_take;
+    phase10_evidence.parallel_submitted_before_wait = issued.storage_reads_submitted_before_first_wait;
+    phase10_evidence.parallel_ready_before_use = issued.demand_ready_before_use;
+    phase10_evidence.serial_submitted_before_wait = control.storage_reads_submitted_before_first_wait;
+    phase10_evidence.routes_equal = parallel.execution_ids == serial.execution_ids;
 }
 
 int source_expert_axis(const ggml_tensor * tensor, int64_t n_expert, bool weight) {
@@ -1329,6 +1778,9 @@ int main(int argc, char ** argv) {
     test_directory_lru_pin_exclusion_and_request_exclusivity();
     test_directory_copy_failure_cleanup_and_reuse();
     test_directory_generation_exhaustion_trim_and_invalid_id();
+    test_blocking_hot_seed_atomic_publication_and_failure();
+    test_blocking_cold_seed_uses_storage_ring_and_ordinary_lru();
+    test_exact_issue_ahead_and_serial_evidence_control();
     if (argc == 2) {
         ggml_backend_load_all();
         test_cuda_directory_copy();
@@ -1340,5 +1792,19 @@ int main(int argc, char ** argv) {
         std::cerr << "usage: test-hot-expert-cache [MODEL]\n";
         return 2;
     }
+    std::cout << "PHASE10_STATIC_SEED"
+              << "\tentries=" << phase10_evidence.seed_entries
+              << "\tstorage_bytes=" << phase10_evidence.seed_storage_bytes
+              << "\th2d_bytes=" << phase10_evidence.seed_h2d_bytes
+              << "\tordinary_lru=" << phase10_evidence.seed_ordinary_lru
+              << "\tfailure_rolled_back=" << phase10_evidence.seed_failure_rolled_back
+              << "\tscheduler_drained=" << phase10_evidence.seed_scheduler_drained << '\n';
+    std::cout << "PHASE10_EXACT_ISSUE_AHEAD"
+              << "\tmisses=" << phase10_evidence.parallel_misses
+              << "\tenqueued_before_take=" << phase10_evidence.parallel_enqueued_before_take
+              << "\tparallel_submitted_before_wait=" << phase10_evidence.parallel_submitted_before_wait
+              << "\tparallel_ready_before_use=" << phase10_evidence.parallel_ready_before_use
+              << "\tserial_submitted_before_wait=" << phase10_evidence.serial_submitted_before_wait
+              << "\troutes_equal=" << phase10_evidence.routes_equal << '\n';
     return 0;
 }

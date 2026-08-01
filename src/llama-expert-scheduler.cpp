@@ -50,6 +50,12 @@ bool valid_transition(llm_expert_request_state current, llm_expert_request_state
     }
 }
 
+bool checked_add(uint64_t lhs, uint64_t rhs, uint64_t & result) {
+    if (rhs > UINT64_MAX - lhs) return false;
+    result = lhs + rhs;
+    return true;
+}
+
 } // namespace
 
 struct llm_expert_scheduler::impl {
@@ -61,6 +67,9 @@ struct llm_expert_scheduler::impl {
         llm_expert_readiness readiness = llm_expert_readiness::host_ready;
         llm_expert_request_state state = llm_expert_request_state::free;
         uint32_t waiters = 0;
+        llm_expert_request_metadata metadata;
+        bool speculative_charge_active = false;
+        bool promoted_from_speculative = false;
     };
 
     llm_expert_scheduler_config config;
@@ -68,6 +77,81 @@ struct llm_expert_scheduler::impl {
     mutable std::mutex mutex;
     llm_expert_scheduler_diagnostics counters;
     uint64_t next_ordinal = 1;
+
+    bool speculative_budgets_enabled() const {
+        return config.max_speculative_flights != 0;
+    }
+
+    bool can_charge(const llm_expert_request_metadata & metadata) const {
+        if (!speculative_budgets_enabled()) return true;
+        if (metadata.origin != llm_expert_request_origin::speculative ||
+            metadata.profile_digest == 0 || metadata.owner_request == 0 ||
+            metadata.target_layer < 0 || metadata.deadline_token < metadata.owner_token ||
+            counters.active_speculative_flights >= config.max_speculative_flights ||
+            counters.speculative_storage_bytes_in_flight >
+                config.max_speculative_storage_bytes_in_flight ||
+            counters.speculative_h2d_bytes_in_flight >
+                config.max_speculative_h2d_bytes_in_flight ||
+            counters.speculative_cold_slots > config.max_speculative_cold_slots ||
+            counters.speculative_hot_slots > config.max_speculative_hot_slots ||
+            metadata.reserved_storage_bytes >
+                config.max_speculative_storage_bytes_in_flight - counters.speculative_storage_bytes_in_flight ||
+            metadata.reserved_h2d_bytes >
+                config.max_speculative_h2d_bytes_in_flight - counters.speculative_h2d_bytes_in_flight ||
+            metadata.speculative_cold_slots >
+                config.max_speculative_cold_slots - counters.speculative_cold_slots ||
+            metadata.speculative_hot_slots >
+                config.max_speculative_hot_slots - counters.speculative_hot_slots) {
+            return false;
+        }
+        uint64_t token_storage = 0;
+        uint64_t token_h2d = 0;
+        for (const auto & request : requests) {
+            if (!request.speculative_charge_active ||
+                request.metadata.owner_request != metadata.owner_request ||
+                request.metadata.owner_token != metadata.owner_token) continue;
+            if (!checked_add(token_storage, request.metadata.reserved_storage_bytes, token_storage) ||
+                !checked_add(token_h2d, request.metadata.reserved_h2d_bytes, token_h2d)) return false;
+        }
+        if (token_storage > config.max_speculative_storage_bytes_per_token ||
+            token_h2d > config.max_speculative_h2d_bytes_per_token) return false;
+        return metadata.reserved_storage_bytes <=
+                config.max_speculative_storage_bytes_per_token - token_storage &&
+            metadata.reserved_h2d_bytes <=
+                config.max_speculative_h2d_bytes_per_token - token_h2d;
+    }
+
+    void charge(request_record & request) {
+        if (!speculative_budgets_enabled()) return;
+        request.speculative_charge_active = true;
+        counters.active_speculative_flights++;
+        counters.speculative_storage_bytes_in_flight += request.metadata.reserved_storage_bytes;
+        counters.speculative_h2d_bytes_in_flight += request.metadata.reserved_h2d_bytes;
+        counters.speculative_cold_slots += request.metadata.speculative_cold_slots;
+        counters.speculative_hot_slots += request.metadata.speculative_hot_slots;
+        counters.peak_speculative_flights = std::max(
+            counters.peak_speculative_flights, counters.active_speculative_flights);
+        counters.peak_speculative_storage_bytes_in_flight = std::max(
+            counters.peak_speculative_storage_bytes_in_flight,
+            counters.speculative_storage_bytes_in_flight);
+        counters.peak_speculative_h2d_bytes_in_flight = std::max(
+            counters.peak_speculative_h2d_bytes_in_flight,
+            counters.speculative_h2d_bytes_in_flight);
+        counters.peak_speculative_cold_slots = std::max(
+            counters.peak_speculative_cold_slots, counters.speculative_cold_slots);
+        counters.peak_speculative_hot_slots = std::max(
+            counters.peak_speculative_hot_slots, counters.speculative_hot_slots);
+    }
+
+    void release_charge(request_record & request) {
+        if (!request.speculative_charge_active) return;
+        counters.active_speculative_flights--;
+        counters.speculative_storage_bytes_in_flight -= request.metadata.reserved_storage_bytes;
+        counters.speculative_h2d_bytes_in_flight -= request.metadata.reserved_h2d_bytes;
+        counters.speculative_cold_slots -= request.metadata.speculative_cold_slots;
+        counters.speculative_hot_slots -= request.metadata.speculative_hot_slots;
+        request.speculative_charge_active = false;
+    }
 
     request_record * find(llm_expert_request_handle handle) {
         if (!handle.valid() || handle.slot >= requests.size()) {
@@ -98,6 +182,7 @@ struct llm_expert_scheduler::impl {
             counters.generation_exhaustions++;
             return false;
         }
+        release_charge(request);
         request.key = { -1, -1 };
         request.generation++;
         request.enqueue_ordinal = 0;
@@ -105,13 +190,34 @@ struct llm_expert_scheduler::impl {
         request.readiness = llm_expert_readiness::host_ready;
         request.state = llm_expert_request_state::free;
         request.waiters = 0;
+        request.metadata = {};
+        request.promoted_from_speculative = false;
         return true;
     }
 };
 
 llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) : pimpl(std::make_unique<impl>()) {
+    const bool any_speculative_budget = config.max_speculative_flights != 0 ||
+        config.max_speculative_storage_bytes_in_flight != 0 ||
+        config.max_speculative_h2d_bytes_in_flight != 0 ||
+        config.max_speculative_storage_bytes_per_token != 0 ||
+        config.max_speculative_h2d_bytes_per_token != 0 ||
+        config.max_speculative_cold_slots != 0 || config.max_speculative_hot_slots != 0;
+    const bool complete_speculative_budget = config.max_speculative_flights != 0 &&
+        config.max_speculative_storage_bytes_in_flight != 0 &&
+        config.max_speculative_h2d_bytes_in_flight != 0 &&
+        config.max_speculative_storage_bytes_per_token != 0 &&
+        config.max_speculative_h2d_bytes_per_token != 0 &&
+        config.max_speculative_cold_slots != 0 && config.max_speculative_hot_slots != 0;
     if (config.layer_count == 0 || config.experts_per_layer == 0 || config.request_capacity == 0 ||
         config.waiters_per_request == 0 ||
+        any_speculative_budget != complete_speculative_budget ||
+        (complete_speculative_budget &&
+            (config.max_speculative_flights > config.request_capacity ||
+             config.max_speculative_storage_bytes_per_token >
+                config.max_speculative_storage_bytes_in_flight ||
+             config.max_speculative_h2d_bytes_per_token >
+                config.max_speculative_h2d_bytes_in_flight)) ||
         uint64_t(config.layer_count)*config.experts_per_layer > uint64_t(std::numeric_limits<uint32_t>::max())) {
         throw std::invalid_argument("invalid expert scheduler configuration");
     }
@@ -130,12 +236,23 @@ llm_expert_scheduler::~llm_expert_scheduler() = default;
 llm_expert_schedule_result llm_expert_scheduler::enqueue(
         llm_expert_key key,
         llm_expert_priority priority,
-        llm_expert_readiness readiness) noexcept {
+        llm_expert_readiness readiness,
+        llm_expert_request_metadata metadata) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->counters.admission_closed) {
         return { llm_expert_schedule_disposition::closed, {} };
     }
     if (!key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer)) {
+        return { llm_expert_schedule_disposition::invalid, {} };
+    }
+    const bool speculative = priority >= llm_expert_priority::prefetch_next;
+    if (speculative && !pimpl->speculative_budgets_enabled() &&
+        metadata.origin == llm_expert_request_origin::demand) {
+        metadata.origin = llm_expert_request_origin::speculative;
+    }
+    if ((speculative && metadata.origin != llm_expert_request_origin::speculative) ||
+        (!speculative && metadata.origin == llm_expert_request_origin::speculative) ||
+        (pimpl->speculative_budgets_enabled() && speculative && metadata.target_layer != key.layer)) {
         return { llm_expert_schedule_disposition::invalid, {} };
     }
     for (uint32_t slot = 0; slot < pimpl->requests.size(); ++slot) {
@@ -146,6 +263,13 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
             }
             request.waiters++;
             pimpl->counters.joins++;
+            if (!speculative && request.metadata.origin == llm_expert_request_origin::speculative) {
+                pimpl->release_charge(request);
+                request.metadata = metadata;
+                request.metadata.origin = llm_expert_request_origin::demand;
+                request.promoted_from_speculative = true;
+                pimpl->counters.demand_promotions++;
+            }
             if (priority < request.priority) {
                 request.priority = priority;
                 pimpl->counters.promotions++;
@@ -165,12 +289,12 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
             break;
         }
     }
-    if (slot == UINT32_MAX && priority == llm_expert_priority::demand_current_layer) {
+    if (slot == UINT32_MAX && priority < llm_expert_priority::prefetch_next) {
         uint64_t oldest = std::numeric_limits<uint64_t>::max();
         for (uint32_t index = 0; index < pimpl->requests.size(); ++index) {
             const impl::request_record & request = pimpl->requests[index];
             if (request.state == llm_expert_request_state::queued &&
-                request.priority >= llm_expert_priority::prefetch_next && request.enqueue_ordinal < oldest) {
+                request.priority > priority && request.enqueue_ordinal < oldest) {
                 slot = index;
                 oldest = request.enqueue_ordinal;
             }
@@ -203,8 +327,21 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     request.enqueue_ordinal = pimpl->next_ordinal++;
     request.priority = priority;
     request.readiness = readiness;
+    request.metadata = metadata;
+    request.promoted_from_speculative = false;
     request.state = llm_expert_request_state::queued;
     request.waiters = 1;
+    if (speculative && !pimpl->can_charge(metadata)) {
+        request.key = { -1, -1 };
+        request.enqueue_ordinal = 0;
+        request.metadata = {};
+        request.state = llm_expert_request_state::free;
+        request.waiters = 0;
+        pimpl->counters.speculative_budget_rejections++;
+        pimpl->counters.drops++;
+        return { llm_expert_schedule_disposition::dropped, {} };
+    }
+    if (speculative) pimpl->charge(request);
     pimpl->counters.flights_created++;
     pimpl->update_occupancy();
     return { llm_expert_schedule_disposition::admitted, { slot, request.generation } };
@@ -238,6 +375,8 @@ llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_sn
         request.state,
         request.waiters,
         request.enqueue_ordinal,
+        request.metadata,
+        request.promoted_from_speculative,
     };
     pimpl->update_occupancy();
     return { llm_expert_schedule_disposition::admitted, result.handle };
@@ -296,11 +435,43 @@ llm_expert_schedule_disposition llm_expert_scheduler::release_terminal(llm_exper
     if (!is_terminal(request->state)) {
         return llm_expert_schedule_disposition::busy;
     }
+    pimpl->release_charge(*request);
     request->key = { -1, -1 };
     request->enqueue_ordinal = 0;
     request->state = llm_expert_request_state::free;
     request->waiters = 0;
+    request->metadata = {};
+    request->promoted_from_speculative = false;
     pimpl->counters.terminal_releases++;
+    pimpl->update_occupancy();
+    return llm_expert_schedule_disposition::admitted;
+}
+
+llm_expert_schedule_disposition llm_expert_scheduler::cancel_queued_speculative(
+        llm_expert_request_handle handle) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    impl::request_record * request = pimpl->find(handle);
+    if (request == nullptr) {
+        pimpl->counters.stale_completions++;
+        return llm_expert_schedule_disposition::stale_generation;
+    }
+    if (request->state != llm_expert_request_state::queued ||
+        request->metadata.origin != llm_expert_request_origin::speculative ||
+        request->promoted_from_speculative) {
+        return llm_expert_schedule_disposition::invalid;
+    }
+    pimpl->counters.terminal_cancelled++;
+    pimpl->counters.terminal_releases++;
+    pimpl->counters.speculative_cancelled_before_submit++;
+    pimpl->release_charge(*request);
+    request->key = { -1, -1 };
+    request->enqueue_ordinal = 0;
+    request->priority = llm_expert_priority::prefetch_speculative;
+    request->readiness = llm_expert_readiness::host_ready;
+    request->state = llm_expert_request_state::free;
+    request->waiters = 0;
+    request->metadata = {};
+    request->promoted_from_speculative = false;
     pimpl->update_occupancy();
     return llm_expert_schedule_disposition::admitted;
 }
@@ -314,10 +485,13 @@ bool llm_expert_scheduler::shutdown() noexcept {
         }
     }
     for (impl::request_record & request : pimpl->requests) {
+        pimpl->release_charge(request);
         request.key = { -1, -1 };
         request.enqueue_ordinal = 0;
         request.state = llm_expert_request_state::free;
         request.waiters = 0;
+        request.metadata = {};
+        request.promoted_from_speculative = false;
     }
     pimpl->update_occupancy();
     return true;

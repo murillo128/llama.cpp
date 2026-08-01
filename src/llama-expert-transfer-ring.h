@@ -168,6 +168,10 @@ public:
     llm_expert_provider_result transfer_wave(
         ggml_backend_t backend,
         const std::vector<llm_transfer_binding> & bindings) noexcept;
+    // Model-load seed path: use the ring's bounded transfer backend and wait
+    // until every destination is device-ready before returning.
+    llm_expert_provider_result transfer_wave_blocking(
+        const std::vector<llm_transfer_binding> & bindings) noexcept;
     // Atomically reserve and queue a background transfer. The Phase 8 path
     // does not wait for the ring mutex; explicit Phase 9 policy ordering may
     // wait for that bounded critical section, but never for a free lane.

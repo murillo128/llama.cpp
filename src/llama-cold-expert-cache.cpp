@@ -588,6 +588,34 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit_with_loader(
     return published;
 }
 
+llm_expert_provider_result llm_cold_expert_cache::find_or_admit_speculative_with_loader(
+        llm_expert_key key,
+        uint64_t deadline,
+        uint64_t utility,
+        llm_cold_reference & reference,
+        llm_cold_cache_loader loader,
+        void * loader_data) noexcept {
+    if (loader == nullptr) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+    }
+    bool hit = false;
+    auto reserved = reserve_or_find_speculative(key, deadline, utility, reference, hit);
+    if (!reserved.is_ready() || hit) return reserved;
+    const auto loaded = loader(loader_data, key, pimpl->arena->bundle, reference.slot);
+    if (!loaded.is_ready()) {
+        (void) fail_reservation(key, reference);
+        return loaded;
+    }
+    const auto published = publish_ready(key, reference);
+    if (!published.is_ready()) {
+        (void) fail_reservation(key, reference);
+        return published;
+    }
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    pimpl->counters.speculative_admissions++;
+    return llm_expert_provider_result::success();
+}
+
 llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
         llm_expert_key key,
         llm_cold_reference & reference,
@@ -615,6 +643,13 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
         existing.last_use = ++pimpl->use_clock;
         const auto touched = policy_result(pimpl->policy.hit(uint32_t(forward.slot), forward.generation));
         if (!touched.is_ready()) return touched;
+        if (existing.origin == llm_expert_residency_origin::speculative) {
+            existing.origin = llm_expert_residency_origin::demand;
+            existing.speculative_consumed = true;
+            existing.speculative_deadline = 0;
+            existing.speculative_utility = 0;
+            pimpl->counters.speculative_demand_consumptions++;
+        }
         reference = { uint32_t(forward.slot), forward.generation };
         pimpl->counters.hits++;
         hit = true;
@@ -640,6 +675,10 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
     slot.generation++;
     slot.last_use = 0;
     slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
+    slot.origin = llm_expert_residency_origin::demand;
+    slot.speculative_consumed = false;
+    slot.speculative_deadline = 0;
+    slot.speculative_utility = 0;
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     const auto loading = policy_result(pimpl->policy.load_begin(uint32_t(victim), slot.generation,
@@ -649,6 +688,132 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
     slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
     reference = { uint32_t(victim), slot.generation };
     pimpl->counters.reservations++;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_cold_expert_cache::reserve_or_find_speculative(
+        llm_expert_key key,
+        uint64_t deadline,
+        uint64_t utility,
+        llm_cold_reference & reference,
+        bool & hit) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    pimpl->counters.requests++;
+    hit = false;
+    if (!pimpl->arena || deadline == 0 || !key.is_valid(LLAMA_MAX_LAYERS, pimpl->n_expert)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+    }
+    auto policy_request = pimpl->ensure_policy_request();
+    if (!policy_request.is_ready()) return policy_request;
+    auto & forward = pimpl->directory[pimpl->forward_index(key)];
+    if (forward.slot >= 0) {
+        if (uint32_t(forward.slot) >= pimpl->slots.size()) {
+            pimpl->counters.invariant_failures++;
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        const auto & existing = pimpl->slots[forward.slot];
+        if (!key_matches(existing.key, key) || existing.generation != forward.generation ||
+            existing.state != llm_cold_slot_state::ready) {
+            pimpl->counters.invariant_failures++;
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        reference = { uint32_t(forward.slot), forward.generation };
+        pimpl->counters.hits++;
+        hit = true;
+        return llm_expert_provider_result::success();
+    }
+    pimpl->counters.misses++;
+    int32_t speculative_victim = -1;
+    for (uint32_t index = 0; index < pimpl->slots.size(); ++index) {
+        const auto & candidate = pimpl->slots[index];
+        if (candidate.state != llm_cold_slot_state::ready || !pimpl->no_refs(candidate) ||
+            candidate.origin != llm_expert_residency_origin::speculative ||
+            candidate.speculative_consumed ||
+            (pimpl->config.cache_policy_config.scope == LLAMA_EXPERT_CACHE_POLICY_SCOPE_PER_LAYER &&
+             candidate.key.layer != key.layer)) continue;
+        if (speculative_victim < 0 ||
+            candidate.speculative_deadline < pimpl->slots[speculative_victim].speculative_deadline ||
+            (candidate.speculative_deadline == pimpl->slots[speculative_victim].speculative_deadline &&
+             (candidate.speculative_utility < pimpl->slots[speculative_victim].speculative_utility ||
+              (candidate.speculative_utility == pimpl->slots[speculative_victim].speculative_utility &&
+               index < uint32_t(speculative_victim))))) {
+            speculative_victim = int32_t(index);
+        }
+    }
+    for (uint32_t index = 0; index < pimpl->slots.size(); ++index) {
+        const auto & slot = pimpl->slots[index];
+        pimpl->policy_candidates[index] = {
+            index, slot.generation, { slot.key.layer, slot.key.expert },
+            pimpl->counters.bundle_payload_bytes, pimpl->counters.aligned_slot_footprint,
+            slot.state == llm_cold_slot_state::free,
+            speculative_victim == int32_t(index),
+        };
+    }
+    llm_expert_cache_policy_decision decision;
+    auto selected = policy_result(pimpl->policy.optional_admission(
+        { key.layer, key.expert }, llm_expert_cache_policy_admission::optional_background,
+        pimpl->policy_candidates.data(), pimpl->policy_candidates.size(), decision));
+    if (!selected.is_ready() || !decision.accept || decision.slot >= pimpl->slots.size()) {
+        pimpl->counters.speculative_rejections++;
+        return selected.is_ready() ?
+            llm_expert_provider_result::failure(llm_expert_provider_error::busy) : selected;
+    }
+    auto & slot = pimpl->slots[decision.slot];
+    const bool valid = decision.free ?
+        slot.state == llm_cold_slot_state::free && slot.generation == decision.generation :
+        int32_t(decision.slot) == speculative_victim &&
+            slot.state == llm_cold_slot_state::ready && pimpl->no_refs(slot) &&
+            slot.origin == llm_expert_residency_origin::speculative &&
+            !slot.speculative_consumed && slot.generation == decision.generation;
+    if (!valid) {
+        pimpl->counters.invariant_failures++;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    if (!decision.free) {
+        auto removed = policy_result(pimpl->policy.evict(decision.slot, slot.generation));
+        if (!removed.is_ready()) return removed;
+        slot.state = llm_cold_slot_state::evicting;
+        pimpl->clear_forward(decision.slot);
+        pimpl->counters.evictions++;
+        pimpl->counters.speculative_replacements++;
+    }
+    if (slot.generation == UINT64_MAX) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
+    }
+    slot.state = llm_cold_slot_state::reserved;
+    slot.key = key;
+    slot.generation++;
+    slot.last_use = 0;
+    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
+    slot.origin = llm_expert_residency_origin::speculative;
+    slot.speculative_consumed = false;
+    slot.speculative_deadline = deadline;
+    slot.speculative_utility = utility;
+    pimpl->counters.generation_changes++;
+    slot.state = llm_cold_slot_state::loading;
+    const auto loading = policy_result(pimpl->policy.load_begin(decision.slot, slot.generation,
+        { key.layer, key.expert }, pimpl->counters.bundle_payload_bytes,
+        pimpl->counters.aligned_slot_footprint, false));
+    if (!loading.is_ready()) return loading;
+    slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
+    pimpl->counters.reservations++;
+    reference = { decision.slot, slot.generation };
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_cold_expert_cache::reclassify(
+        llm_cold_reference reference,
+        llm_expert_residency_origin origin,
+        bool consumed) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->valid_reference(reference) || origin == llm_expert_residency_origin::speculative) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & slot = pimpl->slots[reference.slot];
+    slot.origin = origin;
+    slot.speculative_consumed = consumed;
+    slot.speculative_deadline = 0;
+    slot.speculative_utility = 0;
     return llm_expert_provider_result::success();
 }
 
@@ -721,6 +886,13 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
         slot.last_use = ++pimpl->use_clock;
         const auto touched = policy_result(pimpl->policy.hit(uint32_t(forward.slot), forward.generation));
         if (!touched.is_ready()) return touched;
+        if (slot.origin == llm_expert_residency_origin::speculative) {
+            slot.origin = llm_expert_residency_origin::demand;
+            slot.speculative_consumed = true;
+            slot.speculative_deadline = 0;
+            slot.speculative_utility = 0;
+            pimpl->counters.speculative_demand_consumptions++;
+        }
         reference = { uint32_t(forward.slot), forward.generation };
         pimpl->counters.hits++;
         return llm_expert_provider_result::success();
@@ -745,6 +917,10 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
     slot.generation++;
     slot.last_use = 0;
     slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
+    slot.origin = llm_expert_residency_origin::demand;
+    slot.speculative_consumed = false;
+    slot.speculative_deadline = 0;
+    slot.speculative_utility = 0;
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     const auto loading = policy_result(pimpl->policy.load_begin(uint32_t(victim), slot.generation,
@@ -1043,6 +1219,14 @@ llm_expert_provider_result llm_cold_expert_cache::validate_invariants(
     }
     for (uint32_t index = 0; index < pimpl->slots.size(); ++index) {
         const auto & slot = pimpl->slots[index];
+        if (slot.state == llm_cold_slot_state::ready || slot.state == llm_cold_slot_state::loading) {
+            const bool speculative = slot.origin == llm_expert_residency_origin::speculative;
+            if ((speculative && (slot.speculative_consumed || slot.speculative_deadline == 0)) ||
+                (!speculative && (slot.speculative_deadline != 0 || slot.speculative_utility != 0))) {
+                pimpl->counters.invariant_failures++;
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+        }
         uint32_t expected_hot = 0;
         for (const auto & backing : hot_backings) {
             expected_hot += backing.cold_slot == index;

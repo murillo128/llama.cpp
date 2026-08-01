@@ -70,6 +70,10 @@ struct llm_cold_cache_diagnostics {
     uint64_t publications = 0;
     uint64_t failed_reservations = 0;
     uint64_t evictions = 0;
+    uint64_t speculative_admissions = 0;
+    uint64_t speculative_replacements = 0;
+    uint64_t speculative_rejections = 0;
+    uint64_t speculative_demand_consumptions = 0;
     uint64_t source_copy_bundles = 0;
     uint64_t source_copy_bytes = 0;
     uint64_t source_copy_time_us = 0;
@@ -104,6 +108,10 @@ struct llm_cold_cache_diagnostics {
         uint32_t transfer_refs = 0;
         uint32_t request_refs = 0;
         uint32_t cpu_execution_refs = 0;
+        llm_expert_residency_origin origin = llm_expert_residency_origin::demand;
+        bool speculative_consumed = false;
+        uint64_t speculative_deadline = 0;
+        uint64_t speculative_utility = 0;
         llm_cold_slot_state state = llm_cold_slot_state::free;
     };
     std::vector<slot> slots;
@@ -130,10 +138,27 @@ public:
             llm_cold_reference & reference,
             llm_cold_cache_loader loader,
             void * loader_data) noexcept;
+    llm_expert_provider_result find_or_admit_speculative_with_loader(
+            llm_expert_key key,
+            uint64_t deadline,
+            uint64_t utility,
+            llm_cold_reference & reference,
+            llm_cold_cache_loader loader,
+            void * loader_data) noexcept;
     llm_expert_provider_result reserve_or_find(
             llm_expert_key key,
             llm_cold_reference & reference,
             bool & hit) noexcept;
+    llm_expert_provider_result reserve_or_find_speculative(
+            llm_expert_key key,
+            uint64_t deadline,
+            uint64_t utility,
+            llm_cold_reference & reference,
+            bool & hit) noexcept;
+    llm_expert_provider_result reclassify(
+            llm_cold_reference reference,
+            llm_expert_residency_origin origin,
+            bool consumed = false) noexcept;
     llm_expert_provider_result publish_ready(llm_expert_key key, llm_cold_reference reference) noexcept;
     llm_expert_provider_result fail_reservation(llm_expert_key key, llm_cold_reference reference) noexcept;
     llm_expert_provider_result acquire(

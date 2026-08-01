@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "llama-expert-cache-policy.h"
+#include "llama-expert-prefetch.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -297,6 +298,28 @@ struct llm_expert_phase10_scheduler_event {
     uint64_t take_ns = 0;
 };
 
+struct llm_expert_phase10_issue_ahead_event {
+    uint64_t sequence = 0;
+    uint64_t request = 0;
+    uint64_t ubatch_ordinal = 0;
+    int32_t layer = -1;
+    uint32_t logical_ids = 0;
+    uint32_t unique_ids = 0;
+    uint32_t demand_misses = 0;
+    uint32_t scheduler_enqueued_before_first_take = 0;
+    uint32_t storage_reads = 0;
+    uint32_t storage_reads_submitted_before_first_wait = 0;
+    uint32_t demand_ready_before_use = 0;
+    uint64_t first_take_us = 0;
+    uint64_t first_wait_us = 0;
+    uint64_t last_demand_ready_us = 0;
+    uint64_t demand_completion_us = 0;
+    bool first_take_after_all_demand_enqueues = false;
+    bool first_wait_after_all_storage_submissions = false;
+    bool all_demand_ready_before_use = false;
+    bool serial_control = false;
+};
+
 struct llm_expert_phase10_storage_event {
     struct source_segment {
         uint64_t file_offset = 0;
@@ -320,6 +343,12 @@ struct llm_expert_phase10_h2d_event {
     uint64_t complete_us = 0;
     uint64_t bytes = 0;
     bool cancelled = false;
+};
+
+enum class llm_expert_residency_origin : uint8_t {
+    demand,
+    static_seed,
+    speculative,
 };
 
 struct llm_hot_cache_diagnostics {
@@ -375,6 +404,17 @@ struct llm_hot_cache_diagnostics {
     uint64_t background_h2d_bytes = 0;
     uint32_t active_background_flights = 0;
     uint32_t peak_background_flights = 0;
+    bool phase10_prefetch_configured = false;
+    bool phase10_seed_configured = false;
+    bool phase10_seed_complete = false;
+    uint64_t phase10_seed_attempts = 0;
+    uint64_t phase10_seed_failures = 0;
+    uint64_t phase10_seed_entries = 0;
+    uint64_t phase10_seed_storage_bytes = 0;
+    uint64_t phase10_seed_h2d_bytes = 0;
+    llm_expert_key phase10_seed_last_touch = { -1, -1 };
+    uint64_t phase10_issue_ahead_events = 0;
+    uint64_t phase10_issue_ahead_violations = 0;
     uint32_t requested_capacity = 0;
     uint32_t effective_capacity = 0;
     uint64_t pool_bytes = 0;
@@ -437,6 +477,8 @@ struct llm_hot_cache_diagnostics {
         uint32_t cold_slot = 0;
         uint64_t cold_generation = 0;
         bool has_cold_backing = false;
+        llm_expert_residency_origin origin = llm_expert_residency_origin::demand;
+        bool speculative_consumed = false;
         enum state_type {
             free,
             reserved,
@@ -465,6 +507,10 @@ struct llm_hot_cache_diagnostics {
     uint64_t cold_misses = 0;
     uint64_t cold_admissions = 0;
     uint64_t cold_evictions = 0;
+    uint64_t cold_speculative_admissions = 0;
+    uint64_t cold_speculative_replacements = 0;
+    uint64_t cold_speculative_rejections = 0;
+    uint64_t cold_speculative_demand_consumptions = 0;
     uint64_t cold_source_copy_bundles = 0;
     uint64_t cold_source_copy_bytes = 0;
     uint64_t cold_source_copy_time_us = 0;
@@ -582,6 +628,9 @@ struct llm_hot_cache_diagnostics {
     std::vector<llm_expert_phase10_scheduler_event> phase10_scheduler_events;
     uint32_t phase10_scheduler_event_capacity = 0;
     uint64_t phase10_scheduler_events_dropped = 0;
+    std::vector<llm_expert_phase10_issue_ahead_event> phase10_issue_ahead_trace;
+    uint32_t phase10_issue_ahead_trace_capacity = 0;
+    uint64_t phase10_issue_ahead_trace_dropped = 0;
     std::vector<llm_expert_phase10_storage_event> phase10_storage_events;
     uint32_t phase10_storage_event_capacity = 0;
     uint64_t phase10_storage_events_dropped = 0;
@@ -917,6 +966,11 @@ struct llm_hot_cache_config {
     llama_expert_miss_policy miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
     bool background_promotion = false;
     bool phase10_lead_trace = false;
+    llm_expert_prefetch_config_internal prefetch_config = {};
+    llm_expert_prefetch_profile prefetch_profile = {};
+    bool prefetch_profile_loaded = false;
+    // Internal evidence seam. The model-facing path always leaves this false.
+    bool phase10_serial_issue_for_testing = false;
     llama_expert_auto_cost_model auto_cost_model = {};
     uint64_t auto_cost_model_digest = 0;
     // Internal evidence seams. Model-facing construction always leaves these

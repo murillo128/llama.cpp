@@ -1418,6 +1418,11 @@ void llama_model::init_expert_weight_provider() {
             config.cold_cache_policy_config = pimpl->expert_cold_cache_policy_config;
             config.phase10_lead_trace = params.expert_prefetch_config != nullptr &&
                 params.expert_prefetch_config->policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF;
+            config.prefetch_config = pimpl->expert_prefetch_config;
+            if (pimpl->expert_prefetch_profile.has_value()) {
+                config.prefetch_profile = *pimpl->expert_prefetch_profile;
+                config.prefetch_profile_loaded = true;
+            }
             config.routed_layers = std::move(routed_layers);
             if (params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
                 config.cold_mode = true;
@@ -1557,9 +1562,19 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
     const uint32_t request_capacity = uint32_t(request_capacity_64);
     const uint64_t trace_capacity_64 = std::min<uint64_t>(65536, std::max<uint64_t>(1024, request_capacity_64*16));
+    const auto & prefetch = pimpl->expert_prefetch_config.value;
+    const bool predictive_prefetch = pimpl->expert_prefetch_config.supplied &&
+        prefetch.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF;
     auto scheduler = std::make_unique<llm_expert_scheduler>(llm_expert_scheduler_config{
         uint32_t(layers.size()), uint32_t(hparams.n_expert), request_capacity,
         uint32_t(std::max<int64_t>(1, hparams.n_expert_used)), 0,
+        predictive_prefetch ? prefetch.max_speculative_flights : 0,
+        predictive_prefetch ? prefetch.max_speculative_storage_bytes_in_flight : 0,
+        predictive_prefetch ? prefetch.max_speculative_h2d_bytes_in_flight : 0,
+        predictive_prefetch ? prefetch.max_speculative_storage_bytes_per_token : 0,
+        predictive_prefetch ? prefetch.max_speculative_h2d_bytes_per_token : 0,
+        predictive_prefetch ? prefetch.max_speculative_cold_slots : 0,
+        predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
     });
     auto transport = std::make_unique<llm_expert_async_transport>(llm_expert_async_config{
         params.expert_io_queue_depth,

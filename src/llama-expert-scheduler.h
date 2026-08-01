@@ -17,6 +17,25 @@ enum class llm_expert_readiness : uint8_t {
     device_ready,
 };
 
+enum class llm_expert_request_origin : uint8_t {
+    demand,
+    static_seed,
+    speculative,
+};
+
+struct llm_expert_request_metadata {
+    llm_expert_request_origin origin = llm_expert_request_origin::demand;
+    uint64_t profile_digest = 0;
+    uint64_t owner_request = 0;
+    uint64_t owner_token = 0;
+    int32_t target_layer = -1;
+    uint64_t deadline_token = 0;
+    uint64_t reserved_storage_bytes = 0;
+    uint64_t reserved_h2d_bytes = 0;
+    uint32_t speculative_cold_slots = 0;
+    uint32_t speculative_hot_slots = 0;
+};
+
 enum class llm_expert_request_state : uint8_t {
     free,
     queued,
@@ -45,6 +64,13 @@ struct llm_expert_scheduler_config {
     uint32_t request_capacity = 0;
     uint32_t waiters_per_request = 0;
     uint64_t initial_generation_for_testing = 0;
+    uint32_t max_speculative_flights = 0;
+    uint64_t max_speculative_storage_bytes_in_flight = 0;
+    uint64_t max_speculative_h2d_bytes_in_flight = 0;
+    uint64_t max_speculative_storage_bytes_per_token = 0;
+    uint64_t max_speculative_h2d_bytes_per_token = 0;
+    uint32_t max_speculative_cold_slots = 0;
+    uint32_t max_speculative_hot_slots = 0;
 };
 
 enum class llm_expert_schedule_disposition {
@@ -76,6 +102,8 @@ struct llm_expert_request_snapshot {
     llm_expert_request_state state = llm_expert_request_state::free;
     uint32_t waiters = 0;
     uint64_t enqueue_ordinal = 0;
+    llm_expert_request_metadata metadata;
+    bool promoted_from_speculative = false;
 };
 
 struct llm_expert_scheduler_diagnostics {
@@ -96,6 +124,19 @@ struct llm_expert_scheduler_diagnostics {
     uint64_t terminal_failed = 0;
     uint64_t terminal_cancelled = 0;
     uint64_t terminal_releases = 0;
+    uint64_t speculative_budget_rejections = 0;
+    uint64_t speculative_cancelled_before_submit = 0;
+    uint64_t demand_promotions = 0;
+    uint32_t active_speculative_flights = 0;
+    uint32_t peak_speculative_flights = 0;
+    uint64_t speculative_storage_bytes_in_flight = 0;
+    uint64_t peak_speculative_storage_bytes_in_flight = 0;
+    uint64_t speculative_h2d_bytes_in_flight = 0;
+    uint64_t peak_speculative_h2d_bytes_in_flight = 0;
+    uint32_t speculative_cold_slots = 0;
+    uint32_t peak_speculative_cold_slots = 0;
+    uint32_t speculative_hot_slots = 0;
+    uint32_t peak_speculative_hot_slots = 0;
     bool admission_closed = false;
 };
 
@@ -110,7 +151,8 @@ public:
     llm_expert_schedule_result enqueue(
             llm_expert_key key,
             llm_expert_priority priority,
-            llm_expert_readiness readiness) noexcept;
+            llm_expert_readiness readiness,
+            llm_expert_request_metadata metadata = {}) noexcept;
     llm_expert_schedule_result take_next(llm_expert_request_snapshot & request) noexcept;
     llm_expert_schedule_disposition transition(
             llm_expert_request_handle handle,
@@ -120,6 +162,8 @@ public:
             llm_expert_request_handle handle,
             llm_expert_request_state terminal) noexcept;
     llm_expert_schedule_disposition release_terminal(llm_expert_request_handle handle) noexcept;
+    llm_expert_schedule_disposition cancel_queued_speculative(
+            llm_expert_request_handle handle) noexcept;
     bool shutdown() noexcept;
     llm_expert_scheduler_diagnostics diagnostics() const noexcept;
 

@@ -533,6 +533,7 @@ struct storage_async_flight {
     std::array<llm_expert_storage_read_operation, 12> operations;
     size_t destination_count = 0;
     size_t operation_count = 0;
+    uint64_t scheduler_enqueue_ns = 0;
     bool cold_hit = false;
     bool reserved = false;
     bool submitted = false;
@@ -735,7 +736,9 @@ llm_expert_provider_result load_storage_bundle(
         (void) context->scheduler->finish(selected.handle, llm_expert_request_state::failed);
         (void) context->scheduler->release_terminal(selected.handle);
         return llm_expert_provider_result::failure(
-            !integrity_matches ? llm_expert_provider_error::metadata_mismatch :
+            waited == llm_expert_async_result::ready &&
+                released == llm_expert_async_result::ready && !integrity_matches ?
+                llm_expert_provider_error::metadata_mismatch :
             (waited == llm_expert_async_result::stale_generation ?
                 llm_expert_provider_error::stale_generation : llm_expert_provider_error::copy_failed));
     }
@@ -1215,7 +1218,7 @@ struct hot_slot_entry {
     uint32_t cold_slot = 0;
     uint64_t cold_generation = 0;
     bool has_cold_backing = false;
-    bool background_origin = false;
+    llm_expert_residency_origin origin = llm_expert_residency_origin::demand;
     bool background_useful = false;
     hot_slot_state state = hot_slot_state::free;
 };
@@ -1430,6 +1433,13 @@ public:
             phase10_lead_events = std::make_unique<std::array<llm_expert_phase10_lead_event, 256>>();
             phase10_scheduler_events = std::make_unique<std::array<llm_expert_phase10_scheduler_event, 256>>();
         }
+        const bool phase10_active = this->config.prefetch_config.supplied &&
+            (this->config.prefetch_config.value.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF ||
+             this->config.prefetch_config.value.seed_mode != LLAMA_EXPERT_PREFETCH_SEED_MODE_OFF);
+        if (phase10_active) {
+            phase10_issue_ahead_trace =
+                std::make_unique<std::array<llm_expert_phase10_issue_ahead_event, 256>>();
+        }
         if (config.capacity < config.n_expert_used || config.capacity > config.total_expert_keys ||
             config.n_expert_used == 0 || config.routed_layer_count == 0 || config.total_expert_keys == 0 ||
             config.total_expert_keys % config.routed_layer_count != 0 || config.target_buffer_type == nullptr) {
@@ -1486,6 +1496,15 @@ public:
                                   config.auto_cost_model.version != 0 || config.auto_cost_model_digest != 0)) {
             throw std::invalid_argument("miss-policy configuration outside cold mode");
         }
+        if (config.prefetch_profile_loaded != phase10_active ||
+            (!config.prefetch_config.supplied && config.phase10_serial_issue_for_testing)) {
+            throw std::invalid_argument("incomplete expert prefetch configuration");
+        }
+        if (phase10_active && (config.prefetch_profile.profile_sha256.empty() ||
+            config.prefetch_profile.target.experts_per_layer != n_expert ||
+            config.prefetch_profile.target.routed_layers.size() != config.routed_layer_count)) {
+            throw std::invalid_argument("expert prefetch profile topology mismatch");
+        }
         if (config.miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO) {
             const auto & cost = config.auto_cost_model;
             if (cost.version != LLAMA_EXPERT_AUTO_COST_MODEL_VERSION_1 ||
@@ -1527,7 +1546,8 @@ public:
         }
         for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
             auto & entry = directory_slots[slot];
-            if (entry.background_origin && !entry.background_useful) background_wasted++;
+            if (entry.origin == llm_expert_residency_origin::speculative &&
+                !entry.background_useful) background_wasted++;
             if (entry.state == hot_slot_state::loading) {
                 (void) hot_policy.load_failed(slot, entry.generation);
             } else if (entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned) {
@@ -2056,7 +2076,13 @@ public:
         for (size_t policy_index = 0; policy_index < unique_count; ++policy_index) {
             const size_t index = policy_unique_indices[policy_index];
             if (unique_slots[index] < 0) continue;
-            const auto & entry = directory_slots[unique_slots[index]];
+            auto & entry = directory_slots[unique_slots[index]];
+            if (entry.origin == llm_expert_residency_origin::speculative &&
+                !entry.background_useful) {
+                entry.origin = llm_expert_residency_origin::demand;
+                entry.background_useful = true;
+                background_useful++;
+            }
             const auto touched = cache_policy_result(hot_policy.hit(
                 uint32_t(unique_slots[index]), entry.generation));
             if (!touched.is_ready()) return fail(touched);
@@ -2107,8 +2133,10 @@ public:
                 if (!touched.is_ready()) return fail(touched);
                 touched = pin_slot_locked(uint32_t(unique_slots[index]));
                 if (!touched.is_ready()) return fail(touched);
-                if (entry.background_origin && !entry.background_useful) {
+                if (entry.origin == llm_expert_residency_origin::speculative &&
+                    !entry.background_useful) {
                     entry.background_useful = true;
+                    entry.origin = llm_expert_residency_origin::demand;
                     background_useful++;
                 }
                 hit_count++;
@@ -2350,7 +2378,7 @@ public:
                         if (result.is_ready() && background != nullptr) {
                             auto & entry = directory_slots[background->hot_slot];
                             entry.state = hot_slot_state::ready;
-                            entry.background_origin = true;
+                            entry.origin = llm_expert_residency_origin::demand;
                             entry.background_useful = true;
                             entry.last_use = ++use_clock;
                             directory_forward[forward_index(entry.key)] = {
@@ -2607,6 +2635,8 @@ public:
             entry.generation++;
             entry.refcount = 0;
             entry.has_cold_backing = false;
+            entry.origin = llm_expert_residency_origin::demand;
+            entry.background_useful = false;
             generation_changes++;
             entry.state = hot_slot_state::loading;
             const auto loading = cache_policy_result(hot_policy.load_begin(
@@ -2626,6 +2656,18 @@ public:
         if (config.cold_mode) {
             if (config.storage && config.async_transport && config.scheduler) {
                 size_t submitted_count = 0;
+                size_t scheduled_count = 0;
+                size_t storage_read_count = 0;
+                bool first_storage_wait = false;
+                llm_expert_phase10_issue_ahead_event issue_ahead;
+                issue_ahead.sequence = phase10_issue_ahead_events;
+                issue_ahead.request = active_request_id;
+                issue_ahead.ubatch_ordinal = request_ubatch_ordinal;
+                issue_ahead.layer = binding.layer;
+                issue_ahead.logical_ids = uint32_t(logical_id_count);
+                issue_ahead.unique_ids = uint32_t(unique_count);
+                issue_ahead.demand_misses = uint32_t(miss_count);
+                issue_ahead.serial_control = config.phase10_serial_issue_for_testing;
                 for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
                     auto & flight = async_flights[index];
                     flight = {};
@@ -2638,6 +2680,7 @@ public:
                     cold_references[index] = flight.cold;
                     if (!copy_result.is_ready()) continue;
                     if (!cold_hit) {
+                        storage_read_count++;
                         if (!build_storage_destinations(flight, cold_cache->bundle(), flight.cold.slot)) {
                             copy_result = llm_expert_provider_result::failure(
                                 llm_expert_provider_error::metadata_mismatch);
@@ -2652,7 +2695,7 @@ public:
                             break;
                         }
                     }
-                    const uint64_t scheduler_enqueue_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    flight.scheduler_enqueue_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count();
                     const auto scheduled = config.scheduler->enqueue(
                         flight.key, llm_expert_priority::demand_current_layer,
@@ -2672,14 +2715,66 @@ public:
                     };
                     flight.scheduler_active = true;
                     flight.scheduler_state = llm_expert_request_state::queued;
+                    scheduled_count++;
+                }
+                issue_ahead.scheduler_enqueued_before_first_take = uint32_t(scheduled_count);
+                issue_ahead.storage_reads = uint32_t(storage_read_count);
+                issue_ahead.first_take_after_all_demand_enqueues =
+                    copy_result.is_ready() && scheduled_count == miss_count;
+
+                const auto publish_completed_read = [&](size_t index,
+                        const llm_expert_async_read_completion & completion,
+                        llm_expert_async_result waited) {
+                    auto & flight = async_flights[index];
+                    const auto released = config.async_transport->release_read(flight.handle);
+                    if (released == llm_expert_async_result::ready) flight.read_active = false;
+                    const auto storage_error = waited == llm_expert_async_result::ready ?
+                        llm_expert_storage_error::none :
+                        (waited == llm_expert_async_result::closed ? llm_expert_storage_error::cancelled :
+                         (completion.native_error == 0 ? llm_expert_storage_error::short_read :
+                          llm_expert_storage_error::io_error));
+                    config.storage->record_async_read(
+                        flight.destination_count, completion.bytes_completed, storage_error,
+                        completion.native_error);
+                    uint64_t digest = 1469598103934665603ULL;
+                    if (waited == llm_expert_async_result::ready &&
+                        released == llm_expert_async_result::ready) {
+                        for (size_t destination = 0; destination < flight.destination_count; ++destination) {
+                            const auto * bytes = static_cast<const uint8_t *>(flight.destinations[destination].data);
+                            for (uint64_t offset = 0; offset < flight.destinations[destination].extent; ++offset) {
+                                digest ^= bytes[offset];
+                                digest *= 1099511628211ULL;
+                            }
+                        }
+                    }
+                    const bool integrity_matches = waited == llm_expert_async_result::ready &&
+                        released == llm_expert_async_result::ready && digest == completion.digest;
+                    config.storage->record_integrity_check(integrity_matches);
+                    if (!integrity_matches) {
+                        return llm_expert_provider_result::failure(
+                            waited == llm_expert_async_result::closed ? llm_expert_provider_error::cancelled :
+                            llm_expert_provider_error::copy_failed);
+                    }
+                    flight.read_completed = true;
+                    auto published = cold_cache->publish_ready(flight.key, flight.cold);
+                    if (published.is_ready()) flight.reserved = false;
+                    return published;
+                };
+
+                for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
+                    auto & flight = async_flights[index];
                     llm_expert_request_snapshot selected;
                     const auto taken = config.scheduler->take_next(selected);
                     const uint64_t scheduler_take_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count();
+                    if (issue_ahead.first_take_us == 0) {
+                        issue_ahead.first_take_us = uint64_t(ggml_time_us());
+                    }
                     if (phase10_scheduler_events) {
                         if (phase10_scheduler_event_count < phase10_scheduler_events->size()) {
                             (*phase10_scheduler_events)[phase10_scheduler_event_count] = {
-                                phase10_scheduler_event_count, flight.key, scheduler_enqueue_ns, scheduler_take_ns,
+                                phase10_scheduler_event_count, flight.key,
+                                flight.scheduler_enqueue_ns, scheduler_take_ns,
                             };
                             phase10_scheduler_event_count++;
                         } else {
@@ -2687,8 +2782,8 @@ public:
                         }
                     }
                     if (taken.disposition != llm_expert_schedule_disposition::admitted ||
-                        selected.handle.slot != scheduled.handle.slot ||
-                        selected.handle.generation != scheduled.handle.generation) {
+                        selected.handle.slot != flight.handle.slot ||
+                        selected.handle.generation != flight.handle.generation) {
                         if (taken.disposition == llm_expert_schedule_disposition::admitted) {
                             (void) config.scheduler->transition(selected.handle,
                                 llm_expert_request_state::submitting,
@@ -2702,7 +2797,7 @@ public:
                         break;
                     }
                     flight.scheduler_state = llm_expert_request_state::submitting;
-                    if (cold_hit) {
+                    if (flight.cold_hit) {
                         if (config.scheduler->transition(flight.handle,
                                 llm_expert_request_state::submitting,
                                 llm_expert_request_state::host_ready) !=
@@ -2735,8 +2830,26 @@ public:
                         break;
                     }
                     flight.scheduler_state = llm_expert_request_state::io_in_flight;
+                    if (config.phase10_serial_issue_for_testing) {
+                        config.async_transport->start_deferred_reads();
+                        if (!first_storage_wait) {
+                            first_storage_wait = true;
+                            issue_ahead.first_wait_us = uint64_t(ggml_time_us());
+                            issue_ahead.storage_reads_submitted_before_first_wait = uint32_t(submitted_count);
+                            issue_ahead.first_wait_after_all_storage_submissions =
+                                submitted_count == storage_read_count;
+                        }
+                        llm_expert_async_read_completion completion;
+                        if (provider_lock != nullptr) provider_lock->unlock();
+                        const auto waited = config.async_transport->wait_read(
+                            flight.handle, completion, abort_callback, abort_callback_data);
+                        if (provider_lock != nullptr) provider_lock->lock();
+                        copy_result = publish_completed_read(index, completion, waited);
+                    }
                 }
-                if (submitted_count != 0) config.async_transport->start_deferred_reads();
+                if (!config.phase10_serial_issue_for_testing && submitted_count != 0) {
+                    config.async_transport->start_deferred_reads();
+                }
 
                 size_t completed_count = 0;
                 while (completed_count < miss_count && copy_result.is_ready()) {
@@ -2764,6 +2877,13 @@ public:
                         }
                         llm_expert_async_read_completion completion;
                         llm_expert_request_handle completed_handle;
+                        if (!first_storage_wait) {
+                            first_storage_wait = true;
+                            issue_ahead.first_wait_us = uint64_t(ggml_time_us());
+                            issue_ahead.storage_reads_submitted_before_first_wait = uint32_t(submitted_count);
+                            issue_ahead.first_wait_after_all_storage_submissions =
+                                submitted_count == storage_read_count;
+                        }
                         if (provider_lock != nullptr) provider_lock->unlock();
                         const auto waited = config.async_transport->wait_any_read(
                             async_handles.data(), pending_count, completed_handle, completion,
@@ -2785,39 +2905,7 @@ public:
                                     llm_expert_provider_error::stale_generation);
                             break;
                         }
-                        auto & flight = async_flights[index];
-                        const auto released = config.async_transport->release_read(flight.handle);
-                        if (released == llm_expert_async_result::ready) flight.read_active = false;
-                        const auto storage_error = waited == llm_expert_async_result::ready ?
-                            llm_expert_storage_error::none :
-                            (waited == llm_expert_async_result::closed ? llm_expert_storage_error::cancelled :
-                             (completion.native_error == 0 ? llm_expert_storage_error::short_read :
-                              llm_expert_storage_error::io_error));
-                        config.storage->record_async_read(
-                            flight.destination_count, completion.bytes_completed, storage_error,
-                            completion.native_error);
-                        uint64_t digest = 1469598103934665603ULL;
-                        if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready) {
-                            for (size_t destination = 0; destination < flight.destination_count; ++destination) {
-                                const auto * bytes = static_cast<const uint8_t *>(flight.destinations[destination].data);
-                                for (uint64_t offset = 0; offset < flight.destinations[destination].extent; ++offset) {
-                                    digest ^= bytes[offset];
-                                    digest *= 1099511628211ULL;
-                                }
-                            }
-                        }
-                        const bool integrity_matches = waited == llm_expert_async_result::ready &&
-                            released == llm_expert_async_result::ready && digest == completion.digest;
-                        config.storage->record_integrity_check(integrity_matches);
-                        if (!integrity_matches) {
-                            copy_result = llm_expert_provider_result::failure(
-                                waited == llm_expert_async_result::closed ? llm_expert_provider_error::cancelled :
-                                llm_expert_provider_error::copy_failed);
-                            break;
-                        }
-                        flight.read_completed = true;
-                        copy_result = cold_cache->publish_ready(flight.key, flight.cold);
-                        if (copy_result.is_ready()) flight.reserved = false;
+                        copy_result = publish_completed_read(index, completion, waited);
                         continue;
                     }
 
@@ -2918,6 +3006,10 @@ public:
                         copy_result = transfer_ring->wait_for_hot(
                             execution_backend, slot, entry.generation, deterministic_policy_terminals);
                     }
+                    if (copy_result.is_ready()) {
+                        issue_ahead.demand_ready_before_use++;
+                        issue_ahead.last_demand_ready_us = uint64_t(ggml_time_us());
+                    }
                     if (copy_result.is_ready() && abort_requested()) {
                         copy_result = cancel_post_h2d();
                     }
@@ -2997,6 +3089,27 @@ public:
                         }
                         if (flight.reserved) (void) cold_cache->fail_reservation(flight.key, flight.cold);
                     }
+                }
+                if (!first_storage_wait && storage_read_count == 0) {
+                    issue_ahead.first_wait_after_all_storage_submissions = true;
+                }
+                if (copy_result.is_ready()) {
+                    issue_ahead.demand_completion_us = uint64_t(ggml_time_us());
+                    issue_ahead.all_demand_ready_before_use =
+                        issue_ahead.demand_ready_before_use == miss_count;
+                }
+                if (phase10_issue_ahead_trace) {
+                    if (!issue_ahead.serial_control &&
+                        (!issue_ahead.first_take_after_all_demand_enqueues ||
+                         !issue_ahead.first_wait_after_all_storage_submissions)) {
+                        phase10_issue_ahead_violations++;
+                    }
+                    if (phase10_issue_ahead_trace_count < phase10_issue_ahead_trace->size()) {
+                        (*phase10_issue_ahead_trace)[phase10_issue_ahead_trace_count++] = issue_ahead;
+                    } else {
+                        phase10_issue_ahead_trace_dropped++;
+                    }
+                    phase10_issue_ahead_events++;
                 }
             } else {
                 storage_load_context storage_context = {
@@ -3427,6 +3540,8 @@ public:
 
             std::unique_ptr<llm_cold_expert_cache> cold_candidate;
             std::unique_ptr<llm_expert_transfer_ring> ring_candidate;
+            uint64_t cold_bundle_payload_candidate = 0;
+            uint32_t transfer_lane_capacity_candidate = 0;
             if (config.cold_mode) {
                 llm_cold_cache_config cold_config;
                 cold_config.byte_budget = config.cold_cache_bytes;
@@ -3463,19 +3578,241 @@ public:
                 }
                 const auto cold_diagnostics = cold_candidate->diagnostics();
                 const auto ring_diagnostics = ring_candidate->diagnostics();
-                cold_bundle_payload = cold_diagnostics.bundle_payload_bytes;
-                transfer_lane_capacity = ring_diagnostics.effective_lanes;
-                if (cold_bundle_payload == 0 || transfer_lane_capacity < config.n_expert_used) {
+                cold_bundle_payload_candidate = cold_diagnostics.bundle_payload_bytes;
+                transfer_lane_capacity_candidate = ring_diagnostics.effective_lanes;
+                if (cold_bundle_payload_candidate == 0 ||
+                    transfer_lane_capacity_candidate < config.n_expert_used) {
                     return fail(llm_expert_provider_result::failure(
                         llm_expert_provider_error::unsupported_configuration));
                 }
             }
 
-            directory_forward.assign(size_t(LLAMA_MAX_LAYERS)*n_expert, {});
-            directory_slots.assign(config.capacity, {});
-            for (auto & entry : directory_slots) {
+            std::vector<hot_forward_entry> directory_forward_candidate(
+                size_t(LLAMA_MAX_LAYERS)*n_expert);
+            std::vector<hot_slot_entry> directory_slots_candidate(config.capacity);
+            for (auto & entry : directory_slots_candidate) {
                 entry.generation = config.initial_slot_generation_for_testing;
             }
+            uint64_t seed_use_clock = 0;
+            const bool blocking_seed = config.prefetch_config.supplied &&
+                config.prefetch_config.value.seed_mode == LLAMA_EXPERT_PREFETCH_SEED_MODE_BLOCKING_HOT;
+            if (blocking_seed) {
+                phase10_seed_attempts++;
+                const auto & seeds = config.prefetch_profile.seed;
+                uint64_t seed_physical_bytes = 0;
+                bool seed_fits = !seeds.empty() && seeds.size() <= config.capacity &&
+                    hot_bundle_payload != 0 && seeds.size() <= UINT64_MAX/hot_bundle_payload;
+                for (const auto & seed : seeds) {
+                    seed_fits = seed_fits && seed.layer >= 0 && seed.layer < LLAMA_MAX_LAYERS &&
+                        seed.expert >= 0 && seed.expert < int32_t(n_expert) &&
+                        seed.payload_bytes == hot_bundle_payload &&
+                        seed.physical_bytes <= UINT64_MAX - seed_physical_bytes;
+                    if (!seed_fits) break;
+                    seed_physical_bytes += seed.physical_bytes;
+                }
+                if (config.cold_mode) {
+                    const auto cold = cold_candidate->diagnostics();
+                    const auto scheduler = config.scheduler ?
+                        config.scheduler->diagnostics() : llm_expert_scheduler_diagnostics{};
+                    seed_fits = seed_fits && seeds.size() <= cold.effective_slots &&
+                        seeds.size() <= transfer_lane_capacity_candidate &&
+                        seeds.size() <= scheduler.request_capacity &&
+                        scheduler.active_requests == 0 && !scheduler.admission_closed &&
+                        seed_physical_bytes <= config.cold_cache_bytes &&
+                        config.storage != nullptr && config.async_transport != nullptr &&
+                        config.scheduler != nullptr;
+                }
+                auto seed_result = seed_fits ? llm_expert_provider_result::success() :
+                    llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+                std::vector<llm_expert_cache_policy_candidate> seed_policy_candidates(config.capacity);
+                std::vector<llm_cold_reference> seed_cold(seeds.size());
+                size_t seed_tensor_copies = 0;
+                size_t seed_copy_bytes = 0;
+                if (seed_result.is_ready()) {
+                    seed_result = cache_policy_result(hot_policy_candidate.request_begin());
+                }
+                storage_load_context storage_context = {
+                    config.storage, config.async_transport, config.scheduler,
+                    nullptr, {}, false, nullptr, nullptr,
+                };
+                for (size_t index = 0; index < seeds.size() && seed_result.is_ready(); ++index) {
+                    const auto & seed = seeds[index];
+                    const llm_expert_key key = { seed.layer, seed.expert };
+                    for (uint32_t slot = 0; slot < directory_slots_candidate.size(); ++slot) {
+                        const auto & entry = directory_slots_candidate[slot];
+                        seed_policy_candidates[slot] = {
+                            slot, entry.generation, { entry.key.layer, entry.key.expert },
+                            hot_bundle_payload, hot_slot_footprint,
+                            entry.state == hot_slot_state::free, false,
+                        };
+                    }
+                    llm_expert_cache_policy_decision decision;
+                    seed_result = cache_policy_result(hot_policy_candidate.select(
+                        { key.layer, key.expert }, seed_policy_candidates.data(),
+                        seed_policy_candidates.size(), decision));
+                    if (!seed_result.is_ready()) break;
+                    if (!decision.accept || !decision.free || decision.slot >= directory_slots_candidate.size()) {
+                        seed_result = llm_expert_provider_result::failure(
+                            llm_expert_provider_error::unsupported_configuration);
+                        break;
+                    }
+                    auto & entry = directory_slots_candidate[decision.slot];
+                    if (entry.state != hot_slot_state::free || entry.generation == UINT64_MAX) {
+                        seed_result = llm_expert_provider_result::failure(
+                            llm_expert_provider_error::generation_exhausted);
+                        break;
+                    }
+                    entry.key = key;
+                    entry.generation++;
+                    entry.origin = llm_expert_residency_origin::static_seed;
+                    entry.state = hot_slot_state::loading;
+                    seed_result = cache_policy_result(hot_policy_candidate.load_begin(
+                        decision.slot, entry.generation, { key.layer, key.expert },
+                        hot_bundle_payload, hot_slot_footprint, false));
+                    if (!seed_result.is_ready()) break;
+
+                    if (config.cold_mode) {
+                        seed_result = cold_candidate->find_or_admit_with_loader(
+                            key, seed_cold[index], load_storage_bundle, &storage_context);
+                        if (storage_context.completed_io_pending_publication) {
+                            const auto handle = storage_context.completed_io_handle;
+                            const auto next = seed_result.is_ready() ?
+                                llm_expert_request_state::host_ready :
+                                llm_expert_request_state::draining;
+                            const auto transitioned = config.scheduler->transition(
+                                handle, llm_expert_request_state::io_in_flight, next);
+                            const auto terminal = seed_result.is_ready() ?
+                                llm_expert_request_state::complete :
+                                llm_expert_request_state::failed;
+                            const auto finished = transitioned == llm_expert_schedule_disposition::admitted ?
+                                config.scheduler->finish(handle, terminal) :
+                                llm_expert_schedule_disposition::invalid;
+                            const auto released = finished == llm_expert_schedule_disposition::admitted ?
+                                config.scheduler->release_terminal(handle) :
+                                llm_expert_schedule_disposition::invalid;
+                            storage_context.completed_io_pending_publication = false;
+                            storage_context.completed_io_handle = {};
+                            if ((transitioned != llm_expert_schedule_disposition::admitted ||
+                                 finished != llm_expert_schedule_disposition::admitted ||
+                                 released != llm_expert_schedule_disposition::admitted) &&
+                                seed_result.is_ready()) {
+                                seed_result = llm_expert_provider_result::failure(
+                                    llm_expert_provider_error::metadata_mismatch);
+                            }
+                        }
+                        if (seed_result.is_ready()) {
+                            seed_result = cold_candidate->reclassify(
+                                seed_cold[index], llm_expert_residency_origin::static_seed);
+                        }
+                        if (seed_result.is_ready()) {
+                            seed_result = cold_candidate->acquire(
+                                seed_cold[index], llm_cold_reference_kind::hot);
+                        }
+                        if (seed_result.is_ready()) {
+                            entry.cold_slot = seed_cold[index].slot;
+                            entry.cold_generation = seed_cold[index].generation;
+                            entry.has_cold_backing = true;
+                            llm_transfer_lane_reference lane;
+                            seed_result = ring_candidate->reserve(*cold_candidate, seed_cold[index],
+                                decision.slot, entry.generation, lane);
+                            if (seed_result.is_ready()) {
+                                seed_result = ring_candidate->stage(lane, cold_candidate->bundle());
+                            }
+                            if (seed_result.is_ready()) {
+                                std::vector<llm_transfer_binding> binding = {
+                                    { lane, candidate->bundle, decision.slot },
+                                };
+                                seed_result = ring_candidate->transfer_wave_blocking(binding);
+                            }
+                        }
+                    } else {
+                        const auto registration = registrations.find(key.layer);
+                        bool copied = registration != registrations.end();
+                        if (copied) {
+                            const auto & source_bundle = registration->second;
+                            copied = copy_expert_projection(candidate->bundle.up, source_bundle.up,
+                                         source_bundle.n_expert, config.capacity, key.expert, decision.slot,
+                                         seed_copy_bytes, seed_tensor_copies, faults.fail_copy_after_tensors) &&
+                                copy_expert_projection(candidate->bundle.gate, source_bundle.gate,
+                                         source_bundle.n_expert, config.capacity, key.expert, decision.slot,
+                                         seed_copy_bytes, seed_tensor_copies, faults.fail_copy_after_tensors) &&
+                                copy_expert_projection(candidate->bundle.gate_up, source_bundle.gate_up,
+                                         source_bundle.n_expert, config.capacity, key.expert, decision.slot,
+                                         seed_copy_bytes, seed_tensor_copies, faults.fail_copy_after_tensors) &&
+                                copy_expert_projection(candidate->bundle.down, source_bundle.down,
+                                         source_bundle.n_expert, config.capacity, key.expert, decision.slot,
+                                         seed_copy_bytes, seed_tensor_copies, faults.fail_copy_after_tensors);
+                        }
+                        if (!copied) {
+                            seed_result = llm_expert_provider_result::failure(
+                                llm_expert_provider_error::copy_failed);
+                        }
+                    }
+                    if (!seed_result.is_ready()) break;
+                    seed_result = cache_policy_result(
+                        hot_policy_candidate.load_complete(decision.slot, entry.generation));
+                    if (!seed_result.is_ready()) break;
+                    entry.state = hot_slot_state::ready;
+                    entry.last_use = ++seed_use_clock;
+                    directory_forward_candidate[size_t(key.layer)*n_expert + uint32_t(key.expert)] = {
+                        int32_t(decision.slot), entry.generation,
+                    };
+                    seed_result = cache_policy_result(hot_policy_candidate.demand(
+                        { key.layer, key.expert }, 1, hot_bundle_payload, hot_slot_footprint));
+                    if (seed_result.is_ready()) {
+                        seed_result = cache_policy_result(
+                            hot_policy_candidate.hit(decision.slot, entry.generation));
+                    }
+                }
+                llm_expert_key last_touch = { -1, -1 };
+                if (seed_result.is_ready()) {
+                    const auto highest = std::min_element(seeds.begin(), seeds.end(), [](const auto & lhs, const auto & rhs) {
+                        return lhs.count != rhs.count ? lhs.count > rhs.count :
+                            (lhs.layer != rhs.layer ? lhs.layer < rhs.layer : lhs.expert < rhs.expert);
+                    });
+                    last_touch = { highest->layer, highest->expert };
+                    const auto & forward = directory_forward_candidate[
+                        size_t(highest->layer)*n_expert + uint32_t(highest->expert)];
+                    if (forward.slot < 0) {
+                        seed_result = llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch);
+                    } else {
+                        auto & entry = directory_slots_candidate[forward.slot];
+                        seed_result = cache_policy_result(hot_policy_candidate.demand(
+                            { highest->layer, highest->expert }, 1,
+                            hot_bundle_payload, hot_slot_footprint));
+                        if (seed_result.is_ready()) {
+                            seed_result = cache_policy_result(
+                                hot_policy_candidate.hit(uint32_t(forward.slot), entry.generation));
+                        }
+                        if (seed_result.is_ready() && config.cold_mode) {
+                            seed_result = cold_candidate->policy_shadow_hit(
+                                last_touch, { entry.cold_slot, entry.cold_generation }, 1);
+                        }
+                        if (seed_result.is_ready()) entry.last_use = ++seed_use_clock;
+                    }
+                }
+                if (seed_result.is_ready()) {
+                    seed_result = cache_policy_result(hot_policy_candidate.request_end(true, false));
+                }
+                if (config.cold_mode) {
+                    const auto ended = cold_candidate->policy_request_end(seed_result.is_ready(), false);
+                    if (seed_result.is_ready()) seed_result = ended;
+                }
+                if (!seed_result.is_ready()) {
+                    phase10_seed_failures++;
+                    return fail(seed_result);
+                }
+                counters.tensor_copies += seed_tensor_copies;
+                phase10_seed_complete = true;
+                phase10_seed_entries = seeds.size();
+                phase10_seed_storage_bytes = config.cold_mode ? seed_physical_bytes : 0;
+                phase10_seed_h2d_bytes = config.cold_mode ? hot_bundle_payload*seeds.size() : seed_copy_bytes;
+                phase10_seed_last_touch = last_touch;
+            }
+
+            directory_forward = std::move(directory_forward_candidate);
+            directory_slots = std::move(directory_slots_candidate);
             unique_keys.resize(config.capacity);
             unique_slots.resize(config.capacity);
             unique_cpu_slots.resize(config.capacity);
@@ -3517,6 +3854,9 @@ public:
             hot_policy_phase = llm_expert_cache_policy_phase::prefill;
             hot_logical_bundle_bytes = hot_bundle_payload;
             hot_physical_slot_footprint_bytes = hot_slot_footprint;
+            cold_bundle_payload = cold_bundle_payload_candidate;
+            transfer_lane_capacity = transfer_lane_capacity_candidate;
+            use_clock = seed_use_clock;
 
             candidate->id = ++generation;
             pool = std::move(candidate);
@@ -3551,7 +3891,8 @@ public:
             if (entry.state == hot_slot_state::ready && entry.refcount == 0) {
                 const auto policy_valid = cache_policy_result(hot_policy.validate_evictable(slot, entry.generation));
                 if (!policy_valid.is_ready()) return fail(policy_valid);
-                if (entry.background_origin && !entry.background_useful) background_wasted++;
+                if (entry.origin == llm_expert_residency_origin::speculative &&
+                    !entry.background_useful) background_wasted++;
                 if (config.cold_mode && entry.has_cold_backing) {
                     auto retired = transfer_ring->retire_hot(slot, entry.generation);
                     if (!retired.is_ready()) return fail(retired);
@@ -3596,7 +3937,8 @@ public:
                 return result;
             }
             for (auto & entry : directory_slots) {
-                if (entry.background_origin && !entry.background_useful) background_wasted++;
+                if (entry.origin == llm_expert_residency_origin::speculative &&
+                    !entry.background_useful) background_wasted++;
                 if (entry.has_cold_backing) {
                     result = cold_cache->release(
                         { entry.cold_slot, entry.cold_generation }, llm_cold_reference_kind::hot);
@@ -3741,6 +4083,19 @@ public:
         result.background_h2d_bytes = background_h2d_bytes;
         result.active_background_flights = active_background_flights;
         result.peak_background_flights = peak_background_flights;
+        result.phase10_prefetch_configured = config.prefetch_config.supplied &&
+            config.prefetch_config.value.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF;
+        result.phase10_seed_configured = config.prefetch_config.supplied &&
+            config.prefetch_config.value.seed_mode == LLAMA_EXPERT_PREFETCH_SEED_MODE_BLOCKING_HOT;
+        result.phase10_seed_complete = phase10_seed_complete;
+        result.phase10_seed_attempts = phase10_seed_attempts;
+        result.phase10_seed_failures = phase10_seed_failures;
+        result.phase10_seed_entries = phase10_seed_entries;
+        result.phase10_seed_storage_bytes = phase10_seed_storage_bytes;
+        result.phase10_seed_h2d_bytes = phase10_seed_h2d_bytes;
+        result.phase10_seed_last_touch = phase10_seed_last_touch;
+        result.phase10_issue_ahead_events = phase10_issue_ahead_events;
+        result.phase10_issue_ahead_violations = phase10_issue_ahead_violations;
         result.requested_capacity = config.capacity;
         result.effective_capacity = pool ? config.capacity : 0;
         result.pool_bytes = pool && pool->buffer ? ggml_backend_buffer_get_size(pool->buffer.get()) : 0;
@@ -3829,6 +4184,8 @@ public:
                 entry.cold_slot,
                 entry.cold_generation,
                 entry.has_cold_backing,
+                entry.origin,
+                entry.background_useful,
                 entry.state,
             });
         }
@@ -3851,6 +4208,10 @@ public:
             result.cold_misses = cold.misses;
             result.cold_admissions = cold.admissions;
             result.cold_evictions = cold.evictions;
+            result.cold_speculative_admissions = cold.speculative_admissions;
+            result.cold_speculative_replacements = cold.speculative_replacements;
+            result.cold_speculative_rejections = cold.speculative_rejections;
+            result.cold_speculative_demand_consumptions = cold.speculative_demand_consumptions;
             result.cold_source_copy_bundles = cold.source_copy_bundles;
             result.cold_source_copy_bytes = cold.source_copy_bytes;
             result.cold_source_copy_time_us = cold.source_copy_time_us;
@@ -3885,6 +4246,12 @@ public:
             phase10_scheduler_events->begin() + phase10_scheduler_event_count);
         result.phase10_scheduler_event_capacity = phase10_scheduler_events ? phase10_scheduler_events->size() : 0;
         result.phase10_scheduler_events_dropped = phase10_scheduler_events_dropped;
+        if (phase10_issue_ahead_trace) result.phase10_issue_ahead_trace.assign(
+            phase10_issue_ahead_trace->begin(),
+            phase10_issue_ahead_trace->begin() + phase10_issue_ahead_trace_count);
+        result.phase10_issue_ahead_trace_capacity =
+            phase10_issue_ahead_trace ? phase10_issue_ahead_trace->size() : 0;
+        result.phase10_issue_ahead_trace_dropped = phase10_issue_ahead_trace_dropped;
         if (phase10_lead_events && config.async_transport != nullptr) {
             const auto asynchronous = config.async_transport->diagnostics();
             const auto reads = config.async_transport->completed_read_intervals();
@@ -4409,7 +4776,7 @@ private:
             record.hot_slot, entry.generation));
         if (!completed.is_ready()) return completed;
         entry.state = hot_slot_state::ready;
-        entry.background_origin = true;
+        entry.origin = llm_expert_residency_origin::speculative;
         entry.background_useful = false;
         directory_forward[forward_index(entry.key)] = { int32_t(record.hot_slot), entry.generation };
         admissions++;
@@ -4517,6 +4884,9 @@ private:
                 metadata_mismatches++;
                 return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
             }
+            const bool speculative_victim =
+                entry.origin == llm_expert_residency_origin::speculative &&
+                !entry.background_useful;
             policy_candidate_slots[slot] = {
                 slot,
                 entry.generation,
@@ -4525,7 +4895,9 @@ private:
                 hot_physical_slot_footprint_bytes,
                 entry.state == hot_slot_state::free && policy_free,
                 entry.state == hot_slot_state::ready && policy_ready &&
-                    entry.refcount == 0 && !slot_selected[slot],
+                    entry.refcount == 0 && !slot_selected[slot] &&
+                    (admission != llm_expert_cache_policy_admission::optional_background ||
+                     speculative_victim),
             };
         }
         llm_expert_cache_policy_decision decision;
@@ -4623,7 +4995,8 @@ private:
         if (entry.state != hot_slot_state::free) {
             const auto policy_valid = cache_policy_result(hot_policy.validate_evictable(slot, entry.generation));
             if (!policy_valid.is_ready()) return policy_valid;
-            if (entry.background_origin && !entry.background_useful) background_wasted++;
+            if (entry.origin == llm_expert_residency_origin::speculative &&
+                !entry.background_useful) background_wasted++;
             auto retired = transfer_ring->retire_hot(slot, entry.generation);
             if (!retired.is_ready()) return retired;
             if (!entry.has_cold_backing) {
@@ -5039,6 +5412,18 @@ private:
     std::unique_ptr<std::array<llm_expert_phase10_scheduler_event, 256>> phase10_scheduler_events;
     size_t phase10_scheduler_event_count = 0;
     uint64_t phase10_scheduler_events_dropped = 0;
+    std::unique_ptr<std::array<llm_expert_phase10_issue_ahead_event, 256>> phase10_issue_ahead_trace;
+    size_t phase10_issue_ahead_trace_count = 0;
+    uint64_t phase10_issue_ahead_trace_dropped = 0;
+    uint64_t phase10_issue_ahead_events = 0;
+    uint64_t phase10_issue_ahead_violations = 0;
+    uint64_t phase10_seed_attempts = 0;
+    uint64_t phase10_seed_failures = 0;
+    uint64_t phase10_seed_entries = 0;
+    uint64_t phase10_seed_storage_bytes = 0;
+    uint64_t phase10_seed_h2d_bytes = 0;
+    llm_expert_key phase10_seed_last_touch = { -1, -1 };
+    bool phase10_seed_complete = false;
     uint32_t last_context_extent = 0;
     uint32_t last_required_capacity = 0;
     uint64_t context_validations = 0;
