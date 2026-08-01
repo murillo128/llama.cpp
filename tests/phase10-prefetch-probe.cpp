@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/resource.h>
 #include <tuple>
 #include <unistd.h>
 #include <vector>
@@ -133,11 +135,60 @@ predictor_benchmark benchmark_predictor(
 struct model_profile_validation {
     uint64_t load_ns = 0;
     json lead_measurements;
+    std::vector<int32_t> prompt_tokens;
+    std::string prompt_sha256;
+    std::vector<uint64_t> latency_us;
     std::vector<int32_t> generated_tokens;
     std::vector<std::string> logit_sha256;
+    uint64_t peak_rss_kib = 0;
+    uint64_t minor_faults = 0;
+    uint64_t major_faults = 0;
+    json public_routes = json::array();
     llm_hot_cache_diagnostics initial_diagnostics;
     llm_hot_cache_diagnostics diagnostics;
 };
+
+struct performance_route_record {
+    uint64_t request = 0;
+    uint64_t ubatch = 0;
+    std::string phase;
+    int32_t layer = -1;
+    uint32_t n_tokens = 0;
+    uint32_t n_expert_used = 0;
+    std::vector<int32_t> ids;
+    std::vector<uint32_t> weight_bits;
+};
+
+struct performance_route_capture {
+    std::vector<performance_route_record> records;
+    bool failed = false;
+};
+
+bool capture_performance_route(const llama_route_observation * observation, void * user_data) {
+    auto & capture = *static_cast<performance_route_capture *>(user_data);
+    try {
+        const size_t count = size_t(observation->n_tokens)*observation->n_expert_used;
+        performance_route_record record;
+        record.request = observation->request_ordinal;
+        record.ubatch = observation->ubatch_ordinal;
+        record.phase = observation->phase == LLAMA_ROUTE_PHASE_PREFILL ? "PREFILL" : "DECODE";
+        record.layer = observation->layer;
+        record.n_tokens = observation->n_tokens;
+        record.n_expert_used = observation->n_expert_used;
+        if (count != 0) {
+            record.ids.assign(observation->selected_experts, observation->selected_experts + count);
+            record.weight_bits.resize(count);
+            for (size_t index = 0; index < count; ++index) {
+                std::memcpy(&record.weight_bits[index], &observation->weights[index], sizeof(uint32_t));
+            }
+        }
+        capture.records.push_back(std::move(record));
+        return true;
+    } catch (...) {
+        capture.failed = true;
+        return false;
+    }
+}
 
 struct online_runtime_options {
     llama_expert_weights_mode cache_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
@@ -373,7 +424,9 @@ model_profile_validation validate_model_profile(
         bool measure_lead,
         bool enable_profile = true,
         const online_runtime_options & runtime = {},
-        bool calculate_lead = true) {
+        bool calculate_lead = true,
+        const std::string & prompt_override = {},
+        int requested_steps = 0) {
     const auto selected_cost = std::find_if(profile.costs.begin(), profile.costs.end(), [&](const auto & cost) {
         return cost.transport == profile.selected_transport && cost.readiness == profile.selected_readiness;
     });
@@ -394,6 +447,9 @@ model_profile_validation validate_model_profile(
     const bool seed = profile.selected_policy == "BLOCKING_HOT";
     const uint64_t bundle_bytes = profile.target.expert_bytes.front().physical_bytes;
     if (bundle_bytes == 0 || bundle_bytes > UINT64_MAX/16) throw probe_error("invalid profile bundle bytes");
+    if (seed && profile.seed.size() > UINT64_MAX/bundle_bytes) {
+        throw probe_error("blocking seed transfer ring size overflows");
+    }
     const uint64_t speculative_bytes = 4*bundle_bytes;
     llama_expert_prefetch_config_v1 prefetch = {
         LLAMA_EXPERT_PREFETCH_VERSION_1, sizeof(llama_expert_prefetch_config_v1),
@@ -423,7 +479,7 @@ model_profile_validation validate_model_profile(
     params.expert_cold_cache_bytes = runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE ?
         uint64_t(runtime.cold_slots)*bundle_bytes : 0;
     params.expert_transfer_ring_bytes = runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE ?
-        4*bundle_bytes : 0;
+        (seed ? uint64_t(profile.seed.size()) : 4)*bundle_bytes : 0;
     params.expert_miss_policy = runtime.miss_policy;
     params.expert_auto_cost_model = runtime.miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO ?
         &auto_cost : nullptr;
@@ -438,36 +494,56 @@ model_profile_validation validate_model_profile(
     if (!measure_lead) return result;
 
     const auto * vocab = llama_model_get_vocab(model.get());
-    const std::string prompt_text = profile.target.routed_layers.size() > 8 ? "A" :
-        "According to all known laws";
+    const std::string prompt_text = prompt_override.empty() ?
+        (profile.target.routed_layers.size() > 8 ? "A" : "According to all known laws") :
+        prompt_override;
     const int prompt_count = -llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), nullptr, 0, true, true);
     if (prompt_count <= 0) throw probe_error("lead probe prompt tokenization failed");
     std::vector<llama_token> prompt(prompt_count);
     if (llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), prompt.data(), prompt.size(), true, true) != prompt_count) {
         throw probe_error("lead probe prompt tokenization changed");
     }
+    result.prompt_tokens.assign(prompt.begin(), prompt.end());
+    result.prompt_sha256 = llm_expert_prefetch_sha256(prompt_text.data(), prompt_text.size());
+    const int online_steps = requested_steps > 0 ? requested_steps :
+        (profile.target.routed_layers.size() > 8 ? 2 : 13);
+    if (online_steps < 1 || online_steps > 128 || prompt_count > 512 || prompt_count + online_steps > 640) {
+        throw probe_error("performance prompt or step count exceeds the bounded probe envelope");
+    }
     auto context_params = llama_context_default_params();
-    context_params.n_ctx = 64;
-    context_params.n_batch = 64;
+    context_params.n_ctx = std::max<uint32_t>(64, uint32_t(prompt_count + online_steps));
+    context_params.n_batch = std::max<uint32_t>(64, uint32_t(prompt_count));
     context_params.n_ubatch = std::max<uint32_t>(1, std::min<uint32_t>(
         64, runtime.hot_slots/profile.target.experts_per_token));
     context_params.no_perf = false;
     llama_context_ptr context(llama_init_from_model(model.get(), context_params));
     if (!context) throw probe_error("lead probe context creation failed");
+    performance_route_capture public_routes;
+    if (requested_steps > 0 && llama_set_route_observer(
+            context.get(), capture_performance_route, &public_routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK) {
+        throw probe_error("performance route observer setup failed");
+    }
     auto * provider = model->expert_weight_provider();
     if (provider == nullptr) throw probe_error("lead probe expert provider is unavailable");
     llama_batch batch = llama_batch_get_one(prompt.data(), prompt.size());
     llama_token generated = 0;
     const int vocabulary = llama_vocab_n_tokens(vocab);
     std::vector<uint64_t> decode_begins;
-    const int online_steps = profile.target.routed_layers.size() > 8 ? 2 : 13;
     for (int step = 0; step < online_steps; ++step) {
+        if (requested_steps > 0 && llama_route_observer_begin(context.get(), uint64_t(step + 1),
+                step == 0 ? LLAMA_ROUTE_PHASE_PREFILL : LLAMA_ROUTE_PHASE_DECODE) !=
+                LLAMA_ROUTE_OBSERVER_STATUS_OK) {
+            throw probe_error("performance route observer begin failed");
+        }
         if (step != 0) {
             decode_begins.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         }
+        const auto decode_begin = std::chrono::steady_clock::now();
         if (llama_decode(context.get(), batch) != 0) throw probe_error("lead probe decode failed");
         llama_synchronize(context.get());
+        result.latency_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - decode_begin).count());
         if (step == 0) result.initial_diagnostics = provider->hot_cache_diagnostics();
         const float * logits = llama_get_logits_ith(context.get(), -1);
         const int next = logits == nullptr ? -1 : finite_argmax(logits, vocabulary);
@@ -478,9 +554,23 @@ model_profile_validation validate_model_profile(
             logits, size_t(vocabulary)*sizeof(float)));
         batch = llama_batch_get_one(&generated, 1);
     }
+    if (public_routes.failed) throw probe_error("performance route observer allocation failed");
+    for (const auto & record : public_routes.records) {
+        result.public_routes.push_back({
+            {"request", record.request}, {"ubatch", record.ubatch}, {"phase", record.phase},
+            {"layer", record.layer}, {"n_tokens", record.n_tokens},
+            {"n_expert_used", record.n_expert_used}, {"selected_experts", record.ids},
+            {"weight_f32_bits", record.weight_bits},
+        });
+    }
     context.reset();
     const auto diagnostics = provider->hot_cache_diagnostics();
     result.diagnostics = diagnostics;
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) throw probe_error("getrusage failed");
+    result.peak_rss_kib = usage.ru_maxrss;
+    result.minor_faults = usage.ru_minflt;
+    result.major_faults = usage.ru_majflt;
     if (enable_profile && calculate_lead &&
             (diagnostics.phase10_lead_events_dropped != 0 ||
              diagnostics.phase10_lead_events.empty())) {
@@ -625,14 +715,17 @@ json initial_resident(const llm_hot_cache_diagnostics & diagnostics) {
                 {"origin", origin_name(entry.origin)},
             }).first;
         } else {
+            const bool consumed_seed = found->second.at("origin") == "STATIC_SEED" &&
+                entry.origin == llm_expert_residency_origin::demand;
             if (!entry.has_cold_backing || entry.cold_slot != uint32_t(found->second.at("cold_slot")) ||
                     entry.cold_generation != found->second.at("cold_generation").get<uint64_t>() ||
-                    found->second.at("origin") != origin_name(entry.origin)) {
+                    (found->second.at("origin") != origin_name(entry.origin) && !consumed_seed)) {
                 throw probe_error("initial hot/cold cache snapshot disagrees");
             }
             found->second["hot_slot"] = int32_t(slot);
             found->second["hot_generation"] = entry.generation;
             found->second["hot_last_use"] = entry.last_use;
+            if (consumed_seed) found->second["origin"] = "DEMAND";
         }
     }
     json result = json::array();
@@ -653,13 +746,19 @@ json online_capture(
             diagnostics.phase10_route_events_dropped != 0) {
         throw probe_error("online prediction transcript overflowed");
     }
-    if (enabled && (diagnostics.phase10_route_events == 0 ||
-                    diagnostics.phase10_prediction_events == 0)) {
+    const bool seed = profile.selected_policy == "BLOCKING_HOT";
+    if (enabled && !seed && (diagnostics.phase10_route_events == 0 ||
+                            diagnostics.phase10_prediction_events == 0)) {
         throw probe_error("active online prediction transcript is empty: routes=" +
             std::to_string(diagnostics.phase10_route_events) + " predictions=" +
             std::to_string(diagnostics.phase10_prediction_events) + " circuit=" +
             std::to_string(diagnostics.phase10_circuit_open) + " runtime_failed=" +
             std::to_string(diagnostics.phase10_runtime_failed));
+    }
+    if (enabled && seed && (diagnostics.phase10_prediction_events != 0 ||
+            !diagnostics.phase10_seed_configured ||
+            !diagnostics.phase10_seed_complete || diagnostics.phase10_seed_failures != 0)) {
+        throw probe_error("active blocking seed transcript is incomplete");
     }
     if (!enabled && (diagnostics.phase10_route_events != 0 ||
                      diagnostics.phase10_prediction_events != 0)) {
@@ -743,6 +842,38 @@ json online_capture(
         }}};
 }
 
+json performance_capture(
+        const model_profile_validation & validation,
+        const llm_expert_prefetch_profile & profile,
+        const std::string & identity,
+        bool enabled,
+        const online_runtime_options & runtime,
+        const std::string & prompt_id) {
+    json result = online_capture(validation, profile, identity, enabled, runtime);
+    result["schema_version"] = "phase10-performance-capture-v1";
+    result["selected_policy"] = profile.selected_policy;
+    result["prompt"] = {{"id", prompt_id}, {"sha256", validation.prompt_sha256},
+        {"token_ids", validation.prompt_tokens}};
+    result["latency_us"] = validation.latency_us;
+    result["peak_rss_kib"] = validation.peak_rss_kib;
+    result["minor_faults"] = validation.minor_faults;
+    result["major_faults"] = validation.major_faults;
+    result["public_routes"] = validation.public_routes;
+    result["final_resident"] = initial_resident(validation.diagnostics);
+    result["seed"] = {
+        {"configured", validation.diagnostics.phase10_seed_configured},
+        {"complete", validation.diagnostics.phase10_seed_complete},
+        {"attempts", validation.diagnostics.phase10_seed_attempts},
+        {"failures", validation.diagnostics.phase10_seed_failures},
+        {"entries", validation.diagnostics.phase10_seed_entries},
+        {"storage_bytes", validation.diagnostics.phase10_seed_storage_bytes},
+        {"h2d_bytes", validation.diagnostics.phase10_seed_h2d_bytes},
+        {"last_touch", {{"layer", validation.diagnostics.phase10_seed_last_touch.layer},
+            {"expert", validation.diagnostics.phase10_seed_last_touch.expert}}},
+    };
+    return result;
+}
+
 json capture_fingerprint(const std::string & model_path) {
     auto params = llama_model_default_params();
     params.n_gpu_layers = 0;
@@ -780,7 +911,7 @@ int main(int argc, char ** argv) {
             return 0;
         }
         if (argc < 8) {
-            throw probe_error("usage: phase10-prefetch-probe --fingerprint --model GGUF | --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only | (--online | --online-disabled) [HOT_CACHE|COLD_CACHE BUFFERED|DIRECT_IO PROMOTE_AND_GPU|CPU_FALLBACK|AUTO HOT_SLOTS COLD_SLOTS]");
+            throw probe_error("usage: phase10-prefetch-probe --fingerprint --model GGUF | --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only | (--online | --online-disabled) [RUNTIME] | (--performance | --performance-disabled) PROMPT_ID STEPS PROMPT [RUNTIME]");
         }
         const bool validate_only_mode = std::string(argv[7]) == "--validate-only";
         const bool validate_only = validate_only_mode && (argc == 8 || argc == 13);
@@ -788,26 +919,46 @@ int main(int argc, char ** argv) {
         const bool online_disabled_mode = argc >= 8 && std::string(argv[7]) == "--online-disabled";
         const bool online = online_mode && (argc == 8 || argc == 13);
         const bool online_disabled = online_disabled_mode && (argc == 8 || argc == 13);
+        const bool performance_mode = argc >= 8 && std::string(argv[7]) == "--performance";
+        const bool performance_disabled_mode = argc >= 8 && std::string(argv[7]) == "--performance-disabled";
+        const bool performance = performance_mode && (argc == 11 || argc == 16);
+        const bool performance_disabled = performance_disabled_mode && (argc == 11 || argc == 16);
         if (((argc != 9 || std::string(argv[7]) != "--storage-map") &&
-                !validate_only && !online && !online_disabled) ||
+                !validate_only && !online && !online_disabled && !performance && !performance_disabled) ||
                 std::string(argv[1]) != "--profile" || std::string(argv[3]) != "--model" ||
                 std::string(argv[5]) != "--identity") {
-            throw probe_error("usage: phase10-prefetch-probe --fingerprint --model GGUF | --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only | (--online | --online-disabled) [HOT_CACHE|COLD_CACHE BUFFERED|DIRECT_IO PROMOTE_AND_GPU|CPU_FALLBACK|AUTO HOT_SLOTS COLD_SLOTS]");
+            throw probe_error("usage: phase10-prefetch-probe --fingerprint --model GGUF | --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only | (--online | --online-disabled) [RUNTIME] | (--performance | --performance-disabled) PROMPT_ID STEPS PROMPT [RUNTIME]");
         }
         const std::string profile_path = argv[2];
         const std::string model_path = argv[4];
         const std::string identity = argv[6];
         const size_t separator = identity.find(':');
         if (separator == std::string::npos) throw probe_error("identity must be PROJECT:NESTED");
+        std::string prompt_id;
+        std::string prompt_text;
+        int performance_steps = 0;
+        if (performance || performance_disabled) {
+            prompt_id = argv[8];
+            char * step_end = nullptr;
+            const long steps = std::strtol(argv[9], &step_end, 10);
+            if (prompt_id.empty() || step_end == argv[9] || *step_end != '\0' || steps < 1 || steps > 128) {
+                throw probe_error("invalid performance prompt or step count");
+            }
+            performance_steps = int(steps);
+            prompt_text = argv[10];
+            if (prompt_text.empty()) throw probe_error("performance prompt text is empty");
+        }
         online_runtime_options runtime;
-        if ((validate_only || online || online_disabled) && argc == 13) {
-            const std::string cache_mode = argv[8];
-            const std::string runtime_load_mode = argv[9];
-            const std::string miss_policy = argv[10];
+        const int runtime_offset = (performance || performance_disabled) ? 11 : 8;
+        if (((validate_only || online || online_disabled) && argc == 13) ||
+                ((performance || performance_disabled) && argc == 16)) {
+            const std::string cache_mode = argv[runtime_offset];
+            const std::string runtime_load_mode = argv[runtime_offset + 1];
+            const std::string miss_policy = argv[runtime_offset + 2];
             char * hot_end = nullptr;
             char * cold_end = nullptr;
-            const unsigned long hot_slots = std::strtoul(argv[11], &hot_end, 10);
-            const unsigned long cold_slots = std::strtoul(argv[12], &cold_end, 10);
+            const unsigned long hot_slots = std::strtoul(argv[runtime_offset + 3], &hot_end, 10);
+            const unsigned long cold_slots = std::strtoul(argv[runtime_offset + 4], &cold_end, 10);
             if (cache_mode == "HOT_CACHE") runtime.cache_mode = LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
             else if (cache_mode != "COLD_CACHE") throw probe_error("unknown online cache mode");
             if (runtime_load_mode == "DIRECT_IO") runtime.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
@@ -815,7 +966,8 @@ int main(int argc, char ** argv) {
             if (miss_policy == "CPU_FALLBACK") runtime.miss_policy = LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
             else if (miss_policy == "AUTO") runtime.miss_policy = LLAMA_EXPERT_MISS_POLICY_AUTO;
             else if (miss_policy != "PROMOTE_AND_GPU") throw probe_error("unknown online miss policy");
-            if (hot_end == argv[11] || *hot_end != '\0' || cold_end == argv[12] || *cold_end != '\0' ||
+            if (hot_end == argv[runtime_offset + 3] || *hot_end != '\0' ||
+                    cold_end == argv[runtime_offset + 4] || *cold_end != '\0' ||
                     hot_slots < 4 || hot_slots > UINT32_MAX || cold_slots > UINT32_MAX ||
                     (runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE && cold_slots < 4) ||
                     (runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE && cold_slots != 0) ||
@@ -840,7 +992,9 @@ int main(int argc, char ** argv) {
             profile.selected_transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         const auto model_validation = validate_model_profile(
             model_path, profile_path, profile, measurement_load_mode,
-            !validate_only, !online_disabled, runtime, !online && !online_disabled);
+            !validate_only, !online_disabled && !performance_disabled, runtime,
+            !online && !online_disabled && !performance && !performance_disabled,
+            prompt_text, performance_steps);
         if (validate_only) {
             std::cout << json({ {"schema_version", "phase10-profile-validation-v1"},
                 {"project_head", identity.substr(0, separator)}, {"nested_head", identity.substr(separator + 1)},
@@ -851,6 +1005,11 @@ int main(int argc, char ** argv) {
         if (online || online_disabled) {
             std::cout << online_capture(
                 model_validation, profile, identity, online, runtime).dump(2) << '\n';
+            return 0;
+        }
+        if (performance || performance_disabled) {
+            std::cout << performance_capture(model_validation, profile, identity,
+                performance, runtime, prompt_id).dump(2) << '\n';
             return 0;
         }
         const uint64_t bytes = profile.target.expert_bytes.front().physical_bytes;
