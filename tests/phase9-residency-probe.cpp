@@ -29,6 +29,7 @@ struct arguments {
     uint32_t experts_used = 8;
     uint32_t touch_slots = 0;
     uint32_t classification_samples = 0;
+    uint32_t slru_ratio_bps = 7500;
     bool prefill_protection = false;
     llama_expert_cache_policy policy = LLAMA_EXPERT_CACHE_POLICY_LRU;
     bool self_test = false;
@@ -74,6 +75,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--experts-used") { if (!parse_u32(value, result.experts_used)) return false; }
         else if (option == "--touch-slots") { if (!parse_u32(value, result.touch_slots)) return false; }
         else if (option == "--classification-samples") { if (!parse_u32(value, result.classification_samples)) return false; }
+        else if (option == "--slru-ratio-bps") { if (!parse_u32(value, result.slru_ratio_bps)) return false; }
         else if (option == "--prefill-protection") {
             if (std::string(value) != "0" && std::string(value) != "1") return false;
             result.prefill_protection = std::string(value) == "1";
@@ -175,7 +177,7 @@ int main(int argc, char ** argv) {
         const llama_expert_cache_policy_config public_policy = {
             LLAMA_EXPERT_CACHE_POLICY_VERSION_1, sizeof(llama_expert_cache_policy_config), args.policy,
             LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL,
-            args.policy == LLAMA_EXPERT_CACHE_POLICY_SLRU ? 7500u : 0u,
+            args.policy == LLAMA_EXPERT_CACHE_POLICY_SLRU ? args.slru_ratio_bps : 0u,
             LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS, 0,
             args.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING ? 1024u : 0u, {},
         };
