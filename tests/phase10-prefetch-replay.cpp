@@ -880,6 +880,10 @@ json replay(const json & input) {
     const std::string transport = string_value(input.at("transport"), "transport");
     require(transport == "BUFFERED" || transport == "DIRECT_IO" || transport == "HOST_TO_DEVICE",
         "unknown transport");
+    require(transport == profile.selected_transport, "replay transport does not match profile selection");
+    require((cache_mode == "HOT_CACHE" && transport == "HOST_TO_DEVICE") ||
+            (cache_mode == "COLD_CACHE" && (transport == "BUFFERED" || transport == "DIRECT_IO")),
+        "replay transport does not match cache mode");
     const auto readiness = readiness_value(string_value(input.at("readiness"), "readiness"));
     const std::string seed_mode = string_value(input.at("seed_mode"), "seed_mode");
     const std::string demand_mode = string_value(input.at("demand_mode"), "demand_mode");

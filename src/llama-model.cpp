@@ -1276,6 +1276,12 @@ void llama_model::init_expert_weight_provider() {
                 const auto selected_cost = std::find_if(loaded.costs.begin(), loaded.costs.end(), [&](const auto & cost) {
                     return cost.transport == loaded.selected_transport && cost.readiness == loaded.selected_readiness;
                 });
+                const char * runtime_transport = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE ?
+                    "HOST_TO_DEVICE" :
+                    (params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO ? "DIRECT_IO" : "BUFFERED");
+                if (loaded.selected_transport != runtime_transport) {
+                    throw std::invalid_argument("expert prefetch profile transport does not match runtime");
+                }
                 if (config.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF &&
                     (loaded.selected_policy != policy_name || loaded.selected_candidates != config.candidates_per_target ||
                      loaded.selected_readiness != config.readiness ||

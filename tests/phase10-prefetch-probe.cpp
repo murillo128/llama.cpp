@@ -154,8 +154,10 @@ struct expected_bundle_path {
 
 struct expected_storage_map {
     std::string sha256;
+    std::string package_sha256;
     std::string model_sha256;
     uint64_t model_size = 0;
+    uint64_t source_file_count = 0;
     std::map<std::pair<int32_t, int32_t>, expected_bundle_path> bundles;
 };
 
@@ -178,11 +180,23 @@ expected_storage_map load_storage_map(
     }
     expected_storage_map result;
     result.sha256 = llm_expert_prefetch_sha256(bytes.data(), bytes.size());
-    result.model_sha256 = document.at("model").at("sha256");
-    result.model_size = document.at("model").at("size");
-    if (profile.target.files.size() != 1 || profile.target.files[0].sha256 != result.model_sha256 ||
-            profile.target.files[0].size != result.model_size) {
-        throw probe_error("storage map model identity differs from the profile");
+    const auto & model = document.at("model");
+    result.package_sha256 = model.value("package_sha256", "");
+    result.source_file_count = document.at("source_files").size();
+    if (result.package_sha256.empty()) {
+        result.model_sha256 = model.at("sha256");
+        result.model_size = model.at("size");
+        if (profile.target.files.size() != 1 || profile.target.files[0].sha256 != result.model_sha256 ||
+                profile.target.files[0].size != result.model_size) {
+            throw probe_error("storage map model identity differs from the profile");
+        }
+        result.package_sha256 = profile.target.package_sha256;
+    } else {
+        if (result.package_sha256 != profile.target.package_sha256 ||
+                result.source_file_count != profile.target.files.size()) {
+            throw probe_error("storage map package identity differs from the profile");
+        }
+        result.model_size = model.at("size");
     }
     for (const auto & entry : document.at("entries")) {
         const std::pair<int32_t, int32_t> key = { entry.at("layer"), entry.at("expert_id") };
@@ -319,8 +333,9 @@ runtime_path_measurements measure_runtime_paths(
         if (refill) result.device_refill_ns.push_back(device_ns);
     }
     result.provenance = { {"load_mode", load_mode}, {"path", "runtime COLD_CACHE scheduler -> exact ExpertStorage read plan -> cold cache -> transfer ring -> hot cache"},
-        {"storage_map_sha256", expected.sha256}, {"model_sha256", expected.model_sha256},
-        {"model_size", expected.model_size}, {"all_observed_spans_exact", true},
+        {"storage_map_sha256", expected.sha256}, {"package_sha256", expected.package_sha256},
+        {"model_sha256", expected.model_sha256}, {"model_size", expected.model_size},
+        {"source_file_count", expected.source_file_count}, {"all_observed_spans_exact", true},
         {"storage_operations", diagnostics.phase10_storage_events.size()},
         {"storage_flights", storage.size()}, {"h2d_flights", transfers.size()},
         {"scheduler_samples", result.scheduler_delay_ns.size()},
@@ -746,7 +761,8 @@ int main(int argc, char ** argv) {
         if (argc < 8) {
             throw probe_error("usage: phase10-prefetch-probe --fingerprint --model GGUF | --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only | (--online | --online-disabled) [HOT_CACHE|COLD_CACHE BUFFERED|DIRECT_IO PROMOTE_AND_GPU|CPU_FALLBACK|AUTO HOT_SLOTS COLD_SLOTS]");
         }
-        const bool validate_only = argc == 8 && std::string(argv[7]) == "--validate-only";
+        const bool validate_only_mode = std::string(argv[7]) == "--validate-only";
+        const bool validate_only = validate_only_mode && (argc == 8 || argc == 13);
         const bool online_mode = argc >= 8 && std::string(argv[7]) == "--online";
         const bool online_disabled_mode = argc >= 8 && std::string(argv[7]) == "--online-disabled";
         const bool online = online_mode && (argc == 8 || argc == 13);
@@ -763,7 +779,7 @@ int main(int argc, char ** argv) {
         const size_t separator = identity.find(':');
         if (separator == std::string::npos) throw probe_error("identity must be PROJECT:NESTED");
         online_runtime_options runtime;
-        if ((online || online_disabled) && argc == 13) {
+        if ((validate_only || online || online_disabled) && argc == 13) {
             const std::string cache_mode = argv[8];
             const std::string runtime_load_mode = argv[9];
             const std::string miss_policy = argv[10];
@@ -798,8 +814,11 @@ int main(int argc, char ** argv) {
             throw probe_error("profile load failed: " + profile_error);
         }
         const uint64_t profile_parse_ns = elapsed_ns(profile_begin);
+        const bool storage_measurement = argc == 9 && std::string(argv[7]) == "--storage-map";
+        const llama_load_mode measurement_load_mode = storage_measurement &&
+            profile.selected_transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         const auto model_validation = validate_model_profile(
-            model_path, profile_path, profile, LLAMA_LOAD_MODE_MMAP,
+            model_path, profile_path, profile, measurement_load_mode,
             !validate_only, !online_disabled, runtime, !online && !online_disabled);
         if (validate_only) {
             std::cout << json({ {"schema_version", "phase10-profile-validation-v1"},
@@ -817,16 +836,11 @@ int main(int argc, char ** argv) {
         const expected_storage_map storage_map = load_storage_map(argv[8], profile);
         const auto predictor = benchmark_predictor(profile, profile_path);
         const uint64_t predictor_p95 = predictor.upper_bound_p95_ns;
-        const auto buffered = measure_runtime_paths(model_validation.diagnostics, storage_map, "MMAP_BUFFERED");
-        std::optional<runtime_path_measurements> direct;
-        std::string direct_unavailable_reason;
-        try {
-            const auto direct_validation = validate_model_profile(
-                model_path, profile_path, profile, LLAMA_LOAD_MODE_DIRECT_IO, true);
-            direct = measure_runtime_paths(direct_validation.diagnostics, storage_map, "DIRECT_IO");
-        } catch (const std::exception & error) {
-            direct_unavailable_reason = error.what();
+        if (profile.selected_transport != "BUFFERED" && profile.selected_transport != "DIRECT_IO") {
+            throw probe_error("transport measurement requires a selected storage transport");
         }
+        const char * measurement_name = profile.selected_transport == "DIRECT_IO" ? "DIRECT_IO" : "MMAP_BUFFERED";
+        const auto measured = measure_runtime_paths(model_validation.diagnostics, storage_map, measurement_name);
         json output = { {"schema_version", "phase10-transport-measurements-v1"},
             {"project_head", identity.substr(0, separator)}, {"nested_head", identity.substr(separator + 1)},
             {"host", "skynet"}, {"profile_sha256", profile.profile_sha256},
@@ -835,33 +849,26 @@ int main(int argc, char ** argv) {
             {"predictor_upper_bound", {{"basis", "maximum p95 over full-token topology-capped declared predictors"},
                 {"upper_bound_p95_ns", predictor.upper_bound_p95_ns}, {"measurements", predictor.measurements}}},
             {"path_provenance", {{"storage_map_sha256", storage_map.sha256},
+                {"package_sha256", storage_map.package_sha256},
                 {"model_sha256", storage_map.model_sha256}, {"model_size", storage_map.model_size},
-                {"exact_runtime_provider_path", true}, {"buffered", buffered.provenance},
-                {"direct", direct ? direct->provenance : json({{"supported", false},
-                    {"reason", direct_unavailable_reason}})}}},
+                {"source_file_count", storage_map.source_file_count},
+                {"exact_runtime_provider_path", true},
+                {profile.selected_transport == "DIRECT_IO" ? "direct" : "buffered", measured.provenance}}},
             {"envelopes", json::array()} };
         const uint64_t lead_p50 = model_validation.lead_measurements.at("conservative_lead_p50_ns");
-        output["envelopes"].push_back(envelope("BUFFERED", "HOST_READY", true,
-            buffered.storage_service_ns, buffered.storage_refill_ns, buffered.scheduler_delay_ns,
-            predictor_p95, bytes, 0, lead_p50, buffered.provenance));
-        output["envelopes"].push_back(envelope("DIRECT_IO", "HOST_READY", direct.has_value(),
-            direct ? direct->storage_service_ns : std::vector<uint64_t>{},
-            direct ? direct->storage_refill_ns : std::vector<uint64_t>{},
-            direct ? direct->scheduler_delay_ns : std::vector<uint64_t>{},
-            predictor_p95, bytes, 0, lead_p50,
-            direct ? direct->provenance : output["path_provenance"]["direct"]));
-        output["envelopes"].push_back(envelope("HOST_TO_DEVICE", "DEVICE_READY", true,
-            buffered.h2d_service_ns, buffered.h2d_refill_ns, buffered.scheduler_delay_ns,
-            predictor_p95, 0, bytes, lead_p50, buffered.provenance));
-        output["envelopes"].push_back(envelope("BUFFERED", "DEVICE_READY", true,
-            buffered.device_service_ns, buffered.device_refill_ns, buffered.scheduler_delay_ns,
-            predictor_p95, bytes, bytes, lead_p50, buffered.provenance));
-        output["envelopes"].push_back(envelope("DIRECT_IO", "DEVICE_READY", direct.has_value(),
-            direct ? direct->device_service_ns : std::vector<uint64_t>{},
-            direct ? direct->device_refill_ns : std::vector<uint64_t>{},
-            direct ? direct->scheduler_delay_ns : std::vector<uint64_t>{},
-            predictor_p95, bytes, bytes, lead_p50,
-            direct ? direct->provenance : output["path_provenance"]["direct"]));
+        output["envelopes"].push_back(envelope(profile.selected_transport, "HOST_READY", true,
+            measured.storage_service_ns, measured.storage_refill_ns, measured.scheduler_delay_ns,
+            predictor_p95, bytes, 0, lead_p50, measured.provenance));
+        if (profile.selected_readiness == LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY) {
+            if (profile.selected_transport == "BUFFERED") {
+                output["envelopes"].push_back(envelope("HOST_TO_DEVICE", "DEVICE_READY", true,
+                    measured.h2d_service_ns, measured.h2d_refill_ns, measured.scheduler_delay_ns,
+                    predictor_p95, 0, bytes, lead_p50, measured.provenance));
+            }
+            output["envelopes"].push_back(envelope(profile.selected_transport, "DEVICE_READY", true,
+                measured.device_service_ns, measured.device_refill_ns, measured.scheduler_delay_ns,
+                predictor_p95, bytes, bytes, lead_p50, measured.provenance));
+        }
         std::cout << output.dump(2) << '\n';
         return 0;
     } catch (const std::exception & exception) {
