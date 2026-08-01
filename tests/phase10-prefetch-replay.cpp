@@ -293,6 +293,7 @@ private:
             {"REJECTED", 6}, {"EVICT", 7}, {"TIMELY_USEFUL", 8}, {"LATE_JOINED", 9},
             {"WASTED_UNUSED", 10}, {"SEED_LOAD", 11}, {"SEED_TOUCH", 12},
             {"DEMAND_PROMOTE", 13}, {"CANCELLED_BEFORE_IO", 14}, {"CANCELLED_DRAINED", 15},
+            {"DEMAND_COLD_EVICT", 16}, {"DEMAND_HOT_EVICT", 17},
         };
         record["sequence"] = actions.size() + outcomes.size();
         const auto code = codes.find(record.at("type").get<std::string>());
@@ -371,10 +372,18 @@ private:
         return found;
     }
 
-    std::pair<int32_t, int32_t> ensure_demand_capacity(uint64_t physical) {
+    void emit_demand_eviction(const char * type, uint64_t token, key_type key) {
+        const auto & entry = entries.at(key);
+        emit(actions, { {"type", type}, {"flight_ordinal", entry.flight}, {"token", token},
+            {"layer", key.first}, {"expert", key.second}, {"cold_slot", entry.cold_slot},
+            {"hot_slot", entry.hot_slot}, {"reason", "phase9_lru_capacity"} });
+    }
+
+    std::pair<int32_t, int32_t> ensure_demand_capacity(uint64_t token, uint64_t physical) {
         while (physical > limits.cold_capacity_bytes - occupied_bytes() || free_slot(true) < 0) {
             key_type victim;
             require(demand_victim(true, victim), "mandatory cold demand cannot be admitted");
+            emit_demand_eviction("DEMAND_COLD_EVICT", token, victim);
             discard(victim, "demand_cold_eviction");
         }
         const int32_t cold_slot = free_slot(true);
@@ -383,6 +392,7 @@ private:
             require(demand_victim(false, victim), "mandatory hot demand cannot be admitted");
             auto found = entries.find(victim);
             require(found != entries.end(), "hot victim disappeared");
+            emit_demand_eviction("DEMAND_HOT_EVICT", token, victim);
             if (found->second.origin == "SPECULATIVE") discard(victim, "demand_hot_eviction");
             else found->second.hot_slot = -1;
         }
@@ -411,6 +421,7 @@ private:
                     found->second.phase == "READY")) {
                 auto & entry = found->second;
                 const std::string source_origin = entry.origin;
+                const char * source_tier = entry.hot_slot >= 0 ? "HOT" : "COLD";
                 if (entry.origin == "SPECULATIVE") {
                     counters.timely_useful++;
                     emit(outcomes, { {"type", "TIMELY_USEFUL"}, {"flight_ordinal", entry.flight},
@@ -427,6 +438,7 @@ private:
                         require(demand_victim(false, victim), "mandatory hot promotion cannot be admitted");
                         auto victim_entry = entries.find(victim);
                         require(victim_entry != entries.end(), "hot promotion victim disappeared");
+                        emit_demand_eviction("DEMAND_HOT_EVICT", token, victim);
                         if (victim_entry->second.origin == "SPECULATIVE") discard(victim, "demand_hot_eviction");
                         else victim_entry->second.hot_slot = -1;
                     }
@@ -436,7 +448,7 @@ private:
                 counters.demand_hits++;
                 emit(actions, { {"type", "DEMAND_HIT"}, {"flight_ordinal", entry.flight}, {"token", token},
                     {"layer", layer}, {"expert", expert}, {"cold_slot", entry.cold_slot},
-                    {"hot_slot", entry.hot_slot}, {"source_origin", source_origin} });
+                    {"hot_slot", entry.hot_slot}, {"source_origin", source_origin}, {"source_tier", source_tier} });
                 continue;
             }
             if (found != entries.end() && found->second.origin == "SPECULATIVE") {
@@ -456,6 +468,7 @@ private:
                         require(demand_victim(false, victim), "mandatory late promotion cannot be admitted");
                         auto victim_entry = entries.find(victim);
                         require(victim_entry != entries.end(), "late promotion victim disappeared");
+                        emit_demand_eviction("DEMAND_HOT_EVICT", token, victim);
                         if (victim_entry->second.origin == "SPECULATIVE") discard(victim, "demand_hot_eviction");
                         else victim_entry->second.hot_slot = -1;
                     }
@@ -471,7 +484,7 @@ private:
             if (found != entries.end()) discard(key, "demand_replaced_unready");
             const auto size = sizes.find(key);
             require(size != sizes.end(), "demand key has no byte record");
-            const auto slots = ensure_demand_capacity(size->second.second);
+            const auto slots = ensure_demand_capacity(token, size->second.second);
             entries[key] = {layer, expert, size->second.first, size->second.second, slots.first, slots.second,
                 "DEMAND", token, layer, 0, -1, clock, "READY"};
             counters.demand_loads++;
@@ -781,8 +794,6 @@ json replay(const json & input) {
     hierarchy_replay hierarchy(profile, input.at("events"), candidates, transport,
         input.at("readiness").get<std::string>(), limits, seed_mode, demand_mode);
     json state = hierarchy.run();
-    if (policy == LLAMA_EXPERT_PREFETCH_POLICY_OFF && seed_mode == "OFF") state["state_digest"] = fnv_offset;
-    const std::string event_dump = input.at("events").dump();
     json output = {
         {"schema_version", "phase10-prefetch-replay-output-v1"},
         {"profile_sha256", profile.profile_sha256},
@@ -791,7 +802,6 @@ json replay(const json & input) {
         {"seed_mode", seed_mode}, {"demand_mode", demand_mode},
         {"candidate_stream", candidates},
         {"predictor_state_digest", predictor_state_digest},
-        {"phase9_passthrough_sha256", llm_expert_prefetch_sha256(event_dump.data(), event_dump.size())},
     };
     for (const char * field : {"action_stream", "outcome_stream", "state_digest", "summary", "resident"}) {
         output[field] = std::move(state[field]);
