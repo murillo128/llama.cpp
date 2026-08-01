@@ -233,6 +233,8 @@ struct runtime_path_measurements {
     std::vector<uint64_t> device_service_ns;
     std::vector<uint64_t> device_refill_ns;
     std::vector<uint64_t> scheduler_delay_ns;
+    uint64_t storage_timer_censored_samples = 0;
+    uint64_t h2d_timer_censored_samples = 0;
     json provenance;
 };
 
@@ -290,10 +292,20 @@ runtime_path_measurements measure_runtime_paths(
         if (found == expected.bundles.end()) throw probe_error("runtime storage key is absent from the storage map");
         std::sort(flight.spans.begin(), flight.spans.end());
         if (flight.spans != found->second.spans || flight.useful_bytes != found->second.bytes ||
-                flight.end_us <= flight.begin_us) {
-            throw probe_error("runtime storage flight differs from exact expert bundle spans");
+                flight.end_us < flight.begin_us) {
+            json observed_spans = json::array();
+            json expected_spans = json::array();
+            for (const auto & span : flight.spans) observed_spans.push_back({span.first, span.second});
+            for (const auto & span : found->second.spans) expected_spans.push_back({span.first, span.second});
+            throw probe_error("runtime storage flight differs from exact expert bundle spans: key=" +
+                std::to_string(key.first) + ":" + std::to_string(key.second) + " observed=" +
+                observed_spans.dump() + " expected=" + expected_spans.dump() + " useful=" +
+                std::to_string(flight.useful_bytes) + "/" + std::to_string(found->second.bytes) +
+                " duration_us=" + std::to_string(flight.end_us - flight.begin_us));
         }
-        const uint64_t duration_ns = (flight.end_us - flight.begin_us)*1000;
+        const uint64_t duration_us = flight.end_us - flight.begin_us;
+        result.storage_timer_censored_samples += duration_us == 0;
+        const uint64_t duration_ns = std::max<uint64_t>(1, duration_us)*1000;
         result.storage_service_ns.push_back(duration_ns);
         if (storage_occurrences[key]++ != 0) result.storage_refill_ns.push_back(duration_ns);
         if (representative.is_null()) {
@@ -307,7 +319,8 @@ runtime_path_measurements measure_runtime_paths(
 
     std::vector<const llm_expert_phase10_h2d_event *> transfers;
     for (const auto & event : diagnostics.phase10_h2d_events) {
-        if (!event.cancelled && event.flight.valid() && event.complete_us > event.enqueue_us) transfers.push_back(&event);
+        if (!event.cancelled && event.flight.valid() && event.complete_us >= event.enqueue_us &&
+                event.complete_us != 0) transfers.push_back(&event);
     }
     std::sort(transfers.begin(), transfers.end(), [](const auto * lhs, const auto * rhs) {
         return std::tie(lhs->enqueue_us, lhs->flight.request_slot, lhs->flight.request_generation) <
@@ -320,15 +333,17 @@ runtime_path_measurements measure_runtime_paths(
         if (found == expected.bundles.end() || transfer->bytes != found->second.bytes) {
             throw probe_error("runtime H2D flight differs from exact expert bundle bytes");
         }
-        const uint64_t h2d_ns = (transfer->complete_us - transfer->enqueue_us)*1000;
+        const uint64_t h2d_us = transfer->complete_us - transfer->enqueue_us;
+        result.h2d_timer_censored_samples += h2d_us == 0;
+        const uint64_t h2d_ns = std::max<uint64_t>(1, h2d_us)*1000;
         result.h2d_service_ns.push_back(h2d_ns);
         const bool refill = transfer_occurrences[key]++ != 0;
         if (refill) result.h2d_refill_ns.push_back(h2d_ns);
         uint64_t begin_us = transfer->enqueue_us;
         const auto storage_found = storage.find(exact_flight(transfer->flight));
         if (storage_found != storage.end()) begin_us = std::min(begin_us, storage_found->second.begin_us);
-        if (transfer->complete_us <= begin_us) throw probe_error("combined runtime service timing is invalid");
-        const uint64_t device_ns = (transfer->complete_us - begin_us)*1000;
+        if (transfer->complete_us < begin_us) throw probe_error("combined runtime service timing is invalid");
+        const uint64_t device_ns = std::max<uint64_t>(1, transfer->complete_us - begin_us)*1000;
         result.device_service_ns.push_back(device_ns);
         if (refill) result.device_refill_ns.push_back(device_ns);
     }
@@ -339,6 +354,8 @@ runtime_path_measurements measure_runtime_paths(
         {"storage_operations", diagnostics.phase10_storage_events.size()},
         {"storage_flights", storage.size()}, {"h2d_flights", transfers.size()},
         {"scheduler_samples", result.scheduler_delay_ns.size()},
+        {"storage_timer_censored_samples", result.storage_timer_censored_samples},
+        {"h2d_timer_censored_samples", result.h2d_timer_censored_samples},
         {"storage_refill_samples", result.storage_refill_ns.size()},
         {"h2d_refill_samples", result.h2d_refill_ns.size()},
         {"storage_trace_capacity", diagnostics.phase10_storage_event_capacity},
