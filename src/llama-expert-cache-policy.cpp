@@ -1087,6 +1087,10 @@ bool llm_expert_cache_policy::validate_loading(
         slots[slot].generation == generation && key_matches(slots[slot].key, key);
 }
 
+bool llm_expert_cache_policy::validate_free(uint32_t slot) const noexcept {
+    return slot < slots.size() && !slots[slot].loading && !slots[slot].resident;
+}
+
 llm_expert_cache_policy_result llm_expert_cache_policy::validate_evictable(
         uint32_t slot, uint64_t generation) const noexcept {
     if (slot >= slots.size() || !slots[slot].resident || slots[slot].generation != generation ||

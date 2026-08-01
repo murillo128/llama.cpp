@@ -527,8 +527,10 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_failed_cleanup = 0;
     llm_expert_cache_policy_diagnostics policy;
     std::vector<llm_expert_cache_policy_domain_diagnostics> policy_domains;
+    std::vector<llm_expert_cache_policy_event> policy_events;
     llm_expert_cache_policy_diagnostics cold_policy;
     std::vector<llm_expert_cache_policy_domain_diagnostics> cold_policy_domains;
+    std::vector<llm_expert_cache_policy_event> cold_policy_events;
 };
 
 enum class llm_expert_execution_backend : uint8_t {

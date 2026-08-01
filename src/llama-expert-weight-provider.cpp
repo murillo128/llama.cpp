@@ -1419,7 +1419,9 @@ bool copy_expert_projection(
 class llm_hot_cache_expert_weight_provider final : public llm_expert_weight_provider {
 public:
     llm_hot_cache_expert_weight_provider(llm_hot_cache_config config, llm_expert_provider_faults faults) :
-        config(config), faults(faults) {
+        config(config), faults(faults),
+        deterministic_policy_terminals(
+            config.hot_cache_policy_config.supplied || config.cold_cache_policy_config.supplied) {
         if (faults.initialization != llm_expert_provider_error::none) {
             throw std::runtime_error("hot-cache expert-weight provider initialization failed");
         }
@@ -1834,6 +1836,8 @@ public:
             int32_t * execution_ids,
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
+        std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
+        if (deterministic_policy_terminals) ordered_lock.lock();
         std::unique_lock<std::mutex> lock(mutex);
         return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr, nullptr,
             abort_callback, abort_callback_data, &lock);
@@ -1844,6 +1848,8 @@ public:
             ggml_backend_t execution_backend,
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
+        std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
+        if (deterministic_policy_terminals) ordered_lock.lock();
         std::unique_lock<std::mutex> lock(mutex);
         (void) execution_backend;
         ggml_tensor * checkpoint_ids = binding.hybrid ? binding.checkpoint_ids : binding.execution_ids;
@@ -1923,7 +1929,9 @@ public:
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation));
         }
         if (config.cold_mode && config.background_promotion) {
-            const auto normalized = reap_background_locked(provider_lock);
+            const auto normalized = deterministic_policy_terminals ?
+                normalize_background_terminals_locked(provider_lock) :
+                reap_background_locked(provider_lock);
             if (!normalized.is_ready()) return fail(normalized);
             if (config.phase8_test_control != nullptr) {
                 for (const auto & record : background_promotions) {
@@ -2070,10 +2078,15 @@ public:
                     return fail(llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch));
                 }
                 const llm_cold_reference backing = { entry.cold_slot, entry.cold_generation };
-                auto touched = cold_cache->acquire(backing, llm_cold_reference_kind::request);
+                auto touched = cold_cache->policy_shadow_hit(
+                    unique_keys[index], backing, unique_lane_counts[index]);
+                if (touched.is_ready()) {
+                    touched = cold_cache->acquire(backing, llm_cold_reference_kind::request);
+                }
                 if (touched.is_ready()) touched = cold_cache->release(backing, llm_cold_reference_kind::request);
                 if (!touched.is_ready()) return fail(touched);
-                touched = transfer_ring->wait_for_hot(execution_backend, uint32_t(unique_slots[index]), entry.generation);
+                touched = transfer_ring->wait_for_hot(execution_backend, uint32_t(unique_slots[index]),
+                    entry.generation, deterministic_policy_terminals);
                 if (!touched.is_ready()) return fail(touched);
                 touched = pin_slot_locked(uint32_t(unique_slots[index]));
                 if (!touched.is_ready()) return fail(touched);
@@ -2227,7 +2240,8 @@ public:
                             result = llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
                         }
                         if (result.is_ready()) result = transfer_ring->wait_for_hot(
-                            execution_backend, background->hot_slot, background->hot_generation);
+                            execution_backend, background->hot_slot, background->hot_generation,
+                            deterministic_policy_terminals);
                         background_h2d_complete = result.is_ready();
                         if (!result.is_ready() && result.error == llm_expert_provider_error::copy_failed) {
                             const auto ordered = finish_background_before_locked(
@@ -2398,7 +2412,8 @@ public:
                     const uint32_t unique_index = gpu_unique_indices[index];
                     const uint32_t hot_slot = uint32_t(unique_slots[unique_index]);
                     result = transfer_ring->wait_for_hot(
-                        execution_backend, hot_slot, directory_slots[hot_slot].generation);
+                        execution_backend, hot_slot, directory_slots[hot_slot].generation,
+                        deterministic_policy_terminals);
                 }
                 if (result.is_ready()) {
                     for (size_t index = 0; index < gpu_promotion_count; ++index) {
@@ -2469,8 +2484,10 @@ public:
                 gpu_lanes += gpu;
                 cpu_lanes += !gpu;
             }
-            result = llm_validate_hybrid_execution_ids(execution_ids, cpu_execution_ids, logical_id_count,
-                int32_t(config.capacity), int32_t(cold_cache->diagnostics().effective_slots));
+            if (logical_id_count != 0) {
+                result = llm_validate_hybrid_execution_ids(execution_ids, cpu_execution_ids, logical_id_count,
+                    int32_t(config.capacity), int32_t(cold_cache->diagnostics().effective_slots));
+            }
             if (!result.is_ready()) {
                 const auto released = release_request_pins_locked();
                 return fail(released.is_ready() ? result : released);
@@ -2519,11 +2536,15 @@ public:
                         return fail(llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch));
                     }
                     const llm_cold_reference backing = { entry.cold_slot, entry.cold_generation };
-                    auto touched = cold_cache->acquire(backing, llm_cold_reference_kind::request);
+                    auto touched = cold_cache->policy_shadow_hit(
+                        unique_keys[index], backing, unique_lane_counts[index]);
+                    if (touched.is_ready()) {
+                        touched = cold_cache->acquire(backing, llm_cold_reference_kind::request);
+                    }
                     if (touched.is_ready()) touched = cold_cache->release(backing, llm_cold_reference_kind::request);
                     if (!touched.is_ready()) return fail(touched);
                     touched = transfer_ring->wait_for_hot(execution_backend, uint32_t(unique_slots[index]),
-                        entry.generation);
+                        entry.generation, deterministic_policy_terminals);
                     if (!touched.is_ready()) return fail(touched);
                 }
                 const auto pinned = pin_slot_locked(uint32_t(unique_slots[index]));
@@ -2864,7 +2885,7 @@ public:
                     }
                     if (copy_result.is_ready()) {
                         copy_result = transfer_ring->wait_for_hot(
-                            execution_backend, slot, entry.generation);
+                            execution_backend, slot, entry.generation, deterministic_policy_terminals);
                     }
                     if (copy_result.is_ready() && abort_requested()) {
                         copy_result = cancel_post_h2d();
@@ -2990,7 +3011,8 @@ public:
                     if (copy_result.is_ready()) {
                         for (const auto & transfer : transfer_bindings) {
                             copy_result = transfer_ring->wait_for_hot(execution_backend,
-                                transfer.hot_slot, directory_slots[transfer.hot_slot].generation);
+                                transfer.hot_slot, directory_slots[transfer.hot_slot].generation,
+                                deterministic_policy_terminals);
                             if (!copy_result.is_ready()) break;
                         }
                     }
@@ -3760,6 +3782,9 @@ public:
         result.remap_dynamic_allocations = 0;
         result.policy = hot_policy.diagnostics();
         result.policy_domains = hot_policy.domain_diagnostics();
+        result.policy_events.assign(
+            hot_policy.transcript().begin(),
+            hot_policy.transcript().begin() + hot_policy.transcript_size());
         result.synchronization_checkpoints = synchronization_checkpoints;
         result.slot_tensor_addresses = pool ? pool->addresses : std::vector<uintptr_t> {};
         result.slots.reserve(directory_slots.size());
@@ -3812,6 +3837,7 @@ public:
             result.cold_peak_cpu_execution_refs = cold.peak_cpu_execution_refs;
             result.cold_policy = cold.policy;
             result.cold_policy_domains = cold.policy_domains;
+            result.cold_policy_events = cold.policy_events;
         }
         if (transfer_ring) {
             const auto ring = transfer_ring->diagnostics();
@@ -4104,6 +4130,8 @@ public:
 
 protected:
     void release_handle(uint64_t lease_id) noexcept override {
+        std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
+        if (deterministic_policy_terminals) ordered_lock.lock();
         std::lock_guard<std::mutex> lock(mutex);
         if (!active_request || lease_id != active_request_id || !validate_request_pins_locked()) {
             stale_generation_failures++;
@@ -4335,7 +4363,35 @@ private:
         }
     }
 
+    llm_expert_provider_result normalize_background_terminals_locked(
+            std::unique_lock<std::mutex> * provider_lock) noexcept {
+        while (active_background_flights != 0) {
+            background_promotion_record * earliest = nullptr;
+            for (auto & record : background_promotions) {
+                if (record.active && (earliest == nullptr ||
+                        record.origin_operation_ordinal < earliest->origin_operation_ordinal)) {
+                    earliest = &record;
+                }
+            }
+            if (earliest == nullptr) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+            const auto lane = earliest->lane;
+            const auto waited = transfer_ring->wait_background_h2d(lane);
+            auto result = reap_background_locked(provider_lock);
+            if (!result.is_ready()) return result;
+            if (!waited.is_ready() && earliest->active) return waited;
+            if (earliest->active) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+        }
+        return llm_expert_provider_result::success();
+    }
+
     llm_expert_provider_result finish_background_request_locked() noexcept {
+        if (deterministic_policy_terminals) {
+            return normalize_background_terminals_locked(nullptr);
+        }
         while (active_background_flights != 0) {
             auto result = reap_background_locked(nullptr);
             if (!result.is_ready()) return result;
@@ -4367,14 +4423,28 @@ private:
         if (!capacity.is_ready()) return capacity;
         for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
             const auto & entry = directory_slots[slot];
+            const bool policy_free = hot_policy.validate_free(slot);
+            const bool policy_loading = hot_policy.validate_loading(
+                slot, entry.generation, { entry.key.layer, entry.key.expert });
+            const bool policy_ready = hot_policy.validate_resident(
+                slot, entry.generation, { entry.key.layer, entry.key.expert });
+            const bool mechanism_loading = entry.state == hot_slot_state::loading;
+            const bool mechanism_ready = entry.state == hot_slot_state::ready ||
+                entry.state == hot_slot_state::pinned;
+            if ((entry.state == hot_slot_state::free) != policy_free ||
+                    mechanism_loading != policy_loading || mechanism_ready != policy_ready) {
+                metadata_mismatches++;
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
             policy_candidate_slots[slot] = {
                 slot,
                 entry.generation,
                 { entry.key.layer, entry.key.expert },
                 hot_logical_bundle_bytes,
                 hot_physical_slot_footprint_bytes,
-                entry.state == hot_slot_state::free,
-                entry.state == hot_slot_state::ready && entry.refcount == 0 && !slot_selected[slot],
+                entry.state == hot_slot_state::free && policy_free,
+                entry.state == hot_slot_state::ready && policy_ready &&
+                    entry.refcount == 0 && !slot_selected[slot],
             };
         }
         llm_expert_cache_policy_decision decision;
@@ -4416,6 +4486,19 @@ private:
                 already_candidate = already_candidate || selected_candidates[index] == slot;
             }
             const bool excluded = slot_selected[slot] || already_candidate;
+            const bool policy_free = hot_policy.validate_free(slot);
+            const bool policy_loading = hot_policy.validate_loading(
+                slot, entry.generation, { entry.key.layer, entry.key.expert });
+            const bool policy_ready = hot_policy.validate_resident(
+                slot, entry.generation, { entry.key.layer, entry.key.expert });
+            const bool mechanism_loading = entry.state == hot_slot_state::loading;
+            const bool mechanism_ready = entry.state == hot_slot_state::ready ||
+                entry.state == hot_slot_state::pinned;
+            if ((entry.state == hot_slot_state::free) != policy_free ||
+                    mechanism_loading != policy_loading || mechanism_ready != policy_ready) {
+                metadata_mismatches++;
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
             const bool free = !excluded && entry.state == hot_slot_state::free;
             const bool eligible = !excluded && entry.state == hot_slot_state::ready && entry.refcount == 0;
             policy_candidate_slots[slot] = {
@@ -4536,7 +4619,10 @@ private:
         }
         background_promotion_record record;
         record.state = background_promotion_record::lifecycle::queued_or_staging;
-        record.active = true;
+        // A local record does not own an active-flight count until it is
+        // installed below. Cleanup after a failed ring submission therefore
+        // must not decrement the count belonging to another live flight.
+        record.active = false;
         record.key = key;
         record.cold = cold;
         record.scheduler_handle = scheduled.handle;
@@ -4576,7 +4662,8 @@ private:
             cold_cache->bundle(), pool->bundle, record.lane,
             { config.async_transport ? config.async_transport->diagnostics().transport_epoch : 1,
               record.scheduler_handle.slot,
-              record.scheduler_handle.generation, key });
+              record.scheduler_handle.generation, key },
+            deterministic_policy_terminals);
         if (!result.is_ready()) {
             if (record.hot_generation != 0) {
                 const auto ordered = finish_background_before_locked(record.origin_operation_ordinal);
@@ -4590,6 +4677,7 @@ private:
         auto & slot_record = background_promotions[record.hot_slot];
         GGML_ASSERT(!slot_record.active);
         slot_record = record;
+        slot_record.active = true;
         background_submitted++;
         background_h2d_bytes = cold_bundle_payload > UINT64_MAX - background_h2d_bytes ?
             UINT64_MAX : background_h2d_bytes + cold_bundle_payload;
@@ -4830,9 +4918,13 @@ private:
 
     llm_hot_cache_config config;
     llm_expert_provider_faults faults;
+    const bool deterministic_policy_terminals = false;
     llm_expert_cache_policy hot_policy;
     uint32_t n_expert = 0;
     mutable std::mutex mutex;
+    // Keeps model-owned Phase 9 logical remaps ordered even while the provider
+    // mutex is temporarily released for abort callbacks or storage waits.
+    std::mutex ordered_remap_mutex;
     mutable llm_expert_provider_stats counters;
     std::map<int32_t, llm_expert_bundle_descriptor> registrations;
     std::optional<llm_expert_bundle_descriptor> prototype;

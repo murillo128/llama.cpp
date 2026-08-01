@@ -86,6 +86,7 @@ struct llm_cold_cache_diagnostics {
     uint64_t peak_cpu_execution_refs = 0;
     llm_expert_cache_policy_diagnostics policy;
     std::vector<llm_expert_cache_policy_domain_diagnostics> policy_domains;
+    std::vector<llm_expert_cache_policy_event> policy_events;
 
     struct slot {
         llm_expert_key key = { -1, -1 };
@@ -131,6 +132,10 @@ public:
     llm_expert_provider_result acquire(
             llm_cold_reference reference,
             llm_cold_reference_kind kind) noexcept;
+    llm_expert_provider_result policy_shadow_hit(
+            llm_expert_key key,
+            llm_cold_reference reference,
+            uint64_t occurrence_count) noexcept;
     llm_expert_provider_result release(
             llm_cold_reference reference,
             llm_cold_reference_kind kind) noexcept;

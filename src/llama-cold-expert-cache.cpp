@@ -359,10 +359,10 @@ struct llm_cold_expert_cache::impl {
         return result;
     }
 
-    llm_expert_provider_result observe_demand(llm_expert_key key) {
+    llm_expert_provider_result observe_demand(llm_expert_key key, uint64_t occurrence_count = 1) {
         auto result = ensure_policy_request();
         if (!result.is_ready()) return result;
-        return policy_result(policy.demand({ key.layer, key.expert }, 1,
+        return policy_result(policy.demand({ key.layer, key.expert }, occurrence_count,
             counters.bundle_payload_bytes, counters.aligned_slot_footprint));
     }
 
@@ -741,6 +741,32 @@ llm_expert_provider_result llm_cold_expert_cache::acquire(
     return llm_expert_provider_result::success();
 }
 
+llm_expert_provider_result llm_cold_expert_cache::policy_shadow_hit(
+        llm_expert_key key,
+        llm_cold_reference reference,
+        uint64_t occurrence_count) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (occurrence_count == 0 || !pimpl->valid_reference(reference) ||
+        !key.is_valid(LLAMA_MAX_LAYERS, pimpl->n_expert)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+    }
+    const auto & slot = pimpl->slots[reference.slot];
+    if (!key_matches(slot.key, key)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    if (!pimpl->policy.validate_resident(
+            reference.slot, reference.generation, { key.layer, key.expert })) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    auto result = pimpl->ensure_policy_request();
+    if (result.is_ready()) result = policy_result(pimpl->policy.validate_event_capacity(2));
+    if (result.is_ready()) result = pimpl->observe_demand(key, occurrence_count);
+    if (result.is_ready()) {
+        result = policy_result(pimpl->policy.hit(reference.slot, reference.generation));
+    }
+    return result;
+}
+
 llm_expert_provider_result llm_cold_expert_cache::release(
         llm_cold_reference reference, llm_cold_reference_kind kind) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
@@ -1000,6 +1026,9 @@ llm_cold_cache_diagnostics llm_cold_expert_cache::diagnostics() const {
     auto result = pimpl->counters;
     result.policy = pimpl->policy.diagnostics();
     result.policy_domains = pimpl->policy.domain_diagnostics();
+    result.policy_events.assign(
+        pimpl->policy.transcript().begin(),
+        pimpl->policy.transcript().begin() + pimpl->policy.transcript_size());
     result.slots = pimpl->slots;
     return result;
 }

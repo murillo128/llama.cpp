@@ -168,8 +168,9 @@ public:
     llm_expert_provider_result transfer_wave(
         ggml_backend_t backend,
         const std::vector<llm_transfer_binding> & bindings) noexcept;
-    // Atomically reserve and queue a background transfer without waiting for
-    // the ring mutex or a free lane.
+    // Atomically reserve and queue a background transfer. The Phase 8 path
+    // does not wait for the ring mutex; explicit Phase 9 policy ordering may
+    // wait for that bounded critical section, but never for a free lane.
     llm_expert_provider_result try_queue_background_transfer(
         llm_cold_expert_cache & cold_cache,
         llm_cold_reference cold,
@@ -178,11 +179,13 @@ public:
         const llm_expert_bundle_descriptor & cold_bundle,
         const llm_expert_bundle_descriptor & destination,
         llm_transfer_lane_reference & lane,
-        llm_expert_flight_id flight = {}) noexcept;
+        llm_expert_flight_id flight = {},
+        bool wait_for_mutex = false) noexcept;
     llm_expert_provider_result wait_for_hot(
         ggml_backend_t compute_backend,
         uint32_t hot_slot,
-        uint64_t hot_generation) noexcept;
+        uint64_t hot_generation,
+        bool ordered_terminal = false) noexcept;
     // Arm event completion monitoring without adding a dependency to the
     // current compute stream. Used only by same-key background promotion.
     llm_expert_provider_result monitor_h2d(llm_transfer_lane_reference lane) noexcept;
@@ -190,6 +193,11 @@ public:
         llm_transfer_lane_reference lane,
         llm_expert_same_key_h2d_state & state,
         uint64_t & remaining_bytes) noexcept;
+    // Wait for one background H2D terminal without releasing its held lane.
+    // Phase 9 uses this at a logical boundary before publishing terminals in
+    // immutable origin-operation order.
+    llm_expert_provider_result wait_background_h2d(
+        llm_transfer_lane_reference lane) noexcept;
     // Release a terminal failed or event-complete background lane. Never waits
     // for or cancels unrelated current-token work.
     llm_expert_provider_result release_terminal_background(

@@ -181,11 +181,15 @@ void test_free_pin_failure_and_exhaustion() {
     demand(active_load, 0, 0);
     require(active_load.load_begin(0, 1, { 0, 0 }, 64, 128).is_ready(),
         "reserve active load terminal");
+    require(!active_load.validate_free(0),
+        "policy loading state cannot be presented as a free mechanism slot");
     require(!active_load.request_end(true, false).is_ready(),
         "request cannot end before reserved load terminal");
     require(active_load.load_failed(0, 1).is_ready() &&
         active_load.request_end(false, true).is_ready(),
         "failed terminal precedes cancelled request end");
+    require(active_load.validate_free(0),
+        "failed ordered terminal restores policy free state");
 
     llm_expert_cache_policy multi_pin;
     require(multi_pin.initialize(make_config(LLAMA_EXPERT_CACHE_POLICY_LRU),

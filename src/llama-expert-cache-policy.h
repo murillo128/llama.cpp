@@ -228,6 +228,7 @@ public:
 
     bool validate_resident(uint32_t slot, uint64_t generation, llm_expert_cache_policy_key key) const noexcept;
     bool validate_loading(uint32_t slot, uint64_t generation, llm_expert_cache_policy_key key) const noexcept;
+    bool validate_free(uint32_t slot) const noexcept;
     llm_expert_cache_policy_result validate_evictable(uint32_t slot, uint64_t generation) const noexcept;
     const llm_expert_cache_policy_diagnostics & diagnostics() const noexcept { return counters; }
     const std::vector<llm_expert_cache_policy_domain_diagnostics> & domain_diagnostics() const noexcept {

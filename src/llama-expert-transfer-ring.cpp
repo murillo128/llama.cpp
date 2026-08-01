@@ -156,6 +156,7 @@ struct llm_expert_transfer_ring::impl {
         bool compute_pending = false;
         bool compute_complete = false;
         bool compute_monitoring = false;
+        bool ordered_release = false;
         bool cancelled = false;
         bool background_queued = false;
         bool background_running = false;
@@ -203,6 +204,7 @@ struct llm_expert_transfer_ring::impl {
         lane.compute_pending = false;
         lane.compute_complete = false;
         lane.compute_monitoring = false;
+        lane.ordered_release = false;
         lane.cancelled = false;
         lane.background_queued = false;
         lane.background_running = false;
@@ -236,7 +238,7 @@ struct llm_expert_transfer_ring::impl {
     }
 
     void finish_lane_if_ready(lane_state & lane) {
-        if (!lane.event_complete || lane.hold_after_h2d ||
+        if (!lane.event_complete || lane.hold_after_h2d || lane.ordered_release ||
             (lane.compute_pending && !lane.compute_complete)) return;
         if (traces.size() != 0) {
             if (counters.trace_records < traces.size()) {
@@ -870,8 +872,11 @@ llm_expert_provider_result llm_expert_transfer_ring::try_queue_background_transf
         const llm_expert_bundle_descriptor & cold_bundle,
         const llm_expert_bundle_descriptor & destination,
         llm_transfer_lane_reference & reference,
-        llm_expert_flight_id flight) noexcept {
-    std::unique_lock<std::mutex> lock(pimpl->mutex, std::try_to_lock);
+        llm_expert_flight_id flight,
+        bool wait_for_mutex) noexcept {
+    std::unique_lock<std::mutex> lock(pimpl->mutex, std::defer_lock);
+    if (wait_for_mutex) lock.lock();
+    else (void) lock.try_lock();
     if (!lock.owns_lock() || pimpl->background_stop || !pimpl->counters.event_capable || !pimpl->arena) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
     }
@@ -903,10 +908,50 @@ llm_expert_provider_result llm_expert_transfer_ring::try_queue_background_transf
     return llm_expert_provider_result::success();
 }
 
+llm_expert_provider_result llm_expert_transfer_ring::wait_background_h2d(
+        llm_transfer_lane_reference reference) noexcept {
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    if (reference.lane >= pimpl->lanes.size() ||
+            pimpl->lanes[reference.lane].generation != reference.generation) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & lane = pimpl->lanes[reference.lane];
+    const uint64_t generation = lane.generation;
+    if (lane.state == llm_transfer_lane_state::staging) {
+        pimpl->condition.wait(lock, [&] {
+            return lane.generation != generation || lane.state != llm_transfer_lane_state::staging;
+        });
+    }
+    if (lane.generation != generation || lane.state == llm_transfer_lane_state::free) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    if (lane.state == llm_transfer_lane_state::failed) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+    }
+    if (lane.state != llm_transfer_lane_state::in_flight || lane.event == nullptr || !lane.hold_after_h2d) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    }
+    lane.wait_enqueued = true;
+    pimpl->condition.notify_all();
+    pimpl->condition.wait(lock, [&] {
+        return lane.generation != generation || lane.state != llm_transfer_lane_state::in_flight ||
+            lane.event_complete;
+    });
+    if (lane.generation != generation || lane.state == llm_transfer_lane_state::free) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    if (lane.state == llm_transfer_lane_state::failed) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+    }
+    return lane.event_complete ? llm_expert_provider_result::success() :
+        llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+}
+
 llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
         ggml_backend_t compute_backend,
         uint32_t hot_slot,
-        uint64_t hot_generation) noexcept {
+        uint64_t hot_generation,
+        bool ordered_terminal) noexcept {
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     bool conflicting_generation = false;
     for (auto & lane : pimpl->lanes) {
@@ -959,6 +1004,7 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
                 pimpl->counters.peak_live_compute_events, pimpl->counters.live_compute_events);
             pimpl->refresh_total_event_counters();
         }
+        lane.ordered_release = ordered_terminal;
         const bool background_join = lane.hold_after_h2d;
         ggml_backend_event_wait(compute_backend, lane.event);
         if (background_join && !lane.event_complete) {
@@ -974,6 +1020,18 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
         }
         lane.hold_after_h2d = false;
         lane.wait_enqueued = true;
+        pimpl->condition.notify_all();
+        if (ordered_terminal && (!lane.event_complete ||
+                (lane.compute_pending && !lane.compute_complete))) {
+            pimpl->condition.wait(lock, [&] {
+                return lane.generation != generation || lane.state != llm_transfer_lane_state::in_flight ||
+                    (lane.event_complete && (!lane.compute_pending || lane.compute_complete));
+            });
+            if (lane.generation != generation || lane.state != llm_transfer_lane_state::in_flight) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+            }
+        }
+        lane.ordered_release = false;
         pimpl->counters.compute_waits++;
         pimpl->counters.h2d_event_waits++;
         pimpl->compute_begin_us = 0;

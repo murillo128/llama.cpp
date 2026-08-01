@@ -189,7 +189,19 @@ void test_runtime_policy_adapters() {
         GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
         llm_cold_reference reference;
         GGML_ASSERT(cache.find_or_admit({ 0, 0 }, tensors.bundle(), reference).is_ready());
+        const llm_cold_reference first = reference;
         GGML_ASSERT(cache.find_or_admit({ 0, 1 }, tensors.bundle(), reference).is_ready());
+        const auto before_shadow = cache.diagnostics();
+        GGML_ASSERT(cache.policy_shadow_hit({ 0, 0 }, first, 3).is_ready());
+        const auto after_shadow = cache.diagnostics();
+        GGML_ASSERT(after_shadow.hits == before_shadow.hits &&
+            after_shadow.misses == before_shadow.misses &&
+            after_shadow.admissions == before_shadow.admissions &&
+            after_shadow.policy.demands == before_shadow.policy.demands + 1 &&
+            after_shadow.policy.hits == before_shadow.policy.hits + 1);
+        GGML_ASSERT(cache.policy_shadow_hit({ 0, 3 }, first, 1).error ==
+            llm_expert_provider_error::metadata_mismatch &&
+            cache.diagnostics().policy.events == after_shadow.policy.events);
         GGML_ASSERT(cache.find_or_admit({ 0, 0 }, tensors.bundle(), reference).is_ready());
         GGML_ASSERT(cache.find_or_admit({ 0, 2 }, tensors.bundle(), reference).is_ready());
         const auto diagnostics = cache.diagnostics();
