@@ -57,8 +57,9 @@ json profile_json() {
         {"source", {
             {"kind", "route_trace"},
             {"artifacts", json::array({{{"name", "trace.bin"}, {"size", 64}, {"sha256", hash}}})},
-            {"fold", {{"index", 0}, {"training", json::array({"p02", "p03", "p04", "p05"})},
-                {"validation", "p01"}, {"test", "p00"}, {"training_rows", 40}, {"validation_rows", 10}, {"test_rows", 10}}},
+            {"fold", {{"index", 0}, {"training", json::array({"structured-en-small", "technical-en-large",
+                "narrative-en-large", "narrative-es-large"})}, {"validation", "code-en-small"},
+                {"test", "prose-en-small"}, {"training_rows", 40}, {"validation_rows", 10}, {"test_rows", 10}}},
         }},
         {"target", {
             {"package_sha256", package_hash},
@@ -181,11 +182,29 @@ void test_profile() {
     const std::string duplicate_path = write_profile(duplicate, "duplicate");
     require(!llm_expert_prefetch_load_profile(duplicate_path, 1024*1024, nullptr, rejected, error).is_ready(),
         "duplicate key accepted");
+    auto swapped_fold = profile_json();
+    std::swap(swapped_fold["source"]["fold"]["validation"], swapped_fold["source"]["fold"]["test"]);
+    const std::string swapped_fold_path = write_profile(swapped_fold.dump(2) + "\n", "swapped-fold");
+    require(!llm_expert_prefetch_load_profile(swapped_fold_path, 1024*1024, nullptr, rejected, error).is_ready(),
+        "swapped validation and test prompts accepted");
+    auto arbitrary_fold = profile_json();
+    arbitrary_fold["source"]["fold"]["training"][0] = "arbitrary-prompt";
+    const std::string arbitrary_fold_path = write_profile(arbitrary_fold.dump(2) + "\n", "arbitrary-fold");
+    require(!llm_expert_prefetch_load_profile(arbitrary_fold_path, 1024*1024, nullptr, rejected, error).is_ready(),
+        "arbitrary fold prompt accepted");
+    auto reordered_fold = profile_json();
+    std::swap(reordered_fold["source"]["fold"]["training"][0], reordered_fold["source"]["fold"]["training"][1]);
+    const std::string reordered_fold_path = write_profile(reordered_fold.dump(2) + "\n", "reordered-fold");
+    require(!llm_expert_prefetch_load_profile(reordered_fold_path, 1024*1024, nullptr, rejected, error).is_ready(),
+        "reordered fold training prompts accepted");
     std::remove(path.c_str());
     std::remove(wrong_cost_path.c_str());
     std::remove(blocking_path.c_str());
     std::remove(zero_predictor_path.c_str());
     std::remove(duplicate_path.c_str());
+    std::remove(swapped_fold_path.c_str());
+    std::remove(arbitrary_fold_path.c_str());
+    std::remove(reordered_fold_path.c_str());
 }
 
 std::vector<llm_expert_prefetch_candidate> predict(

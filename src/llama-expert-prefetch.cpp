@@ -77,6 +77,15 @@ struct json_ceiling_guard {
 constexpr uint64_t fnv_offset = UINT64_C(1469598103934665603);
 constexpr uint64_t fnv_prime = UINT64_C(1099511628211);
 
+constexpr const char * canonical_fold_prompts[6][6] = {
+    { "prose-en-small",       "code-en-small",        "structured-en-small", "technical-en-large",  "narrative-en-large", "narrative-es-large" },
+    { "code-en-small",        "structured-en-small",  "prose-en-small",      "technical-en-large",  "narrative-en-large", "narrative-es-large" },
+    { "structured-en-small",  "technical-en-large",   "prose-en-small",      "code-en-small",       "narrative-en-large", "narrative-es-large" },
+    { "technical-en-large",   "narrative-en-large",   "prose-en-small",      "code-en-small",       "structured-en-small", "narrative-es-large" },
+    { "narrative-en-large",   "narrative-es-large",   "prose-en-small",      "code-en-small",       "structured-en-small", "technical-en-large" },
+    { "narrative-es-large",   "prose-en-small",       "code-en-small",       "structured-en-small", "technical-en-large", "narrative-en-large" },
+};
+
 bool checked_add(uint64_t lhs, uint64_t rhs, uint64_t & result) noexcept {
     if (rhs > std::numeric_limits<uint64_t>::max() - lhs) return false;
     result = lhs + rhs;
@@ -484,6 +493,15 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         profile.test_prompt = string_value(fold.at("test"), "fold.test");
         if (!prompt_members.insert(profile.validation_prompt).second || !prompt_members.insert(profile.test_prompt).second ||
             prompt_members.size() != 6) throw std::runtime_error("overlapping fold membership");
+        const auto & expected_fold = canonical_fold_prompts[profile.fold_index];
+        if (profile.test_prompt != expected_fold[0] || profile.validation_prompt != expected_fold[1]) {
+            throw std::runtime_error("noncanonical fold validation or test prompt");
+        }
+        for (size_t index = 0; index < profile.training_prompts.size(); ++index) {
+            if (profile.training_prompts[index] != expected_fold[index + 2]) {
+                throw std::runtime_error("noncanonical fold training prompts");
+            }
+        }
         profile.training_rows = unsigned_value(fold.at("training_rows"), "fold.training_rows");
         profile.validation_rows = unsigned_value(fold.at("validation_rows"), "fold.validation_rows");
         profile.test_rows = unsigned_value(fold.at("test_rows"), "fold.test_rows");
