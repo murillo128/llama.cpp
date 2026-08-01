@@ -133,7 +133,18 @@ predictor_benchmark benchmark_predictor(
 struct model_profile_validation {
     uint64_t load_ns = 0;
     json lead_measurements;
+    std::vector<int32_t> generated_tokens;
+    std::vector<std::string> logit_sha256;
+    llm_hot_cache_diagnostics initial_diagnostics;
     llm_hot_cache_diagnostics diagnostics;
+};
+
+struct online_runtime_options {
+    llama_expert_weights_mode cache_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+    llama_load_mode load_mode = LLAMA_LOAD_MODE_MMAP;
+    llama_expert_miss_policy miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
+    uint32_t hot_slots = 16;
+    uint32_t cold_slots = 16;
 };
 
 struct expected_bundle_path {
@@ -327,7 +338,10 @@ model_profile_validation validate_model_profile(
         const std::string & profile_path,
         const llm_expert_prefetch_profile & profile,
         llama_load_mode load_mode,
-        bool measure_lead) {
+        bool measure_lead,
+        bool enable_profile = true,
+        const online_runtime_options & runtime = {},
+        bool calculate_lead = true) {
     const auto selected_cost = std::find_if(profile.costs.begin(), profile.costs.end(), [&](const auto & cost) {
         return cost.transport == profile.selected_transport && cost.readiness == profile.selected_readiness;
     });
@@ -360,16 +374,29 @@ model_profile_validation validate_model_profile(
         seed ? 0U : selected_cost->utility_window_predictions,
         seed ? 0U : selected_cost->utility_min_observations, {},
     };
+    const llama_expert_auto_cost_model auto_cost = {
+        LLAMA_EXPERT_AUTO_COST_MODEL_VERSION_1,
+        sizeof(llama_expert_auto_cost_model),
+        1, 1, 1, 1,
+        UINT64_C(1000000000), UINT64_C(1000000000),
+        UINT64_C(1000000000), UINT64_C(1000000000),
+        UINT64_C(1000000000), 1, 1,
+    };
     auto params = llama_model_default_params();
-    params.load_mode = load_mode;
+    params.load_mode = runtime.load_mode == LLAMA_LOAD_MODE_MMAP ? load_mode : runtime.load_mode;
     params.n_gpu_layers = -1;
     params.tensor_buft_overrides = overrides;
-    params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
-    params.expert_hot_cache_capacity = 16;
-    params.expert_cold_cache_bytes = 16*bundle_bytes;
-    params.expert_transfer_ring_bytes = 4*bundle_bytes;
-    params.expert_prefetch_config = &prefetch;
-    params.expert_prefetch_profile_path = profile_path.c_str();
+    params.expert_weights_mode = runtime.cache_mode;
+    params.expert_hot_cache_capacity = runtime.hot_slots;
+    params.expert_cold_cache_bytes = runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE ?
+        uint64_t(runtime.cold_slots)*bundle_bytes : 0;
+    params.expert_transfer_ring_bytes = runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE ?
+        4*bundle_bytes : 0;
+    params.expert_miss_policy = runtime.miss_policy;
+    params.expert_auto_cost_model = runtime.miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO ?
+        &auto_cost : nullptr;
+    params.expert_prefetch_config = enable_profile ? &prefetch : nullptr;
+    params.expert_prefetch_profile_path = enable_profile ? profile_path.c_str() : nullptr;
     const auto begin = std::chrono::steady_clock::now();
     llama_model_ptr model(llama_model_load_from_file(model_path.c_str(), params));
     const uint64_t duration = elapsed_ns(begin);
@@ -389,7 +416,8 @@ model_profile_validation validate_model_profile(
     auto context_params = llama_context_default_params();
     context_params.n_ctx = 64;
     context_params.n_batch = 64;
-    context_params.n_ubatch = 64;
+    context_params.n_ubatch = std::max<uint32_t>(1, std::min<uint32_t>(
+        64, runtime.hot_slots/profile.target.experts_per_token));
     context_params.no_perf = false;
     llama_context_ptr context(llama_init_from_model(model.get(), context_params));
     if (!context) throw probe_error("lead probe context creation failed");
@@ -399,23 +427,35 @@ model_profile_validation validate_model_profile(
     llama_token generated = 0;
     const int vocabulary = llama_vocab_n_tokens(vocab);
     std::vector<uint64_t> decode_begins;
-    for (int step = 0; step < 13; ++step) {
+    const int online_steps = profile.target.routed_layers.size() > 8 ? 2 : 13;
+    for (int step = 0; step < online_steps; ++step) {
         if (step != 0) {
             decode_begins.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         }
         if (llama_decode(context.get(), batch) != 0) throw probe_error("lead probe decode failed");
         llama_synchronize(context.get());
+        if (step == 0) result.initial_diagnostics = provider->hot_cache_diagnostics();
         const float * logits = llama_get_logits_ith(context.get(), -1);
         const int next = logits == nullptr ? -1 : finite_argmax(logits, vocabulary);
         if (next < 0) throw probe_error("lead probe logits were unavailable");
         generated = next;
+        result.generated_tokens.push_back(next);
+        result.logit_sha256.push_back(llm_expert_prefetch_sha256(
+            logits, size_t(vocabulary)*sizeof(float)));
         batch = llama_batch_get_one(&generated, 1);
     }
     context.reset();
     const auto diagnostics = provider->hot_cache_diagnostics();
-    if (diagnostics.phase10_lead_events_dropped != 0 || diagnostics.phase10_lead_events.empty()) {
+    result.diagnostics = diagnostics;
+    if (enable_profile && calculate_lead &&
+            (diagnostics.phase10_lead_events_dropped != 0 ||
+             diagnostics.phase10_lead_events.empty())) {
         throw probe_error("lead probe provider timing transcript is incomplete");
+    }
+    if (!enable_profile || !calculate_lead) {
+        result.lead_measurements = json::object();
+        return result;
     }
     std::vector<uint64_t> token_end_ns;
     std::vector<uint64_t> cross_layer_ns;
@@ -456,7 +496,6 @@ model_profile_validation validate_model_profile(
         {"cross_layer_p50_ns", cross_layer_p50}, {"conservative_lead_p50_ns", conservative_p50},
         {"provider_event_capacity", diagnostics.phase10_lead_event_capacity},
         {"provider_events_dropped", diagnostics.phase10_lead_events_dropped}};
-    result.diagnostics = diagnostics;
     return result;
 }
 
@@ -485,21 +524,272 @@ json envelope(
         {"measurement_basis", measurement_basis}};
 }
 
+const char * outcome_name(llm_expert_prefetch_outcome outcome) {
+    switch (outcome) {
+        case llm_expert_prefetch_outcome::pending:             return "PENDING";
+        case llm_expert_prefetch_outcome::timely_useful:       return "TIMELY_USEFUL";
+        case llm_expert_prefetch_outcome::late_joined:         return "LATE_JOINED";
+        case llm_expert_prefetch_outcome::wasted_unused:       return "WASTED_UNUSED";
+        case llm_expert_prefetch_outcome::cancelled_before_io: return "CANCELLED_BEFORE_IO";
+        case llm_expert_prefetch_outcome::cancelled_drained:   return "CANCELLED_DRAINED";
+        case llm_expert_prefetch_outcome::rejected:            return "REJECTED";
+    }
+    throw probe_error("unknown prediction outcome");
+}
+
+const char * origin_name(llm_expert_residency_origin origin) {
+    switch (origin) {
+        case llm_expert_residency_origin::demand:      return "DEMAND";
+        case llm_expert_residency_origin::static_seed: return "STATIC_SEED";
+        case llm_expert_residency_origin::speculative: return "SPECULATIVE";
+    }
+    throw probe_error("unknown residency origin");
+}
+
+json initial_resident(const llm_hot_cache_diagnostics & diagnostics) {
+    using key_type = std::pair<int32_t, int32_t>;
+    std::map<key_type, json> entries;
+    for (size_t slot = 0; slot < diagnostics.cold_slots.size(); ++slot) {
+        const auto & entry = diagnostics.cold_slots[slot];
+        if (entry.state == llm_hot_cache_diagnostics::cold_slot::free) continue;
+        if (entry.state != llm_hot_cache_diagnostics::cold_slot::ready ||
+                entry.layer < 0 || entry.expert < 0 || entry.generation == 0) {
+            throw probe_error("initial cold cache snapshot is not quiescent");
+        }
+        const key_type key = {entry.layer, entry.expert};
+        if (!entries.emplace(key, json{
+                {"layer", entry.layer}, {"expert", entry.expert},
+                {"cold_slot", int32_t(slot)}, {"hot_slot", -1},
+                {"cold_generation", entry.generation}, {"hot_generation", 0},
+                {"cold_last_use", entry.last_use}, {"hot_last_use", 0},
+                {"origin", origin_name(entry.origin)},
+            }).second) {
+            throw probe_error("duplicate key in initial cold cache snapshot");
+        }
+    }
+    for (size_t slot = 0; slot < diagnostics.slots.size(); ++slot) {
+        const auto & entry = diagnostics.slots[slot];
+        if (entry.state == llm_hot_cache_diagnostics::slot::free) continue;
+        if ((entry.state != llm_hot_cache_diagnostics::slot::ready &&
+                entry.state != llm_hot_cache_diagnostics::slot::pinned) ||
+                entry.layer < 0 || entry.expert < 0 || entry.generation == 0) {
+            throw probe_error("initial hot cache snapshot is not quiescent");
+        }
+        const key_type key = {entry.layer, entry.expert};
+        auto found = entries.find(key);
+        if (found == entries.end()) {
+            if (entry.has_cold_backing) {
+                throw probe_error("initial hot cache backing is absent from cold snapshot");
+            }
+            found = entries.emplace(key, json{
+                {"layer", entry.layer}, {"expert", entry.expert},
+                {"cold_slot", -1}, {"hot_slot", int32_t(slot)},
+                {"cold_generation", 0}, {"hot_generation", entry.generation},
+                {"cold_last_use", 0}, {"hot_last_use", entry.last_use},
+                {"origin", origin_name(entry.origin)},
+            }).first;
+        } else {
+            if (!entry.has_cold_backing || entry.cold_slot != uint32_t(found->second.at("cold_slot")) ||
+                    entry.cold_generation != found->second.at("cold_generation").get<uint64_t>() ||
+                    found->second.at("origin") != origin_name(entry.origin)) {
+                throw probe_error("initial hot/cold cache snapshot disagrees");
+            }
+            found->second["hot_slot"] = int32_t(slot);
+            found->second["hot_generation"] = entry.generation;
+            found->second["hot_last_use"] = entry.last_use;
+        }
+    }
+    json result = json::array();
+    for (auto & item : entries) result.push_back(std::move(item.second));
+    return result;
+}
+
+json online_capture(
+        const model_profile_validation & validation,
+        const llm_expert_prefetch_profile & profile,
+        const std::string & identity,
+        bool enabled,
+        const online_runtime_options & runtime) {
+    const size_t separator = identity.find(':');
+    if (separator == std::string::npos) throw probe_error("identity must be PROJECT:NESTED");
+    const auto & diagnostics = validation.diagnostics;
+    if (diagnostics.phase10_prediction_events_dropped != 0 ||
+            diagnostics.phase10_route_events_dropped != 0) {
+        throw probe_error("online prediction transcript overflowed");
+    }
+    if (enabled && (diagnostics.phase10_route_events == 0 ||
+                    diagnostics.phase10_prediction_events == 0)) {
+        throw probe_error("active online prediction transcript is empty: routes=" +
+            std::to_string(diagnostics.phase10_route_events) + " predictions=" +
+            std::to_string(diagnostics.phase10_prediction_events) + " circuit=" +
+            std::to_string(diagnostics.phase10_circuit_open) + " runtime_failed=" +
+            std::to_string(diagnostics.phase10_runtime_failed));
+    }
+    if (!enabled && (diagnostics.phase10_route_events != 0 ||
+                     diagnostics.phase10_prediction_events != 0)) {
+        throw probe_error("disabled online run created prediction state");
+    }
+    json routes = json::array();
+    for (const auto & event : diagnostics.phase10_route_trace) {
+        if (event.id_offset > diagnostics.phase10_route_ids.size() ||
+                event.id_count > diagnostics.phase10_route_ids.size() - event.id_offset) {
+            throw probe_error("online route transcript is malformed");
+        }
+        json ids = json::array();
+        for (uint32_t index = 0; index < event.id_count; ++index) {
+            ids.push_back(diagnostics.phase10_route_ids[event.id_offset + index]);
+        }
+        routes.push_back({{"request", event.request}, {"token", event.token},
+            {"layer", event.layer}, {"selected_experts", ids},
+            {"post_event_digest", event.post_event_digest}});
+    }
+    json predictions = json::array();
+    for (const auto & event : diagnostics.phase10_prediction_trace) {
+        predictions.push_back({
+            {"sequence", event.sequence}, {"request", event.request},
+            {"token", event.token}, {"deadline_token", event.deadline_token},
+            {"source_layer", event.source_layer}, {"target_layer", event.key.layer},
+            {"expert", event.key.expert}, {"rank", event.rank}, {"score", event.score},
+            {"trigger", event.trigger == llm_expert_prefetch_trigger::token_end ?
+                "TOKEN_END" : "ROUTER_RESULT"},
+            {"readiness", event.readiness == LLAMA_EXPERT_PREFETCH_READINESS_HOST_READY ?
+                "HOST_READY" : "DEVICE_READY"},
+            {"priority", event.priority}, {"config_digest", event.config_digest},
+            {"predictor_digest", event.predictor_digest},
+            {"post_event_digest", event.post_event_digest},
+            {"outcome", outcome_name(event.outcome)}, {"admitted", event.admitted},
+            {"demand_claimed", event.demand_claimed}, {"cold_ready", event.cold_ready},
+            {"device_ready", event.device_ready}, {"circuit_open_after", event.circuit_open_after},
+            {"storage_bytes", event.storage_bytes}, {"h2d_bytes", event.h2d_bytes},
+            {"cold_slot", event.cold_slot}, {"cold_generation", event.cold_generation},
+            {"hot_slot", event.hot_slot}, {"hot_generation", event.hot_generation},
+            {"scheduler_slot", event.scheduler_slot},
+            {"scheduler_generation", event.scheduler_generation},
+            {"timing", {{"predictor_compute_ns", event.predictor_compute_ns},
+                {"enqueue_us", event.enqueue_us}, {"host_ready_us", event.host_ready_us},
+                {"device_ready_us", event.device_ready_us}}},
+        });
+    }
+    return {{"schema_version", "phase10-online-capture-v1"},
+        {"project_head", identity.substr(0, separator)},
+        {"nested_head", identity.substr(separator + 1)},
+        {"profile_enabled", enabled}, {"profile_sha256", profile.profile_sha256},
+        {"cache_mode", runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE ?
+            "COLD_CACHE" : "HOT_CACHE"},
+        {"load_mode", runtime.load_mode == LLAMA_LOAD_MODE_DIRECT_IO ? "DIRECT_IO" : "BUFFERED"},
+        {"miss_policy", runtime.miss_policy == LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU ?
+            "PROMOTE_AND_GPU" : (runtime.miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ?
+                "CPU_FALLBACK" : "AUTO")},
+        {"hot_slots", runtime.hot_slots}, {"cold_slots", runtime.cold_slots},
+        {"model_load_ns", validation.load_ns},
+        {"generated_tokens", validation.generated_tokens},
+        {"logit_sha256", validation.logit_sha256},
+        {"initial_resident", initial_resident(validation.initial_diagnostics)},
+        {"routes", routes}, {"predictions", predictions},
+        {"summary", {
+            {"route_events", diagnostics.phase10_route_events},
+            {"prediction_events", diagnostics.phase10_prediction_events},
+            {"admitted", diagnostics.phase10_predictions_admitted},
+            {"rejected", diagnostics.phase10_predictions_rejected},
+            {"timely_useful", diagnostics.phase10_timely_useful},
+            {"late_joined", diagnostics.phase10_late_joined},
+            {"wasted_unused", diagnostics.phase10_wasted_unused},
+            {"cancelled_before_io", diagnostics.phase10_cancelled_before_io},
+            {"cancelled_drained", diagnostics.phase10_cancelled_drained},
+            {"predictor_compute_ns", diagnostics.phase10_predictor_compute_ns},
+            {"predictor_digest", diagnostics.phase10_predictor_digest},
+            {"predictor_state_digest", diagnostics.phase10_predictor_state_digest},
+            {"circuit_opens", diagnostics.phase10_circuit_opens},
+            {"circuit_open", diagnostics.phase10_circuit_open},
+            {"runtime_failed", diagnostics.phase10_runtime_failed},
+            {"active_background_flights", diagnostics.active_background_flights},
+            {"current_pins", diagnostics.current_pins},
+        }}};
+}
+
+json capture_fingerprint(const std::string & model_path) {
+    auto params = llama_model_default_params();
+    params.n_gpu_layers = 0;
+    params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_DISABLED;
+    llama_model_ptr model(llama_model_load_from_file(model_path.c_str(), params));
+    if (!model) throw probe_error("fingerprint model load failed");
+    const auto fingerprint = model->expert_prefetch_fingerprint();
+    json files = json::array();
+    for (const auto & file : fingerprint.files) {
+        files.push_back({{"ordinal", file.ordinal}, {"name", file.name},
+            {"size", file.size}, {"sha256", file.sha256}});
+    }
+    json expert_bytes = json::array();
+    for (const auto & key : fingerprint.expert_bytes) {
+        expert_bytes.push_back({{"layer", key.layer}, {"expert", key.expert},
+            {"payload_bytes", key.payload_bytes}, {"physical_bytes", key.physical_bytes}});
+    }
+    return {{"schema_version", "phase10-target-fingerprint-v1"}, {"target", {
+        {"package_sha256", fingerprint.package_sha256}, {"files", files},
+        {"layer_count", fingerprint.layer_count}, {"routed_layers", fingerprint.routed_layers},
+        {"experts_per_layer", fingerprint.experts_per_layer},
+        {"experts_per_token", fingerprint.experts_per_token},
+        {"tensor_layout_sha256", fingerprint.tensor_layout_sha256},
+        {"expert_bytes", expert_bytes},
+    }}};
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     try {
+        if (argc == 4 && std::string(argv[1]) == "--fingerprint" && std::string(argv[2]) == "--model") {
+            ggml_backend_load_all();
+            std::cout << capture_fingerprint(argv[3]).dump(2) << '\n';
+            return 0;
+        }
+        if (argc < 8) {
+            throw probe_error("usage: phase10-prefetch-probe --fingerprint --model GGUF | --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only | (--online | --online-disabled) [HOT_CACHE|COLD_CACHE BUFFERED|DIRECT_IO PROMOTE_AND_GPU|CPU_FALLBACK|AUTO HOT_SLOTS COLD_SLOTS]");
+        }
         const bool validate_only = argc == 8 && std::string(argv[7]) == "--validate-only";
-        if (((argc != 9 || std::string(argv[7]) != "--storage-map") && !validate_only) ||
+        const bool online_mode = argc >= 8 && std::string(argv[7]) == "--online";
+        const bool online_disabled_mode = argc >= 8 && std::string(argv[7]) == "--online-disabled";
+        const bool online = online_mode && (argc == 8 || argc == 13);
+        const bool online_disabled = online_disabled_mode && (argc == 8 || argc == 13);
+        if (((argc != 9 || std::string(argv[7]) != "--storage-map") &&
+                !validate_only && !online && !online_disabled) ||
                 std::string(argv[1]) != "--profile" || std::string(argv[3]) != "--model" ||
                 std::string(argv[5]) != "--identity") {
-            throw probe_error("usage: phase10-prefetch-probe --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only");
+            throw probe_error("usage: phase10-prefetch-probe --fingerprint --model GGUF | --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only | (--online | --online-disabled) [HOT_CACHE|COLD_CACHE BUFFERED|DIRECT_IO PROMOTE_AND_GPU|CPU_FALLBACK|AUTO HOT_SLOTS COLD_SLOTS]");
         }
         const std::string profile_path = argv[2];
         const std::string model_path = argv[4];
         const std::string identity = argv[6];
         const size_t separator = identity.find(':');
         if (separator == std::string::npos) throw probe_error("identity must be PROJECT:NESTED");
+        online_runtime_options runtime;
+        if ((online || online_disabled) && argc == 13) {
+            const std::string cache_mode = argv[8];
+            const std::string runtime_load_mode = argv[9];
+            const std::string miss_policy = argv[10];
+            char * hot_end = nullptr;
+            char * cold_end = nullptr;
+            const unsigned long hot_slots = std::strtoul(argv[11], &hot_end, 10);
+            const unsigned long cold_slots = std::strtoul(argv[12], &cold_end, 10);
+            if (cache_mode == "HOT_CACHE") runtime.cache_mode = LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
+            else if (cache_mode != "COLD_CACHE") throw probe_error("unknown online cache mode");
+            if (runtime_load_mode == "DIRECT_IO") runtime.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+            else if (runtime_load_mode != "BUFFERED") throw probe_error("unknown online load mode");
+            if (miss_policy == "CPU_FALLBACK") runtime.miss_policy = LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
+            else if (miss_policy == "AUTO") runtime.miss_policy = LLAMA_EXPERT_MISS_POLICY_AUTO;
+            else if (miss_policy != "PROMOTE_AND_GPU") throw probe_error("unknown online miss policy");
+            if (hot_end == argv[11] || *hot_end != '\0' || cold_end == argv[12] || *cold_end != '\0' ||
+                    hot_slots < 4 || hot_slots > UINT32_MAX || cold_slots > UINT32_MAX ||
+                    (runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE && cold_slots < 4) ||
+                    (runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE && cold_slots != 0) ||
+                    (runtime.cache_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE &&
+                        (runtime.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU ||
+                         runtime.load_mode == LLAMA_LOAD_MODE_DIRECT_IO))) {
+                throw probe_error("invalid online runtime configuration");
+            }
+            runtime.hot_slots = uint32_t(hot_slots);
+            runtime.cold_slots = uint32_t(cold_slots);
+        }
         ggml_backend_load_all();
         llm_expert_prefetch_profile profile;
         std::string profile_error;
@@ -509,12 +799,18 @@ int main(int argc, char ** argv) {
         }
         const uint64_t profile_parse_ns = elapsed_ns(profile_begin);
         const auto model_validation = validate_model_profile(
-            model_path, profile_path, profile, LLAMA_LOAD_MODE_MMAP, !validate_only);
+            model_path, profile_path, profile, LLAMA_LOAD_MODE_MMAP,
+            !validate_only, !online_disabled, runtime, !online && !online_disabled);
         if (validate_only) {
             std::cout << json({ {"schema_version", "phase10-profile-validation-v1"},
                 {"project_head", identity.substr(0, separator)}, {"nested_head", identity.substr(separator + 1)},
                 {"profile_sha256", profile.profile_sha256}, {"profile_parse_ns", profile_parse_ns},
                 {"model_profile_load_ns", model_validation.load_ns} }).dump(2) << '\n';
+            return 0;
+        }
+        if (online || online_disabled) {
+            std::cout << online_capture(
+                model_validation, profile, identity, online, runtime).dump(2) << '\n';
             return 0;
         }
         const uint64_t bytes = profile.target.expert_bytes.front().physical_bytes;

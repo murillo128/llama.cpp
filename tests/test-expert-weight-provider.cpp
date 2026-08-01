@@ -34,7 +34,9 @@ public:
 
     llm_expert_provider_result prepare(
             const std::vector<llm_expert_graph_binding> &,
-            llm_expert_execution_plan &) noexcept override {
+            llm_expert_execution_plan &,
+            uint64_t,
+            bool) noexcept override {
         stats.prepare_calls++;
         return llm_expert_provider_result::success();
     }

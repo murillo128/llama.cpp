@@ -22,6 +22,7 @@ class llm_expert_async_transport;
 class llm_expert_scheduler;
 struct llm_expert_provider_stats;
 class llm_expert_storage;
+struct llm_expert_prefetch_fingerprint;
 struct llm_expert_storage_diagnostics;
 struct llm_expert_async_diagnostics;
 struct llm_expert_scheduler_diagnostics;
@@ -708,6 +709,7 @@ struct llama_model {
     int32_t source_file_count(uint32_t * count) const;
     int32_t source_file_metadata(uint32_t index, struct llama_model_source_file_metadata * metadata) const;
     int32_t tensor_storage_metadata(const char * name, struct llama_model_tensor_storage_metadata * metadata) const;
+    llm_expert_prefetch_fingerprint expert_prefetch_fingerprint() const;
 
     void init_expert_weight_provider();
     void init_expert_storage(llama_model_loader & ml);

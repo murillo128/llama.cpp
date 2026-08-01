@@ -796,13 +796,31 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::initialize(
     this->profile = nullptr;
     this->config = {};
     request = {};
+    history_count = 0;
+    history_next = 0;
+    temporal_scores.clear();
+    eligible_scratch.clear();
+    source_scratch.clear();
+    cross_scores.clear();
     if (!config.supplied || config.value.policy == LLAMA_EXPERT_PREFETCH_POLICY_OFF ||
         profile.target.routed_layers.empty() || profile.target.experts_per_layer == 0 || !valid_sha256(profile.profile_sha256) ||
         config.value.candidates_per_target == 0 || config.value.candidates_per_target > profile.target.experts_per_layer) {
         return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_configuration);
     }
     try {
-        request.token_history.reserve(config.value.temporal_window_tokens == 0 ? 1 : config.value.temporal_window_tokens);
+        const uint32_t window = config.value.temporal_window_tokens == 0 ?
+            1 : config.value.temporal_window_tokens;
+        request.token_history.resize(window);
+        for (auto & token : request.token_history) {
+            token.resize(profile.target.routed_layers.size());
+            for (auto & selected : token) {
+                selected.reserve(profile.target.experts_per_token);
+            }
+        }
+        temporal_scores.resize(profile.target.experts_per_layer);
+        eligible_scratch.resize(profile.target.experts_per_layer);
+        source_scratch.reserve(profile.target.experts_per_token);
+        cross_scores.resize(profile.target.experts_per_layer);
     } catch (...) {
         return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::overflow);
     }
@@ -819,7 +837,11 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::request_begin(uint64_t
     request.request_ordinal = request_ordinal;
     request.completed_tokens = 0;
     request.digest = fnv_offset;
-    request.token_history.clear();
+    history_count = 0;
+    history_next = 0;
+    for (auto & token : request.token_history) {
+        for (auto & selected : token) selected.clear();
+    }
     hash_append(request.digest, request_ordinal);
     return llm_expert_prefetch_result::success();
 }
@@ -832,14 +854,17 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::commit_token(
         return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
     }
     try {
-        std::vector<std::vector<int32_t>> canonical;
-        canonical.reserve(routed_experts.size());
-        for (const auto & selected : routed_experts) {
+        if (request.token_history.empty()) {
+            return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
+        }
+        auto & canonical = request.token_history[history_next];
+        for (size_t layer_index = 0; layer_index < routed_experts.size(); ++layer_index) {
+            const auto & selected = routed_experts[layer_index];
             if (selected.empty() || selected.size() > profile->target.experts_per_token) {
                 return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
             }
-            canonical.push_back(selected);
-            auto & values = canonical.back();
+            auto & values = canonical[layer_index];
+            values.assign(selected.begin(), selected.end());
             std::sort(values.begin(), values.end());
             if (std::adjacent_find(values.begin(), values.end()) != values.end()) {
                 return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
@@ -850,14 +875,13 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::commit_token(
                 }
             }
         }
-        const uint32_t window = config.value.temporal_window_tokens == 0 ? 1 : config.value.temporal_window_tokens;
-        if (request.token_history.size() == window) request.token_history.erase(request.token_history.begin());
-        request.token_history.push_back(std::move(canonical));
         hash_append(request.digest, token_ordinal);
-        for (const auto & layer : request.token_history.back()) {
+        for (const auto & layer : canonical) {
             hash_append(request.digest, layer.size());
             for (int32_t expert : layer) hash_append(request.digest, uint32_t(expert));
         }
+        history_next = (history_next + 1)%request.token_history.size();
+        history_count = std::min(history_count + 1, request.token_history.size());
         request.completed_tokens++;
         return llm_expert_prefetch_result::success();
     } catch (...) {
@@ -879,6 +903,8 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_token_end(
         return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
     }
     const size_t layer_index = size_t(layer_it - profile->target.routed_layers.begin());
+    const size_t latest_history = (history_next + request.token_history.size() - 1)%
+        request.token_history.size();
     try {
         switch (config.value.policy) {
             case LLAMA_EXPERT_PREFETCH_POLICY_STATIC_LAYER:
@@ -887,22 +913,23 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_token_end(
                 }
                 break;
             case LLAMA_EXPERT_PREFETCH_POLICY_PREVIOUS_TOKEN:
-                for (int32_t expert : request.token_history.back()[layer_index]) {
+                for (int32_t expert : request.token_history[latest_history][layer_index]) {
                     candidates.push_back({{target_layer, expert}, 0, 1});
                 }
                 break;
             case LLAMA_EXPERT_PREFETCH_POLICY_TEMPORAL_FREQUENCY: {
-                struct score { uint64_t count = 0; uint64_t recency = 0; };
-                std::vector<score> scores(profile->target.experts_per_layer);
-                for (size_t history_index = 0; history_index < request.token_history.size(); ++history_index) {
+                std::fill(temporal_scores.begin(), temporal_scores.end(), temporal_score{});
+                const size_t oldest = history_count == request.token_history.size() ? history_next : 0;
+                for (size_t history_ordinal = 0; history_ordinal < history_count; ++history_ordinal) {
+                    const size_t history_index = (oldest + history_ordinal)%request.token_history.size();
                     for (int32_t expert : request.token_history[history_index][layer_index]) {
-                        if (scores[expert].count != UINT64_MAX) scores[expert].count++;
-                        scores[expert].recency = history_index + 1;
+                        if (temporal_scores[expert].count != UINT64_MAX) temporal_scores[expert].count++;
+                        temporal_scores[expert].recency = history_ordinal + 1;
                     }
                 }
-                for (uint32_t expert = 0; expert < scores.size(); ++expert) {
-                    if (scores[expert].count != 0) candidates.push_back({{target_layer, int32_t(expert)}, 0,
-                        scores[expert].count*128 + scores[expert].recency});
+                for (uint32_t expert = 0; expert < temporal_scores.size(); ++expert) {
+                    if (temporal_scores[expert].count != 0) candidates.push_back({{target_layer, int32_t(expert)}, 0,
+                        temporal_scores[expert].count*128 + temporal_scores[expert].recency});
                 }
                 std::sort(candidates.begin(), candidates.end(), [](const auto & lhs, const auto & rhs) {
                     return lhs.score != rhs.score ? lhs.score > rhs.score : lhs.key.expert < rhs.key.expert;
@@ -910,18 +937,19 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_token_end(
                 break;
             }
             case LLAMA_EXPERT_PREFETCH_POLICY_RANDOM_BASELINE: {
-                std::vector<int32_t> eligible(profile->target.experts_per_layer);
-                for (uint32_t index = 0; index < eligible.size(); ++index) eligible[index] = int32_t(index);
+                for (uint32_t index = 0; index < eligible_scratch.size(); ++index) {
+                    eligible_scratch[index] = int32_t(index);
+                }
                 uint64_t state = config.digest;
                 hash_append(state, profile->fold_index);
                 hash_append(state, request.request_ordinal);
                 hash_append(state, token_ordinal);
                 hash_append(state, uint32_t(target_layer));
-                for (size_t index = 0; index < eligible.size(); ++index) {
-                    const size_t selected = index + splitmix64(state)%(eligible.size() - index);
-                    std::swap(eligible[index], eligible[selected]);
+                for (size_t index = 0; index < eligible_scratch.size(); ++index) {
+                    const size_t selected = index + splitmix64(state)%(eligible_scratch.size() - index);
+                    std::swap(eligible_scratch[index], eligible_scratch[selected]);
                 }
-                for (int32_t expert : eligible) candidates.push_back({{target_layer, expert}, 0, 0});
+                for (int32_t expert : eligible_scratch) candidates.push_back({{target_layer, expert}, 0, 0});
                 break;
             }
             case LLAMA_EXPERT_PREFETCH_POLICY_CROSS_LAYER_TRANSITION:
@@ -930,7 +958,7 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_token_end(
                 return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_configuration);
         }
         if (config.value.policy != LLAMA_EXPERT_PREFETCH_POLICY_TEMPORAL_FREQUENCY) {
-            std::stable_sort(candidates.begin(), candidates.end(), [](const auto & lhs, const auto & rhs) {
+            std::sort(candidates.begin(), candidates.end(), [](const auto & lhs, const auto & rhs) {
                 return lhs.score != rhs.score ? lhs.score > rhs.score : lhs.key.expert < rhs.key.expert;
             });
         }
@@ -960,13 +988,13 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_cross_layer(
     if (source_layer_it == profile->target.routed_layers.end() || source_layer_it + 1 == profile->target.routed_layers.end() ||
         *(source_layer_it + 1) != target_layer) return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
     try {
-        std::vector<int32_t> sources(source_experts, source_experts + source_count);
-        std::sort(sources.begin(), sources.end());
-        if (std::adjacent_find(sources.begin(), sources.end()) != sources.end()) {
+        source_scratch.assign(source_experts, source_experts + source_count);
+        std::sort(source_scratch.begin(), source_scratch.end());
+        if (std::adjacent_find(source_scratch.begin(), source_scratch.end()) != source_scratch.end()) {
             return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
         }
-        std::vector<uint64_t> scores(profile->target.experts_per_layer);
-        for (int32_t source : sources) {
+        std::fill(cross_scores.begin(), cross_scores.end(), uint64_t(0));
+        for (int32_t source : source_scratch) {
             if (source < 0 || uint32_t(source) >= profile->target.experts_per_layer) {
                 return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
             }
@@ -974,11 +1002,13 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_cross_layer(
                 if (transition.source_layer != source_layer || transition.source_expert != source ||
                     transition.target_layer != target_layer) continue;
                 uint64_t updated = 0;
-                scores[transition.target_expert] = checked_add(scores[transition.target_expert], transition.count, updated) ? updated : UINT64_MAX;
+                cross_scores[transition.target_expert] = checked_add(
+                    cross_scores[transition.target_expert], transition.count, updated) ? updated : UINT64_MAX;
             }
         }
-        for (uint32_t expert = 0; expert < scores.size(); ++expert) {
-            if (scores[expert] != 0) candidates.push_back({{target_layer, int32_t(expert)}, 0, scores[expert]});
+        for (uint32_t expert = 0; expert < cross_scores.size(); ++expert) {
+            if (cross_scores[expert] != 0) candidates.push_back(
+                {{target_layer, int32_t(expert)}, 0, cross_scores[expert]});
         }
         std::sort(candidates.begin(), candidates.end(), [](const auto & lhs, const auto & rhs) {
             return lhs.score != rhs.score ? lhs.score > rhs.score : lhs.key.expert < rhs.key.expert;

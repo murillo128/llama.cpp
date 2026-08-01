@@ -348,6 +348,60 @@ struct llm_expert_phase10_h2d_event {
     bool cancelled = false;
 };
 
+enum class llm_expert_prefetch_outcome : uint8_t {
+    pending,
+    timely_useful,
+    late_joined,
+    wasted_unused,
+    cancelled_before_io,
+    cancelled_drained,
+    rejected,
+};
+
+struct llm_expert_phase10_prediction_event {
+    uint64_t sequence = 0;
+    uint64_t request = 0;
+    uint64_t token = 0;
+    uint64_t deadline_token = 0;
+    uint64_t config_digest = 0;
+    uint64_t predictor_digest = 0;
+    uint64_t post_event_digest = 0;
+    uint64_t score = 0;
+    uint64_t storage_bytes = 0;
+    uint64_t h2d_bytes = 0;
+    uint64_t predictor_compute_ns = 0;
+    uint64_t enqueue_us = 0;
+    uint64_t host_ready_us = 0;
+    uint64_t device_ready_us = 0;
+    int32_t source_layer = -1;
+    llm_expert_key key = { -1, -1 };
+    uint32_t rank = 0;
+    uint32_t cold_slot = UINT32_MAX;
+    uint64_t cold_generation = 0;
+    uint32_t hot_slot = UINT32_MAX;
+    uint64_t hot_generation = 0;
+    uint32_t scheduler_slot = UINT32_MAX;
+    uint64_t scheduler_generation = 0;
+    llm_expert_prefetch_trigger trigger = llm_expert_prefetch_trigger::token_end;
+    llama_expert_prefetch_readiness readiness = LLAMA_EXPERT_PREFETCH_READINESS_HOST_READY;
+    uint8_t priority = 0;
+    llm_expert_prefetch_outcome outcome = llm_expert_prefetch_outcome::pending;
+    bool admitted = false;
+    bool demand_claimed = false;
+    bool cold_ready = false;
+    bool device_ready = false;
+    bool circuit_open_after = false;
+};
+
+struct llm_expert_phase10_route_event {
+    uint64_t request = 0;
+    uint64_t token = 0;
+    uint64_t post_event_digest = 0;
+    uint32_t id_offset = 0;
+    uint32_t id_count = 0;
+    int32_t layer = -1;
+};
+
 enum class llm_expert_residency_origin : uint8_t {
     demand,
     static_seed,
@@ -426,6 +480,26 @@ struct llm_hot_cache_diagnostics {
     llm_expert_key phase10_seed_last_touch = { -1, -1 };
     uint64_t phase10_issue_ahead_events = 0;
     uint64_t phase10_issue_ahead_violations = 0;
+    uint64_t phase10_prediction_events = 0;
+    uint64_t phase10_prediction_events_dropped = 0;
+    uint64_t phase10_route_events = 0;
+    uint64_t phase10_route_events_dropped = 0;
+    uint64_t phase10_predictions_admitted = 0;
+    uint64_t phase10_predictions_rejected = 0;
+    uint64_t phase10_timely_useful = 0;
+    uint64_t phase10_late_joined = 0;
+    uint64_t phase10_wasted_unused = 0;
+    uint64_t phase10_cancelled_before_io = 0;
+    uint64_t phase10_cancelled_drained = 0;
+    uint64_t phase10_predictor_compute_ns = 0;
+    uint64_t phase10_predictor_digest = 0;
+    uint64_t phase10_predictor_state_digest = 0;
+    uint64_t phase10_circuit_opens = 0;
+    bool phase10_circuit_open = false;
+    bool phase10_runtime_failed = false;
+    std::vector<llm_expert_phase10_prediction_event> phase10_prediction_trace;
+    std::vector<llm_expert_phase10_route_event> phase10_route_trace;
+    std::vector<int32_t> phase10_route_ids;
     uint32_t requested_capacity = 0;
     uint32_t effective_capacity = 0;
     uint64_t pool_bytes = 0;
@@ -503,6 +577,22 @@ struct llm_hot_cache_diagnostics {
         } state = free;
     };
     std::vector<slot> slots;
+    struct cold_slot {
+        int32_t layer = -1;
+        int32_t expert = -1;
+        uint64_t generation = 0;
+        uint64_t last_use = 0;
+        llm_expert_residency_origin origin = llm_expert_residency_origin::demand;
+        enum state_type {
+            free,
+            reserved,
+            loading,
+            ready,
+            evicting,
+            failed,
+        } state = free;
+    };
+    std::vector<cold_slot> cold_slots;
     ggml_backend_buffer_type_t source_buffer_type = nullptr;
     ggml_backend_buffer_type_t target_buffer_type = nullptr;
     bool source_pageable = false;
@@ -782,7 +872,15 @@ public:
 
     virtual llm_expert_provider_result prepare(
             const std::vector<llm_expert_graph_binding> & bindings,
-            llm_expert_execution_plan & plan) noexcept = 0;
+            llm_expert_execution_plan & plan,
+            uint64_t sequence_owner = 0,
+            bool sequence_start = false) noexcept = 0;
+
+    virtual llm_expert_provider_result end_prefetch_sequence(
+            uint64_t sequence_owner) noexcept {
+        (void) sequence_owner;
+        return llm_expert_provider_result::success();
+    }
 
     virtual llm_expert_provider_stats get_stats() const noexcept = 0;
 

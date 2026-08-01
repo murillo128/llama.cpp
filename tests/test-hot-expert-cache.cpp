@@ -350,6 +350,31 @@ struct failing_async_reader final : llm_expert_async_read_override {
     }
 };
 
+struct gated_async_reader final : llm_expert_async_read_override {
+    const std::vector<uint8_t> & bytes;
+    uint64_t gated_offset = 0;
+    std::atomic<bool> release { false };
+    std::atomic<uint64_t> entered { 0 };
+
+    gated_async_reader(const std::vector<uint8_t> & bytes, uint64_t gated_offset) :
+        bytes(bytes), gated_offset(gated_offset) {}
+
+    int64_t read_at(
+            intptr_t,
+            void * data,
+            size_t size,
+            uint64_t offset,
+            int &) noexcept override {
+        entered.fetch_add(1, std::memory_order_release);
+        while (offset >= gated_offset && !release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        if (offset > bytes.size() || size > bytes.size() - size_t(offset)) return 0;
+        std::memcpy(data, bytes.data() + offset, size);
+        return int64_t(size);
+    }
+};
+
 llm_hot_cache_config blocking_seed_config(const tensor_fixture & tensors) {
     auto result = test_config(2);
     result.prefetch_config.supplied = true;
@@ -408,7 +433,144 @@ llm_hot_cache_config phase10_issue_ahead_config(
     result.prefetch_profile_loaded = true;
     result.prefetch_profile.profile_sha256 = std::string(64, 'b');
     result.prefetch_profile.target.experts_per_layer = 4;
+    result.prefetch_profile.target.experts_per_token = 2;
     result.prefetch_profile.target.routed_layers = { 0 };
+    result.prefetch_profile.selected_transport = "buffered";
+    result.prefetch_profile.selected_readiness =
+        LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY;
+    result.prefetch_profile.costs.push_back({
+        "buffered", LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY,
+        10, 10, 1, 1, 1, 1, 1, 1, 1000, 8, 1, 1,
+    });
+    return result;
+}
+
+llm_hot_cache_config predictive_static_config(
+        llm_expert_storage & storage,
+        llm_expert_async_transport & transport,
+        llm_expert_scheduler & scheduler,
+        llama_expert_prefetch_readiness readiness = LLAMA_EXPERT_PREFETCH_READINESS_HOST_READY,
+        uint32_t hot_capacity = 2) {
+    auto result = phase10_issue_ahead_config(
+        storage, transport, scheduler, false, hot_capacity);
+    auto & prefetch = result.prefetch_config.value;
+    prefetch.policy = LLAMA_EXPERT_PREFETCH_POLICY_STATIC_LAYER;
+    prefetch.readiness = readiness;
+    prefetch.candidates_per_target = 2;
+    result.prefetch_profile.selected_policy = "static-layer";
+    result.prefetch_profile.selected_readiness =
+        readiness;
+    result.prefetch_profile.static_counts = {
+        { 0, 2, 20 },
+        { 0, 3, 10 },
+    };
+    result.prefetch_profile.costs.clear();
+    result.prefetch_profile.costs.push_back({
+        "buffered", readiness,
+        10, 10, 1, 1, 1, 1, 1,
+        readiness == LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY ? 1U : 0U,
+        1000, 8, 1, 1,
+    });
+    return result;
+}
+
+llm_hot_cache_config predictive_hot_circuit_config() {
+    auto result = test_config(4, 1, 4, 2);
+    result.trace_capacity = 64;
+    result.prefetch_config.supplied = true;
+    result.prefetch_config.digest = 0xdef0;
+    auto & prefetch = result.prefetch_config.value;
+    prefetch.version = LLAMA_EXPERT_PREFETCH_VERSION_1;
+    prefetch.struct_size = sizeof(llama_expert_prefetch_config_v1);
+    prefetch.policy = LLAMA_EXPERT_PREFETCH_POLICY_STATIC_LAYER;
+    prefetch.readiness = LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY;
+    prefetch.seed_mode = LLAMA_EXPERT_PREFETCH_SEED_MODE_OFF;
+    prefetch.candidates_per_target = 2;
+    prefetch.max_profile_bytes = 4096;
+    prefetch.max_speculative_flights = 2;
+    prefetch.max_speculative_storage_bytes_in_flight = 1U << 20;
+    prefetch.max_speculative_h2d_bytes_in_flight = 1U << 20;
+    prefetch.max_speculative_storage_bytes_per_token = 1U << 20;
+    prefetch.max_speculative_h2d_bytes_per_token = 1U << 20;
+    prefetch.max_speculative_cold_slots = 2;
+    prefetch.max_speculative_hot_slots = 2;
+    prefetch.utility_window_predictions = 2;
+    prefetch.utility_min_observations = 2;
+    result.prefetch_profile_loaded = true;
+    result.prefetch_profile.profile_sha256 = std::string(64, 'd');
+    result.prefetch_profile.target.experts_per_layer = 4;
+    result.prefetch_profile.target.experts_per_token = 2;
+    result.prefetch_profile.target.routed_layers = { 0 };
+    result.prefetch_profile.selected_policy = "static-layer";
+    result.prefetch_profile.selected_transport = "resident";
+    result.prefetch_profile.selected_readiness =
+        LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY;
+    result.prefetch_profile.static_counts = {
+        { 0, 2, 20 },
+        { 0, 3, 10 },
+    };
+    result.prefetch_profile.costs.push_back({
+        "resident", LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY,
+        10, 10, 1, 1, 1, 1, 0, 1, 1000, 2, 2, 1,
+    });
+    return result;
+}
+
+llm_hot_cache_config predictive_hot_cross_config() {
+    auto result = test_config(4, 2, 8, 2);
+    result.trace_capacity = 64;
+    result.prefetch_config.supplied = true;
+    result.prefetch_config.digest = 0xe123;
+    auto & prefetch = result.prefetch_config.value;
+    prefetch.version = LLAMA_EXPERT_PREFETCH_VERSION_1;
+    prefetch.struct_size = sizeof(llama_expert_prefetch_config_v1);
+    prefetch.policy = LLAMA_EXPERT_PREFETCH_POLICY_CROSS_LAYER_TRANSITION;
+    prefetch.readiness = LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY;
+    prefetch.candidates_per_target = 2;
+    prefetch.max_profile_bytes = 4096;
+    prefetch.max_speculative_flights = 2;
+    prefetch.max_speculative_storage_bytes_in_flight = 1U << 20;
+    prefetch.max_speculative_h2d_bytes_in_flight = 1U << 20;
+    prefetch.max_speculative_storage_bytes_per_token = 1U << 20;
+    prefetch.max_speculative_h2d_bytes_per_token = 1U << 20;
+    prefetch.max_speculative_cold_slots = 2;
+    prefetch.max_speculative_hot_slots = 2;
+    prefetch.utility_window_predictions = 8;
+    prefetch.utility_min_observations = 1;
+    result.prefetch_profile_loaded = true;
+    result.prefetch_profile.profile_sha256 = std::string(64, 'e');
+    result.prefetch_profile.target.experts_per_layer = 4;
+    result.prefetch_profile.target.experts_per_token = 2;
+    result.prefetch_profile.target.routed_layers = { 0, 1 };
+    result.prefetch_profile.selected_policy = "cross-layer-transition";
+    result.prefetch_profile.selected_transport = "resident";
+    result.prefetch_profile.selected_readiness =
+        LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY;
+    result.prefetch_profile.transitions = {
+        { 0, 0, 1, 2, 20 },
+        { 0, 1, 1, 3, 10 },
+    };
+    result.prefetch_profile.costs.push_back({
+        "resident", LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY,
+        10, 10, 1, 1, 1, 1, 0, 1, 1000, 8, 1, 1,
+    });
+    return result;
+}
+
+llm_hot_cache_config predictive_hot_multilayer_circuit_config() {
+    auto result = predictive_hot_circuit_config();
+    result.capacity = 12;
+    result.routed_layer_count = 3;
+    result.total_expert_keys = 12;
+    result.prefetch_config.value.max_speculative_flights = 6;
+    result.prefetch_config.value.max_speculative_cold_slots = 6;
+    result.prefetch_config.value.max_speculative_hot_slots = 6;
+    result.prefetch_profile.target.routed_layers = { 0, 1, 2 };
+    result.prefetch_profile.static_counts = {
+        { 0, 2, 20 }, { 0, 3, 10 },
+        { 1, 2, 20 }, { 1, 3, 10 },
+        { 2, 2, 20 }, { 2, 3, 10 },
+    };
     return result;
 }
 
@@ -478,6 +640,10 @@ void test_runtime_policy_adapters_and_bounded_metadata() {
         GGML_ASSERT(diagnostics.phase10_issue_ahead_trace_capacity == 0);
         GGML_ASSERT(diagnostics.phase10_issue_ahead_trace.empty());
         GGML_ASSERT(diagnostics.phase10_issue_ahead_events == 0);
+        GGML_ASSERT(diagnostics.phase10_route_events == 0);
+        GGML_ASSERT(diagnostics.phase10_route_events_dropped == 0);
+        GGML_ASSERT(diagnostics.phase10_route_trace.empty());
+        GGML_ASSERT(diagnostics.phase10_route_ids.empty());
         GGML_ASSERT(!diagnostics.phase10_prefetch_configured &&
             !diagnostics.phase10_seed_configured && !diagnostics.phase10_seed_complete);
         GGML_ASSERT(diagnostics.phase10_storage_event_capacity == 0);
@@ -496,6 +662,63 @@ void test_runtime_policy_adapters_and_bounded_metadata() {
         binding = {};
         GGML_ASSERT(provider->surrender().is_ready());
     }
+}
+
+void test_predictor_runtime_has_no_heap_allocations() {
+    llm_expert_prefetch_profile profile;
+    profile.profile_sha256 = std::string(64, 'c');
+    profile.target.experts_per_layer = 4;
+    profile.target.experts_per_token = 2;
+    profile.target.routed_layers = { 0, 1 };
+    profile.static_counts = {
+        { 0, 2, 20 },
+        { 0, 3, 10 },
+    };
+    profile.transitions = {
+        { 0, 0, 1, 2, 20 },
+        { 0, 1, 1, 3, 10 },
+    };
+    llm_expert_prefetch_config_internal config;
+    config.supplied = true;
+    config.digest = 0x9abc;
+    config.value.version = LLAMA_EXPERT_PREFETCH_VERSION_1;
+    config.value.struct_size = sizeof(llama_expert_prefetch_config_v1);
+    config.value.readiness = LLAMA_EXPERT_PREFETCH_READINESS_HOST_READY;
+    config.value.candidates_per_target = 2;
+    config.value.temporal_window_tokens = 2;
+    config.value.max_profile_bytes = 4096;
+
+    std::vector<std::vector<int32_t>> routes = {
+        { 0, 1 },
+        { 2, 3 },
+    };
+    std::vector<llm_expert_prefetch_candidate> candidates;
+    candidates.reserve(4);
+    uint64_t request = 10;
+    for (const auto policy : {
+            LLAMA_EXPERT_PREFETCH_POLICY_STATIC_LAYER,
+            LLAMA_EXPERT_PREFETCH_POLICY_PREVIOUS_TOKEN,
+            LLAMA_EXPERT_PREFETCH_POLICY_TEMPORAL_FREQUENCY,
+            LLAMA_EXPERT_PREFETCH_POLICY_RANDOM_BASELINE }) {
+        config.value.policy = policy;
+        llm_expert_prefetch_predictor predictor;
+        GGML_ASSERT(predictor.initialize(profile, config).is_ready());
+        GGML_ASSERT(predictor.request_begin(request++).is_ready());
+        const uint64_t allocations_before = allocation_count.load(std::memory_order_relaxed);
+        GGML_ASSERT(predictor.commit_token(0, routes).is_ready());
+        GGML_ASSERT(predictor.predict_token_end(0, 0, candidates).is_ready());
+        GGML_ASSERT(allocation_count.load(std::memory_order_relaxed) == allocations_before);
+    }
+
+    config.value.policy = LLAMA_EXPERT_PREFETCH_POLICY_CROSS_LAYER_TRANSITION;
+    llm_expert_prefetch_predictor cross;
+    GGML_ASSERT(cross.initialize(profile, config).is_ready());
+    GGML_ASSERT(cross.request_begin(request).is_ready());
+    const int32_t sources[] = { 1, 0 };
+    const uint64_t allocations_before = allocation_count.load(std::memory_order_relaxed);
+    GGML_ASSERT(cross.predict_cross_layer(
+        0, 0, sources, 2, 1, candidates).is_ready());
+    GGML_ASSERT(allocation_count.load(std::memory_order_relaxed) == allocations_before);
 }
 
 void assert_bundle_slot_matches(
@@ -842,6 +1065,644 @@ void test_cancelling_speculative_retry_attempts_all_demands_before_wait() {
     provider.reset();
     GGML_ASSERT(transport.shutdown());
     GGML_ASSERT(scheduler.shutdown());
+}
+
+void test_predictive_runtime_late_join_same_generation() {
+    tensor_fixture tensors;
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+
+    llm_expert_scheduler scheduler({
+        1, 4, 16, 2, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 2, 2,
+    });
+    GGML_ASSERT(!source_file.bundles[2].empty());
+    gated_async_reader reader(
+        source_file.bytes, source_file.bundles[2].front().file_offset);
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 2;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    async_config.read_override_for_testing = &reader;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(handle_count == handles.size());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+
+    auto provider = llm_create_cold_cache_expert_weight_provider(
+        predictive_static_config(storage, transport, scheduler));
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+
+    const int32_t first_ids[] = { 0, 1 };
+    int32_t first_execution[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, first_ids, 2, first_execution).is_ready());
+    GGML_ASSERT(first_execution[0] != first_execution[1]);
+    auto scheduler_diagnostics = scheduler.diagnostics();
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(scheduler_diagnostics.active_speculative_flights == 2);
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 2);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 2);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace.size() == 2);
+
+    const int32_t second_ids[] = { 2, 3 };
+    int32_t second_execution[] = { -1, -1 };
+    auto remap = std::async(std::launch::async, [&] {
+        return provider->remap_checkpoint(
+            binding, second_ids, 2, second_execution);
+    });
+    bool joined_both = false;
+    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+        if (scheduler.diagnostics().demand_promotions == 2) {
+            joined_both = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    GGML_ASSERT(joined_both);
+    reader.release.store(true, std::memory_order_release);
+    GGML_ASSERT(remap.get().is_ready());
+    GGML_ASSERT(second_execution[0] != second_execution[1]);
+
+    diagnostics = provider->hot_cache_diagnostics();
+    scheduler_diagnostics = scheduler.diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 4);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 2);
+    GGML_ASSERT(diagnostics.phase10_predictions_rejected == 2);
+    GGML_ASSERT(diagnostics.phase10_late_joined == 2);
+    GGML_ASSERT(diagnostics.phase10_timely_useful == 0);
+    GGML_ASSERT(diagnostics.phase10_prediction_events_dropped == 0);
+    GGML_ASSERT(!diagnostics.phase10_circuit_open);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[0].outcome ==
+        llm_expert_prefetch_outcome::late_joined);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[1].outcome ==
+        llm_expert_prefetch_outcome::late_joined);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[0].demand_claimed &&
+        diagnostics.phase10_prediction_trace[1].demand_claimed);
+    GGML_ASSERT(scheduler_diagnostics.demand_promotions == 2);
+
+    plan.reset();
+    GGML_ASSERT(scheduler.diagnostics().active_requests == 0);
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.shutdown());
+}
+
+void test_predictive_request_end_cancels_and_drains_storage() {
+    tensor_fixture tensors;
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+    llm_expert_scheduler scheduler({
+        1, 4, 16, 2, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 2, 2,
+    });
+    GGML_ASSERT(!source_file.bundles[2].empty());
+    gated_async_reader reader(
+        source_file.bytes, source_file.bundles[2].front().file_offset);
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 2;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    async_config.read_override_for_testing = &reader;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+    auto provider = llm_create_cold_cache_expert_weight_provider(
+        predictive_static_config(storage, transport, scheduler));
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 2, execution_ids).is_ready());
+    GGML_ASSERT(scheduler.diagnostics().active_speculative_flights == 2);
+
+    auto reset = std::async(std::launch::async, [&] {
+        plan.reset();
+        GGML_ASSERT(provider->end_prefetch_sequence(UINT64_MAX).is_ready());
+    });
+    for (uint32_t attempt = 0; attempt < 100000; ++attempt) std::this_thread::yield();
+    reader.release.store(true, std::memory_order_release);
+    reset.get();
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_wasted_unused == 2);
+    GGML_ASSERT(diagnostics.phase10_prediction_events_dropped == 0);
+    GGML_ASSERT(scheduler.diagnostics().active_requests == 0);
+    GGML_ASSERT(transport.diagnostics().active_read_requests == 0);
+    GGML_ASSERT(transport.diagnostics().read_requests_cancelled != 0);
+
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.shutdown());
+}
+
+void run_predictive_host_ready_hybrid_consumption(bool automatic) {
+    tensor_fixture tensors;
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+    llm_expert_scheduler scheduler({
+        1, 4, 16, 2, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 2, 2,
+    });
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 2;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+    auto config = predictive_static_config(storage, transport, scheduler);
+    config.miss_policy = automatic ?
+        LLAMA_EXPERT_MISS_POLICY_AUTO : LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
+    if (automatic) {
+        config.auto_cost_model = {
+            LLAMA_EXPERT_AUTO_COST_MODEL_VERSION_1,
+            sizeof(llama_expert_auto_cost_model),
+            1, 1, 1, 1,
+            UINT64_C(1000000000), UINT64_C(1000000000),
+            UINT64_C(1000000000), UINT64_C(1000000000),
+            UINT64_C(1000000000), 1, 1,
+        };
+        config.auto_cost_model_digest = UINT64_C(1469598103934665603);
+        const auto * bytes = reinterpret_cast<const uint8_t *>(&config.auto_cost_model);
+        for (size_t index = 0; index < sizeof(config.auto_cost_model); ++index) {
+            config.auto_cost_model_digest ^= bytes[index];
+            config.auto_cost_model_digest *= UINT64_C(1099511628211);
+        }
+    }
+    auto provider = llm_create_cold_cache_expert_weight_provider(config);
+    auto binding = initialize_hot_binding(*provider, tensors);
+    binding = {};
+    ggml_init_params graph_params = { ggml_tensor_overhead()*32, nullptr, true };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    GGML_ASSERT(graph_ctx);
+    GGML_ASSERT(provider->bind_graph(
+        graph_ctx.get(), tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    ggml_backend_buffer_ptr graph_buffer(
+        ggml_backend_alloc_ctx_tensors_from_buft(
+            graph_ctx.get(), ggml_backend_cpu_buffer_type()));
+    GGML_ASSERT(graph_buffer);
+    GGML_ASSERT(binding.hybrid && binding.checkpoint_ids != nullptr &&
+        binding.cpu_execution_ids != nullptr);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t first_ids[] = { 0, 1 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, first_ids, 0, sizeof(first_ids));
+    GGML_ASSERT(provider->remap_checkpoint_tensor(binding).is_ready());
+    bool predictions_read = false;
+    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+        if (transport.diagnostics().read_requests_completed >= 2) {
+            predictions_read = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    GGML_ASSERT(predictions_read);
+    const int32_t second_ids[] = { 2, 3 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, second_ids, 0, sizeof(second_ids));
+    GGML_ASSERT(provider->remap_checkpoint_tensor(binding).is_ready());
+    std::array<int32_t, 2> gpu_ids{};
+    std::array<int32_t, 2> cpu_ids{};
+    ggml_backend_tensor_get(binding.checkpoint_ids, gpu_ids.data(), 0, sizeof(gpu_ids));
+    ggml_backend_tensor_get(binding.cpu_execution_ids, cpu_ids.data(), 0, sizeof(cpu_ids));
+    GGML_ASSERT(gpu_ids[0] == -1 && gpu_ids[1] == -1);
+    GGML_ASSERT(cpu_ids[0] >= 0 && cpu_ids[1] >= 0 && cpu_ids[0] != cpu_ids[1]);
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 4);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 2);
+    GGML_ASSERT(diagnostics.phase10_predictions_rejected == 2);
+    GGML_ASSERT(diagnostics.phase10_timely_useful == 2);
+    GGML_ASSERT(diagnostics.phase10_late_joined == 0);
+    GGML_ASSERT(diagnostics.cpu_execution_lanes == 4);
+    GGML_ASSERT(diagnostics.gpu_execution_lanes == 0);
+    GGML_ASSERT((diagnostics.auto_cpu_decisions > 0) == automatic);
+    GGML_ASSERT(diagnostics.auto_gpu_decisions == 0);
+    GGML_ASSERT(scheduler.diagnostics().demand_promotions == 0);
+
+    plan.reset();
+    GGML_ASSERT(scheduler.diagnostics().active_requests == 0);
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    graph_buffer.reset();
+    graph_ctx.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.shutdown());
+}
+
+void test_predictive_device_readiness_rejects_eventless_transport() {
+    tensor_fixture tensors;
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+    llm_expert_scheduler scheduler({
+        1, 4, 16, 2, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 2, 2,
+    });
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 4;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+    auto provider = llm_create_cold_cache_expert_weight_provider(
+        predictive_static_config(storage, transport, scheduler,
+            LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY, 4));
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+
+    const int32_t first_ids[] = { 0, 1 };
+    int32_t first_execution[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, first_ids, 2, first_execution).is_ready());
+    bool predictions_read = false;
+    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+        if (transport.diagnostics().read_requests_completed >= 4) {
+            predictions_read = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    GGML_ASSERT(predictions_read);
+
+    const int32_t second_ids[] = { 2, 3 };
+    int32_t second_execution[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, second_ids, 2, second_execution).is_ready());
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 4);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 2);
+    GGML_ASSERT(diagnostics.phase10_predictions_rejected == 4);
+    GGML_ASSERT(diagnostics.phase10_timely_useful == 0);
+    GGML_ASSERT(diagnostics.phase10_late_joined == 0);
+    GGML_ASSERT(!diagnostics.phase10_circuit_open);
+    GGML_ASSERT(!diagnostics.phase10_prediction_trace[0].device_ready &&
+        !diagnostics.phase10_prediction_trace[1].device_ready);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[0].outcome ==
+        llm_expert_prefetch_outcome::rejected);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[1].outcome ==
+        llm_expert_prefetch_outcome::rejected);
+    GGML_ASSERT(scheduler.diagnostics().demand_promotions == 0);
+    GGML_ASSERT(second_execution[0] != second_execution[1]);
+
+    plan.reset();
+    GGML_ASSERT(scheduler.diagnostics().active_requests == 0);
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.shutdown());
+}
+
+void test_predictive_hot_expiry_and_deterministic_circuit() {
+    tensor_fixture tensors;
+    auto provider = llm_create_hot_cache_expert_weight_provider(
+        predictive_hot_circuit_config());
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1 };
+    int32_t execution_ids[] = { -1, -1 };
+
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 2, execution_ids).is_ready());
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 2);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 2);
+    GGML_ASSERT(diagnostics.phase10_wasted_unused == 0);
+    GGML_ASSERT(find_slot(diagnostics, 2) >= 0 && find_slot(diagnostics, 3) >= 0);
+
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 2, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 4);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 4);
+    GGML_ASSERT(diagnostics.phase10_wasted_unused == 2);
+    GGML_ASSERT(!diagnostics.phase10_circuit_open);
+    GGML_ASSERT(find_slot(diagnostics, 2) >= 0 && find_slot(diagnostics, 3) >= 0);
+
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 2, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 4);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 4);
+    GGML_ASSERT(diagnostics.phase10_wasted_unused == 4);
+    GGML_ASSERT(diagnostics.phase10_circuit_open);
+    GGML_ASSERT(diagnostics.phase10_circuit_opens == 1);
+    GGML_ASSERT(find_slot(diagnostics, 2) < 0 && find_slot(diagnostics, 3) < 0);
+    GGML_ASSERT(find_slot(diagnostics, 0) >= 0 && find_slot(diagnostics, 1) >= 0);
+
+    plan.reset();
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+}
+
+void test_predictive_circuit_cancels_future_layer_work() {
+    std::array<tensor_fixture, 3> tensors;
+    auto provider = llm_create_hot_cache_expert_weight_provider(
+        predictive_hot_multilayer_circuit_config());
+    std::array<llm_expert_graph_binding, 3> bindings;
+    for (int32_t layer = 0; layer < 3; ++layer) {
+        GGML_ASSERT(provider->bind(
+            tensors[layer].bundle(layer), tensors[layer].selection(layer),
+            bindings[layer]).is_ready());
+        GGML_ASSERT(bindings[layer].bootstrap);
+        bindings[layer] = {};
+    }
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+    std::vector<llm_expert_graph_binding> prepared;
+    prepared.reserve(bindings.size());
+    for (int32_t layer = 0; layer < 3; ++layer) {
+        GGML_ASSERT(provider->bind(
+            tensors[layer].bundle(layer), tensors[layer].selection(layer),
+            bindings[layer]).is_ready());
+        prepared.push_back(bindings[layer]);
+    }
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare(prepared, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1 };
+    int32_t execution_ids[] = { -1, -1 };
+    for (int32_t layer = 0; layer < 3; ++layer) {
+        GGML_ASSERT(provider->remap_checkpoint(
+            bindings[layer], logical_ids, 2, execution_ids).is_ready());
+    }
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 6);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 6);
+
+    GGML_ASSERT(provider->remap_checkpoint(
+        bindings[0], logical_ids, 2, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_wasted_unused == 2);
+    GGML_ASSERT(!diagnostics.phase10_circuit_open);
+    GGML_ASSERT(provider->remap_checkpoint(
+        bindings[1], logical_ids, 2, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_wasted_unused == 4);
+    GGML_ASSERT(diagnostics.phase10_cancelled_drained == 2);
+    GGML_ASSERT(diagnostics.phase10_circuit_open);
+    GGML_ASSERT(diagnostics.phase10_circuit_opens == 1);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[4].outcome ==
+        llm_expert_prefetch_outcome::cancelled_drained);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[5].outcome ==
+        llm_expert_prefetch_outcome::cancelled_drained);
+    GGML_ASSERT(diagnostics.slots[
+        diagnostics.phase10_prediction_trace[4].hot_slot].state ==
+        llm_hot_cache_diagnostics::slot::free);
+    GGML_ASSERT(diagnostics.slots[
+        diagnostics.phase10_prediction_trace[5].hot_slot].state ==
+        llm_hot_cache_diagnostics::slot::free);
+    GGML_ASSERT(provider->remap_checkpoint(
+        bindings[2], logical_ids, 2, execution_ids).is_ready());
+    GGML_ASSERT(provider->hot_cache_diagnostics().phase10_prediction_events == 6);
+
+    plan.reset();
+    prepared.clear();
+    bindings = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+}
+
+void test_predictive_trace_overflow_disables_prediction() {
+    tensor_fixture tensors;
+    auto config = predictive_hot_circuit_config();
+    config.trace_capacity = 2;
+    config.prefetch_config.value.utility_window_predictions = 8;
+    config.prefetch_profile.costs.front().utility_window_predictions = 8;
+    auto provider = llm_create_hot_cache_expert_weight_provider(config);
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t first_ids[] = { 0, 1 };
+    const int32_t second_ids[] = { 2, 3 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, first_ids, 2, execution_ids).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, second_ids, 2, execution_ids).is_ready());
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 3);
+    GGML_ASSERT(diagnostics.phase10_prediction_events_dropped == 1);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace.size() == 2);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 2);
+    GGML_ASSERT(diagnostics.phase10_timely_useful == 2);
+    GGML_ASSERT(diagnostics.phase10_circuit_open);
+    GGML_ASSERT(diagnostics.phase10_circuit_opens == 1);
+    plan.reset();
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+}
+
+void test_predictive_hot_slot_budget_saturation() {
+    tensor_fixture tensors;
+    auto config = predictive_hot_circuit_config();
+    config.prefetch_config.value.max_speculative_flights = 1;
+    config.prefetch_config.value.max_speculative_hot_slots = 1;
+    config.prefetch_config.value.utility_window_predictions = 8;
+    config.prefetch_profile.costs.front().utility_window_predictions = 8;
+    auto provider = llm_create_hot_cache_expert_weight_provider(config);
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 2, execution_ids).is_ready());
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 2);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 1);
+    GGML_ASSERT(diagnostics.phase10_predictions_rejected == 1);
+    GGML_ASSERT(find_slot(diagnostics, 2) >= 0);
+    GGML_ASSERT(find_slot(diagnostics, 3) < 0);
+    plan.reset();
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+}
+
+void test_predictive_cross_layer_router_trigger_and_prefill_exclusion() {
+    tensor_fixture layer_zero;
+    tensor_fixture layer_one;
+    auto provider = llm_create_hot_cache_expert_weight_provider(
+        predictive_hot_cross_config());
+    llm_expert_graph_binding binding_zero;
+    llm_expert_graph_binding binding_one;
+    GGML_ASSERT(provider->bind(
+        layer_zero.bundle(0), layer_zero.selection(0), binding_zero).is_ready());
+    GGML_ASSERT(provider->bind(
+        layer_one.bundle(1), layer_one.selection(1), binding_one).is_ready());
+    GGML_ASSERT(binding_zero.bootstrap && binding_one.bootstrap);
+    binding_zero = {};
+    binding_one = {};
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+    GGML_ASSERT(provider->bind(
+        layer_zero.bundle(0), layer_zero.selection(0), binding_zero).is_ready());
+    GGML_ASSERT(provider->bind(
+        layer_one.bundle(1), layer_one.selection(1), binding_one).is_ready());
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding_zero, binding_one }, plan).is_ready());
+
+    const int32_t source_ids[] = { 1, 0 };
+    int32_t source_execution[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding_zero, source_ids, 2, source_execution).is_ready());
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 2);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 2);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[0].trigger ==
+        llm_expert_prefetch_trigger::router_result);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[1].trigger ==
+        llm_expert_prefetch_trigger::router_result);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[0].key.layer == 1 &&
+        diagnostics.phase10_prediction_trace[0].key.expert == 2);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[1].key.layer == 1 &&
+        diagnostics.phase10_prediction_trace[1].key.expert == 3);
+
+    const int32_t target_ids[] = { 2, 3 };
+    int32_t target_execution[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding_one, target_ids, 2, target_execution).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 2);
+    GGML_ASSERT(diagnostics.phase10_timely_useful == 2);
+    GGML_ASSERT(target_execution[0] ==
+        int32_t(diagnostics.phase10_prediction_trace[0].hot_slot));
+    GGML_ASSERT(target_execution[1] ==
+        int32_t(diagnostics.phase10_prediction_trace[1].hot_slot));
+    plan.reset();
+    binding_zero = {};
+    binding_one = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+
+    tensor_fixture prefill(8, 16, 4, 2, 2);
+    auto prefill_provider = llm_create_hot_cache_expert_weight_provider(
+        predictive_hot_circuit_config());
+    auto prefill_binding = initialize_hot_binding(*prefill_provider, prefill);
+    GGML_ASSERT(prefill_provider->prepare({ prefill_binding }, plan).is_ready());
+    const int32_t prefill_ids[] = { 0, 1, 0, 1 };
+    int32_t prefill_execution[] = { -1, -1, -1, -1 };
+    GGML_ASSERT(prefill_provider->remap_checkpoint(
+        prefill_binding, prefill_ids, 4, prefill_execution).is_ready());
+    diagnostics = prefill_provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 0);
+    GGML_ASSERT(diagnostics.phase10_predictions_admitted == 0);
+    plan.reset();
+    prefill_binding = {};
+    GGML_ASSERT(prefill_provider->trim().is_ready());
+    GGML_ASSERT(prefill_provider->surrender().is_ready());
+}
+
+void test_predictive_reversed_layer_callbacks_are_canonical() {
+    tensor_fixture layer_zero;
+    tensor_fixture layer_one;
+    auto provider = llm_create_hot_cache_expert_weight_provider(
+        predictive_hot_cross_config());
+    llm_expert_graph_binding bindings[2];
+    GGML_ASSERT(provider->bind(
+        layer_zero.bundle(0), layer_zero.selection(0), bindings[0]).is_ready());
+    GGML_ASSERT(provider->bind(
+        layer_one.bundle(1), layer_one.selection(1), bindings[1]).is_ready());
+    bindings[0] = {};
+    bindings[1] = {};
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+    GGML_ASSERT(provider->bind(
+        layer_zero.bundle(0), layer_zero.selection(0), bindings[0]).is_ready());
+    GGML_ASSERT(provider->bind(
+        layer_one.bundle(1), layer_one.selection(1), bindings[1]).is_ready());
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ bindings[0], bindings[1] }, plan).is_ready());
+
+    const int32_t source_ids[] = { 1, 0 };
+    const int32_t target_ids[] = { 3, 2 };
+    int32_t execution_ids[] = { -1, -1 };
+    for (uint64_t token = 0; token < 2; ++token) {
+        GGML_ASSERT(provider->remap_checkpoint(
+            bindings[1], target_ids, 2, execution_ids).is_ready());
+        if (token == 0) {
+            const auto before_prefix = provider->hot_cache_diagnostics();
+            GGML_ASSERT(before_prefix.phase10_route_events == 0);
+            GGML_ASSERT(before_prefix.phase10_prediction_events == 0);
+        }
+        GGML_ASSERT(provider->remap_checkpoint(
+            bindings[0], source_ids, 2, execution_ids).is_ready());
+    }
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(!diagnostics.phase10_runtime_failed);
+    GGML_ASSERT(diagnostics.phase10_route_events == 4);
+    GGML_ASSERT(diagnostics.phase10_prediction_events == 4);
+    GGML_ASSERT(diagnostics.phase10_route_trace.size() == 4);
+    for (size_t index = 0; index < diagnostics.phase10_route_trace.size(); ++index) {
+        GGML_ASSERT(diagnostics.phase10_route_trace[index].token == index/2);
+        GGML_ASSERT(diagnostics.phase10_route_trace[index].layer == int32_t(index%2));
+    }
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[0].trigger ==
+        llm_expert_prefetch_trigger::router_result);
+    GGML_ASSERT(diagnostics.phase10_prediction_trace[0].key.layer == 1);
+
+    plan.reset();
+    bindings[0] = {};
+    bindings[1] = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
 }
 
 void test_exact_issue_ahead_and_serial_evidence_control() {
@@ -2021,6 +2882,7 @@ void test_cuda_directory_copy() {
 
 int main(int argc, char ** argv) {
     test_runtime_policy_adapters_and_bounded_metadata();
+    test_predictor_runtime_has_no_heap_allocations();
     test_initialization_stage_and_descriptor_only_scale();
     test_configuration_matrix();
     test_context_extent_matrix_and_prepare_revalidation();
@@ -2040,6 +2902,17 @@ int main(int argc, char ** argv) {
     test_blocking_cold_seed_uses_storage_ring_and_ordinary_lru();
     test_exact_issue_ahead_and_serial_evidence_control();
     test_cancelling_speculative_retry_attempts_all_demands_before_wait();
+    test_predictive_runtime_late_join_same_generation();
+    test_predictive_request_end_cancels_and_drains_storage();
+    run_predictive_host_ready_hybrid_consumption(false);
+    run_predictive_host_ready_hybrid_consumption(true);
+    test_predictive_device_readiness_rejects_eventless_transport();
+    test_predictive_hot_expiry_and_deterministic_circuit();
+    test_predictive_circuit_cancels_future_layer_work();
+    test_predictive_trace_overflow_disables_prediction();
+    test_predictive_hot_slot_budget_saturation();
+    test_predictive_cross_layer_router_trigger_and_prefill_exclusion();
+    test_predictive_reversed_layer_callbacks_are_canonical();
     test_exact_demand_joins_submitted_same_generation_with_ready_cold_data();
     test_hot_speculative_victim_deadline_utility_slot_order();
     if (argc == 2) {

@@ -237,6 +237,9 @@ public:
             llm_expert_async_read_completion & completion,
             bool (*abort_callback)(void *) = nullptr,
             void * abort_callback_data = nullptr) noexcept;
+    llm_expert_async_result poll_read(
+            llm_expert_request_handle request,
+            llm_expert_async_read_completion & completion) noexcept;
     llm_expert_async_result wait_any_read(
             const llm_expert_request_handle * requests,
             size_t request_count,

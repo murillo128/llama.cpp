@@ -491,6 +491,15 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
     synchronize();
+    if (expert_weight_provider) {
+        const auto ended = expert_weight_provider->end_prefetch_sequence(
+            uint64_t(reinterpret_cast<uintptr_t>(this)));
+        if (!ended.is_ready()) {
+            LLAMA_LOG_ERROR("%s: expert prefetch sequence end failed (status=%d error=%d)\n",
+                __func__, int(ended.status), int(ended.error));
+        }
+        GGML_ASSERT(ended.is_ready());
+    }
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1933,9 +1942,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (expert_weight_provider) {
         GGML_ASSERT(expert_plans);
-        auto provider_result = expert_weight_provider->prepare(res->get_expert_bindings(), expert_plans->pending);
+        bool sequence_start = false;
+        for (uint32_t index = 0; index < ubatch.n_tokens; ++index) {
+            sequence_start = sequence_start || ubatch.pos[index] == 0;
+        }
+        auto provider_result = expert_weight_provider->prepare(
+            res->get_expert_bindings(), expert_plans->pending,
+            uint64_t(reinterpret_cast<uintptr_t>(this)), sequence_start);
         if (!provider_result.is_ready()) {
-            LLAMA_LOG_ERROR("%s: expert-weight provider request preparation failed\n", __func__);
+            LLAMA_LOG_ERROR("%s: expert-weight provider request preparation failed (status=%d error=%d)\n",
+                __func__, int(provider_result.status), int(provider_result.error));
             expert_plans->pending.reset();
             ret = provider_result.status == llm_expert_provider_status::allocation_failed ? GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
             return nullptr;
@@ -1954,7 +1970,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (!expert_eval_result.is_ready()) {
-        LLAMA_LOG_ERROR("%s: expert hot-cache remap checkpoint failed\n", __func__);
+        LLAMA_LOG_ERROR("%s: expert hot-cache remap checkpoint failed (status=%d error=%d)\n",
+            __func__, int(expert_eval_result.status), int(expert_eval_result.error));
         ggml_backend_sched_synchronize(sched.get());
         expert_plans->pending.reset();
         expert_plans->inflight.reset();

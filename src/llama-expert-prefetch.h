@@ -185,9 +185,20 @@ public:
     const llm_expert_prefetch_request_state & state() const noexcept { return request; }
 
 private:
+    struct temporal_score {
+        uint64_t count = 0;
+        uint64_t recency = 0;
+    };
+
     const llm_expert_prefetch_profile * profile = nullptr;
     llm_expert_prefetch_config_internal config;
     llm_expert_prefetch_request_state request;
+    size_t history_count = 0;
+    size_t history_next = 0;
+    mutable std::vector<temporal_score> temporal_scores;
+    mutable std::vector<int32_t> eligible_scratch;
+    mutable std::vector<int32_t> source_scratch;
+    mutable std::vector<uint64_t> cross_scores;
 };
 
 llm_expert_prefetch_result llm_expert_prefetch_break_even(

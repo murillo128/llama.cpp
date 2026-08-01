@@ -96,7 +96,9 @@ public:
 
     llm_expert_provider_result prepare(
             const std::vector<llm_expert_graph_binding> &,
-            llm_expert_execution_plan &) noexcept override {
+            llm_expert_execution_plan &,
+            uint64_t,
+            bool) noexcept override {
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
 
@@ -304,6 +306,49 @@ void test_worker_read_and_drain() {
     GGML_ASSERT(diagnostics.active_read_requests == 0);
     GGML_ASSERT(std::fclose(file) == 0);
 #endif
+}
+
+void test_nonblocking_read_poll() {
+    scripted_async_reader reader;
+    reader.actions = { scripted_async_reader::action::block_then_would_block };
+    auto cfg = config(8);
+    cfg.read_override_for_testing = &reader;
+    llm_expert_async_transport transport(cfg);
+    std::array<uint8_t, 8> destination{};
+    llm_expert_storage_read_operation read;
+    read.native_handle = 17;
+    read.file_offset = 0;
+    read.byte_count = destination.size();
+    read.segment_count = 1;
+    read.segments[0] = { destination.data(), destination.size(), 0,
+        llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+    const llm_expert_async_operation_identity identity = {
+        1, { 0, 2 }, 0, { 0, 4 }, llm_expert_readiness::host_ready,
+        llm_expert_priority::prefetch_next,
+    };
+    GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) ==
+        llm_expert_async_result::ready);
+    {
+        std::unique_lock<std::mutex> lock(reader.mutex);
+        reader.condition.wait(lock, [&] { return reader.entered; });
+    }
+    llm_expert_async_read_completion completion;
+    GGML_ASSERT(transport.poll_read(identity.request, completion) ==
+        llm_expert_async_result::busy);
+    {
+        std::lock_guard<std::mutex> lock(reader.mutex);
+        reader.released = true;
+        reader.condition.notify_all();
+    }
+    llm_expert_async_result result = llm_expert_async_result::busy;
+    for (uint32_t attempt = 0; attempt < 100000 && result == llm_expert_async_result::busy; ++attempt) {
+        result = transport.poll_read(identity.request, completion);
+        std::this_thread::yield();
+    }
+    GGML_ASSERT(result == llm_expert_async_result::ready);
+    GGML_ASSERT(completion.bytes_completed == destination.size());
+    GGML_ASSERT(std::memcmp(destination.data(), reader.bytes.data(), destination.size()) == 0);
+    GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
 }
 
 void test_deferred_multi_request_ring_batch() {
@@ -909,6 +954,7 @@ int main() {
     test_bounded_trace_and_shutdown();
     test_generation_exhaustion();
     test_worker_read_and_drain();
+    test_nonblocking_read_poll();
     test_deferred_multi_request_ring_batch();
     test_partial_ring_submission_falls_back_after_quiescence();
     test_file_registration_or_explicit_fallback();

@@ -1247,81 +1247,10 @@ void llama_model::init_expert_weight_provider() {
                 (params.expert_prefetch_config->policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF ||
                  params.expert_prefetch_config->seed_mode != LLAMA_EXPERT_PREFETCH_SEED_MODE_OFF);
             if (prefetch_active) {
-                if (!pimpl->has_authoritative_file_backing || pimpl->source_files.empty()) {
-                    throw std::invalid_argument("expert prefetch requires authoritative source identity");
+                const llm_expert_prefetch_fingerprint expected = expert_prefetch_fingerprint();
+                if (expected.routed_layers != routed_layers) {
+                    throw std::logic_error("expert prefetch routed-layer fingerprint mismatch");
                 }
-                llm_expert_prefetch_fingerprint expected;
-                expected.layer_count = uint32_t(layers.size());
-                expected.routed_layers = routed_layers;
-                expected.experts_per_layer = uint32_t(hparams.n_expert);
-                expected.experts_per_token = uint32_t(hparams.n_expert_used);
-                std::ostringstream package_identity;
-                for (uint32_t index = 0; index < pimpl->source_files.size(); ++index) {
-                    const auto & source = pimpl->source_files[index];
-                    std::string digest;
-                    if (!llm_expert_prefetch_sha256_file(source.identity, source.size, digest).is_ready()) {
-                        throw std::invalid_argument("unable to hash expert prefetch source file");
-                    }
-                    const size_t separator = source.identity.find_last_of("/\\");
-                    const std::string name = separator == std::string::npos ? source.identity : source.identity.substr(separator + 1);
-                    expected.files.push_back({ index, name, source.size, digest });
-                    package_identity << index << ':' << name.size() << ':' << name << ':' << source.size << ':' << digest << '\n';
-                }
-                std::vector<const impl::tensor_storage *> layout_tensors;
-                auto expert_axis = [&](const impl::tensor_storage & tensor) {
-                    for (int axis = int(tensor.n_dims) - 1; axis >= 0; --axis) {
-                        if (tensor.ne[axis] != hparams.n_expert) continue;
-                        bool upper_unit = true;
-                        for (uint32_t upper = uint32_t(axis + 1); upper < tensor.n_dims; ++upper) {
-                            if (tensor.ne[upper] != 1) upper_unit = false;
-                        }
-                        if (upper_unit) return axis;
-                    }
-                    return -1;
-                };
-                for (int32_t layer : routed_layers) {
-                    const std::string prefix = "blk." + std::to_string(layer) + ".";
-                    uint64_t payload_bytes = 0;
-                    for (const auto & item : pimpl->tensor_storage_by_name) {
-                        const auto & name = item.first;
-                        const auto & tensor = item.second;
-                        if (name.compare(0, prefix.size(), prefix) != 0 || name.find("ffn_") == std::string::npos ||
-                            name.find("_exps") == std::string::npos) continue;
-                        const int axis = expert_axis(tensor);
-                        if (axis < 0 || tensor.nb[axis] == 0 || tensor.nb[axis] > UINT64_MAX - payload_bytes) {
-                            throw std::invalid_argument("invalid expert prefetch tensor layout");
-                        }
-                        payload_bytes += tensor.nb[axis];
-                        layout_tensors.push_back(&tensor);
-                    }
-                    if (payload_bytes == 0) throw std::invalid_argument("empty expert prefetch byte map");
-                    for (uint32_t expert = 0; expert < uint32_t(hparams.n_expert); ++expert) {
-                        expected.expert_bytes.push_back({ layer, int32_t(expert), payload_bytes, payload_bytes });
-                    }
-                }
-                std::ostringstream layout;
-                layout << expected.layer_count << ':' << expected.experts_per_layer << ':' << expected.experts_per_token << '\n';
-                for (int32_t layer : expected.routed_layers) layout << layer << ',';
-                layout << '\n';
-                for (const auto & key : expected.expert_bytes) {
-                    layout << key.layer << ':' << key.expert << ':' << key.payload_bytes << '\n';
-                }
-                std::sort(layout_tensors.begin(), layout_tensors.end(), [](const auto * lhs, const auto * rhs) {
-                    return lhs->name < rhs->name;
-                });
-                for (const auto * tensor : layout_tensors) {
-                    layout << tensor->name.size() << ':' << tensor->name << ':' << uint32_t(tensor->type) << ':'
-                           << tensor->source_file_index << ':' << tensor->alignment << ':' << tensor->byte_size << '\n';
-                    for (uint32_t axis = 0; axis < GGML_MAX_DIMS; ++axis) layout << tensor->ne[axis] << ',';
-                    layout << '\n';
-                    for (uint32_t axis = 0; axis < GGML_MAX_DIMS; ++axis) layout << tensor->nb[axis] << ',';
-                    layout << '\n';
-                }
-                const std::string layout_text = layout.str();
-                expected.tensor_layout_sha256 = llm_expert_prefetch_sha256(layout_text.data(), layout_text.size());
-                package_identity << expected.tensor_layout_sha256 << '\n';
-                const std::string package_text = package_identity.str();
-                expected.package_sha256 = llm_expert_prefetch_sha256(package_text.data(), package_text.size());
                 llm_expert_prefetch_profile loaded;
                 std::string error;
                 const auto profile_result = llm_expert_prefetch_load_profile(
@@ -1805,6 +1734,95 @@ int32_t llama_model::tensor_storage_metadata(const char * name, struct llama_mod
     metadata->runtime_backend_transform = storage.runtime_backend_transform;
     metadata->runtime_repack = storage.runtime_repack;
     return LLAMA_MODEL_STORAGE_STATUS_OK;
+}
+
+llm_expert_prefetch_fingerprint llama_model::expert_prefetch_fingerprint() const {
+    if (!pimpl->has_authoritative_file_backing || pimpl->source_files.empty()) {
+        throw std::invalid_argument("expert prefetch requires authoritative source identity");
+    }
+    if (hparams.n_expert <= 0 || hparams.n_expert_used <= 0) {
+        throw std::invalid_argument("expert prefetch requires routed experts");
+    }
+
+    llm_expert_prefetch_fingerprint result;
+    result.layer_count = uint32_t(layers.size());
+    result.experts_per_layer = uint32_t(hparams.n_expert);
+    result.experts_per_token = uint32_t(hparams.n_expert_used);
+    for (uint32_t layer = 0; layer < layers.size(); ++layer) {
+        if (layers[layer].ffn_down_exps != nullptr) result.routed_layers.push_back(int32_t(layer));
+    }
+    if (result.routed_layers.empty()) throw std::invalid_argument("expert prefetch requires routed layers");
+
+    std::ostringstream package_identity;
+    for (uint32_t index = 0; index < pimpl->source_files.size(); ++index) {
+        const auto & source = pimpl->source_files[index];
+        std::string digest;
+        if (!llm_expert_prefetch_sha256_file(source.identity, source.size, digest).is_ready()) {
+            throw std::invalid_argument("unable to hash expert prefetch source file");
+        }
+        const size_t separator = source.identity.find_last_of("/\\");
+        const std::string name = separator == std::string::npos ? source.identity : source.identity.substr(separator + 1);
+        result.files.push_back({ index, name, source.size, digest });
+        package_identity << index << ':' << name.size() << ':' << name << ':' << source.size << ':' << digest << '\n';
+    }
+
+    std::vector<const impl::tensor_storage *> layout_tensors;
+    const auto expert_axis = [&](const impl::tensor_storage & tensor) {
+        for (int axis = int(tensor.n_dims) - 1; axis >= 0; --axis) {
+            if (tensor.ne[axis] != hparams.n_expert) continue;
+            bool upper_unit = true;
+            for (uint32_t upper = uint32_t(axis + 1); upper < tensor.n_dims; ++upper) {
+                if (tensor.ne[upper] != 1) upper_unit = false;
+            }
+            if (upper_unit) return axis;
+        }
+        return -1;
+    };
+    for (int32_t layer : result.routed_layers) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        uint64_t payload_bytes = 0;
+        for (const auto & item : pimpl->tensor_storage_by_name) {
+            const auto & name = item.first;
+            const auto & tensor = item.second;
+            if (name.compare(0, prefix.size(), prefix) != 0 || name.find("ffn_") == std::string::npos ||
+                    name.find("_exps") == std::string::npos) continue;
+            const int axis = expert_axis(tensor);
+            if (axis < 0 || tensor.nb[axis] == 0 || tensor.nb[axis] > UINT64_MAX - payload_bytes) {
+                throw std::invalid_argument("invalid expert prefetch tensor layout");
+            }
+            payload_bytes += tensor.nb[axis];
+            layout_tensors.push_back(&tensor);
+        }
+        if (payload_bytes == 0) throw std::invalid_argument("empty expert prefetch byte map");
+        for (uint32_t expert = 0; expert < result.experts_per_layer; ++expert) {
+            result.expert_bytes.push_back({ layer, int32_t(expert), payload_bytes, payload_bytes });
+        }
+    }
+
+    std::ostringstream layout;
+    layout << result.layer_count << ':' << result.experts_per_layer << ':' << result.experts_per_token << '\n';
+    for (int32_t layer : result.routed_layers) layout << layer << ',';
+    layout << '\n';
+    for (const auto & key : result.expert_bytes) {
+        layout << key.layer << ':' << key.expert << ':' << key.payload_bytes << '\n';
+    }
+    std::sort(layout_tensors.begin(), layout_tensors.end(), [](const auto * lhs, const auto * rhs) {
+        return lhs->name < rhs->name;
+    });
+    for (const auto * tensor : layout_tensors) {
+        layout << tensor->name.size() << ':' << tensor->name << ':' << uint32_t(tensor->type) << ':'
+               << tensor->source_file_index << ':' << tensor->alignment << ':' << tensor->byte_size << '\n';
+        for (uint32_t axis = 0; axis < GGML_MAX_DIMS; ++axis) layout << tensor->ne[axis] << ',';
+        layout << '\n';
+        for (uint32_t axis = 0; axis < GGML_MAX_DIMS; ++axis) layout << tensor->nb[axis] << ',';
+        layout << '\n';
+    }
+    const std::string layout_text = layout.str();
+    result.tensor_layout_sha256 = llm_expert_prefetch_sha256(layout_text.data(), layout_text.size());
+    package_identity << result.tensor_layout_sha256 << '\n';
+    const std::string package_text = package_identity.str();
+    result.package_sha256 = llm_expert_prefetch_sha256(package_text.data(), package_text.size());
+    return result;
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {

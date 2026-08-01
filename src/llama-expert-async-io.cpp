@@ -1775,6 +1775,17 @@ llm_expert_async_result llm_expert_async_transport::wait_read(
     return completion.result;
 }
 
+llm_expert_async_result llm_expert_async_transport::poll_read(
+        llm_expert_request_handle handle,
+        llm_expert_async_read_completion & completion) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    const auto * request = pimpl->find_read(handle);
+    if (request == nullptr) return llm_expert_async_result::stale_generation;
+    if (request->state != impl::read_state::complete) return llm_expert_async_result::busy;
+    completion = request->completion;
+    return completion.result;
+}
+
 llm_expert_async_result llm_expert_async_transport::wait_any_read(
         const llm_expert_request_handle * handles,
         size_t handle_count,
