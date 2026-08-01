@@ -82,7 +82,7 @@ json profile_json() {
             {"storage_bytes", 128}, {"h2d_bytes", 128}, {"break_even_bps", 3637},
             {"utility_window_predictions", 8}, {"utility_min_observations", 4}, {"utility_min_timely_successes", 3}}})},
         {"selection", {{"matrix_version", 1}, {"tuning_digest", hash}, {"fold_index", 0},
-            {"candidates_per_target", 2}, {"temporal_window_tokens", 4}, {"readiness", "DEVICE_READY"},
+            {"policy", "TEMPORAL_FREQUENCY"}, {"candidates_per_target", 2}, {"temporal_window_tokens", 4}, {"readiness", "DEVICE_READY"},
             {"transport", "BUFFERED"}, {"break_even_bps", 3637}}},
         {"seed", json::array({{{"layer", 1}, {"expert", 1}, {"count", 9},
             {"payload_bytes", 128}, {"physical_bytes", 160}}})},

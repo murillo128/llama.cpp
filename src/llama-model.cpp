@@ -1332,11 +1332,23 @@ void llama_model::init_expert_weight_provider() {
                     throw std::invalid_argument("invalid expert prefetch profile: " + error);
                 }
                 const auto & config = pimpl->expert_prefetch_config.value;
+                const auto policy_name = [&]() -> const char * {
+                    switch (config.policy) {
+                        case LLAMA_EXPERT_PREFETCH_POLICY_STATIC_LAYER:           return "STATIC_LAYER";
+                        case LLAMA_EXPERT_PREFETCH_POLICY_PREVIOUS_TOKEN:         return "PREVIOUS_TOKEN";
+                        case LLAMA_EXPERT_PREFETCH_POLICY_TEMPORAL_FREQUENCY:     return "TEMPORAL_FREQUENCY";
+                        case LLAMA_EXPERT_PREFETCH_POLICY_CROSS_LAYER_TRANSITION: return "CROSS_LAYER_TRANSITION";
+                        case LLAMA_EXPERT_PREFETCH_POLICY_RANDOM_BASELINE:        return "RANDOM_BASELINE";
+                        case LLAMA_EXPERT_PREFETCH_POLICY_OFF:
+                        case LLAMA_EXPERT_PREFETCH_POLICY_COUNT:                  return "";
+                    }
+                    return "";
+                }();
                 const auto selected_cost = std::find_if(loaded.costs.begin(), loaded.costs.end(), [&](const auto & cost) {
                     return cost.transport == loaded.selected_transport && cost.readiness == loaded.selected_readiness;
                 });
                 if (config.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF &&
-                    (loaded.selected_candidates != config.candidates_per_target ||
+                    (loaded.selected_policy != policy_name || loaded.selected_candidates != config.candidates_per_target ||
                      loaded.selected_readiness != config.readiness ||
                      (config.policy == LLAMA_EXPERT_PREFETCH_POLICY_TEMPORAL_FREQUENCY &&
                       loaded.selected_temporal_window != config.temporal_window_tokens) ||
@@ -1346,7 +1358,8 @@ void llama_model::init_expert_weight_provider() {
                     throw std::invalid_argument("expert prefetch profile selection does not match configuration");
                 }
                 if (config.seed_mode == LLAMA_EXPERT_PREFETCH_SEED_MODE_BLOCKING_HOT &&
-                    loaded.selected_readiness != LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY) {
+                    (loaded.selected_policy != "BLOCKING_HOT" ||
+                     loaded.selected_readiness != LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY)) {
                     throw std::invalid_argument("expert prefetch seed requires a device-ready profile");
                 }
                 pimpl->expert_prefetch_profile = std::move(loaded);

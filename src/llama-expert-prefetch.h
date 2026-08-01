@@ -124,6 +124,7 @@ struct llm_expert_prefetch_profile {
     std::vector<llm_expert_prefetch_seed> seed;
     uint32_t selected_candidates = 0;
     uint32_t selected_temporal_window = 0;
+    std::string selected_policy;
     std::string selected_transport;
     llama_expert_prefetch_readiness selected_readiness = LLAMA_EXPERT_PREFETCH_READINESS_HOST_READY;
     uint32_t selected_break_even_bps = 0;

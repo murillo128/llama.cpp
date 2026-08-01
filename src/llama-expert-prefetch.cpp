@@ -583,19 +583,27 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         }
 
         const auto & selection = document.at("selection");
-        require_fields(selection, { "matrix_version", "tuning_digest", "fold_index", "candidates_per_target",
+        require_fields(selection, { "matrix_version", "tuning_digest", "fold_index", "policy", "candidates_per_target",
             "temporal_window_tokens", "transport", "readiness", "break_even_bps" }, "selection");
         if (uint32_value(selection.at("matrix_version"), "matrix_version") != 1 ||
             !valid_sha256(string_value(selection.at("tuning_digest"), "tuning_digest")) ||
             uint32_value(selection.at("fold_index"), "selection.fold_index") != profile.fold_index) throw std::runtime_error("invalid selection provenance");
+        profile.selected_policy = string_value(selection.at("policy"), "selection.policy");
+        static const std::set<std::string> selected_policies = {
+            "STATIC_LAYER", "PREVIOUS_TOKEN", "TEMPORAL_FREQUENCY", "CROSS_LAYER_TRANSITION",
+            "RANDOM_BASELINE", "BLOCKING_HOT",
+        };
+        if (selected_policies.count(profile.selected_policy) == 0) throw std::runtime_error("invalid selected policy");
         profile.selected_candidates = uint32_value(selection.at("candidates_per_target"), "selection.candidates_per_target");
         profile.selected_temporal_window = uint32_value(selection.at("temporal_window_tokens"), "selection.temporal_window_tokens");
         profile.selected_transport = string_value(selection.at("transport"), "selection.transport");
         profile.selected_readiness = readiness_value(selection.at("readiness"));
         profile.selected_break_even_bps = uint32_value(selection.at("break_even_bps"), "selection.break_even_bps");
         if (profile.selected_candidates == 0 || profile.selected_candidates > profile.target.experts_per_layer ||
-            (profile.selected_temporal_window != 0 && (!is_power_of_two(profile.selected_temporal_window) ||
-                profile.selected_temporal_window < 2 || profile.selected_temporal_window > 64)) ||
+            (profile.selected_policy == "TEMPORAL_FREQUENCY" &&
+                (!is_power_of_two(profile.selected_temporal_window) || profile.selected_temporal_window < 2 ||
+                 profile.selected_temporal_window > 64)) ||
+            (profile.selected_policy != "TEMPORAL_FREQUENCY" && profile.selected_temporal_window != 0) ||
             profile.selected_break_even_bps > 10000) throw std::runtime_error("invalid selected tuning");
         const auto selected_cost = std::find_if(profile.costs.begin(), profile.costs.end(), [&](const auto & cost) {
             return cost.transport == profile.selected_transport && cost.readiness == profile.selected_readiness;
