@@ -421,7 +421,8 @@ model_profile_validation validate_model_profile(
     if (!measure_lead) return result;
 
     const auto * vocab = llama_model_get_vocab(model.get());
-    const std::string prompt_text = "According to all known laws";
+    const std::string prompt_text = profile.target.routed_layers.size() > 8 ? "A" :
+        "According to all known laws";
     const int prompt_count = -llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), nullptr, 0, true, true);
     if (prompt_count <= 0) throw probe_error("lead probe prompt tokenization failed");
     std::vector<llama_token> prompt(prompt_count);
