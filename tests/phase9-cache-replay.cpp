@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -697,11 +698,85 @@ int self_test() {
     return 0;
 }
 
+json benchmark_policy_cpu() {
+    json rows = json::array();
+    const std::vector<int32_t> layers = { 0, 1, 2, 3, 4, 5, 6 };
+    for (const char * name : { "LRU", "LFRU", "SLRU", "LFU_AGING" }) {
+        const json value = { {"slots", 64}, {"config", base_config(name)} };
+        tier_mechanism mechanism(value, llm_expert_cache_policy_tier::cold, layers, 8, 786432);
+        const uint64_t administration = mechanism.policy.diagnostics().administration_actual_bytes;
+        uint64_t demands = 0;
+        uint64_t elapsed = 0;
+        const auto measured = [&](auto && operation) {
+            const auto begin = std::chrono::steady_clock::now();
+            const auto result = operation();
+            elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count();
+            return result;
+        };
+        for (uint64_t request = 0; request < 1000; ++request) {
+            require_ready(measured([&] { return mechanism.policy.request_begin(); }), "benchmark request begin failed");
+            require_ready(measured([&] { return mechanism.policy.phase_transition(llm_expert_cache_policy_phase::decode); }),
+                "benchmark phase transition failed");
+            for (int32_t layer : layers) {
+                for (int32_t lane = 0; lane < 2; ++lane) {
+                    const llm_expert_cache_policy_key key = { layer, int32_t((request + lane + layer*3) % 8) };
+                    require_ready(measured([&] { return mechanism.policy.demand(key, 1, 786432, 786432); }),
+                        "benchmark demand failed");
+                    demands++;
+                    if (mechanism.contains(key)) {
+                        const uint32_t slot = mechanism.mapped_slot(key);
+                        require_ready(measured([&] { return mechanism.policy.hit(slot, mechanism.slots[slot].generation); }),
+                            "benchmark hit failed");
+                        continue;
+                    }
+                    auto candidates = mechanism.candidates(786432);
+                    llm_expert_cache_policy_decision decision;
+                    require_ready(measured([&] { return mechanism.policy.select(key, candidates.data(), candidates.size(), decision); }),
+                        "benchmark select failed");
+                    auto & slot = mechanism.slots[decision.slot];
+                    if (slot.ready) {
+                        require_ready(measured([&] { return mechanism.policy.evict(decision.slot, slot.generation); }),
+                            "benchmark evict failed");
+                        mechanism.mapping.erase({ slot.key.layer, slot.key.expert });
+                    }
+                    slot = { key, slot.generation + 1, 786432, true, false };
+                    require_ready(measured([&] { return mechanism.policy.load_begin(
+                        decision.slot, slot.generation, key, 786432, 786432); }),
+                        "benchmark load begin failed");
+                    require_ready(measured([&] { return mechanism.policy.load_complete(decision.slot, slot.generation); }),
+                        "benchmark load complete failed");
+                    slot.loading = false;
+                    slot.ready = true;
+                    mechanism.mapping[{ key.layer, key.expert }] = decision.slot;
+                }
+            }
+            require_ready(measured([&] { return mechanism.policy.request_end(true, false); }),
+                "benchmark request end failed");
+        }
+        const auto diagnostics = mechanism.policy.diagnostics();
+        require(diagnostics.administration_actual_bytes == administration,
+            "benchmark policy administration changed after initialization");
+        rows.push_back({ {"policy", name}, {"requests", 1000}, {"demands", demands},
+            {"elapsed_ns", elapsed}, {"ns_per_demand", double(elapsed)/demands},
+            {"administration_bytes", administration}, {"steady_state_policy_allocations", 0},
+            {"final_digest", diagnostics.state_digest} });
+    }
+    return { {"schema_version", "phase9-policy-cpu-benchmark-v1"}, {"status", "pass"},
+        {"clock", "steady_clock"}, {"rows", rows} };
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--self-test") return self_test();
+        if (argc == 3 && std::string(argv[1]) == "--benchmark-output") {
+            std::ofstream destination(argv[2]);
+            if (!destination) throw replay_error("cannot open benchmark output");
+            destination << benchmark_policy_cpu().dump(2) << '\n';
+            return destination ? 0 : 1;
+        }
         if (argc == 5 && std::string(argv[1]) == "--input" && std::string(argv[3]) == "--output") {
             std::ifstream source(argv[2]);
             if (!source) throw replay_error("cannot open replay input");
@@ -724,7 +799,7 @@ int main(int argc, char ** argv) {
             destination << output.dump(2) << '\n';
             return destination ? 0 : 1;
         }
-        std::fprintf(stderr, "usage: phase9-cache-replay --self-test | --input INPUT --output OUTPUT | --capture-input INPUT --output OUTPUT\n");
+        std::fprintf(stderr, "usage: phase9-cache-replay --self-test | --benchmark-output OUTPUT | --input INPUT --output OUTPUT | --capture-input INPUT --output OUTPUT\n");
         return 2;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "phase9-cache-replay: %s\n", error.what());

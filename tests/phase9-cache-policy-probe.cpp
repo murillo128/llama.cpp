@@ -42,6 +42,7 @@ struct arguments {
     int max_generate = 2;
     bool background = false;
     bool observe_routes = true;
+    std::string transport = "BUFFERED";
 };
 
 bool parse_u64(const char * text, uint64_t & value) {
@@ -88,6 +89,9 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         } else if (option == "--observe-routes") {
             if (std::string(value) != "0" && std::string(value) != "1") return false;
             result.observe_routes = std::string(value) == "1";
+        } else if (option == "--transport") {
+            result.transport = value;
+            if (result.transport != "BUFFERED" && result.transport != "DIRECT_IO") return false;
         } else return false;
     }
     return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ubatch > 0 &&
@@ -296,6 +300,7 @@ int main(int argc, char ** argv) {
             { nullptr, nullptr },
         };
         auto model_params = llama_model_default_params();
+        model_params.load_mode = args.transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         model_params.n_gpu_layers = -1;
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_weights_mode = args.mode == "cold" ?
@@ -409,6 +414,7 @@ int main(int argc, char ** argv) {
         json output = {
             {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
             {"command", command}, {"model_path", args.model}, {"mode", args.mode},
+            {"transport_requested", args.transport},
             {"miss_policy", args.miss_policy}, {"background", args.background},
             {"prompt_ids", prompt}, {"generated_ids", generated}, {"logits_fnv64", logits_digests},
             {"latency_us", latency_us}, {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
