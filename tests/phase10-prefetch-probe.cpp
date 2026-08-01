@@ -478,6 +478,9 @@ model_profile_validation validate_model_profile(
     size_t layer_index = 0;
     uint64_t previous = 0;
     for (const auto & event : diagnostics.phase10_lead_events) {
+        if (!decode_begins.empty() && event.steady_ns < decode_begins.front()) {
+            continue;
+        }
         if (layer_index == 0) {
             if (decode_index >= decode_begins.size() || event.layer != profile.target.routed_layers.front() ||
                     event.steady_ns < decode_begins[decode_index]) {
