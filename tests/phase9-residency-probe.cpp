@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/resource.h>
@@ -28,6 +29,7 @@ struct arguments {
     uint32_t experts_used = 8;
     uint32_t touch_slots = 0;
     uint32_t classification_samples = 0;
+    bool prefill_protection = false;
     llama_expert_cache_policy policy = LLAMA_EXPERT_CACHE_POLICY_LRU;
     bool self_test = false;
 };
@@ -72,6 +74,10 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--experts-used") { if (!parse_u32(value, result.experts_used)) return false; }
         else if (option == "--touch-slots") { if (!parse_u32(value, result.touch_slots)) return false; }
         else if (option == "--classification-samples") { if (!parse_u32(value, result.classification_samples)) return false; }
+        else if (option == "--prefill-protection") {
+            if (std::string(value) != "0" && std::string(value) != "1") return false;
+            result.prefill_protection = std::string(value) == "1";
+        }
         else if (option == "--policy") {
             const std::string policy = value;
             if (policy == "LRU") result.policy = LLAMA_EXPERT_CACHE_POLICY_LRU;
@@ -194,9 +200,68 @@ int main(int argc, char ** argv) {
             }
         }
         if (keys.size() != args.touch_slots) return 6;
-        for (const auto & key : keys) {
-            llm_cold_reference reference;
-            if (!cache.find_or_admit_with_loader(key, reference, zero_loader, nullptr).is_ready()) return 7;
+        json protection = nullptr;
+        if (args.prefill_protection) {
+            const uint32_t protected_count = std::min<uint32_t>(4, std::max<uint32_t>(1, initialized.effective_slots/2));
+            if (keys.size() <= protected_count) return 6;
+            if (!cache.policy_phase_transition(llm_expert_cache_policy_phase::decode).is_ready()) return 7;
+            for (uint32_t pass = 0; pass < 2; ++pass) {
+                for (uint32_t index = 0; index < protected_count; ++index) {
+                    llm_cold_reference reference;
+                    if (!cache.find_or_admit_with_loader(keys[index], reference, zero_loader, nullptr).is_ready()) return 7;
+                }
+            }
+            const auto warm = cache.diagnostics();
+            if (!cache.policy_phase_transition(llm_expert_cache_policy_phase::prefill).is_ready()) return 7;
+            for (uint32_t index = protected_count; index < keys.size(); ++index) {
+                llm_cold_reference reference;
+                if (!cache.find_or_admit_with_loader(keys[index], reference, zero_loader, nullptr).is_ready()) return 7;
+            }
+            const auto after_prefill = cache.diagnostics();
+            std::set<std::pair<int32_t, int32_t>> resident_after_prefill;
+            for (const auto & slot : after_prefill.slots) {
+                if (slot.state == llm_cold_slot_state::ready) resident_after_prefill.insert({ slot.key.layer, slot.key.expert });
+            }
+            uint32_t survivors = 0;
+            for (uint32_t index = 0; index < protected_count; ++index) {
+                survivors += resident_after_prefill.count({ keys[index].layer, keys[index].expert }) != 0;
+            }
+            const uint64_t misses_before_resume = after_prefill.misses;
+            const uint64_t evictions_before_resume = after_prefill.evictions;
+            if (!cache.policy_phase_transition(llm_expert_cache_policy_phase::decode).is_ready()) return 7;
+            std::vector<uint64_t> token_us;
+            for (uint32_t token = 0; token < 8; ++token) {
+                const auto token_begin = std::chrono::steady_clock::now();
+                for (uint32_t index = 0; index < protected_count; ++index) {
+                    llm_cold_reference reference;
+                    if (!cache.find_or_admit_with_loader(keys[index], reference, zero_loader, nullptr).is_ready()) return 7;
+                }
+                token_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - token_begin).count());
+            }
+            const auto resumed = cache.diagnostics();
+            uint64_t protected_bytes = 0;
+            uint64_t probationary_bytes = 0;
+            for (const auto & domain : after_prefill.policy_domains) {
+                protected_bytes += domain.protected_occupancy_bytes;
+                probationary_bytes += domain.occupancy_bytes - domain.protected_occupancy_bytes;
+            }
+            protection = {
+                {"protected_set_keys", protected_count}, {"prefill_burst_keys", keys.size() - protected_count},
+                {"protected_survivors_after_prefill", survivors}, {"protected_occupancy_bytes", protected_bytes},
+                {"probationary_occupancy_bytes", probationary_bytes},
+                {"protected_forced_victims", after_prefill.policy.protected_forced_victims},
+                {"resume_misses", resumed.misses - misses_before_resume},
+                {"resume_evictions", resumed.evictions - evictions_before_resume},
+                {"first_eight_disk_bytes", (resumed.misses - misses_before_resume)*resumed.bundle_payload_bytes},
+                {"first_eight_h2d_bytes", 0}, {"token_time_us", token_us},
+                {"warm_policy_digest", warm.policy.state_digest}, {"post_prefill_policy_digest", after_prefill.policy.state_digest},
+            };
+        } else {
+            for (const auto & key : keys) {
+                llm_cold_reference reference;
+                if (!cache.find_or_admit_with_loader(key, reference, zero_loader, nullptr).is_ready()) return 7;
+            }
         }
         uint32_t classified = 0;
         uint32_t classified_resident = 0;
@@ -240,6 +305,7 @@ int main(int argc, char ** argv) {
             {"smaps_before_kib", kib_json(smaps_before)}, {"smaps_after_kib", kib_json(smaps_after)},
             {"elapsed_us", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()},
             {"policy_digest", diagnostics.policy.state_digest}, {"self_test", args.self_test},
+            {"prefill_protection", protection},
         };
         std::ofstream destination(args.output, std::ios::binary | std::ios::trunc);
         if (!destination) return 10;
