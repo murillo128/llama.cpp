@@ -17,10 +17,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -74,6 +76,7 @@ struct phase10_provider_evidence {
     bool routes_equal = false;
     bool joined_same_generation = false;
     bool joined_submitted_ready = false;
+    bool deferred_retry_multi_key_ordered = false;
     bool hot_speculative_victim_order = false;
 };
 
@@ -663,7 +666,7 @@ issue_ahead_case_result run_issue_ahead_case(bool serial_control, bool prequeue_
 
     llm_expert_scheduler scheduler({
         1, 4, 16, 4, 0,
-        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 4,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 4, 2,
     });
     llm_expert_async_config async_config;
     async_config.requested_queue_depth = 8;
@@ -729,6 +732,118 @@ issue_ahead_case_result run_issue_ahead_case(bool serial_control, bool prequeue_
     return result;
 }
 
+void test_cancelling_speculative_retry_attempts_all_demands_before_wait() {
+    tensor_fixture tensors(8, 16, 4, 2, 2);
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+
+    llm_expert_scheduler scheduler({
+        1, 4, 16, 4, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 4, 2,
+    });
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 4;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(handle_count == handles.size());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+
+    llm_expert_request_metadata metadata;
+    metadata.origin = llm_expert_request_origin::speculative;
+    metadata.profile_digest = 0x5678;
+    metadata.owner_request = 3;
+    metadata.owner_token = 0;
+    metadata.target_layer = 0;
+    metadata.deadline_token = 1;
+    metadata.reserved_storage_bytes = expert_payload_bytes(tensors);
+    metadata.reserved_h2d_bytes = expert_payload_bytes(tensors);
+    metadata.speculative_cold_slots = 1;
+    metadata.speculative_hot_slots = 1;
+    const auto speculative = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::prefetch_next,
+        llm_expert_readiness::device_ready, metadata);
+    GGML_ASSERT(speculative.disposition == llm_expert_schedule_disposition::admitted);
+    llm_expert_request_snapshot selected;
+    GGML_ASSERT(scheduler.take_next(selected).accepted());
+    GGML_ASSERT(scheduler.transition(speculative.handle,
+        llm_expert_request_state::submitting,
+        llm_expert_request_state::io_in_flight) ==
+        llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.begin_speculative_cancellation(speculative.handle,
+        llm_expert_request_state::io_in_flight) ==
+        llm_expert_schedule_disposition::admitted);
+
+    auto provider = llm_create_cold_cache_expert_weight_provider(
+        phase10_issue_ahead_config(storage, transport, scheduler, false));
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1, 0, 1 };
+    std::array<int32_t, 4> execution_ids = { -1, -1, -1, -1 };
+    auto remap = std::async(std::launch::async, [&] {
+        return provider->remap_checkpoint(
+            binding, logical_ids, 4, execution_ids.data());
+    });
+
+    bool later_demand_enqueued = false;
+    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+        if (scheduler.diagnostics().active_requests == 2) {
+            later_demand_enqueued = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    GGML_ASSERT(scheduler.transition(speculative.handle,
+        llm_expert_request_state::cancelling,
+        llm_expert_request_state::draining) ==
+        llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.finish(speculative.handle,
+        llm_expert_request_state::cancelled) ==
+        llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.release_terminal(speculative.handle) ==
+        llm_expert_schedule_disposition::admitted);
+    const auto remapped = remap.get();
+    GGML_ASSERT(later_demand_enqueued && remapped.is_ready());
+    GGML_ASSERT(execution_ids[0] == execution_ids[2] &&
+        execution_ids[1] == execution_ids[3] &&
+        execution_ids[0] != execution_ids[1]);
+
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.phase10_issue_ahead_events == 1);
+    GGML_ASSERT(diagnostics.phase10_issue_ahead_violations == 1);
+    GGML_ASSERT(diagnostics.phase10_issue_ahead_trace.size() == 1);
+    const auto & event = diagnostics.phase10_issue_ahead_trace.front();
+    GGML_ASSERT(event.demand_misses == 2 &&
+        event.scheduler_enqueue_attempts_before_first_wait == 2 &&
+        event.scheduler_release_waits == 1 &&
+        event.first_wait_after_all_demand_enqueue_attempts &&
+        event.scheduler_enqueued_before_first_take == 2 &&
+        event.first_take_after_all_demand_enqueues &&
+        !event.first_wait_after_all_storage_submissions);
+    phase10_evidence.deferred_retry_multi_key_ordered = true;
+
+    plan.reset();
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.shutdown());
+}
+
 void test_exact_issue_ahead_and_serial_evidence_control() {
     const auto parallel = run_issue_ahead_case(false);
     const auto serial = run_issue_ahead_case(true);
@@ -741,7 +856,10 @@ void test_exact_issue_ahead_and_serial_evidence_control() {
     const auto & issued = parallel.diagnostics.phase10_issue_ahead_trace.front();
     const auto & control = serial.diagnostics.phase10_issue_ahead_trace.front();
     GGML_ASSERT(issued.logical_ids == 4 && issued.unique_ids == 2 && issued.demand_misses == 2);
-    GGML_ASSERT(issued.scheduler_enqueued_before_first_take == 2 &&
+    GGML_ASSERT(issued.scheduler_enqueue_attempts_before_first_wait == 2 &&
+        issued.scheduler_release_waits == 0 &&
+        issued.first_wait_after_all_demand_enqueue_attempts &&
+        issued.scheduler_enqueued_before_first_take == 2 &&
         issued.first_take_after_all_demand_enqueues);
     GGML_ASSERT(issued.storage_reads == 2 &&
         issued.storage_reads_submitted_before_first_wait == 2 &&
@@ -752,7 +870,10 @@ void test_exact_issue_ahead_and_serial_evidence_control() {
         issued.demand_completion_us >= issued.last_demand_ready_us);
     GGML_ASSERT(control.logical_ids == issued.logical_ids && control.unique_ids == issued.unique_ids &&
         control.demand_misses == issued.demand_misses && control.storage_reads == issued.storage_reads);
-    GGML_ASSERT(control.scheduler_enqueued_before_first_take == 2 &&
+    GGML_ASSERT(control.scheduler_enqueue_attempts_before_first_wait == 2 &&
+        control.scheduler_release_waits == 0 &&
+        control.first_wait_after_all_demand_enqueue_attempts &&
+        control.scheduler_enqueued_before_first_take == 2 &&
         control.first_take_after_all_demand_enqueues);
     GGML_ASSERT(control.storage_reads_submitted_before_first_wait == 1 &&
         !control.first_wait_after_all_storage_submissions && control.serial_control);
@@ -779,7 +900,7 @@ void test_exact_demand_joins_submitted_same_generation_with_ready_cold_data() {
     source_file.populate(storage);
     llm_expert_scheduler scheduler({
         1, 4, 16, 4, 0,
-        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 2,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 2, 2,
     });
     llm_expert_async_config async_config;
     async_config.requested_queue_depth = 8;
@@ -1918,6 +2039,7 @@ int main(int argc, char ** argv) {
     test_blocking_hot_seed_atomic_publication_and_failure();
     test_blocking_cold_seed_uses_storage_ring_and_ordinary_lru();
     test_exact_issue_ahead_and_serial_evidence_control();
+    test_cancelling_speculative_retry_attempts_all_demands_before_wait();
     test_exact_demand_joins_submitted_same_generation_with_ready_cold_data();
     test_hot_speculative_victim_deadline_utility_slot_order();
     if (argc == 2) {
@@ -1947,6 +2069,8 @@ int main(int argc, char ** argv) {
               << "\tserial_submitted_before_wait=" << phase10_evidence.serial_submitted_before_wait
               << "\troutes_equal=" << phase10_evidence.routes_equal
               << "\tjoined_same_generation=" << phase10_evidence.joined_same_generation
-              << "\tjoined_submitted_ready=" << phase10_evidence.joined_submitted_ready << '\n';
+              << "\tjoined_submitted_ready=" << phase10_evidence.joined_submitted_ready
+              << "\tdeferred_retry_multi_key_ordered="
+              << phase10_evidence.deferred_retry_multi_key_ordered << '\n';
     return 0;
 }

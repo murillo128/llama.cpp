@@ -83,7 +83,8 @@ predictor_benchmark benchmark_predictor(
         };
         llm_expert_prefetch_config_internal config;
         if (!llm_expert_prefetch_copy_config(&value, profile_path.c_str(), LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE,
-            profile.target.experts_per_layer, 64, UINT64_C(1) << 30, 64, UINT64_C(1) << 30,
+            profile.target.experts_per_layer, 64, UINT64_C(1) << 30, 128,
+            UINT64_C(1) << 30,
             UINT64_C(1) << 30, config).is_ready()) throw probe_error("predictor configuration failed");
         llm_expert_prefetch_predictor predictor;
         if (!predictor.initialize(profile, config).is_ready() || !predictor.request_begin(1).is_ready()) {

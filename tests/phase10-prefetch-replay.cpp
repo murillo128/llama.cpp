@@ -739,7 +739,8 @@ json replay(const json & input) {
         };
         llm_expert_prefetch_config_internal config;
         require(llm_expert_prefetch_copy_config(&public_config, profile_path.c_str(), LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE,
-            profile.target.experts_per_layer, 32, UINT64_C(1) << 30, 64, UINT64_C(1) << 30, UINT64_C(1) << 30,
+            profile.target.experts_per_layer, 32, UINT64_C(1) << 30, 64,
+            UINT64_C(1) << 30, UINT64_C(1) << 30,
             config).is_ready(), "invalid replay config");
         llm_expert_prefetch_predictor predictor;
         require(predictor.initialize(profile, config).is_ready(), "predictor initialize failed");

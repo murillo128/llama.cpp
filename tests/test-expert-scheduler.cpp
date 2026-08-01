@@ -21,7 +21,7 @@ struct phase10_scheduler_evidence {
     bool submitted_shutdown_drained = false;
     bool zero_final_charges = false;
     bool cancelling_promotion_fenced = false;
-    bool submitted_headroom_preserved = false;
+    bool submitted_demand_set_headroom_preserved = false;
 };
 
 phase10_scheduler_evidence phase10_evidence;
@@ -39,7 +39,7 @@ llm_expert_scheduler_config config(uint32_t capacity = 4, uint64_t generation = 
 llm_expert_scheduler_config bounded_config() {
     return {
         2, 8, 4, 4, 0,
-        2, 300, 200, 200, 150, 2, 2,
+        2, 300, 200, 200, 150, 2, 2, 2,
     };
 }
 
@@ -70,10 +70,17 @@ void test_configuration() {
             1, 1, 1, 1, 1, 1, 1,
         });
     });
+    expect_invalid([] {
+        llm_expert_scheduler scheduler({
+            1, 8, 4, 4, 0,
+            3, 300, 300, 100, 100, 3, 3, 2,
+        });
+    });
     llm_expert_scheduler scheduler(config());
     const auto diagnostics = scheduler.diagnostics();
     GGML_ASSERT(diagnostics.request_capacity == 4);
     GGML_ASSERT(diagnostics.waiters_per_request == 4);
+    GGML_ASSERT(diagnostics.max_current_layer_demand_flights == 0);
     GGML_ASSERT(diagnostics.administration_bytes > 0);
 }
 
@@ -310,7 +317,7 @@ void test_speculative_budgets_cancel_and_demand_promotion() {
 void test_demand_preemption_submitted_drain_retry_and_shutdown() {
     const llm_expert_scheduler_config single = {
         1, 4, 2, 4, 0,
-        1, 200, 200, 200, 200, 1, 1,
+        1, 200, 200, 200, 200, 1, 1, 1,
     };
     {
         llm_expert_scheduler scheduler(single);
@@ -402,10 +409,10 @@ void test_demand_preemption_submitted_drain_retry_and_shutdown() {
     }
 }
 
-void test_cancelling_promotion_fence_and_submitted_demand_headroom() {
+void test_cancelling_promotion_fence_and_submitted_demand_set_headroom() {
     const llm_expert_scheduler_config bounded = {
         1, 8, 2, 4, 0,
-        1, 200, 200, 200, 200, 1, 1,
+        1, 200, 200, 200, 200, 1, 1, 1,
     };
     {
         llm_expert_scheduler scheduler(bounded);
@@ -481,38 +488,69 @@ void test_cancelling_promotion_fence_and_submitted_demand_headroom() {
         GGML_ASSERT(scheduler.shutdown());
     }
     {
-        llm_expert_scheduler scheduler(bounded);
-        const auto submitted = scheduler.enqueue(
+        const llm_expert_scheduler_config demand_set_bounded = {
+            1, 8, 4, 4, 0,
+            2, 400, 400, 200, 200, 2, 2, 2,
+        };
+        llm_expert_scheduler scheduler(demand_set_bounded);
+        const auto submitted_first = scheduler.enqueue(
             { 0, 2 }, llm_expert_priority::prefetch_next,
             llm_expert_readiness::device_ready,
             speculative_metadata(22, 0, 0, 100, 100));
-        GGML_ASSERT(submitted.accepted());
+        const auto submitted_second = scheduler.enqueue(
+            { 0, 3 }, llm_expert_priority::prefetch_next,
+            llm_expert_readiness::device_ready,
+            speculative_metadata(23, 0, 0, 100, 100));
+        GGML_ASSERT(submitted_first.accepted() && submitted_second.accepted());
         llm_expert_request_snapshot selected;
         GGML_ASSERT(scheduler.take_next(selected).accepted());
-        GGML_ASSERT(scheduler.transition(submitted.handle,
+        GGML_ASSERT(scheduler.transition(submitted_first.handle,
+            llm_expert_request_state::submitting,
+            llm_expert_request_state::io_in_flight) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.take_next(selected).accepted());
+        GGML_ASSERT(scheduler.transition(submitted_second.handle,
             llm_expert_request_state::submitting,
             llm_expert_request_state::io_in_flight) ==
             llm_expert_schedule_disposition::admitted);
         GGML_ASSERT(scheduler.enqueue(
-            { 0, 3 }, llm_expert_priority::prefetch_speculative,
+            { 0, 4 }, llm_expert_priority::prefetch_speculative,
             llm_expert_readiness::host_ready,
-            speculative_metadata(23, 0, 0, 100, 0)).disposition ==
+            speculative_metadata(24, 0, 0, 100, 0)).disposition ==
             llm_expert_schedule_disposition::dropped);
-        const auto demand = scheduler.enqueue(
-            { 0, 4 }, llm_expert_priority::demand_current_layer,
+        const auto demand_first = scheduler.enqueue(
+            { 0, 5 }, llm_expert_priority::demand_current_layer,
             llm_expert_readiness::device_ready);
-        GGML_ASSERT(demand.disposition == llm_expert_schedule_disposition::admitted);
-        GGML_ASSERT(demand.handle.slot != submitted.handle.slot);
-        phase10_evidence.submitted_headroom_preserved = true;
+        const auto demand_second = scheduler.enqueue(
+            { 0, 6 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::device_ready);
+        GGML_ASSERT(demand_first.disposition == llm_expert_schedule_disposition::admitted &&
+            demand_second.disposition == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.diagnostics().max_current_layer_demand_flights == 2);
+        GGML_ASSERT(demand_first.handle.slot != demand_second.handle.slot &&
+            demand_first.handle.slot != submitted_first.handle.slot &&
+            demand_first.handle.slot != submitted_second.handle.slot &&
+            demand_second.handle.slot != submitted_first.handle.slot &&
+            demand_second.handle.slot != submitted_second.handle.slot);
+        phase10_evidence.submitted_demand_set_headroom_preserved = true;
         GGML_ASSERT(!scheduler.shutdown());
-        GGML_ASSERT(scheduler.transition(submitted.handle,
+        GGML_ASSERT(scheduler.transition(submitted_first.handle,
             llm_expert_request_state::io_in_flight,
             llm_expert_request_state::draining) ==
             llm_expert_schedule_disposition::admitted);
-        GGML_ASSERT(scheduler.finish(submitted.handle,
+        GGML_ASSERT(scheduler.finish(submitted_first.handle,
             llm_expert_request_state::failed) ==
             llm_expert_schedule_disposition::admitted);
-        GGML_ASSERT(scheduler.release_terminal(submitted.handle) ==
+        GGML_ASSERT(scheduler.release_terminal(submitted_first.handle) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(submitted_second.handle,
+            llm_expert_request_state::io_in_flight,
+            llm_expert_request_state::draining) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.finish(submitted_second.handle,
+            llm_expert_request_state::failed) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.release_terminal(submitted_second.handle) ==
             llm_expert_schedule_disposition::admitted);
         GGML_ASSERT(scheduler.shutdown());
     }
@@ -531,7 +569,7 @@ int main() {
     test_concurrent_duplicate_joins();
     test_speculative_budgets_cancel_and_demand_promotion();
     test_demand_preemption_submitted_drain_retry_and_shutdown();
-    test_cancelling_promotion_fence_and_submitted_demand_headroom();
+    test_cancelling_promotion_fence_and_submitted_demand_set_headroom();
     std::cout << "PHASE10_SCHEDULER_LIFECYCLE"
               << "\tbudget_rejections=" << phase10_evidence.budget_rejections
               << "\tdemand_promotions=" << phase10_evidence.demand_promotions
@@ -542,6 +580,7 @@ int main() {
               << "\tsubmitted_shutdown_drained=" << phase10_evidence.submitted_shutdown_drained
               << "\tzero_final_charges=" << phase10_evidence.zero_final_charges
               << "\tcancelling_promotion_fenced=" << phase10_evidence.cancelling_promotion_fenced
-              << "\tsubmitted_headroom_preserved=" << phase10_evidence.submitted_headroom_preserved << '\n';
+              << "\tsubmitted_demand_set_headroom_preserved="
+              << phase10_evidence.submitted_demand_set_headroom_preserved << '\n';
     return 0;
 }

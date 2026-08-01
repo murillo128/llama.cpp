@@ -71,6 +71,7 @@ struct llm_expert_scheduler_config {
     uint64_t max_speculative_h2d_bytes_per_token = 0;
     uint32_t max_speculative_cold_slots = 0;
     uint32_t max_speculative_hot_slots = 0;
+    uint32_t max_current_layer_demand_flights = 0;
 };
 
 enum class llm_expert_schedule_disposition {
@@ -112,6 +113,7 @@ struct llm_expert_scheduler_diagnostics {
     uint32_t peak_active_requests = 0;
     uint32_t queued_requests = 0;
     uint32_t waiters_per_request = 0;
+    uint32_t max_current_layer_demand_flights = 0;
     uint64_t administration_bytes = 0;
     uint64_t flights_created = 0;
     uint64_t joins = 0;

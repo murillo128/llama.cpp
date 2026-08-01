@@ -306,7 +306,9 @@ struct llm_expert_phase10_issue_ahead_event {
     uint32_t logical_ids = 0;
     uint32_t unique_ids = 0;
     uint32_t demand_misses = 0;
+    uint32_t scheduler_enqueue_attempts_before_first_wait = 0;
     uint32_t scheduler_enqueued_before_first_take = 0;
+    uint32_t scheduler_release_waits = 0;
     uint32_t storage_reads = 0;
     uint32_t storage_reads_submitted_before_first_wait = 0;
     uint32_t demand_ready_before_use = 0;
@@ -315,6 +317,7 @@ struct llm_expert_phase10_issue_ahead_event {
     uint64_t last_demand_ready_us = 0;
     uint64_t demand_completion_us = 0;
     bool first_take_after_all_demand_enqueues = false;
+    bool first_wait_after_all_demand_enqueue_attempts = false;
     bool first_wait_after_all_storage_submissions = false;
     bool all_demand_ready_before_use = false;
     bool serial_control = false;

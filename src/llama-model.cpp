@@ -1575,6 +1575,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         predictive_prefetch ? prefetch.max_speculative_h2d_bytes_per_token : 0,
         predictive_prefetch ? prefetch.max_speculative_cold_slots : 0,
         predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
+        uint32_t(std::min<int64_t>(hparams.n_expert, params.expert_hot_cache_capacity)),
     });
     auto transport = std::make_unique<llm_expert_async_transport>(llm_expert_async_config{
         params.expert_io_queue_depth,

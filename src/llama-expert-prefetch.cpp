@@ -365,7 +365,12 @@ llm_expert_prefetch_result llm_expert_prefetch_copy_config(
             value.utility_min_observations > value.utility_window_predictions) {
             return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_configuration);
         }
-        if ((scheduler_capacity != 0 && value.max_speculative_flights >= scheduler_capacity) ||
+        const uint32_t max_current_layer_demand_flights = experts_per_layer == 0 ? 0 :
+            std::min(experts_per_layer, hot_capacity);
+        if ((scheduler_capacity != 0 && max_current_layer_demand_flights != 0 &&
+                (max_current_layer_demand_flights > scheduler_capacity ||
+                 value.max_speculative_flights >
+                    scheduler_capacity - max_current_layer_demand_flights)) ||
             (storage_capacity_bytes != 0 && value.max_speculative_storage_bytes_in_flight > storage_capacity_bytes) ||
             (h2d_capacity_bytes != 0 && value.max_speculative_h2d_bytes_in_flight > h2d_capacity_bytes) ||
             value.max_speculative_storage_bytes_per_token > value.max_speculative_storage_bytes_in_flight ||

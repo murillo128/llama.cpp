@@ -528,6 +528,7 @@ struct storage_async_flight {
     llm_expert_key key = { -1, -1 };
     llm_cold_reference cold;
     llm_expert_request_handle handle;
+    llm_expert_request_handle deferred_release_handle;
     llm_expert_flight_id flight_id;
     std::array<llm_expert_storage_destination, 12> destinations;
     std::array<llm_expert_storage_read_operation, 12> operations;
@@ -541,6 +542,7 @@ struct storage_async_flight {
     bool read_completed = false;
     bool scheduler_active = false;
     bool scheduler_joined = false;
+    bool scheduler_deferred_retry = false;
     bool scheduler_taken = false;
     bool processed = false;
     llm_expert_request_state scheduler_state = llm_expert_request_state::free;
@@ -2693,36 +2695,26 @@ public:
                 issue_ahead.unique_ids = uint32_t(unique_count);
                 issue_ahead.demand_misses = uint32_t(miss_count);
                 issue_ahead.serial_control = config.phase10_serial_issue_for_testing;
-                for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
+                size_t scheduler_enqueue_attempts = 0;
+                bool storage_planning_complete = false;
+                const auto record_first_wait = [&]() {
+                    if (issue_ahead.first_wait_us != 0) return;
+                    issue_ahead.first_wait_us = uint64_t(ggml_time_us());
+                    issue_ahead.scheduler_enqueue_attempts_before_first_wait =
+                        uint32_t(scheduler_enqueue_attempts);
+                    issue_ahead.storage_reads_submitted_before_first_wait = uint32_t(submitted_count);
+                    issue_ahead.first_wait_after_all_demand_enqueue_attempts =
+                        scheduler_enqueue_attempts >= miss_count;
+                    issue_ahead.first_wait_after_all_storage_submissions =
+                        storage_planning_complete && submitted_count == storage_read_count;
+                };
+                const auto accept_scheduled = [&](size_t index, const llm_expert_schedule_result & scheduled) {
                     auto & flight = async_flights[index];
-                    flight = {};
-                    const uint32_t unique_index = miss_unique_indices[index];
-                    flight.key = unique_keys[unique_index];
-                    flight.scheduler_enqueue_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                    auto scheduled = config.scheduler->enqueue(
-                        flight.key, llm_expert_priority::demand_current_layer,
-                        llm_expert_readiness::device_ready);
-                    while (scheduled.disposition == llm_expert_schedule_disposition::busy &&
-                            scheduled.handle.valid()) {
-                        if (provider_lock != nullptr) provider_lock->unlock();
-                        const auto drained = config.scheduler->wait_until_released(scheduled.handle);
-                        if (provider_lock != nullptr) provider_lock->lock();
-                        if (drained != llm_expert_schedule_disposition::admitted) {
-                            copy_result = llm_expert_provider_result::failure(
-                                llm_expert_provider_error::stale_generation);
-                            break;
-                        }
-                        scheduled = config.scheduler->enqueue(
-                            flight.key, llm_expert_priority::demand_current_layer,
-                            llm_expert_readiness::device_ready);
-                    }
-                    if (!copy_result.is_ready()) break;
                     if (!scheduled.accepted()) {
                         copy_result = llm_expert_provider_result::failure(
                             scheduled.disposition == llm_expert_schedule_disposition::generation_exhausted ?
                                 llm_expert_provider_error::generation_exhausted : llm_expert_provider_error::busy);
-                        break;
+                        return;
                     }
                     flight.handle = scheduled.handle;
                     flight.flight_id = {
@@ -2737,12 +2729,70 @@ public:
                             llm_expert_schedule_disposition::admitted) {
                         copy_result = llm_expert_provider_result::failure(
                             llm_expert_provider_error::stale_generation);
-                        break;
+                        return;
                     }
                     flight.scheduler_state = scheduler_snapshot.state;
                     flight.scheduler_active = !flight.scheduler_joined ||
                         scheduler_snapshot.state == llm_expert_request_state::queued;
+                    scheduled_count++;
+                };
 
+                // Attempt every current-layer demand before any scheduler or
+                // storage wait. A demand fenced by a cancelling speculative
+                // generation is retried only after all other keys have had
+                // their first enqueue attempt.
+                for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
+                    auto & flight = async_flights[index];
+                    flight = {};
+                    const uint32_t unique_index = miss_unique_indices[index];
+                    flight.key = unique_keys[unique_index];
+                    flight.scheduler_enqueue_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    auto scheduled = config.scheduler->enqueue(
+                        flight.key, llm_expert_priority::demand_current_layer,
+                        llm_expert_readiness::device_ready);
+                    scheduler_enqueue_attempts++;
+                    if (scheduled.disposition == llm_expert_schedule_disposition::busy &&
+                            scheduled.handle.valid()) {
+                        flight.deferred_release_handle = scheduled.handle;
+                        flight.scheduler_deferred_retry = true;
+                        continue;
+                    }
+                    accept_scheduled(index, scheduled);
+                }
+                for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
+                    auto & flight = async_flights[index];
+                    while (flight.scheduler_deferred_retry) {
+                        issue_ahead.scheduler_release_waits++;
+                        record_first_wait();
+                        if (provider_lock != nullptr) provider_lock->unlock();
+                        const auto drained = config.scheduler->wait_until_released(
+                            flight.deferred_release_handle);
+                        if (provider_lock != nullptr) provider_lock->lock();
+                        if (drained != llm_expert_schedule_disposition::admitted) {
+                            copy_result = llm_expert_provider_result::failure(
+                                llm_expert_provider_error::stale_generation);
+                            break;
+                        }
+                        const auto scheduled = config.scheduler->enqueue(
+                            flight.key, llm_expert_priority::demand_current_layer,
+                            llm_expert_readiness::device_ready);
+                        scheduler_enqueue_attempts++;
+                        if (scheduled.disposition == llm_expert_schedule_disposition::busy &&
+                                scheduled.handle.valid()) {
+                            flight.deferred_release_handle = scheduled.handle;
+                            continue;
+                        }
+                        flight.scheduler_deferred_retry = false;
+                        accept_scheduled(index, scheduled);
+                    }
+                }
+
+                // All scheduler demands are now admitted or joined. Cold-cache
+                // joins and storage planning may wait, but cannot hold back a
+                // later current-layer demand enqueue.
+                for (size_t index = 0; index < miss_count && copy_result.is_ready(); ++index) {
+                    auto & flight = async_flights[index];
                     llm_cold_demand_lookup lookup = llm_cold_demand_lookup::reserved;
                     copy_result = cold_cache->reserve_or_join_demand(flight.key, flight.cold, lookup);
                     if (!copy_result.is_ready()) break;
@@ -2753,6 +2803,7 @@ public:
                         break;
                     }
                     if (!flight.scheduler_active && lookup == llm_cold_demand_lookup::joined_loading) {
+                        record_first_wait();
                         if (provider_lock != nullptr) provider_lock->unlock();
                         copy_result = cold_cache->wait_until_ready(flight.cold);
                         if (provider_lock != nullptr) provider_lock->lock();
@@ -2784,8 +2835,8 @@ public:
                             break;
                         }
                     }
-                    scheduled_count++;
                 }
+                storage_planning_complete = copy_result.is_ready();
                 issue_ahead.scheduler_enqueued_before_first_take = uint32_t(scheduled_count);
                 issue_ahead.storage_reads = uint32_t(storage_read_count);
                 issue_ahead.first_take_after_all_demand_enqueues =
@@ -2918,10 +2969,7 @@ public:
                         config.async_transport->start_deferred_reads();
                         if (!first_storage_wait) {
                             first_storage_wait = true;
-                            issue_ahead.first_wait_us = uint64_t(ggml_time_us());
-                            issue_ahead.storage_reads_submitted_before_first_wait = uint32_t(submitted_count);
-                            issue_ahead.first_wait_after_all_storage_submissions =
-                                submitted_count == storage_read_count;
+                            record_first_wait();
                         }
                         llm_expert_async_read_completion completion;
                         if (provider_lock != nullptr) provider_lock->unlock();
@@ -2963,10 +3011,7 @@ public:
                         llm_expert_request_handle completed_handle;
                         if (!first_storage_wait) {
                             first_storage_wait = true;
-                            issue_ahead.first_wait_us = uint64_t(ggml_time_us());
-                            issue_ahead.storage_reads_submitted_before_first_wait = uint32_t(submitted_count);
-                            issue_ahead.first_wait_after_all_storage_submissions =
-                                submitted_count == storage_read_count;
+                            record_first_wait();
                         }
                         if (provider_lock != nullptr) provider_lock->unlock();
                         const auto waited = config.async_transport->wait_any_read(
@@ -3174,6 +3219,10 @@ public:
                     }
                 }
                 if (!first_storage_wait && storage_read_count == 0) {
+                    issue_ahead.scheduler_enqueue_attempts_before_first_wait =
+                        uint32_t(scheduler_enqueue_attempts);
+                    issue_ahead.first_wait_after_all_demand_enqueue_attempts =
+                        scheduler_enqueue_attempts >= miss_count;
                     issue_ahead.first_wait_after_all_storage_submissions = true;
                 }
                 if (copy_result.is_ready()) {
@@ -3183,7 +3232,8 @@ public:
                 }
                 if (phase10_issue_ahead_trace) {
                     if (!issue_ahead.serial_control &&
-                        (!issue_ahead.first_take_after_all_demand_enqueues ||
+                        (!issue_ahead.first_wait_after_all_demand_enqueue_attempts ||
+                         !issue_ahead.first_take_after_all_demand_enqueues ||
                          !issue_ahead.first_wait_after_all_storage_submissions)) {
                         phase10_issue_ahead_violations++;
                     }

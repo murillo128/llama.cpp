@@ -217,7 +217,10 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
         config.waiters_per_request == 0 ||
         any_speculative_budget != complete_speculative_budget ||
         (complete_speculative_budget &&
-            (config.max_speculative_flights >= config.request_capacity ||
+            (config.max_current_layer_demand_flights == 0 ||
+             config.max_current_layer_demand_flights > config.request_capacity ||
+             config.max_speculative_flights >
+                config.request_capacity - config.max_current_layer_demand_flights ||
              config.max_speculative_storage_bytes_per_token >
                 config.max_speculative_storage_bytes_in_flight ||
              config.max_speculative_h2d_bytes_per_token >
@@ -232,6 +235,7 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
     }
     pimpl->counters.request_capacity = config.request_capacity;
     pimpl->counters.waiters_per_request = config.waiters_per_request;
+    pimpl->counters.max_current_layer_demand_flights = config.max_current_layer_demand_flights;
     pimpl->counters.administration_bytes = sizeof(*pimpl) + pimpl->requests.capacity()*sizeof(impl::request_record);
 }
 
