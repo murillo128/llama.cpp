@@ -1416,6 +1416,8 @@ void llama_model::init_expert_weight_provider() {
             config.target_buffer_type = ggml_backend_dev_buffer_type(target);
             config.hot_cache_policy_config = pimpl->expert_hot_cache_policy_config;
             config.cold_cache_policy_config = pimpl->expert_cold_cache_policy_config;
+            config.phase10_lead_trace = params.expert_prefetch_config != nullptr &&
+                params.expert_prefetch_config->policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF;
             config.routed_layers = std::move(routed_layers);
             if (params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
                 config.cold_mode = true;

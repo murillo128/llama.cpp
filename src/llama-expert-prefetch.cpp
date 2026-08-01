@@ -16,9 +16,63 @@
 #include <sys/stat.h>
 #include <utility>
 
-using json = nlohmann::json;
-
 namespace {
+
+struct json_allocation_ceiling {
+    static thread_local bool enabled;
+    static thread_local size_t remaining;
+};
+
+thread_local bool json_allocation_ceiling::enabled = false;
+thread_local size_t json_allocation_ceiling::remaining = 0;
+
+template<typename T>
+struct bounded_json_allocator {
+    using value_type = T;
+    using is_always_equal = std::true_type;
+
+    bounded_json_allocator() noexcept = default;
+    template<typename U> bounded_json_allocator(const bounded_json_allocator<U> &) noexcept {}
+
+    T * allocate(size_t count) {
+        if (count > std::numeric_limits<size_t>::max()/sizeof(T)) throw std::bad_alloc();
+        const size_t bytes = count*sizeof(T);
+        if (json_allocation_ceiling::enabled) {
+            if (bytes > json_allocation_ceiling::remaining) throw std::bad_alloc();
+            json_allocation_ceiling::remaining -= bytes;
+        }
+        return std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T * pointer, size_t count) noexcept {
+        std::allocator<T>{}.deallocate(pointer, count);
+    }
+};
+
+template<typename T, typename U>
+bool operator==(const bounded_json_allocator<T> &, const bounded_json_allocator<U> &) noexcept { return true; }
+
+template<typename T, typename U>
+bool operator!=(const bounded_json_allocator<T> &, const bounded_json_allocator<U> &) noexcept { return false; }
+
+using bounded_json_string = std::basic_string<char, std::char_traits<char>, bounded_json_allocator<char>>;
+using bounded_json_binary = std::vector<uint8_t, bounded_json_allocator<uint8_t>>;
+using json = nlohmann::basic_json<std::map, std::vector, bounded_json_string, bool, int64_t, uint64_t, double,
+    bounded_json_allocator, nlohmann::adl_serializer, bounded_json_binary>;
+using bounded_json_key_set = std::set<bounded_json_string, std::less<bounded_json_string>,
+    bounded_json_allocator<bounded_json_string>>;
+using bounded_json_key_stack = std::vector<bounded_json_key_set, bounded_json_allocator<bounded_json_key_set>>;
+
+struct json_ceiling_guard {
+    explicit json_ceiling_guard(size_t budget) noexcept {
+        json_allocation_ceiling::remaining = budget;
+        json_allocation_ceiling::enabled = true;
+    }
+    ~json_ceiling_guard() {
+        json_allocation_ceiling::enabled = false;
+        json_allocation_ceiling::remaining = 0;
+    }
+};
 
 constexpr uint64_t fnv_offset = UINT64_C(1469598103934665603);
 constexpr uint64_t fnv_prime = UINT64_C(1099511628211);
@@ -143,7 +197,7 @@ bool valid_sha256(const std::string & value) noexcept {
 void require_fields(const json & value, std::initializer_list<const char *> fields, const char * name) {
     if (!value.is_object()) throw std::runtime_error(std::string(name) + " must be an object");
     std::set<std::string> actual;
-    for (const auto & item : value.items()) actual.insert(item.key());
+    for (const auto & item : value.items()) actual.emplace(item.key().data(), item.key().size());
     std::set<std::string> expected;
     for (const char * field : fields) expected.insert(field);
     if (actual != expected) throw std::runtime_error(std::string(name) + " fields do not match v1");
@@ -372,12 +426,13 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
             return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::profile_io);
         }
 
-        std::vector<std::set<std::string>> object_keys;
+        json_ceiling_guard allocation_ceiling(size_t(max_profile_bytes) - bytes.size());
+        bounded_json_key_stack object_keys;
         bool duplicate_key = false;
         auto callback = [&](int, json::parse_event_t event, json & parsed) {
             if (event == json::parse_event_t::object_start) object_keys.emplace_back();
             if (event == json::parse_event_t::key) {
-                if (object_keys.empty() || !object_keys.back().insert(parsed.get<std::string>()).second) duplicate_key = true;
+                if (object_keys.empty() || !object_keys.back().insert(parsed.get<json::string_t>()).second) duplicate_key = true;
             }
             if (event == json::parse_event_t::object_end && !object_keys.empty()) object_keys.pop_back();
             return !duplicate_key;
@@ -419,6 +474,7 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         if (profile.fold_index >= 6 || !fold.at("training").is_array() || fold.at("training").size() != 4) {
             throw std::runtime_error("invalid fold membership");
         }
+        profile.training_prompts.reserve(4);
         std::set<std::string> prompt_members;
         for (const auto & prompt : fold.at("training")) {
             profile.training_prompts.push_back(string_value(prompt, "fold.training"));
@@ -449,6 +505,7 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         if (profile.target.layer_count == 0 || profile.target.experts_per_layer == 0 || profile.target.experts_per_token == 0 ||
             profile.target.experts_per_token > profile.target.experts_per_layer) throw std::runtime_error("invalid target topology");
         if (!target.at("files").is_array() || target.at("files").empty()) throw std::runtime_error("target files missing");
+        profile.target.files.reserve(target.at("files").size());
         for (const auto & file : target.at("files")) {
             require_fields(file, { "ordinal", "name", "size", "sha256" }, "target file");
             llm_expert_prefetch_file_identity identity;
@@ -462,6 +519,7 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
             profile.target.files.push_back(std::move(identity));
         }
         if (!target.at("routed_layers").is_array() || target.at("routed_layers").empty()) throw std::runtime_error("routed layers missing");
+        profile.target.routed_layers.reserve(target.at("routed_layers").size());
         int32_t previous_layer = -1;
         for (const auto & layer_value : target.at("routed_layers")) {
             const uint32_t layer = uint32_value(layer_value, "routed layer");
@@ -473,6 +531,7 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         if (expected_keys > SIZE_MAX || !target.at("expert_bytes").is_array() || target.at("expert_bytes").size() != expected_keys) {
             throw std::runtime_error("expert byte map is incomplete");
         }
+        profile.target.expert_bytes.reserve(size_t(expected_keys));
         for (const auto & item : target.at("expert_bytes")) {
             require_fields(item, { "layer", "expert", "payload_bytes", "physical_bytes" }, "expert bytes");
             llm_expert_prefetch_key_bytes key;
@@ -499,6 +558,7 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         }
 
         if (!document.at("static_counts").is_array()) throw std::runtime_error("static_counts must be an array");
+        profile.static_counts.reserve(document.at("static_counts").size());
         std::set<std::pair<int32_t, int32_t>> count_keys;
         for (const auto & item : document.at("static_counts")) {
             require_fields(item, { "layer", "expert", "count" }, "static count");
@@ -517,6 +577,7 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         });
 
         if (!document.at("transitions").is_array()) throw std::runtime_error("transitions must be an array");
+        profile.transitions.reserve(document.at("transitions").size());
         std::set<std::array<int32_t, 4>> transition_keys;
         for (const auto & item : document.at("transitions")) {
             require_fields(item, { "source_layer", "source_expert", "target_layer", "target_expert", "count" }, "transition");
@@ -542,6 +603,7 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         });
 
         if (!document.at("costs").is_array() || document.at("costs").empty()) throw std::runtime_error("costs missing");
+        profile.costs.reserve(document.at("costs").size());
         std::set<std::pair<std::string, int>> cost_keys;
         for (const auto & item : document.at("costs")) {
             require_fields(item, { "transport", "readiness", "lead_ns", "demand_service_ns", "speculative_service_ns",
@@ -599,7 +661,8 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         profile.selected_transport = string_value(selection.at("transport"), "selection.transport");
         profile.selected_readiness = readiness_value(selection.at("readiness"));
         profile.selected_break_even_bps = uint32_value(selection.at("break_even_bps"), "selection.break_even_bps");
-        if (profile.selected_candidates == 0 || profile.selected_candidates > profile.target.experts_per_layer ||
+        if ((profile.selected_policy == "BLOCKING_HOT") != (profile.selected_candidates == 0) ||
+            profile.selected_candidates > profile.target.experts_per_layer ||
             (profile.selected_policy == "TEMPORAL_FREQUENCY" &&
                 (!is_power_of_two(profile.selected_temporal_window) || profile.selected_temporal_window < 2 ||
                  profile.selected_temporal_window > 64)) ||
@@ -613,6 +676,7 @@ llm_expert_prefetch_result llm_expert_prefetch_load_profile(
         }
 
         if (!document.at("seed").is_array()) throw std::runtime_error("seed must be an array");
+        profile.seed.reserve(document.at("seed").size());
         std::set<std::pair<int32_t, int32_t>> seed_keys;
         for (const auto & item : document.at("seed")) {
             require_fields(item, { "layer", "expert", "count", "payload_bytes", "physical_bytes" }, "seed");

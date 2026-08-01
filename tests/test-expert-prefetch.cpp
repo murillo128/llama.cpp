@@ -157,11 +157,24 @@ void test_profile() {
         llm_expert_prefetch_error::profile_identity_mismatch, "wrong package accepted");
     require(llm_expert_prefetch_load_profile(path, 16, nullptr, rejected, error).error ==
         llm_expert_prefetch_error::profile_too_large, "profile ceiling not enforced");
+    require(llm_expert_prefetch_load_profile(path, contents.size(), nullptr, rejected, error).error ==
+        llm_expert_prefetch_error::profile_too_large, "parse allocation ceiling not enforced");
     auto wrong_cost = profile_json();
     wrong_cost["selection"]["break_even_bps"] = 3636;
     const std::string wrong_cost_path = write_profile(wrong_cost.dump(2) + "\n", "wrong-cost");
     require(!llm_expert_prefetch_load_profile(wrong_cost_path, 1024*1024, nullptr, rejected, error).is_ready(),
         "mismatched selected cost accepted");
+    auto blocking = profile_json();
+    blocking["selection"]["policy"] = "BLOCKING_HOT";
+    blocking["selection"]["candidates_per_target"] = 0;
+    blocking["selection"]["temporal_window_tokens"] = 0;
+    const std::string blocking_path = write_profile(blocking.dump(2) + "\n", "blocking");
+    require(llm_expert_prefetch_load_profile(blocking_path, 1024*1024, nullptr, rejected, error).is_ready(),
+        "seed-only profile was rejected");
+    blocking["selection"]["policy"] = "STATIC_LAYER";
+    const std::string zero_predictor_path = write_profile(blocking.dump(2) + "\n", "zero-predictor");
+    require(!llm_expert_prefetch_load_profile(zero_predictor_path, 1024*1024, nullptr, rejected, error).is_ready(),
+        "active predictor accepted zero candidates");
     std::string duplicate = contents;
     duplicate.replace(duplicate.find("\"profile_id\""), std::string("\"profile_id\"").size(),
         "\"profile_id\": \"duplicate\", \"profile_id\"");
@@ -170,6 +183,8 @@ void test_profile() {
         "duplicate key accepted");
     std::remove(path.c_str());
     std::remove(wrong_cost_path.c_str());
+    std::remove(blocking_path.c_str());
+    std::remove(zero_predictor_path.c_str());
     std::remove(duplicate_path.c_str());
 }
 

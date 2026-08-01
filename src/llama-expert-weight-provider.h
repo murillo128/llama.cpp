@@ -283,6 +283,13 @@ struct llm_expert_provider_stats {
     uint64_t surrender_busy = 0;
 };
 
+struct llm_expert_phase10_lead_event {
+    uint64_t sequence = 0;
+    uint64_t ubatch_ordinal = 0;
+    int32_t layer = -1;
+    uint64_t steady_ns = 0;
+};
+
 struct llm_hot_cache_diagnostics {
     struct auto_decision {
         uint64_t request = 0;
@@ -537,6 +544,9 @@ struct llm_hot_cache_diagnostics {
     llm_expert_cache_policy_diagnostics cold_policy;
     std::vector<llm_expert_cache_policy_domain_diagnostics> cold_policy_domains;
     std::vector<llm_expert_cache_policy_event> cold_policy_events;
+    std::vector<llm_expert_phase10_lead_event> phase10_lead_events;
+    uint32_t phase10_lead_event_capacity = 0;
+    uint64_t phase10_lead_events_dropped = 0;
 };
 
 enum class llm_expert_execution_backend : uint8_t {
@@ -865,6 +875,7 @@ struct llm_hot_cache_config {
     uint32_t trace_capacity = 256;
     llama_expert_miss_policy miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
     bool background_promotion = false;
+    bool phase10_lead_trace = false;
     llama_expert_auto_cost_model auto_cost_model = {};
     uint64_t auto_cost_model_digest = 0;
     // Internal evidence seams. Model-facing construction always leaves these

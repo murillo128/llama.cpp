@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1425,6 +1426,9 @@ public:
         if (faults.initialization != llm_expert_provider_error::none) {
             throw std::runtime_error("hot-cache expert-weight provider initialization failed");
         }
+        if (this->config.phase10_lead_trace) {
+            phase10_lead_events = std::make_unique<std::array<llm_expert_phase10_lead_event, 256>>();
+        }
         if (config.capacity < config.n_expert_used || config.capacity > config.total_expert_keys ||
             config.n_expert_used == 0 || config.routed_layer_count == 0 || config.total_expert_keys == 0 ||
             config.total_expert_keys % config.routed_layer_count != 0 || config.target_buffer_type == nullptr) {
@@ -1988,6 +1992,18 @@ public:
                 llm_expert_provider_error::unsupported_configuration));
         }
         const uint64_t ubatch_ordinal = request_ubatch_ordinal + 1;
+        if (phase10_lead_events && requested_phase == llm_expert_cache_policy_phase::decode) {
+            if (phase10_lead_event_count < phase10_lead_events->size()) {
+                const uint64_t steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                (*phase10_lead_events)[phase10_lead_event_count] = {
+                    phase10_lead_event_count, ubatch_ordinal, binding.layer, steady_ns,
+                };
+                phase10_lead_event_count++;
+            } else {
+                phase10_lead_events_dropped++;
+            }
+        }
         auto ubatch_set = cache_policy_result(hot_policy.set_ubatch_ordinal(ubatch_ordinal));
         if (ubatch_set.is_ready() && cold_cache) {
             ubatch_set = cold_cache->policy_set_ubatch_ordinal(ubatch_ordinal);
@@ -3845,6 +3861,10 @@ public:
             result.cold_policy_domains = cold.policy_domains;
             result.cold_policy_events = cold.policy_events;
         }
+        if (phase10_lead_events) result.phase10_lead_events.assign(
+            phase10_lead_events->begin(), phase10_lead_events->begin() + phase10_lead_event_count);
+        result.phase10_lead_event_capacity = phase10_lead_events ? phase10_lead_events->size() : 0;
+        result.phase10_lead_events_dropped = phase10_lead_events_dropped;
         if (transfer_ring) {
             const auto ring = transfer_ring->diagnostics();
             result.ring_requested_bytes = ring.requested_bytes;
@@ -4958,6 +4978,9 @@ private:
     uint32_t last_context_n_ctx = 0;
     uint32_t last_context_n_ubatch = 0;
     uint64_t request_ubatch_ordinal = 0;
+    std::unique_ptr<std::array<llm_expert_phase10_lead_event, 256>> phase10_lead_events;
+    size_t phase10_lead_event_count = 0;
+    uint64_t phase10_lead_events_dropped = 0;
     uint32_t last_context_extent = 0;
     uint32_t last_required_capacity = 0;
     uint64_t context_validations = 0;
