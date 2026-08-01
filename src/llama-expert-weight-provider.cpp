@@ -1428,6 +1428,7 @@ public:
         }
         if (this->config.phase10_lead_trace) {
             phase10_lead_events = std::make_unique<std::array<llm_expert_phase10_lead_event, 256>>();
+            phase10_scheduler_events = std::make_unique<std::array<llm_expert_phase10_scheduler_event, 256>>();
         }
         if (config.capacity < config.n_expert_used || config.capacity > config.total_expert_keys ||
             config.n_expert_used == 0 || config.routed_layer_count == 0 || config.total_expert_keys == 0 ||
@@ -2651,6 +2652,8 @@ public:
                             break;
                         }
                     }
+                    const uint64_t scheduler_enqueue_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
                     const auto scheduled = config.scheduler->enqueue(
                         flight.key, llm_expert_priority::demand_current_layer,
                         llm_expert_readiness::device_ready);
@@ -2671,6 +2674,18 @@ public:
                     flight.scheduler_state = llm_expert_request_state::queued;
                     llm_expert_request_snapshot selected;
                     const auto taken = config.scheduler->take_next(selected);
+                    const uint64_t scheduler_take_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    if (phase10_scheduler_events) {
+                        if (phase10_scheduler_event_count < phase10_scheduler_events->size()) {
+                            (*phase10_scheduler_events)[phase10_scheduler_event_count] = {
+                                phase10_scheduler_event_count, flight.key, scheduler_enqueue_ns, scheduler_take_ns,
+                            };
+                            phase10_scheduler_event_count++;
+                        } else {
+                            phase10_scheduler_events_dropped++;
+                        }
+                    }
                     if (taken.disposition != llm_expert_schedule_disposition::admitted ||
                         selected.handle.slot != scheduled.handle.slot ||
                         selected.handle.generation != scheduled.handle.generation) {
@@ -3865,6 +3880,36 @@ public:
             phase10_lead_events->begin(), phase10_lead_events->begin() + phase10_lead_event_count);
         result.phase10_lead_event_capacity = phase10_lead_events ? phase10_lead_events->size() : 0;
         result.phase10_lead_events_dropped = phase10_lead_events_dropped;
+        if (phase10_scheduler_events) result.phase10_scheduler_events.assign(
+            phase10_scheduler_events->begin(),
+            phase10_scheduler_events->begin() + phase10_scheduler_event_count);
+        result.phase10_scheduler_event_capacity = phase10_scheduler_events ? phase10_scheduler_events->size() : 0;
+        result.phase10_scheduler_events_dropped = phase10_scheduler_events_dropped;
+        if (phase10_lead_events && config.async_transport != nullptr) {
+            const auto asynchronous = config.async_transport->diagnostics();
+            const auto reads = config.async_transport->completed_read_intervals();
+            result.phase10_storage_events.reserve(reads.size());
+            for (const auto & read : reads) {
+                llm_expert_phase10_storage_event event;
+                event.flight = read.flight;
+                event.operation_index = read.operation_index;
+                event.submit_us = read.submit_us;
+                event.complete_us = read.complete_us;
+                event.completed_bytes = read.bytes;
+                event.useful_bytes = read.useful_bytes;
+                event.operation_file_offset = read.operation_file_offset;
+                event.source_segment_count = read.source_segment_count;
+                for (uint32_t index = 0; index < read.source_segment_count; ++index) {
+                    event.source_segments[index] = {
+                        read.source_segments[index].file_offset,
+                        read.source_segments[index].byte_count,
+                    };
+                }
+                result.phase10_storage_events.push_back(event);
+            }
+            result.phase10_storage_event_capacity = asynchronous.trace_capacity;
+            result.phase10_storage_events_dropped = asynchronous.trace_records_dropped;
+        }
         if (transfer_ring) {
             const auto ring = transfer_ring->diagnostics();
             result.ring_requested_bytes = ring.requested_bytes;
@@ -3920,6 +3965,16 @@ public:
             result.ring_h2d_compute_overlap_bytes = ring.h2d_compute_overlap_bytes;
             result.ring_h2d_compute_overlap_work = ring.h2d_compute_overlap_work;
             result.ring_h2d_compute_overlap_flights = ring.h2d_compute_overlap_flights;
+            if (phase10_lead_events) {
+                const auto transfers = transfer_ring->completed_intervals();
+                result.phase10_h2d_events.reserve(transfers.size());
+                for (const auto & transfer : transfers) {
+                    result.phase10_h2d_events.push_back({ transfer.flight, transfer.h2d_enqueue_us,
+                        transfer.h2d_complete_us, transfer.bytes, transfer.cancelled });
+                }
+                result.phase10_h2d_event_capacity = ring.trace_capacity;
+                result.phase10_h2d_events_dropped = ring.trace_records_dropped;
+            }
             if (config.async_transport != nullptr && ring.event_capable) {
                 const auto reads = config.async_transport->completed_read_intervals();
                 const auto transfers = transfer_ring->completed_intervals();
@@ -4981,6 +5036,9 @@ private:
     std::unique_ptr<std::array<llm_expert_phase10_lead_event, 256>> phase10_lead_events;
     size_t phase10_lead_event_count = 0;
     uint64_t phase10_lead_events_dropped = 0;
+    std::unique_ptr<std::array<llm_expert_phase10_scheduler_event, 256>> phase10_scheduler_events;
+    size_t phase10_scheduler_event_count = 0;
+    uint64_t phase10_scheduler_events_dropped = 0;
     uint32_t last_context_extent = 0;
     uint32_t last_required_capacity = 0;
     uint64_t context_validations = 0;

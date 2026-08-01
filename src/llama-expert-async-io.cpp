@@ -447,14 +447,20 @@ struct llm_expert_async_transport::impl {
             if (counters.trace_records < traces.size()) {
                 auto & trace = traces[counters.trace_records++];
                 trace.sequence = counters.trace_records;
-                trace.read = {
-                    { operation.identity.transport_epoch, operation.identity.request.slot,
-                        operation.identity.request.generation, operation.identity.key },
-                    operation.identity.request_operation_index,
-                    operation.submit_us,
-                    operation.complete_us,
-                    operation.completed_bytes,
-                };
+                trace.read = {};
+                trace.read.flight = { operation.identity.transport_epoch, operation.identity.request.slot,
+                    operation.identity.request.generation, operation.identity.key };
+                trace.read.operation_index = operation.identity.request_operation_index;
+                trace.read.submit_us = operation.submit_us;
+                trace.read.complete_us = operation.complete_us;
+                trace.read.bytes = operation.completed_bytes;
+                trace.read.operation_file_offset = operation.read.file_offset;
+                trace.read.source_segment_count = operation.read.segment_count;
+                for (uint32_t index = 0; index < operation.read.segment_count; ++index) {
+                    const auto & segment = operation.read.segments[index];
+                    trace.read.source_segments[index] = { segment.file_offset, segment.byte_count };
+                    trace.read.useful_bytes += segment.byte_count;
+                }
             } else {
                 counters.trace_records_dropped++;
             }

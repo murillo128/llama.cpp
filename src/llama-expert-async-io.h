@@ -188,11 +188,20 @@ struct llm_expert_async_read_completion {
 };
 
 struct llm_expert_async_read_interval {
+    struct source_segment {
+        uint64_t file_offset = 0;
+        uint64_t byte_count = 0;
+    };
+
     llm_expert_flight_id flight;
     uint32_t operation_index = 0;
     uint64_t submit_us = 0;
     uint64_t complete_us = 0;
     uint64_t bytes = 0;
+    uint64_t useful_bytes = 0;
+    uint64_t operation_file_offset = 0;
+    uint32_t source_segment_count = 0;
+    std::array<source_segment, 12> source_segments;
 };
 
 class llm_expert_async_transport {

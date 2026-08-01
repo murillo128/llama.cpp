@@ -18,8 +18,13 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <optional>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -51,68 +56,6 @@ uint64_t percentile(std::vector<uint64_t> values, uint32_t numerator, uint32_t d
 
 uint64_t elapsed_ns(std::chrono::steady_clock::time_point begin) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();
-}
-
-std::vector<uint64_t> benchmark_pread(const std::string & path, uint64_t bytes, bool direct, bool & supported) {
-    supported = false;
-    const size_t alignment = 4096;
-    const size_t extent = direct ? size_t((bytes + alignment - 1)/alignment*alignment) : size_t(bytes);
-    int flags = O_RDONLY;
-#ifdef O_DIRECT
-    if (direct) flags |= O_DIRECT;
-#else
-    if (direct) return {};
-#endif
-    const int descriptor = open(path.c_str(), flags);
-    if (descriptor < 0) return {};
-    void * buffer = nullptr;
-    if (posix_memalign(&buffer, alignment, extent) != 0) {
-        close(descriptor);
-        return {};
-    }
-    std::vector<uint64_t> measurements;
-    for (uint32_t repetition = 0; repetition < 21; ++repetition) {
-        const auto begin = std::chrono::steady_clock::now();
-        const ssize_t result = pread(descriptor, buffer, extent, 0);
-        const uint64_t elapsed = elapsed_ns(begin);
-        if (result != ssize_t(extent)) {
-            std::free(buffer);
-            close(descriptor);
-            return {};
-        }
-        if (repetition != 0) measurements.push_back(elapsed);
-    }
-    std::free(buffer);
-    close(descriptor);
-    supported = true;
-    return measurements;
-}
-
-std::vector<uint64_t> benchmark_h2d(uint64_t bytes, bool & supported) {
-    supported = false;
-    ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-    if (device == nullptr || bytes > SIZE_MAX) return {};
-    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
-    if (!backend) return {};
-    ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
-    ggml_context_ptr context(ggml_init(params));
-    if (!context) return {};
-    ggml_tensor * tensor = ggml_new_tensor_1d(context.get(), GGML_TYPE_I8, int64_t(bytes));
-    ggml_backend_buffer_ptr destination(
-        ggml_backend_alloc_ctx_tensors_from_buft(context.get(), ggml_backend_dev_buffer_type(device)));
-    ggml_backend_buffer_ptr source(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(device), size_t(bytes)));
-    if (!destination || !source || !ggml_backend_buffer_is_host(source.get())) return {};
-    ggml_backend_buffer_clear(source.get(), 0);
-    std::vector<uint64_t> measurements;
-    for (uint32_t repetition = 0; repetition < 21; ++repetition) {
-        const auto begin = std::chrono::steady_clock::now();
-        ggml_backend_tensor_set_async(backend.get(), tensor, ggml_backend_buffer_get_base(source.get()), 0, size_t(bytes));
-        ggml_backend_synchronize(backend.get());
-        const uint64_t elapsed = elapsed_ns(begin);
-        if (repetition != 0) measurements.push_back(elapsed);
-    }
-    supported = true;
-    return measurements;
 }
 
 struct predictor_benchmark {
@@ -189,12 +132,200 @@ predictor_benchmark benchmark_predictor(
 struct model_profile_validation {
     uint64_t load_ns = 0;
     json lead_measurements;
+    llm_hot_cache_diagnostics diagnostics;
 };
+
+struct expected_bundle_path {
+    uint64_t bytes = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> spans;
+};
+
+struct expected_storage_map {
+    std::string sha256;
+    std::string model_sha256;
+    uint64_t model_size = 0;
+    std::map<std::pair<int32_t, int32_t>, expected_bundle_path> bundles;
+};
+
+std::string read_text(const std::string & path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw probe_error("cannot open storage map");
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    if (!input.good() && !input.eof()) throw probe_error("cannot read storage map");
+    return buffer.str();
+}
+
+expected_storage_map load_storage_map(
+        const std::string & path,
+        const llm_expert_prefetch_profile & profile) {
+    const std::string bytes = read_text(path);
+    const json document = json::parse(bytes);
+    if (document.value("schema_version", "") != "expert-storage-map-v1") {
+        throw probe_error("unsupported storage map");
+    }
+    expected_storage_map result;
+    result.sha256 = llm_expert_prefetch_sha256(bytes.data(), bytes.size());
+    result.model_sha256 = document.at("model").at("sha256");
+    result.model_size = document.at("model").at("size");
+    if (profile.target.files.size() != 1 || profile.target.files[0].sha256 != result.model_sha256 ||
+            profile.target.files[0].size != result.model_size) {
+        throw probe_error("storage map model identity differs from the profile");
+    }
+    for (const auto & entry : document.at("entries")) {
+        const std::pair<int32_t, int32_t> key = { entry.at("layer"), entry.at("expert_id") };
+        expected_bundle_path bundle;
+        bundle.bytes = entry.at("atomic_bundle_bytes");
+        for (const char * projection : { "gate", "up", "down" }) {
+            for (const auto & span : entry.at("projections").at(projection).at("spans")) {
+                bundle.spans.emplace_back(span.at("file_offset"), span.at("length"));
+            }
+        }
+        std::sort(bundle.spans.begin(), bundle.spans.end());
+        if (!result.bundles.emplace(key, std::move(bundle)).second) {
+            throw probe_error("duplicate storage-map expert key");
+        }
+    }
+    if (result.bundles.size() != profile.target.expert_bytes.size()) {
+        throw probe_error("storage-map/profile key count mismatch");
+    }
+    return result;
+}
+
+using flight_key = std::tuple<uint64_t, uint32_t, uint64_t, int32_t, int32_t>;
+
+flight_key exact_flight(const llm_expert_flight_id & flight) {
+    return { flight.transport_epoch, flight.request_slot, flight.request_generation,
+        flight.key.layer, flight.key.expert };
+}
+
+struct runtime_path_measurements {
+    std::vector<uint64_t> storage_service_ns;
+    std::vector<uint64_t> storage_refill_ns;
+    std::vector<uint64_t> h2d_service_ns;
+    std::vector<uint64_t> h2d_refill_ns;
+    std::vector<uint64_t> device_service_ns;
+    std::vector<uint64_t> device_refill_ns;
+    std::vector<uint64_t> scheduler_delay_ns;
+    json provenance;
+};
+
+runtime_path_measurements measure_runtime_paths(
+        const llm_hot_cache_diagnostics & diagnostics,
+        const expected_storage_map & expected,
+        const char * load_mode) {
+    if (diagnostics.phase10_lead_events_dropped != 0 ||
+            diagnostics.phase10_scheduler_events_dropped != 0 ||
+            diagnostics.phase10_storage_events_dropped != 0 ||
+            diagnostics.phase10_h2d_events_dropped != 0) {
+        throw probe_error("Phase 10 runtime measurement transcript overflowed");
+    }
+    runtime_path_measurements result;
+    for (const auto & event : diagnostics.phase10_scheduler_events) {
+        if (event.take_ns < event.enqueue_ns) throw probe_error("scheduler timing regressed");
+        result.scheduler_delay_ns.push_back(event.take_ns - event.enqueue_ns);
+    }
+
+    struct storage_flight {
+        llm_expert_key key = { -1, -1 };
+        uint64_t begin_us = UINT64_MAX;
+        uint64_t end_us = 0;
+        uint64_t completed_bytes = 0;
+        uint64_t useful_bytes = 0;
+        std::vector<std::pair<uint64_t, uint64_t>> spans;
+    };
+    std::map<flight_key, storage_flight> storage;
+    for (const auto & event : diagnostics.phase10_storage_events) {
+        if (!event.flight.valid() || event.complete_us < event.submit_us || event.source_segment_count == 0) {
+            throw probe_error("invalid runtime storage timing event");
+        }
+        auto & flight = storage[exact_flight(event.flight)];
+        flight.key = event.flight.key;
+        flight.begin_us = std::min(flight.begin_us, event.submit_us);
+        flight.end_us = std::max(flight.end_us, event.complete_us);
+        flight.completed_bytes += event.completed_bytes;
+        flight.useful_bytes += event.useful_bytes;
+        for (uint32_t index = 0; index < event.source_segment_count; ++index) {
+            flight.spans.emplace_back(event.source_segments[index].file_offset,
+                event.source_segments[index].byte_count);
+        }
+    }
+    std::vector<std::pair<flight_key, storage_flight *>> ordered_storage;
+    for (auto & item : storage) ordered_storage.push_back({ item.first, &item.second });
+    std::sort(ordered_storage.begin(), ordered_storage.end(), [](const auto & lhs, const auto & rhs) {
+        return std::tie(lhs.second->begin_us, lhs.first) < std::tie(rhs.second->begin_us, rhs.first);
+    });
+    std::map<std::pair<int32_t, int32_t>, uint32_t> storage_occurrences;
+    json representative = nullptr;
+    for (const auto & ordered : ordered_storage) {
+        auto & flight = *ordered.second;
+        const std::pair<int32_t, int32_t> key = { flight.key.layer, flight.key.expert };
+        const auto found = expected.bundles.find(key);
+        if (found == expected.bundles.end()) throw probe_error("runtime storage key is absent from the storage map");
+        std::sort(flight.spans.begin(), flight.spans.end());
+        if (flight.spans != found->second.spans || flight.useful_bytes != found->second.bytes ||
+                flight.end_us <= flight.begin_us) {
+            throw probe_error("runtime storage flight differs from exact expert bundle spans");
+        }
+        const uint64_t duration_ns = (flight.end_us - flight.begin_us)*1000;
+        result.storage_service_ns.push_back(duration_ns);
+        if (storage_occurrences[key]++ != 0) result.storage_refill_ns.push_back(duration_ns);
+        if (representative.is_null()) {
+            representative = { {"layer", key.first}, {"expert", key.second},
+                {"useful_bytes", flight.useful_bytes}, {"completed_bytes", flight.completed_bytes},
+                {"spans", json::array()} };
+            for (const auto & span : flight.spans) representative["spans"].push_back(
+                { {"file_offset", span.first}, {"length", span.second} });
+        }
+    }
+
+    std::vector<const llm_expert_phase10_h2d_event *> transfers;
+    for (const auto & event : diagnostics.phase10_h2d_events) {
+        if (!event.cancelled && event.flight.valid() && event.complete_us > event.enqueue_us) transfers.push_back(&event);
+    }
+    std::sort(transfers.begin(), transfers.end(), [](const auto * lhs, const auto * rhs) {
+        return std::tie(lhs->enqueue_us, lhs->flight.request_slot, lhs->flight.request_generation) <
+            std::tie(rhs->enqueue_us, rhs->flight.request_slot, rhs->flight.request_generation);
+    });
+    std::map<std::pair<int32_t, int32_t>, uint32_t> transfer_occurrences;
+    for (const auto * transfer : transfers) {
+        const std::pair<int32_t, int32_t> key = { transfer->flight.key.layer, transfer->flight.key.expert };
+        const auto found = expected.bundles.find(key);
+        if (found == expected.bundles.end() || transfer->bytes != found->second.bytes) {
+            throw probe_error("runtime H2D flight differs from exact expert bundle bytes");
+        }
+        const uint64_t h2d_ns = (transfer->complete_us - transfer->enqueue_us)*1000;
+        result.h2d_service_ns.push_back(h2d_ns);
+        const bool refill = transfer_occurrences[key]++ != 0;
+        if (refill) result.h2d_refill_ns.push_back(h2d_ns);
+        uint64_t begin_us = transfer->enqueue_us;
+        const auto storage_found = storage.find(exact_flight(transfer->flight));
+        if (storage_found != storage.end()) begin_us = std::min(begin_us, storage_found->second.begin_us);
+        if (transfer->complete_us <= begin_us) throw probe_error("combined runtime service timing is invalid");
+        const uint64_t device_ns = (transfer->complete_us - begin_us)*1000;
+        result.device_service_ns.push_back(device_ns);
+        if (refill) result.device_refill_ns.push_back(device_ns);
+    }
+    result.provenance = { {"load_mode", load_mode}, {"path", "runtime COLD_CACHE scheduler -> exact ExpertStorage read plan -> cold cache -> transfer ring -> hot cache"},
+        {"storage_map_sha256", expected.sha256}, {"model_sha256", expected.model_sha256},
+        {"model_size", expected.model_size}, {"all_observed_spans_exact", true},
+        {"storage_operations", diagnostics.phase10_storage_events.size()},
+        {"storage_flights", storage.size()}, {"h2d_flights", transfers.size()},
+        {"scheduler_samples", result.scheduler_delay_ns.size()},
+        {"storage_refill_samples", result.storage_refill_ns.size()},
+        {"h2d_refill_samples", result.h2d_refill_ns.size()},
+        {"storage_trace_capacity", diagnostics.phase10_storage_event_capacity},
+        {"h2d_trace_capacity", diagnostics.phase10_h2d_event_capacity},
+        {"scheduler_trace_capacity", diagnostics.phase10_scheduler_event_capacity},
+        {"representative_bundle", representative} };
+    return result;
+}
 
 model_profile_validation validate_model_profile(
         const std::string & model_path,
         const std::string & profile_path,
         const llm_expert_prefetch_profile & profile,
+        llama_load_mode load_mode,
         bool measure_lead) {
     const auto selected_cost = std::find_if(profile.costs.begin(), profile.costs.end(), [&](const auto & cost) {
         return cost.transport == profile.selected_transport && cost.readiness == profile.selected_readiness;
@@ -214,24 +345,28 @@ model_profile_validation validate_model_profile(
         throw probe_error("unsupported selected profile policy");
     }();
     const bool seed = profile.selected_policy == "BLOCKING_HOT";
+    const uint64_t bundle_bytes = profile.target.expert_bytes.front().physical_bytes;
+    if (bundle_bytes == 0 || bundle_bytes > UINT64_MAX/16) throw probe_error("invalid profile bundle bytes");
+    const uint64_t speculative_bytes = 4*bundle_bytes;
     llama_expert_prefetch_config_v1 prefetch = {
         LLAMA_EXPERT_PREFETCH_VERSION_1, sizeof(llama_expert_prefetch_config_v1),
         selected_policy, profile.selected_readiness,
         seed ? LLAMA_EXPERT_PREFETCH_SEED_MODE_BLOCKING_HOT : LLAMA_EXPERT_PREFETCH_SEED_MODE_OFF,
         profile.selected_temporal_window, seed ? 0U : profile.selected_candidates,
-        64U*1024U*1024U, seed ? 0U : 16U, seed ? 0U : 16U*1024U*1024U,
-        seed ? 0U : 16U*1024U*1024U, seed ? 0U : 16U*1024U*1024U,
-        seed ? 0U : 16U*1024U*1024U, seed ? 0U : 14U, seed ? 0U : 14U,
+        64U*1024U*1024U, seed ? 0U : 4U, seed ? 0U : speculative_bytes,
+        seed ? 0U : speculative_bytes, seed ? 0U : speculative_bytes,
+        seed ? 0U : speculative_bytes, seed ? 0U : 4U, seed ? 0U : 4U,
         seed ? 0U : selected_cost->utility_window_predictions,
         seed ? 0U : selected_cost->utility_min_observations, {},
     };
     auto params = llama_model_default_params();
+    params.load_mode = load_mode;
     params.n_gpu_layers = -1;
     params.tensor_buft_overrides = overrides;
     params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
     params.expert_hot_cache_capacity = 16;
-    params.expert_cold_cache_bytes = 64U*1024U*1024U;
-    params.expert_transfer_ring_bytes = 16U*1024U*1024U;
+    params.expert_cold_cache_bytes = 16*bundle_bytes;
+    params.expert_transfer_ring_bytes = 4*bundle_bytes;
     params.expert_prefetch_config = &prefetch;
     params.expert_prefetch_profile_path = profile_path.c_str();
     const auto begin = std::chrono::steady_clock::now();
@@ -263,7 +398,7 @@ model_profile_validation validate_model_profile(
     llama_token generated = 0;
     const int vocabulary = llama_vocab_n_tokens(vocab);
     std::vector<uint64_t> decode_begins;
-    for (int step = 0; step < 6; ++step) {
+    for (int step = 0; step < 13; ++step) {
         if (step != 0) {
             decode_begins.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -320,6 +455,7 @@ model_profile_validation validate_model_profile(
         {"cross_layer_p50_ns", cross_layer_p50}, {"conservative_lead_p50_ns", conservative_p50},
         {"provider_event_capacity", diagnostics.phase10_lead_event_capacity},
         {"provider_events_dropped", diagnostics.phase10_lead_events_dropped}};
+    result.diagnostics = diagnostics;
     return result;
 }
 
@@ -328,17 +464,24 @@ json envelope(
         const std::string & readiness,
         bool supported,
         const std::vector<uint64_t> & service,
+        const std::vector<uint64_t> & refill,
+        const std::vector<uint64_t> & scheduler,
         uint64_t predictor_p95,
         uint64_t storage_bytes,
         uint64_t h2d_bytes,
-        uint64_t lead_p50) {
+        uint64_t lead_p50,
+        const json & measurement_basis) {
+    supported = supported && !service.empty() && !refill.empty() && !scheduler.empty();
     const uint64_t p50 = supported ? percentile(service, 50, 100) : 0;
     const uint64_t p95 = supported ? percentile(service, 95, 100) : 0;
     return {{"transport", transport}, {"readiness", readiness}, {"supported", supported},
         {"lead_p50_ns", lead_p50}, {"demand_service_p50_ns", p50}, {"speculative_service_p95_ns", p95},
-        {"predictor_compute_p95_ns", predictor_p95}, {"scheduler_demand_delay_p95_ns", 0},
-        {"displacement_refill_p95_ns", p95}, {"storage_bytes", storage_bytes}, {"h2d_bytes", h2d_bytes},
-        {"utility_window_predictions", 64}, {"utility_min_observations", 32}};
+        {"predictor_compute_p95_ns", predictor_p95},
+        {"scheduler_demand_delay_p95_ns", supported ? percentile(scheduler, 95, 100) : 0},
+        {"displacement_refill_p95_ns", supported ? percentile(refill, 95, 100) : 0},
+        {"storage_bytes", storage_bytes}, {"h2d_bytes", h2d_bytes},
+        {"utility_window_predictions", 64}, {"utility_min_observations", 32},
+        {"measurement_basis", measurement_basis}};
 }
 
 } // namespace
@@ -346,9 +489,10 @@ json envelope(
 int main(int argc, char ** argv) {
     try {
         const bool validate_only = argc == 8 && std::string(argv[7]) == "--validate-only";
-        if ((argc != 7 && !validate_only) || std::string(argv[1]) != "--profile" ||
-            std::string(argv[3]) != "--model" || std::string(argv[5]) != "--identity") {
-            throw probe_error("usage: phase10-prefetch-probe --profile FILE --model GGUF --identity PROJECT:NESTED [--validate-only]");
+        if (((argc != 9 || std::string(argv[7]) != "--storage-map") && !validate_only) ||
+                std::string(argv[1]) != "--profile" || std::string(argv[3]) != "--model" ||
+                std::string(argv[5]) != "--identity") {
+            throw probe_error("usage: phase10-prefetch-probe --profile FILE --model GGUF --identity PROJECT:NESTED --storage-map FILE | --validate-only");
         }
         const std::string profile_path = argv[2];
         const std::string model_path = argv[4];
@@ -363,7 +507,8 @@ int main(int argc, char ** argv) {
             throw probe_error("profile load failed: " + profile_error);
         }
         const uint64_t profile_parse_ns = elapsed_ns(profile_begin);
-        const auto model_validation = validate_model_profile(model_path, profile_path, profile, !validate_only);
+        const auto model_validation = validate_model_profile(
+            model_path, profile_path, profile, LLAMA_LOAD_MODE_MMAP, !validate_only);
         if (validate_only) {
             std::cout << json({ {"schema_version", "phase10-profile-validation-v1"},
                 {"project_head", identity.substr(0, separator)}, {"nested_head", identity.substr(separator + 1)},
@@ -372,18 +517,18 @@ int main(int argc, char ** argv) {
             return 0;
         }
         const uint64_t bytes = profile.target.expert_bytes.front().physical_bytes;
+        const expected_storage_map storage_map = load_storage_map(argv[8], profile);
         const auto predictor = benchmark_predictor(profile, profile_path);
         const uint64_t predictor_p95 = predictor.upper_bound_p95_ns;
-        bool buffered_supported = false, direct_supported = false, h2d_supported = false;
-        const auto buffered = benchmark_pread(model_path, bytes, false, buffered_supported);
-        const auto direct = benchmark_pread(model_path, bytes, true, direct_supported);
-        const auto h2d = benchmark_h2d(bytes, h2d_supported);
-        std::vector<uint64_t> buffered_device, direct_device;
-        if (buffered_supported && h2d_supported) {
-            for (size_t index = 0; index < std::min(buffered.size(), h2d.size()); ++index) buffered_device.push_back(buffered[index] + h2d[index]);
-        }
-        if (direct_supported && h2d_supported) {
-            for (size_t index = 0; index < std::min(direct.size(), h2d.size()); ++index) direct_device.push_back(direct[index] + h2d[index]);
+        const auto buffered = measure_runtime_paths(model_validation.diagnostics, storage_map, "MMAP_BUFFERED");
+        std::optional<runtime_path_measurements> direct;
+        std::string direct_unavailable_reason;
+        try {
+            const auto direct_validation = validate_model_profile(
+                model_path, profile_path, profile, LLAMA_LOAD_MODE_DIRECT_IO, true);
+            direct = measure_runtime_paths(direct_validation.diagnostics, storage_map, "DIRECT_IO");
+        } catch (const std::exception & error) {
+            direct_unavailable_reason = error.what();
         }
         json output = { {"schema_version", "phase10-transport-measurements-v1"},
             {"project_head", identity.substr(0, separator)}, {"nested_head", identity.substr(separator + 1)},
@@ -392,13 +537,34 @@ int main(int argc, char ** argv) {
             {"lead_measurements", model_validation.lead_measurements},
             {"predictor_upper_bound", {{"basis", "maximum p95 over full-token topology-capped declared predictors"},
                 {"upper_bound_p95_ns", predictor.upper_bound_p95_ns}, {"measurements", predictor.measurements}}},
+            {"path_provenance", {{"storage_map_sha256", storage_map.sha256},
+                {"model_sha256", storage_map.model_sha256}, {"model_size", storage_map.model_size},
+                {"exact_runtime_provider_path", true}, {"buffered", buffered.provenance},
+                {"direct", direct ? direct->provenance : json({{"supported", false},
+                    {"reason", direct_unavailable_reason}})}}},
             {"envelopes", json::array()} };
         const uint64_t lead_p50 = model_validation.lead_measurements.at("conservative_lead_p50_ns");
-        output["envelopes"].push_back(envelope("BUFFERED", "HOST_READY", buffered_supported, buffered, predictor_p95, bytes, 0, lead_p50));
-        output["envelopes"].push_back(envelope("DIRECT_IO", "HOST_READY", direct_supported, direct, predictor_p95, bytes, 0, lead_p50));
-        output["envelopes"].push_back(envelope("HOST_TO_DEVICE", "DEVICE_READY", h2d_supported, h2d, predictor_p95, 0, bytes, lead_p50));
-        output["envelopes"].push_back(envelope("BUFFERED", "DEVICE_READY", !buffered_device.empty(), buffered_device, predictor_p95, bytes, bytes, lead_p50));
-        output["envelopes"].push_back(envelope("DIRECT_IO", "DEVICE_READY", !direct_device.empty(), direct_device, predictor_p95, bytes, bytes, lead_p50));
+        output["envelopes"].push_back(envelope("BUFFERED", "HOST_READY", true,
+            buffered.storage_service_ns, buffered.storage_refill_ns, buffered.scheduler_delay_ns,
+            predictor_p95, bytes, 0, lead_p50, buffered.provenance));
+        output["envelopes"].push_back(envelope("DIRECT_IO", "HOST_READY", direct.has_value(),
+            direct ? direct->storage_service_ns : std::vector<uint64_t>{},
+            direct ? direct->storage_refill_ns : std::vector<uint64_t>{},
+            direct ? direct->scheduler_delay_ns : std::vector<uint64_t>{},
+            predictor_p95, bytes, 0, lead_p50,
+            direct ? direct->provenance : output["path_provenance"]["direct"]));
+        output["envelopes"].push_back(envelope("HOST_TO_DEVICE", "DEVICE_READY", true,
+            buffered.h2d_service_ns, buffered.h2d_refill_ns, buffered.scheduler_delay_ns,
+            predictor_p95, 0, bytes, lead_p50, buffered.provenance));
+        output["envelopes"].push_back(envelope("BUFFERED", "DEVICE_READY", true,
+            buffered.device_service_ns, buffered.device_refill_ns, buffered.scheduler_delay_ns,
+            predictor_p95, bytes, bytes, lead_p50, buffered.provenance));
+        output["envelopes"].push_back(envelope("DIRECT_IO", "DEVICE_READY", direct.has_value(),
+            direct ? direct->device_service_ns : std::vector<uint64_t>{},
+            direct ? direct->device_refill_ns : std::vector<uint64_t>{},
+            direct ? direct->scheduler_delay_ns : std::vector<uint64_t>{},
+            predictor_p95, bytes, bytes, lead_p50,
+            direct ? direct->provenance : output["path_provenance"]["direct"]));
         std::cout << output.dump(2) << '\n';
         return 0;
     } catch (const std::exception & exception) {

@@ -290,6 +290,38 @@ struct llm_expert_phase10_lead_event {
     uint64_t steady_ns = 0;
 };
 
+struct llm_expert_phase10_scheduler_event {
+    uint64_t sequence = 0;
+    llm_expert_key key = { -1, -1 };
+    uint64_t enqueue_ns = 0;
+    uint64_t take_ns = 0;
+};
+
+struct llm_expert_phase10_storage_event {
+    struct source_segment {
+        uint64_t file_offset = 0;
+        uint64_t byte_count = 0;
+    };
+
+    llm_expert_flight_id flight;
+    uint32_t operation_index = 0;
+    uint64_t submit_us = 0;
+    uint64_t complete_us = 0;
+    uint64_t completed_bytes = 0;
+    uint64_t useful_bytes = 0;
+    uint64_t operation_file_offset = 0;
+    uint32_t source_segment_count = 0;
+    std::array<source_segment, 12> source_segments;
+};
+
+struct llm_expert_phase10_h2d_event {
+    llm_expert_flight_id flight;
+    uint64_t enqueue_us = 0;
+    uint64_t complete_us = 0;
+    uint64_t bytes = 0;
+    bool cancelled = false;
+};
+
 struct llm_hot_cache_diagnostics {
     struct auto_decision {
         uint64_t request = 0;
@@ -547,6 +579,15 @@ struct llm_hot_cache_diagnostics {
     std::vector<llm_expert_phase10_lead_event> phase10_lead_events;
     uint32_t phase10_lead_event_capacity = 0;
     uint64_t phase10_lead_events_dropped = 0;
+    std::vector<llm_expert_phase10_scheduler_event> phase10_scheduler_events;
+    uint32_t phase10_scheduler_event_capacity = 0;
+    uint64_t phase10_scheduler_events_dropped = 0;
+    std::vector<llm_expert_phase10_storage_event> phase10_storage_events;
+    uint32_t phase10_storage_event_capacity = 0;
+    uint64_t phase10_storage_events_dropped = 0;
+    std::vector<llm_expert_phase10_h2d_event> phase10_h2d_events;
+    uint32_t phase10_h2d_event_capacity = 0;
+    uint64_t phase10_h2d_events_dropped = 0;
 };
 
 enum class llm_expert_execution_backend : uint8_t {

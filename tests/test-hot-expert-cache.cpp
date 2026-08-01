@@ -264,6 +264,15 @@ void test_runtime_policy_adapters_and_bounded_metadata() {
         GGML_ASSERT(diagnostics.phase10_lead_event_capacity == 0);
         GGML_ASSERT(diagnostics.phase10_lead_events.empty());
         GGML_ASSERT(diagnostics.phase10_lead_events_dropped == 0);
+        GGML_ASSERT(diagnostics.phase10_scheduler_event_capacity == 0);
+        GGML_ASSERT(diagnostics.phase10_scheduler_events.empty());
+        GGML_ASSERT(diagnostics.phase10_scheduler_events_dropped == 0);
+        GGML_ASSERT(diagnostics.phase10_storage_event_capacity == 0);
+        GGML_ASSERT(diagnostics.phase10_storage_events.empty());
+        GGML_ASSERT(diagnostics.phase10_storage_events_dropped == 0);
+        GGML_ASSERT(diagnostics.phase10_h2d_event_capacity == 0);
+        GGML_ASSERT(diagnostics.phase10_h2d_events.empty());
+        GGML_ASSERT(diagnostics.phase10_h2d_events_dropped == 0);
         GGML_ASSERT(diagnostics.policy.config.policy == policy_name);
         GGML_ASSERT(diagnostics.policy.config.supplied);
         GGML_ASSERT(diagnostics.policy.events > 0);
