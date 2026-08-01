@@ -43,6 +43,7 @@ struct arguments {
     bool background = false;
     bool observe_routes = true;
     std::string transport = "BUFFERED";
+    std::string config_source = "EXPLICIT";
 };
 
 bool parse_u64(const char * text, uint64_t & value) {
@@ -92,6 +93,9 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         } else if (option == "--transport") {
             result.transport = value;
             if (result.transport != "BUFFERED" && result.transport != "DIRECT_IO") return false;
+        } else if (option == "--config-source") {
+            result.config_source = value;
+            if (result.config_source != "EXPLICIT" && result.config_source != "NULL") return false;
         } else return false;
     }
     return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ubatch > 0 &&
@@ -306,7 +310,7 @@ int main(int argc, char ** argv) {
         model_params.expert_weights_mode = args.mode == "cold" ?
             LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
         model_params.expert_hot_cache_capacity = args.hot_slots;
-        model_params.expert_hot_cache_policy = &hot_config;
+        model_params.expert_hot_cache_policy = args.config_source == "NULL" ? nullptr : &hot_config;
         if (args.mode == "cold") {
             model_params.expert_cold_cache_bytes = args.cold_bytes;
             model_params.expert_transfer_ring_bytes = args.ring_bytes;
@@ -315,7 +319,7 @@ int main(int argc, char ** argv) {
                 model_params.expert_auto_cost_model = &auto_cost;
             }
             model_params.expert_background_promotion = args.background;
-            model_params.expert_cold_cache_policy = &cold_config;
+            model_params.expert_cold_cache_policy = args.config_source == "NULL" ? nullptr : &cold_config;
         }
         llama_model_ptr model(llama_model_load_from_file(args.model.c_str(), model_params));
         if (!model) return 3;
@@ -415,6 +419,7 @@ int main(int argc, char ** argv) {
             {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
             {"command", command}, {"model_path", args.model}, {"mode", args.mode},
             {"transport_requested", args.transport},
+            {"config_source", args.config_source},
             {"miss_policy", args.miss_policy}, {"background", args.background},
             {"prompt_ids", prompt}, {"generated_ids", generated}, {"logits_fnv64", logits_digests},
             {"latency_us", latency_us}, {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
