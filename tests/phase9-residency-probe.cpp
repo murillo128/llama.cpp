@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <sys/resource.h>
 #include <vector>
@@ -127,13 +128,13 @@ llm_expert_provider_result zero_loader(
 std::map<std::string, uint64_t> read_kib(const std::string & path) {
     std::ifstream source(path);
     std::map<std::string, uint64_t> result;
-    std::string key;
-    uint64_t value = 0;
-    std::string unit;
-    while (source >> key >> value) {
-        if (!key.empty() && key.back() == ':') key.pop_back();
-        std::getline(source, unit);
-        result[key] = value;
+    std::string line;
+    while (std::getline(source, line)) {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        uint64_t value = 0;
+        std::istringstream fields(line.substr(colon + 1));
+        if (fields >> value) result[line.substr(0, colon)] = value;
     }
     return result;
 }
