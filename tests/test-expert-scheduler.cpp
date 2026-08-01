@@ -2,6 +2,8 @@
 
 #include "ggml.h"
 
+#include <chrono>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -18,6 +20,8 @@ struct phase10_scheduler_evidence {
     bool retry_new_generation = false;
     bool submitted_shutdown_drained = false;
     bool zero_final_charges = false;
+    bool cancelling_promotion_fenced = false;
+    bool submitted_headroom_preserved = false;
 };
 
 phase10_scheduler_evidence phase10_evidence;
@@ -60,6 +64,12 @@ void test_configuration() {
     expect_invalid([] { llm_expert_scheduler scheduler({}); });
     expect_invalid([] { llm_expert_scheduler scheduler({ 1, 1, 0, 1, 0 }); });
     expect_invalid([] { llm_expert_scheduler scheduler({ 1, 1, 1, 0, 0 }); });
+    expect_invalid([] {
+        llm_expert_scheduler scheduler({
+            1, 2, 1, 1, 0,
+            1, 1, 1, 1, 1, 1, 1,
+        });
+    });
     llm_expert_scheduler scheduler(config());
     const auto diagnostics = scheduler.diagnostics();
     GGML_ASSERT(diagnostics.request_capacity == 4);
@@ -181,8 +191,9 @@ void test_post_h2d_cancellation_path() {
         llm_expert_request_state::host_ready) == llm_expert_schedule_disposition::admitted);
     GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::host_ready,
         llm_expert_request_state::h2d_in_flight) == llm_expert_schedule_disposition::admitted);
-    GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::h2d_in_flight,
-        llm_expert_request_state::cancelling) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.begin_demand_cancellation(
+        admitted.handle, llm_expert_request_state::h2d_in_flight) ==
+        llm_expert_schedule_disposition::admitted);
     GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::cancelling,
         llm_expert_request_state::draining) == llm_expert_schedule_disposition::admitted);
     GGML_ASSERT(scheduler.finish(admitted.handle, llm_expert_request_state::cancelled) ==
@@ -298,7 +309,7 @@ void test_speculative_budgets_cancel_and_demand_promotion() {
 
 void test_demand_preemption_submitted_drain_retry_and_shutdown() {
     const llm_expert_scheduler_config single = {
-        1, 4, 1, 4, 0,
+        1, 4, 2, 4, 0,
         1, 200, 200, 200, 200, 1, 1,
     };
     {
@@ -308,8 +319,11 @@ void test_demand_preemption_submitted_drain_retry_and_shutdown() {
             llm_expert_readiness::device_ready,
             speculative_metadata(1, 0, 0, 100, 100));
         GGML_ASSERT(speculative.accepted());
+        GGML_ASSERT(scheduler.enqueue(
+            { 0, 3 }, llm_expert_priority::demand_future_dependency,
+            llm_expert_readiness::host_ready).accepted());
         const auto demand = scheduler.enqueue(
-            { 0, 1 }, llm_expert_priority::demand_future_dependency,
+            { 0, 1 }, llm_expert_priority::demand_current_layer,
             llm_expert_readiness::device_ready);
         GGML_ASSERT(demand.disposition == llm_expert_schedule_disposition::admitted);
         GGML_ASSERT(demand.handle.generation != speculative.handle.generation);
@@ -321,7 +335,7 @@ void test_demand_preemption_submitted_drain_retry_and_shutdown() {
             llm_expert_schedule_disposition::stale_generation);
         llm_expert_request_snapshot selected;
         GGML_ASSERT(scheduler.take_next(selected).accepted());
-        GGML_ASSERT(selected.priority == llm_expert_priority::demand_future_dependency);
+        GGML_ASSERT(selected.priority == llm_expert_priority::demand_current_layer);
         GGML_ASSERT(scheduler.transition(demand.handle, llm_expert_request_state::submitting,
             llm_expert_request_state::host_ready) == llm_expert_schedule_disposition::admitted);
         GGML_ASSERT(scheduler.finish(demand.handle, llm_expert_request_state::complete) ==
@@ -388,6 +402,122 @@ void test_demand_preemption_submitted_drain_retry_and_shutdown() {
     }
 }
 
+void test_cancelling_promotion_fence_and_submitted_demand_headroom() {
+    const llm_expert_scheduler_config bounded = {
+        1, 8, 2, 4, 0,
+        1, 200, 200, 200, 200, 1, 1,
+    };
+    {
+        llm_expert_scheduler scheduler(bounded);
+        const auto speculative = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::prefetch_next,
+            llm_expert_readiness::device_ready,
+            speculative_metadata(20, 0, 0, 100, 100));
+        GGML_ASSERT(speculative.accepted());
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(scheduler.take_next(selected).accepted());
+        GGML_ASSERT(scheduler.transition(speculative.handle,
+            llm_expert_request_state::submitting,
+            llm_expert_request_state::io_in_flight) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.begin_speculative_cancellation(
+            speculative.handle, llm_expert_request_state::io_in_flight) ==
+            llm_expert_schedule_disposition::admitted);
+        const auto fenced = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::device_ready);
+        GGML_ASSERT(fenced.disposition == llm_expert_schedule_disposition::busy &&
+            fenced.handle.slot == speculative.handle.slot &&
+            fenced.handle.generation == speculative.handle.generation);
+        auto waiter = std::async(std::launch::async, [&] {
+            return scheduler.wait_until_released(fenced.handle);
+        });
+        GGML_ASSERT(waiter.wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout);
+        GGML_ASSERT(scheduler.transition(speculative.handle,
+            llm_expert_request_state::cancelling,
+            llm_expert_request_state::draining) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.finish(speculative.handle,
+            llm_expert_request_state::cancelled) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.release_terminal(speculative.handle) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(waiter.get() == llm_expert_schedule_disposition::admitted);
+        const auto retry = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::device_ready);
+        GGML_ASSERT(retry.accepted() && retry.handle.generation > speculative.handle.generation);
+        GGML_ASSERT(scheduler.shutdown());
+        phase10_evidence.cancelling_promotion_fenced = true;
+    }
+    {
+        llm_expert_scheduler scheduler(bounded);
+        const auto speculative = scheduler.enqueue(
+            { 0, 1 }, llm_expert_priority::prefetch_next,
+            llm_expert_readiness::device_ready,
+            speculative_metadata(21, 0, 0, 100, 100));
+        GGML_ASSERT(speculative.accepted());
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(scheduler.take_next(selected).accepted());
+        const auto promoted = scheduler.enqueue(
+            { 0, 1 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::device_ready);
+        GGML_ASSERT(promoted.disposition == llm_expert_schedule_disposition::joined);
+        GGML_ASSERT(scheduler.begin_speculative_cancellation(
+            promoted.handle, llm_expert_request_state::submitting) ==
+            llm_expert_schedule_disposition::invalid);
+        GGML_ASSERT(scheduler.begin_demand_cancellation(
+            promoted.handle, llm_expert_request_state::submitting) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.transition(promoted.handle,
+            llm_expert_request_state::cancelling,
+            llm_expert_request_state::draining) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.finish(promoted.handle,
+            llm_expert_request_state::cancelled) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.release_terminal(promoted.handle) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.shutdown());
+    }
+    {
+        llm_expert_scheduler scheduler(bounded);
+        const auto submitted = scheduler.enqueue(
+            { 0, 2 }, llm_expert_priority::prefetch_next,
+            llm_expert_readiness::device_ready,
+            speculative_metadata(22, 0, 0, 100, 100));
+        GGML_ASSERT(submitted.accepted());
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(scheduler.take_next(selected).accepted());
+        GGML_ASSERT(scheduler.transition(submitted.handle,
+            llm_expert_request_state::submitting,
+            llm_expert_request_state::io_in_flight) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.enqueue(
+            { 0, 3 }, llm_expert_priority::prefetch_speculative,
+            llm_expert_readiness::host_ready,
+            speculative_metadata(23, 0, 0, 100, 0)).disposition ==
+            llm_expert_schedule_disposition::dropped);
+        const auto demand = scheduler.enqueue(
+            { 0, 4 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::device_ready);
+        GGML_ASSERT(demand.disposition == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(demand.handle.slot != submitted.handle.slot);
+        phase10_evidence.submitted_headroom_preserved = true;
+        GGML_ASSERT(!scheduler.shutdown());
+        GGML_ASSERT(scheduler.transition(submitted.handle,
+            llm_expert_request_state::io_in_flight,
+            llm_expert_request_state::draining) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.finish(submitted.handle,
+            llm_expert_request_state::failed) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.release_terminal(submitted.handle) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.shutdown());
+    }
+}
+
 } // namespace
 
 int main() {
@@ -401,6 +531,7 @@ int main() {
     test_concurrent_duplicate_joins();
     test_speculative_budgets_cancel_and_demand_promotion();
     test_demand_preemption_submitted_drain_retry_and_shutdown();
+    test_cancelling_promotion_fence_and_submitted_demand_headroom();
     std::cout << "PHASE10_SCHEDULER_LIFECYCLE"
               << "\tbudget_rejections=" << phase10_evidence.budget_rejections
               << "\tdemand_promotions=" << phase10_evidence.demand_promotions
@@ -409,6 +540,8 @@ int main() {
               << "\tdemand_preemptions=" << phase10_evidence.demand_preemptions
               << "\tretry_new_generation=" << phase10_evidence.retry_new_generation
               << "\tsubmitted_shutdown_drained=" << phase10_evidence.submitted_shutdown_drained
-              << "\tzero_final_charges=" << phase10_evidence.zero_final_charges << '\n';
+              << "\tzero_final_charges=" << phase10_evidence.zero_final_charges
+              << "\tcancelling_promotion_fenced=" << phase10_evidence.cancelling_promotion_fenced
+              << "\tsubmitted_headroom_preserved=" << phase10_evidence.submitted_headroom_preserved << '\n';
     return 0;
 }

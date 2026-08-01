@@ -4,8 +4,10 @@
 #include "ggml-cpp.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -512,6 +514,33 @@ void test_speculative_free_or_speculative_admission_and_reclassification() {
     GGML_ASSERT(cache.surrender().is_ready());
 }
 
+void test_demand_joins_loading_speculative_cold_generation() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    llm_cold_reference speculative;
+    bool hit = false;
+    GGML_ASSERT(cache.reserve_or_find_speculative(
+        { 0, 1 }, 5, 40, speculative, hit).is_ready());
+    GGML_ASSERT(!hit);
+    auto waiter = std::async(std::launch::async, [&] {
+        return cache.wait_until_ready(speculative);
+    });
+    llm_cold_reference joined;
+    llm_cold_demand_lookup lookup = llm_cold_demand_lookup::reserved;
+    GGML_ASSERT(cache.reserve_or_join_demand({ 0, 1 }, joined, lookup).is_ready());
+    GGML_ASSERT(lookup == llm_cold_demand_lookup::joined_loading);
+    GGML_ASSERT(joined.slot == speculative.slot && joined.generation == speculative.generation);
+    GGML_ASSERT(waiter.wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout);
+    GGML_ASSERT(cache.publish_ready({ 0, 1 }, speculative).is_ready());
+    GGML_ASSERT(waiter.get().is_ready());
+    const auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.slots[joined.slot].origin == llm_expert_residency_origin::demand);
+    GGML_ASSERT(diagnostics.slots[joined.slot].speculative_consumed);
+    GGML_ASSERT(diagnostics.speculative_demand_consumptions == 1);
+    GGML_ASSERT(cache.surrender().is_ready());
+}
+
 } // namespace
 
 int main() {
@@ -527,6 +556,7 @@ int main() {
     test_generation_wrap_and_reinitialize();
     test_loader_publication_failure_cleanup_and_reread();
     test_speculative_free_or_speculative_admission_and_reclassification();
+    test_demand_joins_loading_speculative_cold_generation();
     std::cout << "cold expert cache tests passed\n";
     return 0;
 }

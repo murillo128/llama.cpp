@@ -351,6 +351,14 @@ enum class llm_expert_residency_origin : uint8_t {
     speculative,
 };
 
+bool llm_expert_speculative_victim_precedes(
+        uint64_t candidate_deadline,
+        uint64_t candidate_utility,
+        uint32_t candidate_slot,
+        uint64_t incumbent_deadline,
+        uint64_t incumbent_utility,
+        uint32_t incumbent_slot) noexcept;
+
 struct llm_hot_cache_diagnostics {
     struct auto_decision {
         uint64_t request = 0;
@@ -479,6 +487,8 @@ struct llm_hot_cache_diagnostics {
         bool has_cold_backing = false;
         llm_expert_residency_origin origin = llm_expert_residency_origin::demand;
         bool speculative_consumed = false;
+        uint64_t speculative_deadline = 0;
+        uint64_t speculative_utility = 0;
         enum state_type {
             free,
             reserved,

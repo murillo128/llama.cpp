@@ -1,6 +1,7 @@
 #include "llama-expert-scheduler.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -70,11 +71,13 @@ struct llm_expert_scheduler::impl {
         llm_expert_request_metadata metadata;
         bool speculative_charge_active = false;
         bool promoted_from_speculative = false;
+        bool cancellation_demand_owned = false;
     };
 
     llm_expert_scheduler_config config;
     std::vector<request_record> requests;
     mutable std::mutex mutex;
+    std::condition_variable state_cv;
     llm_expert_scheduler_diagnostics counters;
     uint64_t next_ordinal = 1;
 
@@ -192,6 +195,7 @@ struct llm_expert_scheduler::impl {
         request.waiters = 0;
         request.metadata = {};
         request.promoted_from_speculative = false;
+        request.cancellation_demand_owned = false;
         return true;
     }
 };
@@ -213,7 +217,7 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
         config.waiters_per_request == 0 ||
         any_speculative_budget != complete_speculative_budget ||
         (complete_speculative_budget &&
-            (config.max_speculative_flights > config.request_capacity ||
+            (config.max_speculative_flights >= config.request_capacity ||
              config.max_speculative_storage_bytes_per_token >
                 config.max_speculative_storage_bytes_in_flight ||
              config.max_speculative_h2d_bytes_per_token >
@@ -258,6 +262,14 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     for (uint32_t slot = 0; slot < pimpl->requests.size(); ++slot) {
         impl::request_record & request = pimpl->requests[slot];
         if (request.state != llm_expert_request_state::free && !is_terminal(request.state) && same_key(request.key, key)) {
+            // Cancellation ownership is already committed once a speculative
+            // request reaches cancelling/draining. Exact demand must retry with
+            // a new generation after that drain; it must never be attached to
+            // a generation which can still terminalize as speculative cancel.
+            if (!speculative && (request.state == llm_expert_request_state::cancelling ||
+                    request.state == llm_expert_request_state::draining)) {
+                return { llm_expert_schedule_disposition::busy, { slot, request.generation } };
+            }
             if (request.waiters == pimpl->config.waiters_per_request) {
                 return { llm_expert_schedule_disposition::busy, {} };
             }
@@ -329,6 +341,7 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     request.readiness = readiness;
     request.metadata = metadata;
     request.promoted_from_speculative = false;
+    request.cancellation_demand_owned = false;
     request.state = llm_expert_request_state::queued;
     request.waiters = 1;
     if (speculative && !pimpl->can_charge(metadata)) {
@@ -344,6 +357,7 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     if (speculative) pimpl->charge(request);
     pimpl->counters.flights_created++;
     pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
     return { llm_expert_schedule_disposition::admitted, { slot, request.generation } };
 }
 
@@ -392,11 +406,56 @@ llm_expert_schedule_disposition llm_expert_scheduler::transition(
         pimpl->counters.stale_completions++;
         return llm_expert_schedule_disposition::stale_generation;
     }
-    if (request->state != expected || !valid_transition(expected, next)) {
+    if (request->state != expected || next == llm_expert_request_state::cancelling ||
+        !valid_transition(expected, next)) {
         return llm_expert_schedule_disposition::invalid;
     }
     request->state = next;
     pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
+    return llm_expert_schedule_disposition::admitted;
+}
+
+llm_expert_schedule_disposition llm_expert_scheduler::begin_speculative_cancellation(
+        llm_expert_request_handle handle,
+        llm_expert_request_state expected) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    impl::request_record * request = pimpl->find(handle);
+    if (request == nullptr) {
+        pimpl->counters.stale_completions++;
+        return llm_expert_schedule_disposition::stale_generation;
+    }
+    if (request->state != expected ||
+        !valid_transition(expected, llm_expert_request_state::cancelling) ||
+        request->metadata.origin != llm_expert_request_origin::speculative ||
+        request->promoted_from_speculative) {
+        return llm_expert_schedule_disposition::invalid;
+    }
+    request->cancellation_demand_owned = false;
+    request->state = llm_expert_request_state::cancelling;
+    pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
+    return llm_expert_schedule_disposition::admitted;
+}
+
+llm_expert_schedule_disposition llm_expert_scheduler::begin_demand_cancellation(
+        llm_expert_request_handle handle,
+        llm_expert_request_state expected) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    impl::request_record * request = pimpl->find(handle);
+    if (request == nullptr) {
+        pimpl->counters.stale_completions++;
+        return llm_expert_schedule_disposition::stale_generation;
+    }
+    if (request->state != expected ||
+        !valid_transition(expected, llm_expert_request_state::cancelling) ||
+        request->metadata.origin != llm_expert_request_origin::demand) {
+        return llm_expert_schedule_disposition::invalid;
+    }
+    request->cancellation_demand_owned = true;
+    request->state = llm_expert_request_state::cancelling;
+    pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
     return llm_expert_schedule_disposition::admitted;
 }
 
@@ -417,11 +476,16 @@ llm_expert_schedule_disposition llm_expert_scheduler::finish(
     if (!complete_ready && !drained_terminal) {
         return llm_expert_schedule_disposition::invalid;
     }
+    if (terminal == llm_expert_request_state::cancelled &&
+        request->promoted_from_speculative && !request->cancellation_demand_owned) {
+        return llm_expert_schedule_disposition::invalid;
+    }
     request->state = terminal;
     if (terminal == llm_expert_request_state::complete) pimpl->counters.terminal_complete++;
     if (terminal == llm_expert_request_state::failed) pimpl->counters.terminal_failed++;
     if (terminal == llm_expert_request_state::cancelled) pimpl->counters.terminal_cancelled++;
     pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
     return llm_expert_schedule_disposition::admitted;
 }
 
@@ -442,8 +506,47 @@ llm_expert_schedule_disposition llm_expert_scheduler::release_terminal(llm_exper
     request->waiters = 0;
     request->metadata = {};
     request->promoted_from_speculative = false;
+    request->cancellation_demand_owned = false;
     pimpl->counters.terminal_releases++;
     pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
+    return llm_expert_schedule_disposition::admitted;
+}
+
+llm_expert_schedule_disposition llm_expert_scheduler::wait_until_released(
+        llm_expert_request_handle handle) noexcept {
+    if (!handle.valid()) return llm_expert_schedule_disposition::invalid;
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    if (handle.slot >= pimpl->requests.size()) {
+        return llm_expert_schedule_disposition::stale_generation;
+    }
+    pimpl->state_cv.wait(lock, [&] {
+        const auto & request = pimpl->requests[handle.slot];
+        return request.generation != handle.generation ||
+            request.state == llm_expert_request_state::free;
+    });
+    return llm_expert_schedule_disposition::admitted;
+}
+
+llm_expert_schedule_disposition llm_expert_scheduler::snapshot(
+        llm_expert_request_handle handle,
+        llm_expert_request_snapshot & snapshot) const noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    const impl::request_record * request = pimpl->find(handle);
+    if (request == nullptr) {
+        return llm_expert_schedule_disposition::stale_generation;
+    }
+    snapshot = {
+        request->key,
+        handle,
+        request->priority,
+        request->readiness,
+        request->state,
+        request->waiters,
+        request->enqueue_ordinal,
+        request->metadata,
+        request->promoted_from_speculative,
+    };
     return llm_expert_schedule_disposition::admitted;
 }
 
@@ -472,7 +575,9 @@ llm_expert_schedule_disposition llm_expert_scheduler::cancel_queued_speculative(
     request->waiters = 0;
     request->metadata = {};
     request->promoted_from_speculative = false;
+    request->cancellation_demand_owned = false;
     pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
     return llm_expert_schedule_disposition::admitted;
 }
 
@@ -492,8 +597,10 @@ bool llm_expert_scheduler::shutdown() noexcept {
         request.waiters = 0;
         request.metadata = {};
         request.promoted_from_speculative = false;
+        request.cancellation_demand_owned = false;
     }
     pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
     return true;
 }
 

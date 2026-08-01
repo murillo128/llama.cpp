@@ -154,10 +154,21 @@ public:
             llm_expert_readiness readiness,
             llm_expert_request_metadata metadata = {}) noexcept;
     llm_expert_schedule_result take_next(llm_expert_request_snapshot & request) noexcept;
+    llm_expert_schedule_disposition snapshot(
+            llm_expert_request_handle handle,
+            llm_expert_request_snapshot & request) const noexcept;
+    llm_expert_schedule_disposition wait_until_released(
+            llm_expert_request_handle handle) noexcept;
     llm_expert_schedule_disposition transition(
             llm_expert_request_handle handle,
             llm_expert_request_state expected,
             llm_expert_request_state next) noexcept;
+    llm_expert_schedule_disposition begin_speculative_cancellation(
+            llm_expert_request_handle handle,
+            llm_expert_request_state expected) noexcept;
+    llm_expert_schedule_disposition begin_demand_cancellation(
+            llm_expert_request_handle handle,
+            llm_expert_request_state expected) noexcept;
     llm_expert_schedule_disposition finish(
             llm_expert_request_handle handle,
             llm_expert_request_state terminal) noexcept;

@@ -359,8 +359,9 @@ void test_native_event_ordering_reuse_and_unload() {
         GGML_ASSERT(cancelling.transfer_wave(
             backend.get(), { { cancelled_lane, hot.bundle(), 0 } }).is_ready());
         GGML_ASSERT(cancelling.diagnostics().live_h2d_events == 1);
-        GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::h2d_in_flight,
-            llm_expert_request_state::cancelling) == llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.begin_demand_cancellation(
+            admitted.handle, llm_expert_request_state::h2d_in_flight) ==
+            llm_expert_schedule_disposition::admitted);
         GGML_ASSERT(scheduler.transition(admitted.handle, llm_expert_request_state::cancelling,
             llm_expert_request_state::draining) == llm_expert_schedule_disposition::admitted);
 

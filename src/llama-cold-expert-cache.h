@@ -29,6 +29,12 @@ struct llm_cold_reference {
     uint64_t generation = 0;
 };
 
+enum class llm_cold_demand_lookup {
+    reserved,
+    joined_loading,
+    ready,
+};
+
 struct llm_cold_hot_backing {
     llm_expert_key key = { -1, -1 };
     uint32_t cold_slot = 0;
@@ -149,6 +155,11 @@ public:
             llm_expert_key key,
             llm_cold_reference & reference,
             bool & hit) noexcept;
+    llm_expert_provider_result reserve_or_join_demand(
+            llm_expert_key key,
+            llm_cold_reference & reference,
+            llm_cold_demand_lookup & lookup) noexcept;
+    llm_expert_provider_result wait_until_ready(llm_cold_reference reference) noexcept;
     llm_expert_provider_result reserve_or_find_speculative(
             llm_expert_key key,
             uint64_t deadline,

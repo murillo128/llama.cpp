@@ -130,6 +130,10 @@ void test_config() {
     require(!llm_expert_prefetch_copy_config(&value, "profile.json", LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE,
         4, 4, 4096, 8, 4096, 4096, copied).is_ready(), "oversized hot budget accepted");
     value = config(LLAMA_EXPERT_PREFETCH_POLICY_PREVIOUS_TOKEN);
+    value.max_speculative_flights = 8;
+    require(!llm_expert_prefetch_copy_config(&value, "profile.json", LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE,
+        4, 4, 4096, 8, 4096, 4096, copied).is_ready(), "missing demand headroom accepted");
+    value = config(LLAMA_EXPERT_PREFETCH_POLICY_PREVIOUS_TOKEN);
     value.max_speculative_storage_bytes_per_token = value.max_speculative_storage_bytes_in_flight + 1;
     require(!llm_expert_prefetch_copy_config(&value, "profile.json", LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE,
         4, 4, 4096, 8, 4096, 4096, copied).is_ready(), "oversized per-token budget accepted");
