@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 enum class llm_cold_slot_state {
@@ -84,6 +85,12 @@ struct llm_cold_cache_diagnostics {
     uint64_t peak_request_refs = 0;
     uint64_t current_cpu_execution_refs = 0;
     uint64_t peak_cpu_execution_refs = 0;
+    bool residency_supported = false;
+    std::string residency_unavailable_reason;
+    uint64_t ready_logical_bytes = 0;
+    uint64_t ready_page_count = 0;
+    uint64_t resident_ready_page_count = 0;
+    uint64_t resident_ready_bytes = 0;
     llm_expert_cache_policy_diagnostics policy;
     std::vector<llm_expert_cache_policy_domain_diagnostics> policy_domains;
     std::vector<llm_expert_cache_policy_event> policy_events;

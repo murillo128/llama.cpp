@@ -3833,6 +3833,12 @@ public:
             result.cold_peak_transfer_refs = cold.peak_transfer_refs;
             result.cold_current_request_refs = cold.current_request_refs;
             result.cold_peak_request_refs = cold.peak_request_refs;
+            result.cold_residency_supported = cold.residency_supported;
+            result.cold_residency_unavailable_reason = cold.residency_unavailable_reason;
+            result.cold_ready_logical_bytes = cold.ready_logical_bytes;
+            result.cold_ready_page_count = cold.ready_page_count;
+            result.cold_resident_ready_page_count = cold.resident_ready_page_count;
+            result.cold_resident_ready_bytes = cold.resident_ready_bytes;
             result.cold_current_cpu_execution_refs = cold.current_cpu_execution_refs;
             result.cold_peak_cpu_execution_refs = cold.peak_cpu_execution_refs;
             result.cold_policy = cold.policy;

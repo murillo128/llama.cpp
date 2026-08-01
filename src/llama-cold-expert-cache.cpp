@@ -14,6 +14,13 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
+
+#ifdef __linux__
+#include <cerrno>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -127,6 +134,76 @@ struct cold_allocation {
     ggml_backend_buffer_ptr buffer;
     llm_expert_bundle_descriptor bundle = {};
 };
+
+#ifdef __linux__
+void add_tensor_slot_pages(
+        std::unordered_set<uintptr_t> & pages,
+        const ggml_tensor * tensor,
+        uint32_t slot,
+        int32_t n_expert,
+        bool weight,
+        uintptr_t page_mask) {
+    if (tensor == nullptr || tensor->data == nullptr) return;
+    const int axis = expert_axis(tensor, n_expert, weight);
+    if (axis < 0) return;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(tensor->data) + uintptr_t(slot)*tensor->nb[axis];
+    const uintptr_t end = begin + tensor->nb[axis];
+    for (uintptr_t page = begin & page_mask; page < end; page += ~page_mask + 1) pages.insert(page);
+}
+
+void sample_ready_residency(
+        const cold_allocation & arena,
+        const std::vector<llm_cold_cache_diagnostics::slot> & slots,
+        llm_cold_cache_diagnostics & result) {
+    const long page_size_value = sysconf(_SC_PAGESIZE);
+    if (page_size_value <= 0 || (uint64_t(page_size_value) & (uint64_t(page_size_value) - 1)) != 0) {
+        result.residency_unavailable_reason = "sysconf(_SC_PAGESIZE) returned an invalid value";
+        return;
+    }
+    const uintptr_t page_size = uintptr_t(page_size_value);
+    const uintptr_t page_mask = ~(page_size - 1);
+    std::unordered_set<uintptr_t> page_set;
+    const auto add_projection = [&](const llm_expert_projection_descriptor & projection, uint32_t slot) {
+        add_tensor_slot_pages(page_set, projection.weight, slot, arena.bundle.n_expert, true, page_mask);
+        add_tensor_slot_pages(page_set, projection.bias, slot, arena.bundle.n_expert, false, page_mask);
+        add_tensor_slot_pages(page_set, projection.scale, slot, arena.bundle.n_expert, false, page_mask);
+    };
+    uint64_t ready_slots = 0;
+    for (uint32_t slot = 0; slot < slots.size(); ++slot) {
+        if (slots[slot].state != llm_cold_slot_state::ready) continue;
+        ready_slots++;
+        add_projection(arena.bundle.up, slot);
+        add_projection(arena.bundle.gate, slot);
+        add_projection(arena.bundle.gate_up, slot);
+        add_projection(arena.bundle.down, slot);
+    }
+    result.ready_logical_bytes = ready_slots*result.aligned_slot_footprint;
+    result.ready_page_count = page_set.size();
+    if (page_set.empty()) {
+        result.residency_supported = true;
+        return;
+    }
+    std::vector<uintptr_t> pages(page_set.begin(), page_set.end());
+    std::sort(pages.begin(), pages.end());
+    size_t begin = 0;
+    while (begin < pages.size()) {
+        size_t end = begin + 1;
+        while (end < pages.size() && pages[end] == pages[end - 1] + page_size) end++;
+        std::vector<unsigned char> status(end - begin);
+        if (mincore(reinterpret_cast<void *>(pages[begin]), (end - begin)*page_size, status.data()) != 0) {
+            result.residency_unavailable_reason = std::string("mincore failed: errno=") + std::to_string(errno);
+            result.ready_page_count = 0;
+            result.resident_ready_page_count = 0;
+            result.resident_ready_bytes = 0;
+            return;
+        }
+        for (unsigned char value : status) result.resident_ready_page_count += (value & 1) != 0;
+        begin = end;
+    }
+    result.resident_ready_bytes = result.resident_ready_page_count*page_size;
+    result.residency_supported = true;
+}
+#endif
 
 std::unique_ptr<cold_allocation> make_allocation(
         const llm_expert_bundle_descriptor & source,
@@ -1030,5 +1107,10 @@ llm_cold_cache_diagnostics llm_cold_expert_cache::diagnostics() const {
         pimpl->policy.transcript().begin(),
         pimpl->policy.transcript().begin() + pimpl->policy.transcript_size());
     result.slots = pimpl->slots;
+#ifdef __linux__
+    if (pimpl->arena) sample_ready_residency(*pimpl->arena, pimpl->slots, result);
+#else
+    result.residency_unavailable_reason = "mincore residency telemetry is supported only on Linux";
+#endif
     return result;
 }

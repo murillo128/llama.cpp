@@ -135,6 +135,10 @@ void test_configuration_and_budget_edges() {
     GGML_ASSERT(diagnostics.bundle_payload_bytes > 0);
     GGML_ASSERT(diagnostics.alignment > 0);
     GGML_ASSERT(diagnostics.pageable);
+#ifdef __linux__
+    GGML_ASSERT(diagnostics.residency_supported);
+    GGML_ASSERT(diagnostics.ready_page_count == 0);
+#endif
 
     llm_cold_expert_cache insufficient(config(full_budget - 1, 4));
     GGML_ASSERT(insufficient.initialize(tensors.bundle()).error ==

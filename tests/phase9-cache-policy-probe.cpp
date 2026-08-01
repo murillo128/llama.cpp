@@ -423,6 +423,14 @@ int main(int argc, char ** argv) {
                 {"cold_actual_bytes", diagnostics.cold_actual_bytes}, {"cold_effective_slots", diagnostics.cold_effective_slots},
                 {"cold_slot_footprint", diagnostics.cold_slot_footprint},
             }},
+            {"cold_residency", {
+                {"supported", diagnostics.cold_residency_supported},
+                {"unavailable_reason", diagnostics.cold_residency_supported ? "" : diagnostics.cold_residency_unavailable_reason},
+                {"ready_logical_bytes", diagnostics.cold_ready_logical_bytes},
+                {"ready_page_count", diagnostics.cold_ready_page_count},
+                {"resident_ready_page_count", diagnostics.cold_resident_ready_page_count},
+                {"resident_ready_bytes", diagnostics.cold_resident_ready_bytes},
+            }},
             {"hot", {
                 {"config", config_json(diagnostics.policy)}, {"diagnostics", diagnostics_json(diagnostics.policy)},
                 {"events", events_json(diagnostics.policy_events)},

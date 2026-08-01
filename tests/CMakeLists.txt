@@ -286,6 +286,10 @@ llama_build(phase9-cache-policy-probe.cpp)
 unset(LLAMA_TEST_NAME)
 target_include_directories(phase9-cache-policy-probe PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
 
+llama_build(phase9-residency-probe.cpp)
+target_include_directories(phase9-residency-probe PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+llama_test(phase9-residency-probe LABEL "model" ARGS --self-test)
+
 set(LLAMA_TEST_NAME phase8-miss-execution-probe)
 llama_build(phase8-miss-execution-probe.cpp)
 unset(LLAMA_TEST_NAME)

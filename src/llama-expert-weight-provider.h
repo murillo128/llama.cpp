@@ -441,6 +441,12 @@ struct llm_hot_cache_diagnostics {
     uint64_t cold_peak_request_refs = 0;
     uint64_t cold_current_cpu_execution_refs = 0;
     uint64_t cold_peak_cpu_execution_refs = 0;
+    bool cold_residency_supported = false;
+    std::string cold_residency_unavailable_reason;
+    uint64_t cold_ready_logical_bytes = 0;
+    uint64_t cold_ready_page_count = 0;
+    uint64_t cold_resident_ready_page_count = 0;
+    uint64_t cold_resident_ready_bytes = 0;
     uint64_t ring_requested_bytes = 0;
     uint64_t ring_actual_bytes = 0;
     uint64_t ring_lane_footprint = 0;
