@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-expert-weight-provider.h"
 #include "llama-expert-cache-policy.h"
+#include "llama-expert-prefetch.h"
 #include "llama-expert-storage.h"
 #include "llama-expert-async-io.h"
 #include "llama-expert-scheduler.h"
@@ -1062,6 +1063,10 @@ struct llama_model::impl {
     std::optional<llama_expert_cache_policy_config> expert_cold_cache_policy_owned;
     llm_expert_cache_policy_config_internal expert_hot_cache_policy_config;
     llm_expert_cache_policy_config_internal expert_cold_cache_policy_config;
+    std::optional<llama_expert_prefetch_config_v1> expert_prefetch_config_owned;
+    llm_expert_prefetch_config_internal expert_prefetch_config;
+    std::string expert_prefetch_profile_path_owned;
+    std::optional<llm_expert_prefetch_profile> expert_prefetch_profile;
 
     struct source_file_storage {
         std::string identity;
@@ -1122,6 +1127,27 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         pimpl->expert_cold_cache_policy_owned = *params.expert_cold_cache_policy;
         this->params.expert_cold_cache_policy = &*pimpl->expert_cold_cache_policy_owned;
     }
+    const uint64_t scheduler_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
+    if (scheduler_capacity_64 > UINT32_MAX) {
+        throw std::invalid_argument("expert prefetch scheduler capacity overflow");
+    }
+    const auto prefetch_result = llm_expert_prefetch_copy_config(
+        params.expert_prefetch_config, params.expert_prefetch_profile_path, params.expert_weights_mode,
+        0, params.expert_hot_cache_capacity, params.expert_cold_cache_bytes, uint32_t(scheduler_capacity_64),
+        params.expert_cold_cache_bytes, params.expert_transfer_ring_bytes, pimpl->expert_prefetch_config);
+    if (!prefetch_result.is_ready()) {
+        throw std::invalid_argument("invalid expert prefetch configuration");
+    }
+    if (params.expert_prefetch_config != nullptr) {
+        pimpl->expert_prefetch_config_owned = *params.expert_prefetch_config;
+        this->params.expert_prefetch_config = &*pimpl->expert_prefetch_config_owned;
+        if (params.expert_prefetch_profile_path != nullptr) {
+            pimpl->expert_prefetch_profile_path_owned = params.expert_prefetch_profile_path;
+            this->params.expert_prefetch_profile_path = pimpl->expert_prefetch_profile_path_owned.c_str();
+        } else {
+            this->params.expert_prefetch_profile_path = nullptr;
+        }
+    }
     if (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU &&
         params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK &&
         params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_AUTO) {
@@ -1180,6 +1206,15 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 void llama_model::init_expert_weight_provider() {
+    if (params.expert_prefetch_config != nullptr) {
+        const uint64_t scheduler_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
+        const auto validated = llm_expert_prefetch_copy_config(
+            params.expert_prefetch_config, params.expert_prefetch_profile_path, params.expert_weights_mode,
+            uint32_t(hparams.n_expert), params.expert_hot_cache_capacity, params.expert_cold_cache_bytes,
+            uint32_t(scheduler_capacity_64), params.expert_cold_cache_bytes, params.expert_transfer_ring_bytes,
+            pimpl->expert_prefetch_config);
+        if (!validated.is_ready()) throw std::invalid_argument("invalid expert prefetch topology or capacity");
+    }
     switch (params.expert_weights_mode) {
         case LLAMA_EXPERT_WEIGHTS_MODE_DISABLED:
             return;
@@ -1207,6 +1242,114 @@ void llama_model::init_expert_weight_provider() {
             }
             if (target == nullptr || hparams.n_expert <= 0 || hparams.n_expert_used <= 0) {
                 throw std::invalid_argument("hot-cache mode requires routed experts and a CUDA target");
+            }
+            const bool prefetch_active = params.expert_prefetch_config != nullptr &&
+                (params.expert_prefetch_config->policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF ||
+                 params.expert_prefetch_config->seed_mode != LLAMA_EXPERT_PREFETCH_SEED_MODE_OFF);
+            if (prefetch_active) {
+                if (!pimpl->has_authoritative_file_backing || pimpl->source_files.empty()) {
+                    throw std::invalid_argument("expert prefetch requires authoritative source identity");
+                }
+                llm_expert_prefetch_fingerprint expected;
+                expected.layer_count = uint32_t(layers.size());
+                expected.routed_layers = routed_layers;
+                expected.experts_per_layer = uint32_t(hparams.n_expert);
+                expected.experts_per_token = uint32_t(hparams.n_expert_used);
+                std::ostringstream package_identity;
+                for (uint32_t index = 0; index < pimpl->source_files.size(); ++index) {
+                    const auto & source = pimpl->source_files[index];
+                    std::string digest;
+                    if (!llm_expert_prefetch_sha256_file(source.identity, source.size, digest).is_ready()) {
+                        throw std::invalid_argument("unable to hash expert prefetch source file");
+                    }
+                    const size_t separator = source.identity.find_last_of("/\\");
+                    const std::string name = separator == std::string::npos ? source.identity : source.identity.substr(separator + 1);
+                    expected.files.push_back({ index, name, source.size, digest });
+                    package_identity << index << ':' << name.size() << ':' << name << ':' << source.size << ':' << digest << '\n';
+                }
+                std::vector<const impl::tensor_storage *> layout_tensors;
+                auto expert_axis = [&](const impl::tensor_storage & tensor) {
+                    for (int axis = int(tensor.n_dims) - 1; axis >= 0; --axis) {
+                        if (tensor.ne[axis] != hparams.n_expert) continue;
+                        bool upper_unit = true;
+                        for (uint32_t upper = uint32_t(axis + 1); upper < tensor.n_dims; ++upper) {
+                            if (tensor.ne[upper] != 1) upper_unit = false;
+                        }
+                        if (upper_unit) return axis;
+                    }
+                    return -1;
+                };
+                for (int32_t layer : routed_layers) {
+                    const std::string prefix = "blk." + std::to_string(layer) + ".";
+                    uint64_t payload_bytes = 0;
+                    for (const auto & item : pimpl->tensor_storage_by_name) {
+                        const auto & name = item.first;
+                        const auto & tensor = item.second;
+                        if (name.compare(0, prefix.size(), prefix) != 0 || name.find("ffn_") == std::string::npos ||
+                            name.find("_exps") == std::string::npos) continue;
+                        const int axis = expert_axis(tensor);
+                        if (axis < 0 || tensor.nb[axis] == 0 || tensor.nb[axis] > UINT64_MAX - payload_bytes) {
+                            throw std::invalid_argument("invalid expert prefetch tensor layout");
+                        }
+                        payload_bytes += tensor.nb[axis];
+                        layout_tensors.push_back(&tensor);
+                    }
+                    if (payload_bytes == 0) throw std::invalid_argument("empty expert prefetch byte map");
+                    for (uint32_t expert = 0; expert < uint32_t(hparams.n_expert); ++expert) {
+                        expected.expert_bytes.push_back({ layer, int32_t(expert), payload_bytes, payload_bytes });
+                    }
+                }
+                std::ostringstream layout;
+                layout << expected.layer_count << ':' << expected.experts_per_layer << ':' << expected.experts_per_token << '\n';
+                for (int32_t layer : expected.routed_layers) layout << layer << ',';
+                layout << '\n';
+                for (const auto & key : expected.expert_bytes) {
+                    layout << key.layer << ':' << key.expert << ':' << key.payload_bytes << '\n';
+                }
+                std::sort(layout_tensors.begin(), layout_tensors.end(), [](const auto * lhs, const auto * rhs) {
+                    return lhs->name < rhs->name;
+                });
+                for (const auto * tensor : layout_tensors) {
+                    layout << tensor->name.size() << ':' << tensor->name << ':' << uint32_t(tensor->type) << ':'
+                           << tensor->source_file_index << ':' << tensor->alignment << ':' << tensor->byte_size << '\n';
+                    for (uint32_t axis = 0; axis < GGML_MAX_DIMS; ++axis) layout << tensor->ne[axis] << ',';
+                    layout << '\n';
+                    for (uint32_t axis = 0; axis < GGML_MAX_DIMS; ++axis) layout << tensor->nb[axis] << ',';
+                    layout << '\n';
+                }
+                const std::string layout_text = layout.str();
+                expected.tensor_layout_sha256 = llm_expert_prefetch_sha256(layout_text.data(), layout_text.size());
+                package_identity << expected.tensor_layout_sha256 << '\n';
+                const std::string package_text = package_identity.str();
+                expected.package_sha256 = llm_expert_prefetch_sha256(package_text.data(), package_text.size());
+                llm_expert_prefetch_profile loaded;
+                std::string error;
+                const auto profile_result = llm_expert_prefetch_load_profile(
+                    pimpl->expert_prefetch_profile_path_owned,
+                    pimpl->expert_prefetch_config.value.max_profile_bytes,
+                    &expected, loaded, error);
+                if (!profile_result.is_ready()) {
+                    throw std::invalid_argument("invalid expert prefetch profile: " + error);
+                }
+                const auto & config = pimpl->expert_prefetch_config.value;
+                const auto selected_cost = std::find_if(loaded.costs.begin(), loaded.costs.end(), [&](const auto & cost) {
+                    return cost.transport == loaded.selected_transport && cost.readiness == loaded.selected_readiness;
+                });
+                if (config.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF &&
+                    (loaded.selected_candidates != config.candidates_per_target ||
+                     loaded.selected_readiness != config.readiness ||
+                     (config.policy == LLAMA_EXPERT_PREFETCH_POLICY_TEMPORAL_FREQUENCY &&
+                      loaded.selected_temporal_window != config.temporal_window_tokens) ||
+                     selected_cost == loaded.costs.end() ||
+                     selected_cost->utility_window_predictions != config.utility_window_predictions ||
+                     selected_cost->utility_min_observations != config.utility_min_observations)) {
+                    throw std::invalid_argument("expert prefetch profile selection does not match configuration");
+                }
+                if (config.seed_mode == LLAMA_EXPERT_PREFETCH_SEED_MODE_BLOCKING_HOT &&
+                    loaded.selected_readiness != LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY) {
+                    throw std::invalid_argument("expert prefetch seed requires a device-ready profile");
+                }
+                pimpl->expert_prefetch_profile = std::move(loaded);
             }
             if (pimpl->expert_hot_cache_policy_config.scope == LLAMA_EXPERT_CACHE_POLICY_SCOPE_PER_LAYER &&
                 params.expert_hot_cache_capacity < uint64_t(routed_layer_count)*uint32_t(hparams.n_expert_used)) {
@@ -2936,6 +3079,8 @@ llama_model_params llama_model_default_params() {
         /*.expert_auto_cost_model      =*/ nullptr,
         /*.expert_hot_cache_policy     =*/ nullptr,
         /*.expert_cold_cache_policy    =*/ nullptr,
+        /*.expert_prefetch_config      =*/ nullptr,
+        /*.expert_prefetch_profile_path=*/ nullptr,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

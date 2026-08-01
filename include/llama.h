@@ -384,11 +384,34 @@ extern "C" {
         LLAMA_EXPERT_CACHE_ADMISSION_COUNT             = 2,
     };
 
+    enum llama_expert_prefetch_policy {
+        LLAMA_EXPERT_PREFETCH_POLICY_OFF                    = 0,
+        LLAMA_EXPERT_PREFETCH_POLICY_STATIC_LAYER           = 1,
+        LLAMA_EXPERT_PREFETCH_POLICY_PREVIOUS_TOKEN         = 2,
+        LLAMA_EXPERT_PREFETCH_POLICY_TEMPORAL_FREQUENCY     = 3,
+        LLAMA_EXPERT_PREFETCH_POLICY_CROSS_LAYER_TRANSITION = 4,
+        LLAMA_EXPERT_PREFETCH_POLICY_RANDOM_BASELINE        = 5,
+        LLAMA_EXPERT_PREFETCH_POLICY_COUNT                  = 6,
+    };
+
+    enum llama_expert_prefetch_readiness {
+        LLAMA_EXPERT_PREFETCH_READINESS_HOST_READY   = 0,
+        LLAMA_EXPERT_PREFETCH_READINESS_DEVICE_READY = 1,
+        LLAMA_EXPERT_PREFETCH_READINESS_COUNT        = 2,
+    };
+
+    enum llama_expert_prefetch_seed_mode {
+        LLAMA_EXPERT_PREFETCH_SEED_MODE_OFF          = 0,
+        LLAMA_EXPERT_PREFETCH_SEED_MODE_BLOCKING_HOT = 1,
+        LLAMA_EXPERT_PREFETCH_SEED_MODE_COUNT        = 2,
+    };
+
     enum {
         LLAMA_EXPERT_CACHE_POLICY_VERSION_1 = 1,
         LLAMA_EXPERT_CACHE_POLICY_SLRU_PROTECTED_RATIO_DEFAULT_BPS = 7500,
         LLAMA_EXPERT_CACHE_POLICY_FREQUENCY_WINDOW_DEFAULT_EVENTS = 1024,
         LLAMA_EXPERT_CACHE_POLICY_LFU_AGING_DEFAULT_EVENTS = 1024,
+        LLAMA_EXPERT_PREFETCH_VERSION_1 = 1,
     };
 
     // Versioned experimental cache-policy configuration. The model copies the
@@ -402,6 +425,29 @@ extern "C" {
         enum llama_expert_cache_admission admission;
         uint32_t admission_window_events;
         uint32_t lfu_aging_interval_events;
+        uint64_t reserved[4];
+    };
+
+    // Versioned experimental prefetch configuration. The model copies the
+    // complete v1 structure and profile path during load.
+    struct llama_expert_prefetch_config_v1 {
+        uint32_t version;
+        uint32_t struct_size;
+        enum llama_expert_prefetch_policy policy;
+        enum llama_expert_prefetch_readiness readiness;
+        enum llama_expert_prefetch_seed_mode seed_mode;
+        uint32_t temporal_window_tokens;
+        uint32_t candidates_per_target;
+        uint64_t max_profile_bytes;
+        uint32_t max_speculative_flights;
+        uint64_t max_speculative_storage_bytes_in_flight;
+        uint64_t max_speculative_h2d_bytes_in_flight;
+        uint64_t max_speculative_storage_bytes_per_token;
+        uint64_t max_speculative_h2d_bytes_per_token;
+        uint32_t max_speculative_cold_slots;
+        uint32_t max_speculative_hot_slots;
+        uint32_t utility_window_predictions;
+        uint32_t utility_min_observations;
         uint64_t reserved[4];
     };
 
@@ -449,6 +495,8 @@ extern "C" {
         const struct llama_expert_auto_cost_model * expert_auto_cost_model; // copied at model load [EXPERIMENTAL]
         const struct llama_expert_cache_policy_config * expert_hot_cache_policy; // copied at model load [EXPERIMENTAL]
         const struct llama_expert_cache_policy_config * expert_cold_cache_policy; // copied at model load [EXPERIMENTAL]
+        const struct llama_expert_prefetch_config_v1 * expert_prefetch_config; // copied at model load [EXPERIMENTAL]
+        const char * expert_prefetch_profile_path; // copied at model load [EXPERIMENTAL]
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

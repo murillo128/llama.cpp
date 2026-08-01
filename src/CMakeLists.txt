@@ -19,6 +19,7 @@ add_library(llama
             llama-cparams.cpp
             llama-cold-expert-cache.cpp
             llama-expert-cache-policy.cpp
+            llama-expert-prefetch.cpp
             llama-expert-async-io.cpp
             llama-expert-scheduler.cpp
             llama-expert-transfer-ring.cpp
@@ -57,6 +58,7 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

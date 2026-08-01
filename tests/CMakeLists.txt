@@ -277,6 +277,18 @@ target_include_directories(test-expert-miss-policy PRIVATE ${PROJECT_SOURCE_DIR}
 llama_build_and_test(test-expert-cache-policy.cpp LABEL "model")
 target_include_directories(test-expert-cache-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-expert-prefetch.cpp LABEL "model")
+target_include_directories(test-expert-prefetch PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+
+llama_build(phase10-prefetch-replay.cpp)
+target_include_directories(phase10-prefetch-replay PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+llama_test(phase10-prefetch-replay LABEL "model" ARGS --self-test)
+
+set(LLAMA_TEST_NAME phase10-prefetch-probe)
+llama_build(phase10-prefetch-probe.cpp)
+unset(LLAMA_TEST_NAME)
+target_include_directories(phase10-prefetch-probe PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+
 llama_build(phase9-cache-replay.cpp)
 target_include_directories(phase9-cache-replay PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
 llama_test(phase9-cache-replay LABEL "model" ARGS --self-test)

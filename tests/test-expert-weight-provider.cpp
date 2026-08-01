@@ -106,6 +106,8 @@ llm_expert_bundle_descriptor separate_bundle(test_tensors & tensors) {
 void test_default_and_model_ownership() {
     auto params = llama_model_default_params();
     GGML_ASSERT(params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_DISABLED);
+    GGML_ASSERT(params.expert_prefetch_config == nullptr);
+    GGML_ASSERT(params.expert_prefetch_profile_path == nullptr);
     GGML_ASSERT(params.expert_hot_cache_capacity == 0);
     GGML_ASSERT(params.expert_cold_cache_bytes == 0);
     GGML_ASSERT(params.expert_transfer_ring_bytes == 0);
