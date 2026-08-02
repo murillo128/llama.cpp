@@ -123,6 +123,40 @@ void test_transactional_current_layer_batch() {
     GGML_ASSERT(diagnostics.active_requests == 4);
 }
 
+void test_submitted_optional_work_does_not_block_full_demand_batch() {
+    llm_expert_scheduler scheduler({ 1, 8, 4, 4, 2, 0 });
+    const auto optional = scheduler.enqueue(
+        { 0, 7 }, llm_expert_priority::demand_future_dependency,
+        llm_expert_readiness::device_ready);
+    GGML_ASSERT(optional.accepted());
+    llm_expert_request_snapshot optional_snapshot;
+    GGML_ASSERT(scheduler.take(optional.handle, optional_snapshot).accepted());
+    GGML_ASSERT(scheduler.transition(optional.handle,
+        llm_expert_request_state::submitting,
+        llm_expert_request_state::io_in_flight) ==
+        llm_expert_schedule_disposition::admitted);
+
+    const llm_expert_current_layer_schedule_entry entries[] = {
+        { { 0, 1 }, llm_expert_readiness::host_ready },
+        { { 0, 2 }, llm_expert_readiness::device_ready },
+    };
+    llm_expert_current_layer_schedule_result results[2];
+    llm_expert_request_handle revoked[2];
+    size_t revoked_count = 0;
+    GGML_ASSERT(scheduler.enqueue_current_layer_batch(
+        entries, 2, results, 2, revoked, 2, revoked_count) ==
+        llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(revoked_count == 0);
+    const auto diagnostics = scheduler.diagnostics();
+    GGML_ASSERT(diagnostics.active_requests == 3);
+    GGML_ASSERT(diagnostics.current_layer_batch_entries == 2);
+    for (const auto & result : results) {
+        llm_expert_request_snapshot demand;
+        GGML_ASSERT(scheduler.take(result.handle, demand).accepted());
+        GGML_ASSERT(demand.demand_owned);
+    }
+}
+
 void test_batch_preflight_has_no_partial_mutation() {
     llm_expert_scheduler scheduler({ 1, 8, 3, 1, 2, 0 });
     const auto optional = scheduler.enqueue(
@@ -451,6 +485,7 @@ int main() {
     test_priority_fifo_and_promotion();
     test_saturation_and_preemption();
     test_transactional_current_layer_batch();
+    test_submitted_optional_work_does_not_block_full_demand_batch();
     test_batch_preflight_has_no_partial_mutation();
     test_optional_reclaim_and_demand_promotion();
     test_pending_successor_is_generation_safe();

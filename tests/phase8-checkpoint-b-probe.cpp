@@ -338,6 +338,9 @@ std::string run_live_operand_case(
     GGML_ASSERT(fixture.control.release_gate().is_ready());
     GGML_ASSERT(future.get().is_ready());
     const auto diagnostics = fixture.provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.last_demand_event.full_set_enqueued_before_first_take);
+    GGML_ASSERT(diagnostics.last_demand_event.full_set_enqueued_before_first_terminal_release);
+    GGML_ASSERT(diagnostics.last_demand_event.full_set_enqueued_before_first_blocking_wait);
     const auto & record = only_last_decision(diagnostics, before);
     GGML_ASSERT(record.same_key_h2d_present && record.same_key_h2d_state == expected_state);
     fixture.destroy();
@@ -668,6 +671,9 @@ std::string run_current_output_nonblocking_case() {
     GGML_ASSERT(fixture.control.release_gate().is_ready());
     GGML_ASSERT(later.get().is_ready());
     const auto joined = fixture.provider->hot_cache_diagnostics();
+    GGML_ASSERT(joined.last_demand_event.full_set_enqueued_before_first_take);
+    GGML_ASSERT(joined.last_demand_event.full_set_enqueued_before_first_terminal_release);
+    GGML_ASSERT(joined.last_demand_event.full_set_enqueued_before_first_blocking_wait);
     GGML_ASSERT(joined.background_later_joins == 1 && joined.active_background_flights == 0);
     const auto & record = only_last_decision(joined, before);
     fixture.destroy();
