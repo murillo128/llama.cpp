@@ -283,6 +283,56 @@ struct llm_expert_provider_stats {
     uint64_t surrender_busy = 0;
 };
 
+enum class llm_expert_demand_mode : uint8_t {
+    issue_ahead,
+    serial_control,
+};
+
+enum class llm_expert_demand_wait_kind : uint8_t {
+    none,
+    scheduler_predecessor_drain,
+    scheduler_terminal_release,
+    storage_completion,
+    h2d_completion,
+    cuda_event,
+    cancellation_drain,
+};
+
+struct llm_expert_demand_event {
+    uint32_t version = 1;
+    llm_expert_demand_mode mode = llm_expert_demand_mode::issue_ahead;
+    uint64_t request = 0;
+    uint64_t ubatch = 0;
+    int32_t layer = -1;
+    uint8_t phase = 0;
+    uint64_t selected_occurrence_count = 0;
+    uint64_t unique_count = 0;
+    uint64_t miss_count = 0;
+    std::vector<int32_t> selected_logical_ids;
+    std::vector<int32_t> occurrence_to_unique;
+    std::vector<llm_expert_key> canonical_unique_keys;
+    std::vector<uint64_t> canonical_occurrence_counts;
+    uint64_t enqueued_before_first_take = 0;
+    uint64_t enqueued_before_first_terminal_release = 0;
+    uint64_t enqueued_before_first_blocking_wait = 0;
+    uint64_t acquired_read_count = 0;
+    uint64_t submitted_before_first_storage_wait = 0;
+    llm_expert_demand_wait_kind first_wait_kind = llm_expert_demand_wait_kind::none;
+    uint64_t first_wait_ordinal = 0;
+    uint64_t first_take_ordinal = 0;
+    uint64_t first_terminal_release_ordinal = 0;
+    uint64_t same_key_joins = 0;
+    uint64_t same_key_promotions = 0;
+    uint64_t pending_successors = 0;
+    uint64_t queued_optional_reclaims = 0;
+    bool full_set_enqueued_before_first_take = false;
+    bool full_set_enqueued_before_first_terminal_release = false;
+    bool full_set_enqueued_before_first_blocking_wait = false;
+    bool all_acquired_reads_submitted_before_first_storage_wait = false;
+    bool exact_generations_ready_before_use = false;
+    bool bounds_ok = false;
+};
+
 struct llm_hot_cache_diagnostics {
     struct auto_decision {
         uint64_t request = 0;
@@ -313,6 +363,9 @@ struct llm_hot_cache_diagnostics {
     uint32_t auto_cost_model_version = 0;
     uint64_t auto_cost_model_digest = 0;
     uint64_t hybrid_bindings = 0;
+    uint64_t demand_event_records = 0;
+    uint64_t demand_event_records_dropped = 0;
+    llm_expert_demand_event last_demand_event;
     uint64_t gpu_execution_lanes = 0;
     uint64_t cpu_execution_lanes = 0;
     uint64_t mixed_execution_layers = 0;
@@ -871,6 +924,7 @@ struct llm_hot_cache_config {
     // null; focused tests may install them on a live provider.
     llm_expert_phase8_test_control * phase8_test_control = nullptr;
     llm_expert_phase8_closeout_witness * phase8_closeout_witness = nullptr;
+    bool serial_current_layer_demand_for_testing = false;
     bool descriptor_only_source_for_testing = false;
     llm_expert_cache_policy_config_internal hot_cache_policy_config = {};
     llm_expert_cache_policy_config_internal cold_cache_policy_config = {};

@@ -94,7 +94,7 @@ evidence_counters capture_evidence(
 struct provider_fixture {
     source_fixture source;
     llm_expert_phase8_test_control control;
-    llm_expert_scheduler scheduler { { 1, 2, 8, 8, 0 } };
+    llm_expert_scheduler scheduler { { 1, 2, 8, 8, 2, 0 } };
     ggml_backend_ptr backend;
     ggml_context_ptr graph_ctx;
     ggml_backend_buffer_ptr graph_buffer;

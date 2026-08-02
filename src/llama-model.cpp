@@ -1398,10 +1398,12 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     const uint64_t request_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
     if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
     const uint32_t request_capacity = uint32_t(request_capacity_64);
+    const uint32_t current_layer_demand_reserve = uint32_t(std::min<uint64_t>(
+        uint32_t(hparams.n_expert), params.expert_hot_cache_capacity));
     const uint64_t trace_capacity_64 = std::min<uint64_t>(65536, std::max<uint64_t>(1024, request_capacity_64*16));
     auto scheduler = std::make_unique<llm_expert_scheduler>(llm_expert_scheduler_config{
         uint32_t(layers.size()), uint32_t(hparams.n_expert), request_capacity,
-        uint32_t(std::max<int64_t>(1, hparams.n_expert_used)), 0,
+        uint32_t(std::max<int64_t>(2, hparams.n_expert_used)), current_layer_demand_reserve, 0,
     });
     auto transport = std::make_unique<llm_expert_async_transport>(llm_expert_async_config{
         params.expert_io_queue_depth,

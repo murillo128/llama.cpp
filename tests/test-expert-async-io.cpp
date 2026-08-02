@@ -615,7 +615,7 @@ void test_model_owner_drains_before_provider_destination_destroy() {
     auto cfg = config(8);
     cfg.pause_after_ring_submit_for_testing = true;
     auto transport = std::make_unique<llm_expert_async_transport>(cfg);
-    auto scheduler = std::make_unique<llm_expert_scheduler>(llm_expert_scheduler_config{ 1, 1, 1, 1, 0 });
+    auto scheduler = std::make_unique<llm_expert_scheduler>(llm_expert_scheduler_config{ 1, 1, 1, 1, 1, 0 });
     bool drained_before_provider_destroy = false;
     auto destination_owner = std::make_unique<provider_owned_destination>(
         transport.get(), drained_before_provider_destroy);

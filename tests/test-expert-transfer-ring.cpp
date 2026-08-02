@@ -337,7 +337,7 @@ void test_native_event_ordering_reuse_and_unload() {
         cancel_config.h2d_gate_event_for_testing = gate_event;
         llm_expert_transfer_ring cancelling(cancel_config);
         GGML_ASSERT(cancelling.initialize(source.bundle()).is_ready());
-        llm_expert_scheduler scheduler({ 1, 4, 2, 1, 0 });
+        llm_expert_scheduler scheduler({ 1, 4, 2, 1, 1, 0 });
         const llm_expert_key key = { 0, 0 };
         const auto admitted = scheduler.enqueue(key, llm_expert_priority::demand_current_layer,
             llm_expert_readiness::device_ready);
