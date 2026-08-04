@@ -673,6 +673,7 @@ struct llm_hot_cache_diagnostics {
     std::string uma_zram_status_reason;
     std::string uma_zswap_status_reason;
     std::string uma_nvidia_hmm_status_reason;
+    std::string uma_pressure_rejection_reason;
     std::string uma_telemetry_unavailable_reason;
     uint64_t ring_requested_bytes = 0;
     uint64_t ring_actual_bytes = 0;

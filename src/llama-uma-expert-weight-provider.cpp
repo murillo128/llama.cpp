@@ -174,6 +174,8 @@ llm_expert_provider_result load_uma_bundle(
 
 class llm_uma_expert_weight_provider final : public llm_expert_weight_provider {
 public:
+    static constexpr uint32_t policy_trace_capacity = 65536;
+
     llm_uma_expert_weight_provider(llm_uma_cache_config config, llm_expert_provider_faults faults) :
         config(std::move(config)), faults(faults) {
         if (this->config.sample_memory == nullptr) this->config.sample_memory = llm_expert_uma_sample_memory;
@@ -506,6 +508,7 @@ public:
         result.uma_zram_status_reason = memory_sample.zram_status_reason;
         result.uma_zswap_status_reason = memory_sample.zswap_status_reason;
         result.uma_nvidia_hmm_status_reason = memory_sample.nvidia_hmm_status_reason;
+        result.uma_pressure_rejection_reason = pressure_rejection_reason;
         result.uma_telemetry_unavailable_reason = !memory_sample.unavailable_reason.empty() ?
             memory_sample.unavailable_reason : residency_unavailable_reason;
         result.cold_policy = cold.policy;
@@ -629,6 +632,7 @@ public:
         cold.minimum_domain_slots = config.n_expert_used;
         cold.cache_policy_config = config.cold_cache_policy_config;
         cold.routed_layers = config.routed_layers;
+        cold.policy_trace_capacity = policy_trace_capacity;
         cold.buffer_type = config.buffer_type;
         cold.reclaim_free_pages = true;
         auto candidate = std::make_unique<llm_cold_expert_cache>(std::move(cold));
@@ -642,7 +646,7 @@ public:
         auto hot_initialized = policy_result(hot_policy.initialize(
             config.hot_cache_policy_config, llm_expert_cache_policy_tier::hot,
             config.routed_layers.data(), config.routed_layer_count, n_expert, config.n_expert_used,
-            config.hot_capacity, diagnostics.aligned_slot_footprint, 16384));
+            config.hot_capacity, diagnostics.aligned_slot_footprint, policy_trace_capacity));
         if (!hot_initialized.is_ready()) return failure(hot_initialized.error);
         const size_t probe_bytes = std::min<size_t>(4096, ggml_backend_buffer_get_size(candidate->buffer()));
         int readiness_status = -1;
@@ -898,12 +902,15 @@ private:
         pressure_samples++;
         if (pressure_circuit_open) {
             pressure_rejections++;
+            if (pressure_rejection_reason.empty()) pressure_rejection_reason = "pressure circuit already open";
             return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
         llm_expert_uma_memory_sample current;
         if (!config.sample_memory(current).is_ready()) {
             memory_sample = current;
             pressure_rejections++;
+            pressure_rejection_reason = !current.unavailable_reason.empty() ?
+                current.unavailable_reason : "pressure telemetry unavailable";
             return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
         if (!current.swap_counters_supported || !current.psi_full_supported ||
@@ -919,6 +926,14 @@ private:
             pressure_circuit_open = true;
             pressure_rejections++;
             memory_sample = current;
+            if (current.process_swap_bytes > baseline_memory_sample.process_swap_bytes) pressure_rejection_reason = "process swap grew";
+            else if (current.cgroup_swap_current_bytes > baseline_memory_sample.cgroup_swap_current_bytes) pressure_rejection_reason = "cgroup swap grew";
+            else if (current.pswpin_pages > baseline_memory_sample.pswpin_pages) pressure_rejection_reason = "system swap-in grew";
+            else if (current.pswpout_pages > baseline_memory_sample.pswpout_pages) pressure_rejection_reason = "system swap-out grew";
+            else if (current.psi_full_total_usec > baseline_memory_sample.psi_full_total_usec) pressure_rejection_reason = "cgroup PSI-full grew";
+            else if (current.zram_write_bytes > baseline_memory_sample.zram_write_bytes) pressure_rejection_reason = "zram writes grew";
+            else if (current.zswap_write_pages > baseline_memory_sample.zswap_write_pages) pressure_rejection_reason = "zswap writes grew";
+            else pressure_rejection_reason = "required pressure counter became unavailable";
             return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
         const uint64_t cgroup_available = current.cgroup_memory_current_bytes <= current.cgroup_memory_max_bytes ?
@@ -946,6 +961,7 @@ private:
         memory_sample = current;
         if (available < required) {
             pressure_rejections++;
+            pressure_rejection_reason = "available memory fell below reserves plus hysteresis";
             return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
         return llm_expert_provider_result::success();
@@ -1000,7 +1016,16 @@ private:
             after.zram_write_bytes > observation.before.zram_write_bytes ||
             after.zswap_write_pages > observation.before.zswap_write_pages;
         const bool faulted = after.major_faults > observation.before.major_faults;
-        if (pressure_refill) pressure_circuit_open = true;
+        if (pressure_refill) {
+            pressure_circuit_open = true;
+            if (after.process_swap_bytes > observation.before.process_swap_bytes) pressure_rejection_reason = "process swap grew during hit";
+            else if (after.cgroup_swap_current_bytes > observation.before.cgroup_swap_current_bytes) pressure_rejection_reason = "cgroup swap grew during hit";
+            else if (after.pswpin_pages > observation.before.pswpin_pages) pressure_rejection_reason = "system swap-in grew during hit";
+            else if (after.pswpout_pages > observation.before.pswpout_pages) pressure_rejection_reason = "system swap-out grew during hit";
+            else if (after.psi_full_total_usec > observation.before.psi_full_total_usec) pressure_rejection_reason = "cgroup PSI-full grew during hit";
+            else if (after.zram_write_bytes > observation.before.zram_write_bytes) pressure_rejection_reason = "zram writes grew during hit";
+            else pressure_rejection_reason = "zswap writes grew during hit";
+        }
         if (faulted || pressure_refill) degraded_hits++;
         else if (observation.kind == hit_kind::resident_hot) resident_hot_hits++;
         else prepared_cold_hits++;
@@ -1146,6 +1171,7 @@ private:
     llm_expert_uma_memory_sample baseline_memory_sample;
     llm_expert_uma_memory_sample memory_sample;
     std::string residency_unavailable_reason;
+    std::string pressure_rejection_reason;
     uint32_t hot_count = 0;
     llama_expert_uma_readiness resolved_readiness = LLAMA_EXPERT_UMA_READINESS_AUTO;
     int32_t last_execution_backend_device_type = -1;

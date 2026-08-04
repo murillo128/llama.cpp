@@ -141,6 +141,7 @@ struct live_arguments {
     bool cancel_on_storage = false;
     bool cancel_after_h2d = false;
     bool require_overlap = false;
+    bool ignore_eog = false;
     std::string dump_cold_bundle;
 };
 
@@ -166,6 +167,10 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
             result.require_overlap = true;
             continue;
         }
+        if (std::string(argv[index]) == "--ignore-eog") {
+            result.ignore_eog = true;
+            continue;
+        }
         if (index + 1 >= argc) return false;
         const std::string option = argv[index];
         const char * value = argv[++index];
@@ -175,7 +180,7 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
         else if (option == "--capacity" && parse_u64(value, parsed) && parsed <= UINT32_MAX) result.capacity = parsed;
         else if (option == "--cold-bytes" && parse_u64(value, result.cold_bytes)) {}
         else if (option == "--ring-bytes" && parse_u64(value, result.ring_bytes)) {}
-        else if (option == "--steps" && parse_u64(value, parsed) && parsed > 0 && parsed <= 64) result.steps = parsed;
+        else if (option == "--steps" && parse_u64(value, parsed) && parsed > 0 && parsed <= 128) result.steps = parsed;
         else if (option == "--dump-cold-bundle") result.dump_cold_bundle = value;
         else if (option == "--load-mode") {
             try {
@@ -495,8 +500,25 @@ int run_live(int argc, char ** argv) {
     for (int step = 0; step < args.steps; ++step) {
         const auto phase = step == 0 ? LLAMA_ROUTE_PHASE_PREFILL : LLAMA_ROUTE_PHASE_DECODE;
         const int64_t begin_us = ggml_time_us();
-        if (llama_route_observer_begin(context, step, phase) != LLAMA_ROUTE_OBSERVER_STATUS_OK ||
-            llama_decode(context, batch) != 0) return 25;
+        if (llama_route_observer_begin(context, step, phase) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 25;
+        const int decode_status = llama_decode(context, batch);
+        if (decode_status != 0) {
+            llama_synchronize(context);
+            const auto failure_diagnostics = model->expert_weight_provider() ?
+                model->expert_weight_provider()->hot_cache_diagnostics() : llm_hot_cache_diagnostics {};
+            std::cout << "PHASE11_UMA_FAILURE"
+                      << "\tstep=" << step
+                      << "\tdecode_status=" << decode_status
+                      << "\tpressure_rejections=" << failure_diagnostics.uma_pressure_rejections
+                      << "\tpressure_circuit_open=" << failure_diagnostics.uma_pressure_circuit_open
+                      << "\tpressure_reason=" << failure_diagnostics.uma_pressure_rejection_reason
+                      << "\tprocess_swap_bytes=" << failure_diagnostics.uma_process_swap_bytes
+                      << "\tdegraded_hits=" << failure_diagnostics.uma_degraded_hits
+                      << "\tunknown_residency_hits=" << failure_diagnostics.uma_unknown_residency_hits
+                      << "\tscheduler_active=" << model->expert_scheduler_diagnostics().active_requests
+                      << '\n';
+            return 25;
+        }
         decode_us.push_back(uint64_t(ggml_time_us() - begin_us));
         const float * logits = llama_get_logits_ith(context, -1);
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
@@ -505,7 +527,7 @@ int run_live(int argc, char ** argv) {
         int32_t next = 0;
         for (int32_t token = 1; token < n_vocab; ++token) if (logits[token] > logits[next]) next = token;
         generated.push_back(next);
-        if (llama_vocab_is_eog(vocab, next)) break;
+        if (!args.ignore_eog && llama_vocab_is_eog(vocab, next)) break;
         batch = llama_batch_get_one(&generated.back(), 1);
     }
     llama_synchronize(context);
@@ -590,6 +612,11 @@ int run_live(int argc, char ** argv) {
     };
     uint64_t decode_total_us = 0;
     for (size_t index = 1; index < decode_us.size(); ++index) decode_total_us += decode_us[index];
+    std::ostringstream token_samples;
+    for (size_t index = 0; index < decode_us.size(); ++index) {
+        if (index) token_samples << ',';
+        token_samples << decode_us[index];
+    }
     std::cout << (args.mode == "uma" ? "PHASE11_UMA_LIVE" : "PHASE5_LIVE")
               << "\tmode=" << args.mode
               << "\tload_mode=" << llama_load_mode_name(args.load_mode)
@@ -604,6 +631,8 @@ int run_live(int argc, char ** argv) {
               << "\ttoken_p50_us=" << percentile(50, 100)
               << "\ttoken_p95_us=" << percentile(95, 100)
               << "\ttoken_p99_us=" << percentile(99, 100)
+              << "\ttoken_max_us=" << (sorted_us.empty() ? 0 : sorted_us.back())
+              << "\ttoken_samples_us=" << token_samples.str()
               << "\thot_requested_capacity=" << diagnostics.requested_capacity
               << "\thot_effective_capacity=" << diagnostics.effective_capacity
               << "\thot_slots=" << diagnostics.slots.size()
@@ -673,6 +702,7 @@ int run_live(int argc, char ** argv) {
               << "\tuma_zswap_status_reason=" << diagnostics.uma_zswap_status_reason
               << "\tuma_nvidia_hmm_counters_supported=" << diagnostics.uma_nvidia_hmm_counters_supported
               << "\tuma_nvidia_hmm_status_reason=" << diagnostics.uma_nvidia_hmm_status_reason
+              << "\tuma_pressure_rejection_reason=" << diagnostics.uma_pressure_rejection_reason
               << "\tuma_storage_misses=" << diagnostics.uma_storage_misses
               << "\tuma_resident_hot_hits=" << diagnostics.uma_resident_hot_hits
               << "\tuma_prepared_cold_hits=" << diagnostics.uma_prepared_cold_hits
