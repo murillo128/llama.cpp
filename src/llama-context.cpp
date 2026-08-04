@@ -709,7 +709,9 @@ void llama_context::sched_reserve() {
             auto * gf = graph_discover(tokens, seqs, outputs, mctx.get());
             const auto & provider_result = gf_res_reserve->get_expert_provider_result();
             if (gf == nullptr || !provider_result.is_ready()) {
-                throw std::runtime_error("cold-cache descriptor discovery failed");
+                throw std::runtime_error(format(
+                    "cold-cache descriptor discovery failed (status=%d, error=%d)",
+                    int(provider_result.status), int(provider_result.error)));
             }
             const auto & bindings = gf_res_reserve->get_expert_bindings();
             if (bindings.empty() || std::any_of(bindings.begin(), bindings.end(), [](const auto & binding) {
