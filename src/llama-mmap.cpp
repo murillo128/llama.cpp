@@ -214,6 +214,7 @@ struct llama_file::impl {
             }
 
             size = file_stats.st_size;
+#if defined(STATX_DIOALIGN)
             struct statx direct_info{};
             const int statx_result = statx(
                 fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT, STATX_DIOALIGN, &direct_info);
@@ -228,6 +229,12 @@ struct llama_file::impl {
             }
             alignment = std::max<size_t>({ direct_info.stx_dio_mem_align,
                 direct_info.stx_dio_offset_align, sizeof(void *) });
+#else
+            direct_error = EOPNOTSUPP;
+            close(fd);
+            fd = -1;
+            return false;
+#endif
 
             void * probe = nullptr;
             const int allocation_error = posix_memalign(&probe, alignment, alignment);

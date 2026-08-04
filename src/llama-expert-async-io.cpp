@@ -19,6 +19,10 @@
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+#ifndef IORING_ASYNC_CANCEL_USERDATA
+#define IORING_ASYNC_CANCEL_USERDATA 0
+#endif
 #endif
 
 namespace {
