@@ -191,7 +191,7 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
         (result.mode == "disabled" || result.mode == "resident" || cached_mode) &&
         (!cached_mode || result.capacity > 0) &&
         (result.mode != "cold" || (result.cold_bytes > 0 && result.ring_bytes > 0)) &&
-        (result.mode != "uma" || (result.cold_bytes > 0 && result.ring_bytes == 0));
+        (result.mode != "uma" || result.ring_bytes == 0);
 }
 
 struct storage_cancel_state {
@@ -631,6 +631,41 @@ int run_live(int argc, char ** argv) {
               << "\tcold_failed_copies=" << diagnostics.cold_failed_copies
               << "\tcold_failed_cleanups=" << diagnostics.cold_failed_cleanups
               << "\tcold_generation_changes=" << diagnostics.cold_generation_changes
+              << "\tcold_reclaimed_bytes=" << diagnostics.cold_reclaimed_bytes
+              << "\tcold_reclaim_failures=" << diagnostics.cold_reclaim_failures
+              << "\thot_policy=" << int(diagnostics.policy.config.policy)
+              << "\thot_policy_scope=" << int(diagnostics.policy.config.scope)
+              << "\thot_policy_admission=" << int(diagnostics.policy.config.admission)
+              << "\thot_policy_digest=" << diagnostics.policy.state_digest
+              << "\thot_policy_drops=" << diagnostics.policy.transcript_dropped
+              << "\tcold_policy=" << int(diagnostics.cold_policy.config.policy)
+              << "\tcold_policy_scope=" << int(diagnostics.cold_policy.config.scope)
+              << "\tcold_policy_admission=" << int(diagnostics.cold_policy.config.admission)
+              << "\tcold_policy_digest=" << diagnostics.cold_policy.state_digest
+              << "\tcold_policy_drops=" << diagnostics.cold_policy.transcript_dropped
+              << "\tuma_physical_ram_bytes=" << diagnostics.uma_physical_ram_bytes
+              << "\tuma_memory_available_bytes=" << diagnostics.uma_memory_available_bytes
+              << "\tuma_cgroup_memory_max_bytes=" << diagnostics.uma_cgroup_memory_max_bytes
+              << "\tuma_cgroup_memory_current_bytes=" << diagnostics.uma_cgroup_memory_current_bytes
+              << "\tuma_process_rss_bytes=" << diagnostics.uma_process_rss_bytes
+              << "\tuma_process_swap_bytes=" << diagnostics.uma_process_swap_bytes
+              << "\tuma_safe_pool_bytes=" << diagnostics.uma_safe_pool_bytes
+              << "\tuma_effective_pool_bytes=" << diagnostics.uma_effective_pool_bytes
+              << "\tuma_system_reserve_bytes=" << diagnostics.uma_system_reserve_bytes
+              << "\tuma_runtime_reserve_bytes=" << diagnostics.uma_runtime_reserve_bytes
+              << "\tuma_runtime_delta_bytes=" << diagnostics.uma_runtime_delta_bytes
+              << "\tuma_headroom_remainder_bytes=" << diagnostics.uma_headroom_remainder_bytes
+              << "\tuma_autofit=" << diagnostics.uma_autofit
+              << "\tuma_pressure_samples=" << diagnostics.uma_pressure_samples
+              << "\tuma_pressure_rejections=" << diagnostics.uma_pressure_rejections
+              << "\tuma_pressure_circuit_open=" << diagnostics.uma_pressure_circuit_open
+              << "\tuma_swap_counters_supported=" << diagnostics.uma_swap_counters_supported
+              << "\tuma_storage_misses=" << diagnostics.uma_storage_misses
+              << "\tuma_resident_hot_hits=" << diagnostics.uma_resident_hot_hits
+              << "\tuma_prepared_cold_hits=" << diagnostics.uma_prepared_cold_hits
+              << "\tuma_degraded_hits=" << diagnostics.uma_degraded_hits
+              << "\tuma_unknown_residency_hits=" << diagnostics.uma_unknown_residency_hits
+              << "\tuma_telemetry_unavailable_reason=" << diagnostics.uma_telemetry_unavailable_reason
               << "\tstorage_read_requests=" << storage_diagnostics.read_requests
               << "\tstorage_read_chunks=" << storage_diagnostics.read_chunks
               << "\tstorage_read_bytes=" << storage_diagnostics.read_bytes

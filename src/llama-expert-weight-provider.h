@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "llama-expert-cache-policy.h"
 #include "llama-expert-prefetch.h"
+#include "llama-expert-uma.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -635,6 +636,31 @@ struct llm_hot_cache_diagnostics {
     uint64_t cold_ready_page_count = 0;
     uint64_t cold_resident_ready_page_count = 0;
     uint64_t cold_resident_ready_bytes = 0;
+    uint64_t cold_reclaimed_bytes = 0;
+    uint64_t cold_reclaim_failures = 0;
+    uint64_t uma_physical_ram_bytes = 0;
+    uint64_t uma_memory_available_bytes = 0;
+    uint64_t uma_cgroup_memory_max_bytes = 0;
+    uint64_t uma_cgroup_memory_current_bytes = 0;
+    uint64_t uma_process_rss_bytes = 0;
+    uint64_t uma_process_swap_bytes = 0;
+    uint64_t uma_safe_pool_bytes = 0;
+    uint64_t uma_effective_pool_bytes = 0;
+    uint64_t uma_system_reserve_bytes = 0;
+    uint64_t uma_runtime_reserve_bytes = 0;
+    uint64_t uma_runtime_delta_bytes = 0;
+    uint64_t uma_headroom_remainder_bytes = 0;
+    uint64_t uma_pressure_samples = 0;
+    uint64_t uma_pressure_rejections = 0;
+    uint64_t uma_storage_misses = 0;
+    uint64_t uma_resident_hot_hits = 0;
+    uint64_t uma_prepared_cold_hits = 0;
+    uint64_t uma_degraded_hits = 0;
+    uint64_t uma_unknown_residency_hits = 0;
+    bool uma_autofit = false;
+    bool uma_pressure_circuit_open = false;
+    bool uma_swap_counters_supported = false;
+    std::string uma_telemetry_unavailable_reason;
     uint64_t ring_requested_bytes = 0;
     uint64_t ring_actual_bytes = 0;
     uint64_t ring_lane_footprint = 0;
@@ -1098,6 +1124,7 @@ struct llm_uma_cache_config {
     using is_buffer_type_fn = bool (*)(ggml_backend_buffer_type_t);
     using prepare_fn = int (*)(ggml_backend_buffer_t, size_t, size_t);
     using checksum_fn = int (*)(ggml_backend_buffer_t, size_t, size_t, uint64_t *);
+    using sample_memory_fn = llm_expert_uma_result (*)(llm_expert_uma_memory_sample &);
     uint64_t pool_bytes = 0;
     uint32_t hot_capacity = 0;
     uint32_t n_expert_used = 0;
@@ -1110,7 +1137,10 @@ struct llm_uma_cache_config {
     is_buffer_type_fn is_uma_buffer_type = nullptr;
     prepare_fn prefetch = nullptr;
     checksum_fn checksum = nullptr;
+    sample_memory_fn sample_memory = nullptr;
     llama_expert_uma_readiness readiness = LLAMA_EXPERT_UMA_READINESS_AUTO;
+    uint64_t min_system_headroom_bytes = 0;
+    uint64_t min_runtime_headroom_bytes = 0;
     llm_expert_cache_policy_config_internal hot_cache_policy_config = {};
     llm_expert_cache_policy_config_internal cold_cache_policy_config = {};
     std::vector<int32_t> routed_layers;

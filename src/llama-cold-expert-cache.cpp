@@ -546,6 +546,28 @@ llm_cold_expert_cache::~llm_cold_expert_cache() = default;
 llm_cold_expert_cache::llm_cold_expert_cache(llm_cold_expert_cache &&) noexcept = default;
 llm_cold_expert_cache & llm_cold_expert_cache::operator=(llm_cold_expert_cache &&) noexcept = default;
 
+llm_expert_provider_result llm_cold_expert_cache::calculate_slot_footprint(
+        const llm_expert_bundle_descriptor & prototype,
+        ggml_backend_buffer_type_t buffer_type,
+        uint64_t & footprint) noexcept {
+    footprint = 0;
+    if (!prototype.validate().is_ready() || buffer_type == nullptr) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
+    try {
+        const size_t size = allocation_size(prototype, 1, buffer_type);
+        if (size == 0) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
+        footprint = size;
+        return llm_expert_provider_result::success();
+    } catch (const std::bad_alloc &) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+    } catch (...) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
+    }
+}
+
 llm_expert_provider_result llm_cold_expert_cache::initialize(
         const llm_expert_bundle_descriptor & prototype) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
@@ -1366,6 +1388,22 @@ llm_expert_provider_result llm_cold_expert_cache::trim() noexcept {
             pimpl->clear_forward(index);
             slot.key = { -1, -1 };
             slot.state = llm_cold_slot_state::free;
+            if (pimpl->config.reclaim_free_pages) {
+#ifdef __linux__
+                const uint64_t reclaimed = pimpl->counters.aligned_slot_footprint;
+                auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(pimpl->arena->buffer.get()));
+                if (reclaimed == 0 || reclaimed > SIZE_MAX || index > SIZE_MAX/size_t(reclaimed) ||
+                    madvise(base + size_t(index)*size_t(reclaimed), size_t(reclaimed), MADV_DONTNEED) != 0 ||
+                    reclaimed > UINT64_MAX - pimpl->counters.reclaimed_bytes) {
+                    pimpl->counters.reclaim_failures++;
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
+                }
+                pimpl->counters.reclaimed_bytes += reclaimed;
+#else
+                pimpl->counters.reclaim_failures++;
+                return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+#endif
+            }
         }
     }
     return llm_expert_provider_result::success();
@@ -1373,6 +1411,9 @@ llm_expert_provider_result llm_cold_expert_cache::trim() noexcept {
 
 llm_expert_provider_result llm_cold_expert_cache::surrender() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (pimpl->arena && pimpl->arena.use_count() != 1) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+    }
     for (const auto & slot : pimpl->slots) {
         if (!pimpl->no_refs(slot) || slot.state == llm_cold_slot_state::loading) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);

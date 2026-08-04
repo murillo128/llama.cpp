@@ -2,7 +2,16 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <fstream>
 #include <limits>
+#include <sstream>
+#include <string>
+
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/sysinfo.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -33,7 +42,104 @@ uint64_t digest_config(const llama_expert_uma_config_v1 & value) {
     return digest;
 }
 
+#ifdef __linux__
+bool read_number(const std::string & path, uint64_t & value) {
+    std::ifstream input(path);
+    std::string text;
+    if (!(input >> text) || text == "max") return false;
+    try {
+        size_t consumed = 0;
+        value = std::stoull(text, &consumed);
+        return consumed == text.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+bool read_kib_field(const char * path, const char * field, uint64_t & bytes) {
+    std::ifstream input(path);
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream fields(line);
+        std::string key, unit;
+        uint64_t value = 0;
+        if (fields >> key >> value >> unit && key == field) {
+            if (value > std::numeric_limits<uint64_t>::max()/1024) return false;
+            bytes = value*1024;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool read_vmstat(uint64_t & pswpin, uint64_t & pswpout) {
+    std::ifstream input("/proc/vmstat");
+    std::string key;
+    uint64_t value = 0;
+    bool have_in = false, have_out = false;
+    while (input >> key >> value) {
+        if (key == "pswpin") { pswpin = value; have_in = true; }
+        if (key == "pswpout") { pswpout = value; have_out = true; }
+    }
+    return have_in && have_out;
+}
+#endif
+
 } // namespace
+
+llm_expert_uma_result llm_expert_uma_sample_memory(llm_expert_uma_memory_sample & output) noexcept {
+    output = {};
+#ifdef __linux__
+    try {
+        struct sysinfo info = {};
+        if (sysinfo(&info) != 0 || info.totalram == 0 || info.mem_unit == 0 ||
+            uint64_t(info.totalram) > std::numeric_limits<uint64_t>::max()/uint64_t(info.mem_unit)) {
+            output.unavailable_reason = "sysinfo physical RAM unavailable";
+            return llm_expert_uma_result::failure(llm_expert_uma_error::unavailable_measurement);
+        }
+        output.physical_ram_bytes = uint64_t(info.totalram)*uint64_t(info.mem_unit);
+        if (!read_kib_field("/proc/meminfo", "MemAvailable:", output.memory_available_bytes) ||
+            !read_kib_field("/proc/self/status", "VmRSS:", output.process_rss_bytes) ||
+            !read_kib_field("/proc/self/status", "VmSwap:", output.process_swap_bytes)) {
+            output.unavailable_reason = "procfs memory fields unavailable";
+            return llm_expert_uma_result::failure(llm_expert_uma_error::unavailable_measurement);
+        }
+        std::ifstream cgroup("/proc/self/cgroup");
+        std::string line, relative;
+        while (std::getline(cgroup, line)) {
+            if (line.rfind("0::", 0) == 0) { relative = line.substr(3); break; }
+        }
+        if (relative.empty()) relative = "/";
+        const std::string root = "/sys/fs/cgroup" + (relative == "/" ? "" : relative);
+        if (!read_number(root + "/memory.current", output.cgroup_memory_current_bytes)) {
+            output.unavailable_reason = "finite cgroup-v2 memory.current unavailable";
+            return llm_expert_uma_result::failure(llm_expert_uma_error::unavailable_measurement);
+        }
+        output.cgroup_v2 = true;
+        if (!read_number(root + "/memory.max", output.cgroup_memory_max_bytes)) {
+            output.cgroup_memory_max_bytes = output.physical_ram_bytes;
+        }
+        output.swap_counters_supported = read_number(
+            root + "/memory.swap.current", output.cgroup_swap_current_bytes) &&
+            read_vmstat(output.pswpin_pages, output.pswpout_pages);
+        struct rusage usage = {};
+        if (getrusage(RUSAGE_SELF, &usage) != 0 || usage.ru_majflt < 0) {
+            output.unavailable_reason = "getrusage major-fault counter unavailable";
+            return llm_expert_uma_result::failure(llm_expert_uma_error::unavailable_measurement);
+        }
+        output.major_faults = uint64_t(usage.ru_majflt);
+        if (!output.swap_counters_supported) output.unavailable_reason = "swap counters unavailable";
+        return llm_expert_uma_result::success();
+    } catch (...) {
+        output = {};
+        output.unavailable_reason = "memory sampling failed";
+        return llm_expert_uma_result::failure(llm_expert_uma_error::unavailable_measurement);
+    }
+#else
+    output.unavailable_reason = "Linux memory telemetry required";
+    return llm_expert_uma_result::failure(llm_expert_uma_error::unavailable_measurement);
+#endif
+}
 
 llm_expert_uma_result llm_expert_uma_copy_config(
         const llama_expert_uma_config_v1 * source,

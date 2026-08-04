@@ -52,6 +52,7 @@ struct llm_cold_cache_config {
     std::vector<int32_t> routed_layers;
     uint32_t policy_trace_capacity = 4096;
     ggml_backend_buffer_type_t buffer_type = nullptr;
+    bool reclaim_free_pages = false;
 };
 
 using llm_cold_cache_loader = llm_expert_provider_result (*)(
@@ -102,6 +103,8 @@ struct llm_cold_cache_diagnostics {
     uint64_t ready_page_count = 0;
     uint64_t resident_ready_page_count = 0;
     uint64_t resident_ready_bytes = 0;
+    uint64_t reclaimed_bytes = 0;
+    uint64_t reclaim_failures = 0;
     llm_expert_cache_policy_diagnostics policy;
     std::vector<llm_expert_cache_policy_domain_diagnostics> policy_domains;
     std::vector<llm_expert_cache_policy_event> policy_events;
@@ -135,6 +138,10 @@ public:
     llm_cold_expert_cache & operator=(llm_cold_expert_cache &&) noexcept;
 
     llm_expert_provider_result initialize(const llm_expert_bundle_descriptor & prototype) noexcept;
+    static llm_expert_provider_result calculate_slot_footprint(
+            const llm_expert_bundle_descriptor & prototype,
+            ggml_backend_buffer_type_t buffer_type,
+            uint64_t & footprint) noexcept;
     llm_expert_provider_result find_or_admit(
             llm_expert_key key,
             const llm_expert_bundle_descriptor & source,

@@ -30,6 +30,42 @@ struct failure_lifecycle_witness {
     uint64_t scheduler_active = 0;
 } witness;
 
+struct policy_pressure_witness {
+    uint64_t safe_pool_bytes = 0;
+    uint64_t effective_pool_bytes = 0;
+    uint64_t pressure_samples = 0;
+    uint64_t pressure_rejections = 0;
+    bool autofit = false;
+    bool explicit_policy = false;
+    bool pressure_circuit = false;
+    bool before_io = false;
+    bool trim_zero_refs = false;
+    bool surrender = false;
+} policy_witness;
+
+llm_expert_uma_memory_sample controlled_memory;
+bool memory_sample_failure = false;
+
+void reset_memory_sample() {
+    constexpr uint64_t GIB = UINT64_C(1024)*1024*1024;
+    controlled_memory = {};
+    controlled_memory.physical_ram_bytes = 128*GIB;
+    controlled_memory.memory_available_bytes = 100*GIB;
+    controlled_memory.cgroup_memory_max_bytes = 120*GIB;
+    controlled_memory.cgroup_memory_current_bytes = 20*GIB;
+    controlled_memory.process_rss_bytes = 2*GIB;
+    controlled_memory.cgroup_v2 = true;
+    controlled_memory.swap_counters_supported = true;
+    memory_sample_failure = false;
+}
+
+llm_expert_uma_result sample_controlled_memory(llm_expert_uma_memory_sample & output) {
+    output = controlled_memory;
+    return memory_sample_failure ?
+        llm_expert_uma_result::failure(llm_expert_uma_error::unavailable_measurement) :
+        llm_expert_uma_result::success();
+}
+
 int controlled_prefetch(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
     prefetch_calls++;
     int remaining = prefetch_failures.load();
@@ -78,6 +114,7 @@ std::vector<llm_expert_storage_span> spans(uint64_t base) {
 }
 
 void test_provider() {
+    reset_memory_sample();
     temporary_source source;
     llama_file file(source.path, "rb");
     llm_expert_storage storage({ 1, 2, 2, 1024 }, { { 0, &file, 512, source.path, false } });
@@ -99,6 +136,7 @@ void test_provider() {
     config.is_uma_buffer_type = ggml_backend_buft_is_cuda_uma;
     config.prefetch = ggml_backend_cuda_uma_prefetch;
     config.checksum = ggml_backend_cuda_uma_checksum;
+    config.sample_memory = sample_controlled_memory;
     config.routed_layers = { 0 };
     auto provider = llm_create_uma_cache_expert_weight_provider(config);
 
@@ -151,10 +189,26 @@ void test_provider() {
     const auto provider_stats = provider->get_stats();
     const auto storage_stats = storage.diagnostics();
     const auto scheduler_stats = scheduler.diagnostics();
+    const auto policy_stats = provider->hot_cache_diagnostics();
     require(provider_stats.tensor_copies == 0 && storage_stats.read_bytes == 288,
         "provider copied payload or storage byte count is wrong");
     require(scheduler_stats.terminal_complete == 2 && scheduler_stats.active_requests == 0,
         "readiness scheduler did not drain");
+    require(policy_stats.policy.config.policy == LLAMA_EXPERT_CACHE_POLICY_LRU &&
+        policy_stats.cold_policy.config.policy == LLAMA_EXPERT_CACHE_POLICY_LRU &&
+        policy_stats.policy.config.admission == LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS &&
+        policy_stats.cold_policy.config.admission == LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS,
+        "null Phase 9 configuration did not preserve global LRU/ALWAYS defaults");
+    const uint64_t bytes_before_trim = storage.diagnostics().read_bytes;
+    require(provider->trim().is_ready(), "default-policy trim failed");
+    {
+        llm_expert_execution_plan plan;
+        require(provider->prepare({ binding }, plan).is_ready(), "post-trim prepare failed");
+        int32_t expert = 0, execution = -1;
+        require(provider->remap_checkpoint(binding, &expert, 1, &execution).is_ready() &&
+            storage.diagnostics().read_bytes == bytes_before_trim + 144,
+            "post-trim demand did not reload the full bundle");
+    }
 }
 
 void initialize_provider(
@@ -179,6 +233,7 @@ void initialize_provider(
 }
 
 void test_readiness_selection_and_failed_generation_retry() {
+    reset_memory_sample();
     temporary_source source;
     llama_file file(source.path, "rb");
     llm_expert_storage storage({ 1, 2, 2, 1024 }, { { 0, &file, 512, source.path, false } });
@@ -206,6 +261,7 @@ void test_readiness_selection_and_failed_generation_retry() {
         config.is_uma_buffer_type = ggml_backend_buft_is_cuda_uma;
         config.prefetch = controlled_prefetch;
         config.checksum = controlled_checksum;
+        config.sample_memory = sample_controlled_memory;
         config.readiness = readiness;
         config.routed_layers = { 0 };
         return config;
@@ -332,11 +388,157 @@ void test_readiness_selection_and_failed_generation_retry() {
     }
 }
 
+llm_expert_cache_policy_config_internal explicit_lfu(llm_expert_cache_policy_tier tier) {
+    const llama_expert_cache_policy_config source = {
+        LLAMA_EXPERT_CACHE_POLICY_VERSION_1,
+        sizeof(llama_expert_cache_policy_config),
+        LLAMA_EXPERT_CACHE_POLICY_LFU_AGING,
+        LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL,
+        0,
+        LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS,
+        0,
+        LLAMA_EXPERT_CACHE_POLICY_LFU_AGING_DEFAULT_EVENTS,
+        {},
+    };
+    llm_expert_cache_policy_config_internal result;
+    require(llm_expert_cache_policy_copy_config(&source, tier, result).is_ready(), "explicit LFU copy failed");
+    return result;
+}
+
+void test_autofit_policy_pressure_trim_and_surrender() {
+    reset_memory_sample();
+    temporary_source source;
+    llama_file file(source.path, "rb");
+    llm_expert_storage storage({ 1, 2, 2, 1024 }, { { 0, &file, 512, source.path, false } });
+    require(storage.add_bundle({ 0, 0 }, spans(0)).is_ready(), "pressure expert 0 directory failed");
+    require(storage.add_bundle({ 0, 1 }, spans(144)).is_ready(), "pressure expert 1 directory failed");
+    require(storage.seal().is_ready(), "pressure storage seal failed");
+    llm_expert_scheduler scheduler({ 1, 2, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+    llm_uma_cache_config config;
+    config.pool_bytes = 0;
+    config.hot_capacity = 1;
+    config.n_expert_used = 1;
+    config.routed_layer_count = 1;
+    config.total_expert_keys = 2;
+    config.buffer_type = ggml_backend_cuda_uma_buffer_type(0);
+    config.target_device = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0);
+    config.storage = &storage;
+    config.scheduler = &scheduler;
+    config.is_uma_buffer_type = ggml_backend_buft_is_cuda_uma;
+    config.prefetch = ggml_backend_cuda_uma_prefetch;
+    config.checksum = ggml_backend_cuda_uma_checksum;
+    config.sample_memory = sample_controlled_memory;
+    config.hot_cache_policy_config = explicit_lfu(llm_expert_cache_policy_tier::hot);
+    config.cold_cache_policy_config = explicit_lfu(llm_expert_cache_policy_tier::cold);
+    config.routed_layers = { 0 };
+    auto provider = llm_create_uma_cache_expert_weight_provider(config);
+    ggml_init_params params = { ggml_tensor_overhead()*32, nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    require(bool(ctx), "pressure context failed");
+    auto bundle = make_bundle(ctx.get());
+    auto * logical = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
+    llm_expert_selection selection = { 0, 2, 1, 1, logical };
+    auto reject_initialization = [&](llm_uma_cache_config rejected_config,
+                                     llm_expert_provider_status expected_status) {
+        auto rejected_provider = llm_create_uma_cache_expert_weight_provider(std::move(rejected_config));
+        bool owner = false;
+        require(rejected_provider->begin_initialization(
+            llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve, owner).is_ready() && owner,
+            "negative initialization begin failed");
+        llm_expert_graph_binding bootstrap;
+        require(rejected_provider->bind_graph(ctx.get(), bundle, selection, bootstrap).is_ready() &&
+            rejected_provider->bind_graph(ctx.get(), bundle, selection, bootstrap).is_ready(),
+            "negative initialization bootstrap failed");
+        require(rejected_provider->complete_descriptor_discovery(2, 2, 0, {}, {}).is_ready(),
+            "negative descriptor discovery failed");
+        const auto rejected = rejected_provider->initialize_after_reserve();
+        require(rejected.status == expected_status && rejected_provider->finish_initialization(false).is_ready(),
+            "unsafe or unmeasurable initialization did not fail transactionally");
+    };
+    memory_sample_failure = true;
+    reject_initialization(config, llm_expert_provider_status::failed);
+    memory_sample_failure = false;
+    auto unsafe_config = config;
+    unsafe_config.pool_bytes = UINT64_C(80)*1024*1024*1024;
+    reject_initialization(unsafe_config, llm_expert_provider_status::allocation_failed);
+    llm_expert_graph_binding binding;
+    initialize_provider(*provider, ctx.get(), bundle, selection, binding);
+    auto diagnostics = provider->hot_cache_diagnostics();
+    require(diagnostics.uma_autofit && diagnostics.uma_safe_pool_bytes >= diagnostics.uma_effective_pool_bytes &&
+        diagnostics.uma_effective_pool_bytes == diagnostics.cold_actual_bytes,
+        "autofit did not select the safe topology-bounded whole-slot arena");
+    require(diagnostics.policy.config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING &&
+        diagnostics.cold_policy.config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING &&
+        diagnostics.policy.config.admission == LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS &&
+        diagnostics.cold_policy.config.admission == LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS,
+        "explicit Phase 9 policy was not preserved");
+
+    controlled_memory.memory_available_bytes = UINT64_C(1024)*1024*1024;
+    int32_t logical_id = 0, execution = -1;
+    {
+        llm_expert_execution_plan plan;
+        require(provider->prepare({ binding }, plan).is_ready(), "pressure prepare failed");
+        const auto rejected = provider->remap_checkpoint(binding, &logical_id, 1, &execution);
+        require(rejected.status == llm_expert_provider_status::allocation_failed && storage.diagnostics().read_bytes == 0,
+            "headroom pressure was not rejected before storage I/O");
+    }
+    controlled_memory.memory_available_bytes = UINT64_C(100)*1024*1024*1024;
+    {
+        llm_expert_execution_plan plan;
+        require(provider->prepare({ binding }, plan).is_ready(), "pressure retry prepare failed");
+        require(provider->remap_checkpoint(binding, &logical_id, 1, &execution).is_ready(),
+            "recoverable headroom rejection poisoned retry");
+    }
+    const uint64_t bytes_before_swap = storage.diagnostics().read_bytes;
+    controlled_memory.pswpin_pages = 1;
+    logical_id = 1;
+    {
+        llm_expert_execution_plan plan;
+        require(provider->prepare({ binding }, plan).is_ready(), "swap prepare failed");
+        const auto rejected = provider->remap_checkpoint(binding, &logical_id, 1, &execution);
+        require(rejected.status == llm_expert_provider_status::allocation_failed,
+            "post-activation swap did not open the pressure circuit");
+    }
+    controlled_memory.pswpin_pages = 0;
+    {
+        llm_expert_execution_plan plan;
+        require(provider->prepare({ binding }, plan).is_ready(), "open-circuit prepare failed");
+        require(provider->remap_checkpoint(binding, &logical_id, 1, &execution).status ==
+            llm_expert_provider_status::allocation_failed, "pressure circuit did not remain open");
+    }
+    diagnostics = provider->hot_cache_diagnostics();
+    require(diagnostics.uma_pressure_circuit_open && diagnostics.uma_pressure_rejections == 3 &&
+        diagnostics.uma_pressure_samples == 4 && storage.diagnostics().read_bytes == bytes_before_swap,
+        "pressure telemetry or before-I/O circuit behavior is wrong");
+    policy_witness.safe_pool_bytes = diagnostics.uma_safe_pool_bytes;
+    policy_witness.effective_pool_bytes = diagnostics.uma_effective_pool_bytes;
+    policy_witness.pressure_samples = diagnostics.uma_pressure_samples;
+    policy_witness.pressure_rejections = diagnostics.uma_pressure_rejections;
+    policy_witness.autofit = diagnostics.uma_autofit;
+    policy_witness.explicit_policy = diagnostics.policy.config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING &&
+        diagnostics.cold_policy.config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING;
+    policy_witness.pressure_circuit = diagnostics.uma_pressure_circuit_open;
+    policy_witness.before_io = storage.diagnostics().read_bytes == bytes_before_swap;
+    require(provider->trim().is_ready(), "UMA trim failed");
+    diagnostics = provider->hot_cache_diagnostics();
+    require(diagnostics.cold_current_hot_refs == 0 && diagnostics.cold_current_request_refs == 0 &&
+        diagnostics.cold_reclaimed_bytes > 0 && diagnostics.cold_reclaim_failures == 0,
+        "UMA trim retained live references");
+    policy_witness.trim_zero_refs = true;
+    require(provider->surrender().error == llm_expert_provider_error::busy,
+        "UMA surrender ignored a live graph allocation lease");
+    binding = {};
+    require(provider->surrender().is_ready() && provider->get_stats().pool_generations == 0,
+        "UMA surrender did not release the arena");
+    policy_witness.surrender = true;
+}
+
 } // namespace
 
 int main() try {
     test_provider();
     test_readiness_selection_and_failed_generation_retry();
+    test_autofit_policy_pressure_trim_and_surrender();
     printf("PHASE11_UMA_FAILURES\tauto_prefetch_probes=%d\tauto_touch_calls=%d"
         "\treadiness_retry_generation=%llu\tstale_rejected=%d\trestored_capacity=%d"
         "\tcancellation_cleanups=%llu\tcancellation_retry=%d\tscheduler_active=%llu\n",
@@ -344,6 +546,14 @@ int main() try {
         (unsigned long long) witness.readiness_retry_generation, witness.stale_rejected,
         witness.restored_capacity, (unsigned long long) witness.cancellation_cleanups,
         witness.cancellation_retry, (unsigned long long) witness.scheduler_active);
+    printf("PHASE11_UMA_LIFECYCLE\tsafe_pool_bytes=%llu\teffective_pool_bytes=%llu"
+        "\tautofit=%d\texplicit_policy=%d\tpressure_samples=%llu\tpressure_rejections=%llu"
+        "\tpressure_circuit=%d\tbefore_io=%d\ttrim_zero_refs=%d\tsurrender=%d\n",
+        (unsigned long long) policy_witness.safe_pool_bytes,
+        (unsigned long long) policy_witness.effective_pool_bytes, policy_witness.autofit,
+        policy_witness.explicit_policy, (unsigned long long) policy_witness.pressure_samples,
+        (unsigned long long) policy_witness.pressure_rejections, policy_witness.pressure_circuit,
+        policy_witness.before_io, policy_witness.trim_zero_refs, policy_witness.surrender);
     return 0;
 } catch (const std::exception & error) {
     fprintf(stderr, "test-expert-uma-provider: %s\n", error.what());

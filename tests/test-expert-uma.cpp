@@ -57,10 +57,25 @@ void test_headroom() {
         "missing cgroup limit accepted");
 }
 
+void test_native_memory_sample() {
+    llm_expert_uma_memory_sample sample;
+#ifdef __linux__
+    require(llm_expert_uma_sample_memory(sample).is_ready(), "Linux memory sample failed");
+    require(sample.physical_ram_bytes > 0 && sample.memory_available_bytes > 0 &&
+        sample.cgroup_memory_max_bytes > 0 && sample.cgroup_memory_current_bytes > 0 &&
+        sample.cgroup_memory_current_bytes <= sample.cgroup_memory_max_bytes && sample.cgroup_v2,
+        "Linux memory sample is incomplete");
+#else
+    require(!llm_expert_uma_sample_memory(sample).is_ready() && !sample.unavailable_reason.empty(),
+        "unsupported memory sampling was reported as zero");
+#endif
+}
+
 } // namespace
 
 int main() {
     test_config_copy();
     test_headroom();
+    test_native_memory_sample();
     return 0;
 }

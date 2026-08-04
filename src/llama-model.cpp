@@ -1388,6 +1388,7 @@ void llama_model::init_expert_weight_provider() {
                     ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_cuda_uma_prefetch"));
                 uma.checksum = reinterpret_cast<llm_uma_cache_config::checksum_fn>(
                     ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_cuda_uma_checksum"));
+                uma.sample_memory = llm_expert_uma_sample_memory;
                 int target_index = -1;
                 for (size_t index = 0; index < ggml_backend_reg_dev_count(target_reg); ++index) {
                     if (ggml_backend_reg_dev_get(target_reg, index) == target) target_index = int(index);
@@ -1406,6 +1407,8 @@ void llama_model::init_expert_weight_provider() {
                 uma.storage = pimpl->expert_storage.get();
                 uma.scheduler = pimpl->expert_scheduler.get();
                 uma.readiness = pimpl->expert_uma_config.value.readiness;
+                uma.min_system_headroom_bytes = pimpl->expert_uma_config.value.min_system_headroom_bytes;
+                uma.min_runtime_headroom_bytes = pimpl->expert_uma_config.value.min_runtime_headroom_bytes;
                 uma.hot_cache_policy_config = pimpl->expert_hot_cache_policy_config;
                 uma.cold_cache_policy_config = pimpl->expert_cold_cache_policy_config;
                 uma.routed_layers = std::move(routed_layers);
@@ -1566,12 +1569,14 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
         uint32_t(std::min<int64_t>(hparams.n_expert, params.expert_hot_cache_capacity)),
     });
+    const uint64_t transport_accounting_bytes = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE &&
+        params.expert_cold_cache_bytes == 0 ? storage_diagnostics.maximum_bundle_bytes : params.expert_cold_cache_bytes;
     auto transport = std::make_unique<llm_expert_async_transport>(llm_expert_async_config{
         params.expert_io_queue_depth,
         params.expert_hot_cache_capacity,
         request_capacity,
         uint32_t(trace_capacity_64),
-        params.expert_cold_cache_bytes,
+        transport_accounting_bytes,
         params.expert_io_staging_bytes,
         maximum_aligned_read_bytes,
         params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO,

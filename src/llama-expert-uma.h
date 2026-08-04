@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 
 enum class llm_expert_uma_error : uint8_t {
     none,
@@ -55,6 +56,24 @@ struct llm_expert_uma_headroom {
     uint64_t remainder_bytes = 0;
     bool autofit = false;
 };
+
+struct llm_expert_uma_memory_sample {
+    uint64_t physical_ram_bytes = 0;
+    uint64_t memory_available_bytes = 0;
+    uint64_t cgroup_memory_max_bytes = 0;
+    uint64_t cgroup_memory_current_bytes = 0;
+    uint64_t cgroup_swap_current_bytes = 0;
+    uint64_t process_rss_bytes = 0;
+    uint64_t process_swap_bytes = 0;
+    uint64_t major_faults = 0;
+    uint64_t pswpin_pages = 0;
+    uint64_t pswpout_pages = 0;
+    bool cgroup_v2 = false;
+    bool swap_counters_supported = false;
+    std::string unavailable_reason;
+};
+
+llm_expert_uma_result llm_expert_uma_sample_memory(llm_expert_uma_memory_sample & output) noexcept;
 
 llm_expert_uma_result llm_expert_uma_calculate_headroom(
         const llm_expert_uma_headroom_input & input,
