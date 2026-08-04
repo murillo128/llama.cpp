@@ -23,6 +23,7 @@ add_library(llama
             llama-expert-async-io.cpp
             llama-expert-scheduler.cpp
             llama-expert-transfer-ring.cpp
+            llama-expert-uma.cpp
             llama-expert-storage.cpp
             llama-expert-weight-provider.cpp
             llama-grammar.cpp

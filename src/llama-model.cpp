@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-expert-weight-provider.h"
 #include "llama-expert-cache-policy.h"
+#include "llama-expert-uma.h"
 #include "llama-expert-prefetch.h"
 #include "llama-expert-storage.h"
 #include "llama-expert-async-io.h"
@@ -1063,6 +1064,8 @@ struct llama_model::impl {
     std::optional<llama_expert_cache_policy_config> expert_cold_cache_policy_owned;
     llm_expert_cache_policy_config_internal expert_hot_cache_policy_config;
     llm_expert_cache_policy_config_internal expert_cold_cache_policy_config;
+    std::optional<llama_expert_uma_config_v1> expert_uma_config_owned;
+    llm_expert_uma_config_internal expert_uma_config;
     std::optional<llama_expert_prefetch_config_v1> expert_prefetch_config_owned;
     llm_expert_prefetch_config_internal expert_prefetch_config;
     std::string expert_prefetch_profile_path_owned;
@@ -1099,16 +1102,18 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_DISABLED &&
         params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT &&
         params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE &&
-        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
+        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
+        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) {
         throw std::invalid_argument("invalid expert weights mode");
     }
     const bool cold_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
-    const bool cached_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE || cold_mode;
+    const bool uma_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
+    const bool cached_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE || cold_mode || uma_mode;
     if (!cached_mode && params.expert_hot_cache_policy != nullptr) {
         throw std::invalid_argument("expert hot-cache policy requires hot-cache or cold-cache mode");
     }
-    if (!cold_mode && params.expert_cold_cache_policy != nullptr) {
-        throw std::invalid_argument("expert cold-cache policy requires cold-cache mode");
+    if (!cold_mode && !uma_mode && params.expert_cold_cache_policy != nullptr) {
+        throw std::invalid_argument("expert cold-cache policy requires cold-cache or UMA-cache mode");
     }
     const auto hot_policy_result = llm_expert_cache_policy_copy_config(
         params.expert_hot_cache_policy, llm_expert_cache_policy_tier::hot,
@@ -1126,6 +1131,13 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     if (params.expert_cold_cache_policy != nullptr) {
         pimpl->expert_cold_cache_policy_owned = *params.expert_cold_cache_policy;
         this->params.expert_cold_cache_policy = &*pimpl->expert_cold_cache_policy_owned;
+    }
+    const auto uma_result = llm_expert_uma_copy_config(
+        params.expert_uma_config, params.expert_weights_mode, pimpl->expert_uma_config);
+    if (!uma_result.is_ready()) throw std::invalid_argument("invalid expert UMA configuration");
+    if (params.expert_uma_config != nullptr) {
+        pimpl->expert_uma_config_owned = *params.expert_uma_config;
+        this->params.expert_uma_config = &*pimpl->expert_uma_config_owned;
     }
     const uint64_t scheduler_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
     if (scheduler_capacity_64 > UINT32_MAX) {
@@ -1155,9 +1167,13 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     }
     const bool hybrid_policy = params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
         params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
-    if (!cold_mode && (hybrid_policy || params.expert_background_promotion ||
+    if (!cold_mode && !uma_mode && (hybrid_policy || params.expert_background_promotion ||
                        params.expert_auto_cost_model != nullptr)) {
         throw std::invalid_argument("non-default expert miss configuration requires cold-cache mode");
+    }
+    if (uma_mode && (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU ||
+        params.expert_background_promotion || params.expert_auto_cost_model != nullptr)) {
+        throw std::invalid_argument("UMA-cache mode requires PROMOTE_AND_GPU without background promotion");
     }
     if (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_AUTO &&
         params.expert_auto_cost_model != nullptr) {
@@ -1188,13 +1204,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         }
         pimpl->expert_auto_cost_model_digest = digest;
     }
-    if ((!cold_mode && (params.expert_cold_cache_bytes != 0 || params.expert_transfer_ring_bytes != 0)) ||
+    if ((!cold_mode && !uma_mode && (params.expert_cold_cache_bytes != 0 || params.expert_transfer_ring_bytes != 0)) ||
         (cold_mode && (params.expert_hot_cache_capacity == 0 || params.expert_cold_cache_bytes == 0 ||
-                       params.expert_transfer_ring_bytes == 0))) {
+                       params.expert_transfer_ring_bytes == 0)) ||
+        (uma_mode && (params.expert_hot_cache_capacity == 0 || params.expert_transfer_ring_bytes != 0))) {
         throw std::invalid_argument("invalid cold-cache byte budgets");
     }
-    if (cold_mode && params.load_mode != LLAMA_LOAD_MODE_MMAP && params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO) {
-        throw std::invalid_argument("cold-cache mode requires mmap or direct-I/O source tensors");
+    if ((cold_mode || uma_mode) && params.load_mode != LLAMA_LOAD_MODE_MMAP && params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO) {
+        throw std::invalid_argument("cold-cache and UMA-cache modes require mmap or direct-I/O source tensors");
     }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1380,6 +1397,8 @@ void llama_model::init_expert_weight_provider() {
             }
             return;
         }
+        case LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE:
+            throw std::runtime_error("UMA-cache provider is not initialized");
         case LLAMA_EXPERT_WEIGHTS_MODE_COUNT:
             break;
     }
@@ -3134,6 +3153,7 @@ llama_model_params llama_model_default_params() {
         /*.expert_auto_cost_model      =*/ nullptr,
         /*.expert_hot_cache_policy     =*/ nullptr,
         /*.expert_cold_cache_policy    =*/ nullptr,
+        /*.expert_uma_config           =*/ nullptr,
         /*.expert_prefetch_config      =*/ nullptr,
         /*.expert_prefetch_profile_path=*/ nullptr,
         /*.main_gpu                    =*/ 0,

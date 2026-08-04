@@ -354,7 +354,15 @@ extern "C" {
         LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT = 1,
         LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE = 2,
         LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE = 3,
-        LLAMA_EXPERT_WEIGHTS_MODE_COUNT = 4,
+        LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE = 4,
+        LLAMA_EXPERT_WEIGHTS_MODE_COUNT = 5,
+    };
+
+    enum llama_expert_uma_readiness {
+        LLAMA_EXPERT_UMA_READINESS_AUTO          = 0,
+        LLAMA_EXPERT_UMA_READINESS_CUDA_PREFETCH = 1,
+        LLAMA_EXPERT_UMA_READINESS_CUDA_TOUCH    = 2,
+        LLAMA_EXPERT_UMA_READINESS_COUNT         = 3,
     };
 
     enum llama_expert_miss_policy {
@@ -412,6 +420,17 @@ extern "C" {
         LLAMA_EXPERT_CACHE_POLICY_FREQUENCY_WINDOW_DEFAULT_EVENTS = 1024,
         LLAMA_EXPERT_CACHE_POLICY_LFU_AGING_DEFAULT_EVENTS = 1024,
         LLAMA_EXPERT_PREFETCH_VERSION_1 = 1,
+        LLAMA_EXPERT_UMA_CONFIG_VERSION_1 = 1,
+    };
+
+    struct llama_expert_uma_config_v1 {
+        uint32_t version;
+        uint32_t struct_size;
+        enum llama_expert_uma_readiness readiness;
+        uint32_t flags;
+        uint64_t min_system_headroom_bytes;
+        uint64_t min_runtime_headroom_bytes;
+        uint64_t reserved[4];
     };
 
     // Versioned experimental cache-policy configuration. The model copies the
@@ -495,6 +514,7 @@ extern "C" {
         const struct llama_expert_auto_cost_model * expert_auto_cost_model; // copied at model load [EXPERIMENTAL]
         const struct llama_expert_cache_policy_config * expert_hot_cache_policy; // copied at model load [EXPERIMENTAL]
         const struct llama_expert_cache_policy_config * expert_cold_cache_policy; // copied at model load [EXPERIMENTAL]
+        const struct llama_expert_uma_config_v1 * expert_uma_config; // copied at model load [EXPERIMENTAL]
         const struct llama_expert_prefetch_config_v1 * expert_prefetch_config; // copied at model load [EXPERIMENTAL]
         const char * expert_prefetch_profile_path; // copied at model load [EXPERIMENTAL]
 

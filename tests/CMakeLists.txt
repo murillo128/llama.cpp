@@ -279,6 +279,12 @@ target_include_directories(test-expert-cache-policy PRIVATE ${PROJECT_SOURCE_DIR
 
 llama_build_and_test(test-expert-prefetch.cpp LABEL "model")
 target_include_directories(test-expert-prefetch PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+llama_build_and_test(test-expert-uma.cpp LABEL "model")
+target_include_directories(test-expert-uma PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (TARGET ggml-cuda)
+    llama_build(phase11-uma-probe.cpp)
+    target_link_libraries(phase11-uma-probe PRIVATE ggml-cuda)
+endif()
 
 llama_build(phase10-prefetch-replay.cpp)
 target_include_directories(phase10-prefetch-replay PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
