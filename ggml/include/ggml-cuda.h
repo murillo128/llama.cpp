@@ -46,6 +46,8 @@ struct ggml_backend_cuda_uma_capabilities {
     int32_t host_native_atomic_supported;
     int32_t unified_addressing;
     int32_t integrated;
+    int32_t cuda_driver_version;
+    int32_t cuda_runtime_version;
     char device_name[256];
 };
 

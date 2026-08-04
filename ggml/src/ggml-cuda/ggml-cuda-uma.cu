@@ -3,6 +3,7 @@
 #include "ggml-cuda/common.cuh"
 
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -15,6 +16,32 @@ struct ggml_backend_cuda_uma_buffer_type_context {
     int device;
     std::string name;
 };
+
+static __global__ void ggml_cuda_uma_checksum_kernel(
+        const uint8_t * bytes, size_t size, unsigned long long * checksum);
+static __global__ void ggml_cuda_uma_fill_kernel(uint8_t * bytes, size_t size, uint8_t seed);
+
+static bool ggml_backend_cuda_uma_authorized_board() {
+#if defined(__linux__) && defined(__aarch64__)
+    auto read_value = [](const char * path, char * value, size_t size) {
+        FILE * file = fopen(path, "rb");
+        if (file == nullptr) return false;
+        const size_t count = fread(value, 1, size - 1, file);
+        fclose(file);
+        while (count != 0 && (value[strlen(value) - 1] == '\n' || value[strlen(value) - 1] == '\r')) {
+            value[strlen(value) - 1] = 0;
+        }
+        return count != 0;
+    };
+    char board[256] = {};
+    char product[256] = {};
+    return read_value("/sys/class/dmi/id/board_name", board, sizeof(board)) &&
+        read_value("/sys/class/dmi/id/product_name", product, sizeof(product)) &&
+        strcmp(board, "EdgeXpert (MS-C931)") == 0 && strcmp(product, "MS-C931") == 0;
+#else
+    return false;
+#endif
+}
 
 static const char * ggml_backend_cuda_uma_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     auto * ctx = static_cast<ggml_backend_cuda_uma_buffer_type_context *>(buft->context);
@@ -40,6 +67,10 @@ int ggml_backend_cuda_uma_get_capabilities(
     result.compute_capability_minor = properties.minor;
     result.unified_addressing = properties.unifiedAddressing;
     result.integrated = properties.integrated;
+    error = cudaDriverGetVersion(&result.cuda_driver_version);
+    if (error != cudaSuccess) return int(error);
+    error = cudaRuntimeGetVersion(&result.cuda_runtime_version);
+    if (error != cudaSuccess) return int(error);
     snprintf(result.device_name, sizeof(result.device_name), "%s", properties.name);
     const cudaDeviceAttr attributes[] = {
         cudaDevAttrPageableMemoryAccess,
@@ -67,8 +98,64 @@ static bool ggml_backend_cuda_uma_supported(int device) {
     ggml_backend_cuda_uma_capabilities capabilities = {};
     capabilities.struct_size = sizeof(capabilities);
     return ggml_backend_cuda_uma_get_capabilities(device, &capabilities) == 0 &&
-        capabilities.device_count == 1 && capabilities.pageable_memory_access != 0 &&
-        capabilities.pageable_memory_access_uses_host_page_tables != 0 && capabilities.unified_addressing != 0;
+        capabilities.device_count == 1 && strcmp(capabilities.device_name, "NVIDIA GB10") == 0 &&
+        capabilities.compute_capability_major == 12 && capabilities.compute_capability_minor == 1 &&
+        capabilities.integrated != 0 && capabilities.pageable_memory_access != 0 &&
+        capabilities.pageable_memory_access_uses_host_page_tables != 0 && capabilities.unified_addressing != 0 &&
+        ggml_backend_cuda_uma_authorized_board();
+}
+
+static bool ggml_backend_cuda_uma_native_qualification(int device) {
+#if defined(__linux__) && defined(__aarch64__)
+    static std::once_flag flags[GGML_CUDA_MAX_DEVICES];
+    static bool qualified[GGML_CUDA_MAX_DEVICES] = {};
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return false;
+    std::call_once(flags[device], [device]() {
+        if (!ggml_backend_cuda_uma_supported(device)) return;
+        constexpr size_t size = 4096;
+        void * mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) return;
+        auto * bytes = static_cast<uint8_t *>(mapping);
+        unsigned long long expected = 0;
+        for (size_t i = 0; i < size; ++i) {
+            bytes[i] = uint8_t(17 + uint8_t(i*131U));
+            expected += bytes[i];
+        }
+        ggml_cuda_set_device(device);
+        unsigned long long * device_checksum = nullptr;
+        cudaError_t error = cudaMalloc(&device_checksum, sizeof(*device_checksum));
+        if (error == cudaSuccess) error = cudaMemset(device_checksum, 0, sizeof(*device_checksum));
+        if (error == cudaSuccess) {
+            ggml_cuda_uma_checksum_kernel<<<1, 256>>>(bytes, size, device_checksum);
+            error = cudaGetLastError();
+        }
+        unsigned long long observed = 0;
+        if (error == cudaSuccess) {
+            error = cudaMemcpy(&observed, device_checksum, sizeof(observed), cudaMemcpyDeviceToHost);
+        }
+        if (error == cudaSuccess && observed == expected) {
+            ggml_cuda_uma_fill_kernel<<<1, 256>>>(bytes, size, 29);
+            error = cudaGetLastError();
+        }
+        if (error == cudaSuccess) error = cudaDeviceSynchronize();
+        if (error == cudaSuccess) {
+            for (size_t i = 0; i < size; ++i) {
+                if (bytes[i] != uint8_t(29 + uint8_t(i*131U))) {
+                    error = cudaErrorUnknown;
+                    break;
+                }
+            }
+        }
+        if (device_checksum != nullptr) cudaFree(device_checksum);
+        const bool coherent = error == cudaSuccess;
+        const int unmap_result = munmap(mapping, size);
+        qualified[device] = coherent && unmap_result == 0;
+    });
+    return qualified[device];
+#else
+    GGML_UNUSED(device);
+    return false;
+#endif
 }
 
 static void ggml_backend_cuda_uma_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -83,7 +170,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_uma_buffer_type_alloc_buffer(
         ggml_backend_buffer_type_t buft, size_t size) {
 #if defined(__linux__) && defined(__aarch64__)
     auto * buft_ctx = static_cast<ggml_backend_cuda_uma_buffer_type_context *>(buft->context);
-    if (size == 0 || !ggml_backend_cuda_uma_supported(buft_ctx->device)) return nullptr;
+    if (size == 0 || !ggml_backend_cuda_uma_native_qualification(buft_ctx->device)) return nullptr;
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0 || size > SIZE_MAX - size_t(page_size - 1)) return nullptr;
     const size_t mapped_size = (size + size_t(page_size - 1))/size_t(page_size)*size_t(page_size);
