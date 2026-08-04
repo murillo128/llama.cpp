@@ -188,6 +188,7 @@ public:
             size_t reference_count,
             llm_cold_reference_kind kind) noexcept;
     bool ready(llm_cold_reference reference) const noexcept;
+    llm_expert_provider_result retire_ready(llm_cold_reference reference) noexcept;
     llm_expert_provider_result cleanup_failed_slots() noexcept;
     llm_expert_provider_result policy_request_begin() noexcept;
     llm_expert_provider_result policy_set_ubatch_ordinal(uint64_t ordinal) noexcept;

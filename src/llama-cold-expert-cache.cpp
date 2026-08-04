@@ -1296,6 +1296,23 @@ bool llm_cold_expert_cache::ready(llm_cold_reference reference) const noexcept {
     return pimpl->valid_reference(reference);
 }
 
+llm_expert_provider_result llm_cold_expert_cache::retire_ready(llm_cold_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->valid_reference(reference)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & slot = pimpl->slots[reference.slot];
+    if (slot.state != llm_cold_slot_state::ready || !pimpl->no_refs(slot)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+    }
+    const auto removed = policy_result(pimpl->policy.remove_resident(reference.slot, reference.generation));
+    if (!removed.is_ready()) return removed;
+    pimpl->clear_forward(reference.slot);
+    slot.key = { -1, -1 };
+    slot.state = llm_cold_slot_state::free;
+    return llm_expert_provider_result::success();
+}
+
 llm_expert_provider_result llm_cold_expert_cache::cleanup_failed_slots() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     for (auto & slot : pimpl->slots) {

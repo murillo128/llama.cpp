@@ -255,7 +255,11 @@ public:
             if (result.is_ready()) {
                 result = cache->find_or_admit_with_loader(unique[index], references[index], load_uma_bundle, &load);
             }
-            if (!result.is_ready()) { rollback(rollback_begin); return failure(result.error); }
+            if (!result.is_ready()) {
+                (void) cache->cleanup_failed_slots();
+                rollback(rollback_begin);
+                return failure(result.error);
+            }
             ensure_slot_state(references[index]);
             auto & slot = slots[references[index].slot];
             if (!slot.hot) {
@@ -263,7 +267,12 @@ public:
                 if (!result.is_ready() && load.active) (void) fail_scheduler(load, false);
                 if (result.is_ready()) result = complete_readiness(load, references[index]);
                 if (result.is_ready()) result = cache->acquire(references[index], llm_cold_reference_kind::hot);
-                if (!result.is_ready()) { rollback(rollback_begin); return failure(result.error); }
+                if (!result.is_ready()) {
+                    if (cache->ready(references[index])) (void) cache->retire_ready(references[index]);
+                    (void) cache->cleanup_failed_slots();
+                    rollback(rollback_begin);
+                    return failure(result.error);
+                }
                 slot.hot = true;
                 hot_count++;
             } else if (load.active) {
@@ -451,6 +460,22 @@ public:
             !config.is_uma_buffer_type(ggml_backend_buffer_get_type(candidate->buffer()))) {
             return failure(llm_expert_provider_error::unsupported_configuration);
         }
+        const size_t probe_bytes = std::min<size_t>(4096, ggml_backend_buffer_get_size(candidate->buffer()));
+        int readiness_status = -1;
+        if (config.readiness == LLAMA_EXPERT_UMA_READINESS_AUTO ||
+                config.readiness == LLAMA_EXPERT_UMA_READINESS_CUDA_PREFETCH) {
+            readiness_status = config.prefetch(candidate->buffer(), 0, probe_bytes);
+            if (readiness_status == 0) resolved_readiness = LLAMA_EXPERT_UMA_READINESS_CUDA_PREFETCH;
+        }
+        if (readiness_status != 0 && (config.readiness == LLAMA_EXPERT_UMA_READINESS_AUTO ||
+                config.readiness == LLAMA_EXPERT_UMA_READINESS_CUDA_TOUCH)) {
+            uint64_t checksum = 0;
+            readiness_status = config.checksum(candidate->buffer(), 0, probe_bytes, &checksum);
+            if (readiness_status == 0) resolved_readiness = LLAMA_EXPERT_UMA_READINESS_CUDA_TOUCH;
+        }
+        if (readiness_status != 0) {
+            return failure(llm_expert_provider_error::preparation_failed);
+        }
         slots.assign(diagnostics.effective_slots, {});
         cache = std::move(candidate);
         epoch++;
@@ -620,7 +645,7 @@ private:
         auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(cache->buffer()));
         for (size_t index = 0; index < count; ++index) {
             const size_t offset = static_cast<uint8_t *>(destinations[index].data) - base;
-            int status = config.readiness == LLAMA_EXPERT_UMA_READINESS_CUDA_TOUCH ?
+            int status = resolved_readiness == LLAMA_EXPERT_UMA_READINESS_CUDA_TOUCH ?
                 config.checksum(cache->buffer(), offset, destinations[index].extent, &readiness_checksum) :
                 config.prefetch(cache->buffer(), offset, destinations[index].extent);
             if (status != 0) return load.active ? fail_scheduler(load, false) :
@@ -683,6 +708,7 @@ private:
     uint64_t use_clock = 0;
     uint64_t readiness_checksum = 0;
     uint32_t hot_count = 0;
+    llama_expert_uma_readiness resolved_readiness = LLAMA_EXPERT_UMA_READINESS_AUTO;
     int32_t last_execution_backend_device_type = -1;
     bool initialization_in_progress = false;
     bool descriptors_complete = false;
