@@ -51,6 +51,7 @@ struct llm_cold_cache_config {
     llm_expert_cache_policy_config_internal cache_policy_config = {};
     std::vector<int32_t> routed_layers;
     uint32_t policy_trace_capacity = 4096;
+    ggml_backend_buffer_type_t buffer_type = nullptr;
 };
 
 using llm_cold_cache_loader = llm_expert_provider_result (*)(
@@ -198,6 +199,8 @@ public:
             const std::vector<llm_cold_hot_backing> & hot_backings = {}) noexcept;
 
     const llm_expert_bundle_descriptor & bundle() const noexcept;
+    ggml_backend_buffer_t buffer() const noexcept;
+    std::shared_ptr<void> allocation_lease() const noexcept;
     llm_cold_cache_diagnostics diagnostics() const;
 
 private:

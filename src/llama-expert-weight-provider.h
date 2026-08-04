@@ -1094,6 +1094,28 @@ struct llm_hot_cache_config {
     std::vector<int32_t> routed_layers;
 };
 
+struct llm_uma_cache_config {
+    using is_buffer_type_fn = bool (*)(ggml_backend_buffer_type_t);
+    using prepare_fn = int (*)(ggml_backend_buffer_t, size_t, size_t);
+    using checksum_fn = int (*)(ggml_backend_buffer_t, size_t, size_t, uint64_t *);
+    uint64_t pool_bytes = 0;
+    uint32_t hot_capacity = 0;
+    uint32_t n_expert_used = 0;
+    uint32_t routed_layer_count = 0;
+    uint32_t total_expert_keys = 0;
+    ggml_backend_buffer_type_t buffer_type = nullptr;
+    ggml_backend_dev_t target_device = nullptr;
+    llm_expert_storage * storage = nullptr;
+    llm_expert_scheduler * scheduler = nullptr;
+    is_buffer_type_fn is_uma_buffer_type = nullptr;
+    prepare_fn prefetch = nullptr;
+    checksum_fn checksum = nullptr;
+    llama_expert_uma_readiness readiness = LLAMA_EXPERT_UMA_READINESS_AUTO;
+    llm_expert_cache_policy_config_internal hot_cache_policy_config = {};
+    llm_expert_cache_policy_config_internal cold_cache_policy_config = {};
+    std::vector<int32_t> routed_layers;
+};
+
 std::unique_ptr<llm_expert_weight_provider> llm_create_resident_expert_weight_provider(
         llm_expert_provider_faults faults = {});
 
@@ -1103,4 +1125,8 @@ std::unique_ptr<llm_expert_weight_provider> llm_create_hot_cache_expert_weight_p
 
 std::unique_ptr<llm_expert_weight_provider> llm_create_cold_cache_expert_weight_provider(
         llm_hot_cache_config config,
+        llm_expert_provider_faults faults = {});
+
+std::unique_ptr<llm_expert_weight_provider> llm_create_uma_cache_expert_weight_provider(
+        llm_uma_cache_config config,
         llm_expert_provider_faults faults = {});

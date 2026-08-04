@@ -206,16 +206,22 @@ void sample_ready_residency(
 }
 #endif
 
-std::unique_ptr<cold_allocation> make_allocation(
+size_t align_up(size_t value, size_t alignment) {
+    if (alignment == 0 || value > SIZE_MAX - (alignment - 1)) return SIZE_MAX;
+    return (value + alignment - 1)/alignment*alignment;
+}
+
+std::shared_ptr<cold_allocation> make_allocation(
         const llm_expert_bundle_descriptor & source,
         uint32_t capacity,
-        bool allocate) {
+        bool allocate,
+        ggml_backend_buffer_type_t buffer_type) {
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*32,
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
-    auto result = std::make_unique<cold_allocation>();
+    auto result = std::make_shared<cold_allocation>();
     result->ctx.reset(ggml_init(params));
     if (!result->ctx) {
         return nullptr;
@@ -226,7 +232,40 @@ std::unique_ptr<cold_allocation> make_allocation(
     result->bundle.gate = make_slot_projection(result->ctx.get(), source.gate, source.n_expert, capacity, "cold.gate");
     result->bundle.gate_up = make_slot_projection(result->ctx.get(), source.gate_up, source.n_expert, capacity, "cold.gate_up");
     result->bundle.down = make_slot_projection(result->ctx.get(), source.down, source.n_expert, capacity, "cold.down");
-    if (allocate) {
+    if (allocate && buffer_type != nullptr) {
+        struct tensor_layout { ggml_tensor * tensor; int axis; size_t offset; size_t span; };
+        std::vector<tensor_layout> layouts;
+        size_t within_slot = 0;
+        for (auto * projection : { &result->bundle.up, &result->bundle.gate,
+                &result->bundle.gate_up, &result->bundle.down }) {
+            size_t sidecar = 0;
+            for (ggml_tensor * tensor : { projection->weight, projection->bias, projection->scale }) {
+                if (tensor == nullptr) { sidecar++; continue; }
+                const int axis = expert_axis(tensor, capacity, sidecar == 0);
+                const size_t span = tensor->nb[axis];
+                within_slot = align_up(within_slot, std::max<size_t>(64, ggml_type_size(tensor->type)));
+                if (axis < 0 || span == 0 || within_slot == SIZE_MAX || span > SIZE_MAX - within_slot) return nullptr;
+                layouts.push_back({ tensor, axis, within_slot, span });
+                within_slot += span;
+                sidecar++;
+            }
+        }
+        const size_t alignment = std::max<size_t>(4096, ggml_backend_buft_get_alignment(buffer_type));
+        const size_t slot_stride = align_up(within_slot, alignment);
+        if (slot_stride == SIZE_MAX || capacity > SIZE_MAX/slot_stride) return nullptr;
+        result->buffer.reset(ggml_backend_buft_alloc_buffer(buffer_type, slot_stride*capacity));
+        if (!result->buffer) return nullptr;
+        auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(result->buffer.get()));
+        for (const auto & layout : layouts) {
+            layout.tensor->nb[layout.axis] = slot_stride;
+            for (int axis = layout.axis + 1; axis < GGML_MAX_DIMS; ++axis) {
+                layout.tensor->nb[axis] = layout.tensor->nb[axis - 1]*layout.tensor->ne[axis - 1];
+            }
+            if (ggml_backend_tensor_alloc(result->buffer.get(), layout.tensor, base + layout.offset) != GGML_STATUS_SUCCESS) {
+                return nullptr;
+            }
+        }
+    } else if (allocate) {
         result->buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(
             result->ctx.get(), ggml_backend_cpu_buffer_type()));
         if (!result->buffer || !ggml_backend_buffer_is_host(result->buffer.get())) {
@@ -241,8 +280,29 @@ std::unique_ptr<cold_allocation> make_allocation(
     return result;
 }
 
-uint64_t allocation_size(const llm_expert_bundle_descriptor & source, uint32_t capacity) {
-    auto allocation = make_allocation(source, capacity, false);
+uint64_t allocation_size(
+        const llm_expert_bundle_descriptor & source,
+        uint32_t capacity,
+        ggml_backend_buffer_type_t buffer_type) {
+    if (buffer_type != nullptr) {
+        size_t within_slot = 0;
+        for (const auto * projection : { &source.up, &source.gate, &source.gate_up, &source.down }) {
+            size_t sidecar = 0;
+            for (const ggml_tensor * tensor : { projection->weight, projection->bias, projection->scale }) {
+                if (tensor == nullptr) { sidecar++; continue; }
+                const int axis = expert_axis(tensor, source.n_expert, sidecar == 0);
+                if (axis < 0) return UINT64_MAX;
+                within_slot = align_up(within_slot, std::max<size_t>(64, ggml_type_size(tensor->type)));
+                if (within_slot == SIZE_MAX || tensor->nb[axis] > SIZE_MAX - within_slot) return UINT64_MAX;
+                within_slot += tensor->nb[axis];
+                sidecar++;
+            }
+        }
+        const size_t stride = align_up(within_slot,
+            std::max<size_t>(4096, ggml_backend_buft_get_alignment(buffer_type)));
+        return stride == SIZE_MAX || capacity > UINT64_MAX/stride ? UINT64_MAX : uint64_t(stride)*capacity;
+    }
+    auto allocation = make_allocation(source, capacity, false, nullptr);
     if (!allocation) {
         return std::numeric_limits<uint64_t>::max();
     }
@@ -382,7 +442,7 @@ struct llm_cold_expert_cache::impl {
     uint32_t n_expert = 0;
     mutable std::mutex mutex;
     std::condition_variable ready_cv;
-    std::unique_ptr<cold_allocation> arena;
+    std::shared_ptr<cold_allocation> arena;
     std::vector<forward_entry> directory;
     std::vector<llm_cold_cache_diagnostics::slot> slots;
     llm_cold_cache_diagnostics counters;
@@ -504,7 +564,7 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
         uint32_t high = pimpl->config.total_expert_keys;
         while (low < high) {
             const uint32_t middle = low + (high - low + 1)/2;
-            if (allocation_size(prototype, middle) <= pimpl->config.byte_budget) {
+            if (allocation_size(prototype, middle, pimpl->config.buffer_type) <= pimpl->config.byte_budget) {
                 low = middle;
             } else {
                 high = middle - 1;
@@ -517,7 +577,7 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
             uint64_t(low) < uint64_t(pimpl->config.routed_layer_count)*pimpl->config.minimum_domain_slots) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
         }
-        auto candidate = make_allocation(prototype, low, true);
+        auto candidate = make_allocation(prototype, low, true, pimpl->config.buffer_type);
         if (!candidate || !candidate->buffer) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
@@ -535,7 +595,8 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
         pimpl->counters.unused_budget_bytes = pimpl->config.byte_budget - actual;
         pimpl->counters.bundle_payload_bytes = payload;
         pimpl->counters.aligned_slot_footprint = actual/low + (actual % low != 0);
-        pimpl->counters.alignment = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+        pimpl->counters.alignment = ggml_backend_buft_get_alignment(
+            pimpl->config.buffer_type ? pimpl->config.buffer_type : ggml_backend_cpu_buffer_type());
         pimpl->counters.effective_slots = low;
         pimpl->counters.pageable = ggml_backend_buffer_is_host(candidate->buffer.get());
         pimpl->policy_candidates.assign(low, {});
@@ -1405,6 +1466,14 @@ llm_expert_provider_result llm_cold_expert_cache::validate_invariants(
 const llm_expert_bundle_descriptor & llm_cold_expert_cache::bundle() const noexcept {
     static const llm_expert_bundle_descriptor empty = {};
     return pimpl->arena ? pimpl->arena->bundle : empty;
+}
+
+ggml_backend_buffer_t llm_cold_expert_cache::buffer() const noexcept {
+    return pimpl->arena ? pimpl->arena->buffer.get() : nullptr;
+}
+
+std::shared_ptr<void> llm_cold_expert_cache::allocation_lease() const noexcept {
+    return std::static_pointer_cast<void>(pimpl->arena);
 }
 
 llm_cold_cache_diagnostics llm_cold_expert_cache::diagnostics() const {

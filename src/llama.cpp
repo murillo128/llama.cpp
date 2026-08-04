@@ -304,10 +304,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        const llama_load_mode loader_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
+        const bool deferred_expert_mode =
+            params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE ||
+            params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
+        const llama_load_mode loader_mode = deferred_expert_mode &&
             params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO ? LLAMA_LOAD_MODE_MMAP : params.load_mode;
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, loader_mode,
-            params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE,
+            deferred_expert_mode,
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();

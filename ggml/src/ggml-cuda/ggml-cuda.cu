@@ -5382,6 +5382,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+    if (strcmp(name, "ggml_backend_cuda_uma_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_uma_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_buft_is_cuda_uma") == 0) {
+        return (void *)ggml_backend_buft_is_cuda_uma;
+    }
+    if (strcmp(name, "ggml_backend_cuda_uma_prefetch") == 0) {
+        return (void *)ggml_backend_cuda_uma_prefetch;
+    }
+    if (strcmp(name, "ggml_backend_cuda_uma_checksum") == 0) {
+        return (void *)ggml_backend_cuda_uma_checksum;
+    }
     return nullptr;
 }
 

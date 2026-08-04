@@ -1239,7 +1239,9 @@ void llama_model::init_expert_weight_provider() {
             pimpl->expert_weight_provider = llm_create_resident_expert_weight_provider();
             return;
         case LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE:
-        case LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE: {
+        case LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE:
+        case LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE: {
+            const bool uma_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
             ggml_backend_dev_t target = nullptr;
             uint32_t routed_layer_count = 0;
             std::vector<int32_t> routed_layers;
@@ -1375,8 +1377,41 @@ void llama_model::init_expert_weight_provider() {
                 config.prefetch_profile = *pimpl->expert_prefetch_profile;
                 config.prefetch_profile_loaded = true;
             }
-            config.routed_layers = std::move(routed_layers);
-            if (params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
+            if (uma_mode) {
+                llm_uma_cache_config uma;
+                ggml_backend_reg_t target_reg = ggml_backend_dev_backend_reg(target);
+                auto buffer_type_fn = reinterpret_cast<ggml_backend_buffer_type_t (*)(int)>(
+                    ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_cuda_uma_buffer_type"));
+                uma.is_uma_buffer_type = reinterpret_cast<llm_uma_cache_config::is_buffer_type_fn>(
+                    ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_buft_is_cuda_uma"));
+                uma.prefetch = reinterpret_cast<llm_uma_cache_config::prepare_fn>(
+                    ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_cuda_uma_prefetch"));
+                uma.checksum = reinterpret_cast<llm_uma_cache_config::checksum_fn>(
+                    ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_cuda_uma_checksum"));
+                int target_index = -1;
+                for (size_t index = 0; index < ggml_backend_reg_dev_count(target_reg); ++index) {
+                    if (ggml_backend_reg_dev_get(target_reg, index) == target) target_index = int(index);
+                }
+                if (buffer_type_fn == nullptr || uma.is_uma_buffer_type == nullptr || uma.prefetch == nullptr ||
+                    uma.checksum == nullptr || target_index < 0) {
+                    throw std::invalid_argument("CUDA target does not expose coherent UMA support");
+                }
+                uma.pool_bytes = params.expert_cold_cache_bytes;
+                uma.hot_capacity = params.expert_hot_cache_capacity;
+                uma.n_expert_used = uint32_t(hparams.n_expert_used);
+                uma.routed_layer_count = routed_layer_count;
+                uma.total_expert_keys = uint32_t(directory_entries);
+                uma.buffer_type = buffer_type_fn(target_index);
+                uma.target_device = target;
+                uma.storage = pimpl->expert_storage.get();
+                uma.scheduler = pimpl->expert_scheduler.get();
+                uma.readiness = pimpl->expert_uma_config.value.readiness;
+                uma.hot_cache_policy_config = pimpl->expert_hot_cache_policy_config;
+                uma.cold_cache_policy_config = pimpl->expert_cold_cache_policy_config;
+                uma.routed_layers = std::move(routed_layers);
+                pimpl->expert_weight_provider = llm_create_uma_cache_expert_weight_provider(std::move(uma));
+            } else if (params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
+                config.routed_layers = std::move(routed_layers);
                 config.cold_mode = true;
                 config.cold_cache_bytes = params.expert_cold_cache_bytes;
                 config.transfer_ring_bytes = params.expert_transfer_ring_bytes;
@@ -1393,12 +1428,11 @@ void llama_model::init_expert_weight_provider() {
                 }
                 pimpl->expert_weight_provider = llm_create_cold_cache_expert_weight_provider(config);
             } else {
+                config.routed_layers = std::move(routed_layers);
                 pimpl->expert_weight_provider = llm_create_hot_cache_expert_weight_provider(config);
             }
             return;
         }
-        case LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE:
-            throw std::runtime_error("UMA-cache provider is not initialized");
         case LLAMA_EXPERT_WEIGHTS_MODE_COUNT:
             break;
     }
@@ -1431,7 +1465,8 @@ int routed_expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight
 } // namespace
 
 void llama_model::init_expert_storage(llama_model_loader & ml) {
-    if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
+    if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
+        params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) {
         return;
     }
     if (!ml.defer_routed_expert_payloads || !ml.full_file_prefetch_disabled || ml.deferred_expert_tensors.empty() ||

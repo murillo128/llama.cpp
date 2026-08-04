@@ -27,11 +27,11 @@ bool is_submitted(llm_expert_request_state state) {
 
 bool valid_transition(llm_expert_request_state current, llm_expert_request_state next) {
     if (next == llm_expert_request_state::cancelling) {
-        return current >= llm_expert_request_state::queued && current <= llm_expert_request_state::h2d_in_flight;
+        return current >= llm_expert_request_state::queued && current <= llm_expert_request_state::device_preparing;
     }
     if (next == llm_expert_request_state::draining) {
         return (current >= llm_expert_request_state::queued &&
-                current <= llm_expert_request_state::h2d_in_flight) ||
+                current <= llm_expert_request_state::device_preparing) ||
             current == llm_expert_request_state::cancelling;
     }
     switch (current) {
@@ -41,8 +41,11 @@ bool valid_transition(llm_expert_request_state current, llm_expert_request_state
         case llm_expert_request_state::io_in_flight:
             return next == llm_expert_request_state::host_ready;
         case llm_expert_request_state::host_ready:
-            return next == llm_expert_request_state::h2d_in_flight;
+            return next == llm_expert_request_state::h2d_in_flight ||
+                next == llm_expert_request_state::device_preparing;
         case llm_expert_request_state::h2d_in_flight:
+            return next == llm_expert_request_state::device_ready;
+        case llm_expert_request_state::device_preparing:
             return next == llm_expert_request_state::device_ready;
         case llm_expert_request_state::cancelling:
             return next == llm_expert_request_state::draining;

@@ -43,6 +43,7 @@ enum class llm_expert_request_state : uint8_t {
     io_in_flight,
     host_ready,
     h2d_in_flight,
+    device_preparing,
     device_ready,
     complete,
     cancelling,

@@ -186,11 +186,12 @@ bool parse_live(int argc, char ** argv, live_arguments & result) {
         }
         else return false;
     }
-    const bool cached_mode = result.mode == "hot" || result.mode == "cold";
+    const bool cached_mode = result.mode == "hot" || result.mode == "cold" || result.mode == "uma";
     return !(result.cancel_on_storage && result.cancel_after_h2d) && !result.model.empty() &&
         (result.mode == "disabled" || result.mode == "resident" || cached_mode) &&
         (!cached_mode || result.capacity > 0) &&
-        (result.mode != "cold" || (result.cold_bytes > 0 && result.ring_bytes > 0));
+        (result.mode != "cold" || (result.cold_bytes > 0 && result.ring_bytes > 0)) &&
+        (result.mode != "uma" || (result.cold_bytes > 0 && result.ring_bytes == 0));
 }
 
 struct storage_cancel_state {
@@ -231,11 +232,11 @@ int run_live(int argc, char ** argv) {
     model_params.load_mode = args.load_mode;
     if (args.mode == "resident") {
         model_params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT;
-    } else if (args.mode == "hot" || args.mode == "cold") {
+    } else if (args.mode == "hot" || args.mode == "cold" || args.mode == "uma") {
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_hot_cache_capacity = args.capacity;
-        model_params.expert_weights_mode = args.mode == "hot" ?
-            LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+        model_params.expert_weights_mode = args.mode == "hot" ? LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE :
+            args.mode == "cold" ? LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
         model_params.expert_cold_cache_bytes = args.cold_bytes;
         model_params.expert_transfer_ring_bytes = args.ring_bytes;
     }
@@ -510,6 +511,8 @@ int run_live(int argc, char ** argv) {
     llama_synchronize(context);
     const auto diagnostics = model->expert_weight_provider() ?
         model->expert_weight_provider()->hot_cache_diagnostics() : llm_hot_cache_diagnostics {};
+    const auto provider_stats = model->expert_weight_provider() ?
+        model->expert_weight_provider()->get_stats() : llm_expert_provider_stats {};
     const auto storage_diagnostics = model->expert_storage() ?
         model->expert_storage()->diagnostics() : llm_expert_storage_diagnostics {};
     const auto async_diagnostics = model->expert_async_diagnostics();
@@ -587,7 +590,7 @@ int run_live(int argc, char ** argv) {
     };
     uint64_t decode_total_us = 0;
     for (size_t index = 1; index < decode_us.size(); ++index) decode_total_us += decode_us[index];
-    std::cout << "PHASE5_LIVE"
+    std::cout << (args.mode == "uma" ? "PHASE11_UMA_LIVE" : "PHASE5_LIVE")
               << "\tmode=" << args.mode
               << "\tload_mode=" << llama_load_mode_name(args.load_mode)
               << "\tprompt_ids=" << prompt_ids.str()
@@ -608,6 +611,11 @@ int run_live(int argc, char ** argv) {
               << "\thot_misses=" << diagnostics.misses
               << "\thot_admissions=" << diagnostics.admissions
               << "\thot_evictions=" << diagnostics.evictions
+              << "\tprovider_pool_bytes=" << provider_stats.pool_bytes
+              << "\tprovider_pool_generations=" << provider_stats.pool_generations
+              << "\tprovider_effective_capacity=" << provider_stats.effective_capacity
+              << "\tprovider_tensor_copies=" << provider_stats.tensor_copies
+              << "\tprovider_failures=" << provider_stats.failures
               << "\tcold_hits=" << diagnostics.cold_hits
               << "\tcold_misses=" << diagnostics.cold_misses
               << "\tcold_evictions=" << diagnostics.cold_evictions
@@ -744,15 +752,24 @@ int run_live(int argc, char ** argv) {
               << "\texecution_backend_device_type=" << diagnostics.last_execution_backend_device_type
               << "\tresident_runtime_quiet=" << resident_runtime_quiet
               << '\n';
-    const bool cached_mode = args.mode == "hot" || args.mode == "cold";
+    const bool cached_mode = args.mode == "hot" || args.mode == "cold" || args.mode == "uma";
     const bool routing_backend_valid = placement.routing_cpu + placement.routing_non_cpu > 0 &&
         placement.routing_backend_device_type >= 0 && placement.routing_backend_consistent;
+    const auto expected_execution_device = args.mode == "uma" ?
+        GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU;
     const bool valid_placement = cached_mode ?
         placement.cpu > 0 && placement.non_cpu == 0 && placement.backend_consistent &&
             placement.backend_device_type == GGML_BACKEND_DEVICE_TYPE_CPU &&
             placement.routing_cpu == 0 && placement.routing_non_cpu > 0 && routing_backend_valid &&
-            diagnostics.last_execution_backend_device_type == GGML_BACKEND_DEVICE_TYPE_GPU :
+            diagnostics.last_execution_backend_device_type == expected_execution_device :
         placement.cpu == 0 && placement.non_cpu == 0 && routing_backend_valid && resident_runtime_quiet;
+    if (!valid_placement) {
+        std::cerr << "invalid placement cached=" << cached_mode << " cpu=" << placement.cpu
+                  << " non_cpu=" << placement.non_cpu << " backend_consistent=" << placement.backend_consistent
+                  << " backend_type=" << placement.backend_device_type << " routing_cpu=" << placement.routing_cpu
+                  << " routing_non_cpu=" << placement.routing_non_cpu << " routing_valid=" << routing_backend_valid
+                  << " execution_backend=" << diagnostics.last_execution_backend_device_type << '\n';
+    }
     bool valid_overlap = true;
     if (args.require_overlap) {
         valid_overlap = args.mode == "cold" && diagnostics.ring_event_capable &&

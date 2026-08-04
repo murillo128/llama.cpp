@@ -691,7 +691,11 @@ void llama_context::sched_reserve() {
         for (const auto & binding : gf_res_reserve->get_expert_bindings()) {
             final_bootstrap_source_bindings += binding.bootstrap;
             if (binding.bootstrap || binding.generation_lease == nullptr || binding.graph_epoch != current_epoch) {
-                throw std::runtime_error("cold-cache final graph retained a descriptor-only source binding");
+                throw std::runtime_error(format(
+                    "cold-cache final graph retained a descriptor-only source binding "
+                    "(layer=%d bootstrap=%d lease=%d binding_epoch=%" PRIu64 " provider_epoch=%" PRIu64 ")",
+                    binding.layer, int(binding.bootstrap), int(binding.generation_lease != nullptr),
+                    binding.graph_epoch, current_epoch));
             }
         }
     };
