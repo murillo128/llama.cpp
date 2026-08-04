@@ -68,8 +68,20 @@ struct llm_expert_uma_memory_sample {
     uint64_t major_faults = 0;
     uint64_t pswpin_pages = 0;
     uint64_t pswpout_pages = 0;
+    uint64_t psi_full_total_usec = 0;
+    uint64_t zram_write_bytes = 0;
+    uint64_t zswap_write_pages = 0;
     bool cgroup_v2 = false;
     bool swap_counters_supported = false;
+    bool psi_full_supported = false;
+    bool zram_present = false;
+    bool zram_counters_supported = false;
+    bool zswap_enabled = false;
+    bool zswap_counters_supported = false;
+    bool nvidia_hmm_counters_supported = false;
+    std::string zram_status_reason;
+    std::string zswap_status_reason;
+    std::string nvidia_hmm_status_reason;
     std::string unavailable_reason;
 };
 

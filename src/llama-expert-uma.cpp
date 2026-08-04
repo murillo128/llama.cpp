@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -83,6 +84,70 @@ bool read_vmstat(uint64_t & pswpin, uint64_t & pswpout) {
     }
     return have_in && have_out;
 }
+
+bool read_psi_full(const std::string & path, uint64_t & total_usec) {
+    std::ifstream input(path);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.rfind("full ", 0) != 0) continue;
+        std::istringstream fields(line);
+        std::string item;
+        while (fields >> item) {
+            if (item.rfind("total=", 0) != 0) continue;
+            try {
+                size_t consumed = 0;
+                total_usec = std::stoull(item.substr(6), &consumed);
+                return consumed == item.size() - 6;
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+bool read_zram_writes(llm_expert_uma_memory_sample & output) {
+    const std::filesystem::path root("/sys/block");
+    std::error_code error;
+    for (const auto & entry : std::filesystem::directory_iterator(root, error)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("zram", 0) != 0) continue;
+        output.zram_present = true;
+        std::ifstream stat(entry.path()/"stat");
+        uint64_t value = 0, sectors_written = 0;
+        for (int index = 0; index <= 6; ++index) {
+            if (!(stat >> value)) return false;
+            if (index == 6) sectors_written = value;
+        }
+        if (sectors_written > std::numeric_limits<uint64_t>::max()/512 ||
+            output.zram_write_bytes > std::numeric_limits<uint64_t>::max() - sectors_written*512) return false;
+        output.zram_write_bytes += sectors_written*512;
+    }
+    if (error) return false;
+    output.zram_counters_supported = output.zram_present;
+    if (!output.zram_present) output.zram_status_reason = "unsupported: no zram block device";
+    return true;
+}
+
+bool read_zswap(llm_expert_uma_memory_sample & output) {
+    std::ifstream enabled("/sys/module/zswap/parameters/enabled");
+    char value = 0;
+    if (!(enabled >> value)) {
+        output.zswap_status_reason = "unsupported: zswap module parameter unavailable";
+        return true;
+    }
+    output.zswap_enabled = value == 'Y' || value == '1';
+    if (!output.zswap_enabled) {
+        output.zswap_status_reason = "unsupported: zswap disabled";
+        return true;
+    }
+    if (!read_number("/sys/kernel/debug/zswap/written_back_pages", output.zswap_write_pages)) {
+        output.zswap_status_reason = "unavailable: enabled zswap write counter is not readable";
+        return false;
+    }
+    output.zswap_counters_supported = true;
+    return true;
+}
 #endif
 
 } // namespace
@@ -122,6 +187,13 @@ llm_expert_uma_result llm_expert_uma_sample_memory(llm_expert_uma_memory_sample 
         output.swap_counters_supported = read_number(
             root + "/memory.swap.current", output.cgroup_swap_current_bytes) &&
             read_vmstat(output.pswpin_pages, output.pswpout_pages);
+        output.psi_full_supported = read_psi_full(root + "/memory.pressure", output.psi_full_total_usec);
+        if (!output.psi_full_supported || !read_zram_writes(output) || !read_zswap(output)) {
+            output.unavailable_reason = !output.psi_full_supported ? "cgroup PSI-full counter unavailable" :
+                output.zswap_status_reason.empty() ? "zram write counters unavailable" : output.zswap_status_reason;
+            return llm_expert_uma_result::failure(llm_expert_uma_error::unavailable_measurement);
+        }
+        output.nvidia_hmm_status_reason = "unsupported: no stable per-process NVIDIA HMM fault counter exposed";
         struct rusage usage = {};
         if (getrusage(RUSAGE_SELF, &usage) != 0 || usage.ru_majflt < 0) {
             output.unavailable_reason = "getrusage major-fault counter unavailable";

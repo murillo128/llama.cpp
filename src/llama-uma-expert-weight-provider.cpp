@@ -333,7 +333,7 @@ public:
                 rollback(rollback_begin);
                 return failure(llm_expert_provider_error::metadata_mismatch);
             }
-            classify_hit(load.active, hot_slot >= 0, references[index]);
+            const auto hit = classify_hit(load.active, hot_slot >= 0, references[index]);
             if (hot_slot < 0) {
                 result = policy_result(hot_policy.load_begin(
                     decision.slot, references[index].generation,
@@ -377,7 +377,7 @@ public:
             if (!result.is_ready()) { rollback(rollback_begin); return failure(result.error); }
             slot.refs++;
             slot.last_use = ++use_clock;
-            request_pins.push_back({ references[index], uint32_t(hot_slot) });
+            request_pins.push_back({ references[index], uint32_t(hot_slot), hit });
         }
         for (size_t index = 0; index < logical_count; ++index) {
             execution_ids[index] = int32_t(references[element_index[index]].slot);
@@ -490,9 +490,22 @@ public:
         result.uma_prepared_cold_hits = prepared_cold_hits;
         result.uma_degraded_hits = degraded_hits;
         result.uma_unknown_residency_hits = unknown_residency_hits;
+        result.uma_major_faults = memory_sample.major_faults;
+        result.uma_psi_full_total_usec = memory_sample.psi_full_total_usec;
+        result.uma_zram_write_bytes = memory_sample.zram_write_bytes;
+        result.uma_zswap_write_pages = memory_sample.zswap_write_pages;
         result.uma_autofit = headroom.autofit;
         result.uma_pressure_circuit_open = pressure_circuit_open;
         result.uma_swap_counters_supported = memory_sample.swap_counters_supported;
+        result.uma_psi_full_supported = memory_sample.psi_full_supported;
+        result.uma_zram_present = memory_sample.zram_present;
+        result.uma_zram_counters_supported = memory_sample.zram_counters_supported;
+        result.uma_zswap_enabled = memory_sample.zswap_enabled;
+        result.uma_zswap_counters_supported = memory_sample.zswap_counters_supported;
+        result.uma_nvidia_hmm_counters_supported = memory_sample.nvidia_hmm_counters_supported;
+        result.uma_zram_status_reason = memory_sample.zram_status_reason;
+        result.uma_zswap_status_reason = memory_sample.zswap_status_reason;
+        result.uma_nvidia_hmm_status_reason = memory_sample.nvidia_hmm_status_reason;
         result.uma_telemetry_unavailable_reason = !memory_sample.unavailable_reason.empty() ?
             memory_sample.unavailable_reason : residency_unavailable_reason;
         result.cold_policy = cold.policy;
@@ -576,7 +589,9 @@ public:
             *prototype, config.buffer_type, calculated_slot_footprint);
         if (!result.is_ready()) return failure(result.error);
         llm_expert_uma_memory_sample sampled;
-        if (!config.sample_memory(sampled).is_ready() || !sampled.swap_counters_supported) {
+        if (!config.sample_memory(sampled).is_ready() || !sampled.swap_counters_supported ||
+            !sampled.psi_full_supported || (sampled.zram_present && !sampled.zram_counters_supported) ||
+            (sampled.zswap_enabled && !sampled.zswap_counters_supported)) {
             memory_sample = sampled;
             return failure(llm_expert_provider_error::unsupported_configuration);
         }
@@ -754,9 +769,19 @@ protected:
     }
 
 private:
+    enum class hit_kind : uint8_t { none, resident_hot, prepared_cold, degraded, unknown };
+    struct hit_observation {
+        hit_kind kind = hit_kind::none;
+        llm_expert_uma_memory_sample before;
+        bool sampled = false;
+    };
     struct slot_state { uint64_t generation = 0; uint64_t last_use = 0; uint32_t refs = 0; bool hot = false; };
     struct hot_entry { llm_expert_key key; llm_cold_reference reference; bool occupied = false; };
-    struct request_pin { llm_cold_reference reference; uint32_t hot_slot = UINT32_MAX; };
+    struct request_pin {
+        llm_cold_reference reference;
+        uint32_t hot_slot = UINT32_MAX;
+        hit_observation hit;
+    };
 
     llm_expert_provider_result bind_impl(
             ggml_context * graph_ctx,
@@ -881,10 +906,16 @@ private:
             pressure_rejections++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
-        if (!current.swap_counters_supported || current.process_swap_bytes > baseline_memory_sample.process_swap_bytes ||
+        if (!current.swap_counters_supported || !current.psi_full_supported ||
+            (current.zram_present && !current.zram_counters_supported) ||
+            (current.zswap_enabled && !current.zswap_counters_supported) ||
+            current.process_swap_bytes > baseline_memory_sample.process_swap_bytes ||
             current.cgroup_swap_current_bytes > baseline_memory_sample.cgroup_swap_current_bytes ||
             current.pswpin_pages > baseline_memory_sample.pswpin_pages ||
-            current.pswpout_pages > baseline_memory_sample.pswpout_pages) {
+            current.pswpout_pages > baseline_memory_sample.pswpout_pages ||
+            current.psi_full_total_usec > baseline_memory_sample.psi_full_total_usec ||
+            current.zram_write_bytes > baseline_memory_sample.zram_write_bytes ||
+            current.zswap_write_pages > baseline_memory_sample.zswap_write_pages) {
             pressure_circuit_open = true;
             pressure_rejections++;
             memory_sample = current;
@@ -920,23 +951,59 @@ private:
         return llm_expert_provider_result::success();
     }
 
-    void classify_hit(bool storage_miss, bool hot_hit, llm_cold_reference reference) {
+    hit_observation classify_hit(bool storage_miss, bool hot_hit, llm_cold_reference reference) {
         if (storage_miss) {
             storage_misses++;
-            return;
+            return {};
         }
         bool supported = false, resident = false;
         exact_slot_residency(reference, supported, resident);
         if (!supported) {
-            unknown_residency_hits++;
             residency_unavailable_reason = "exact-slot mincore telemetry unavailable";
-        } else if (!resident) {
-            degraded_hits++;
-        } else if (hot_hit) {
-            resident_hot_hits++;
-        } else {
-            prepared_cold_hits++;
+            return { hit_kind::unknown, {}, false };
         }
+        if (!resident) return { hit_kind::degraded, {}, false };
+        hit_observation result;
+        result.kind = hot_hit ? hit_kind::resident_hot : hit_kind::prepared_cold;
+        result.sampled = config.sample_memory(result.before).is_ready();
+        if (!result.sampled || !result.before.swap_counters_supported || !result.before.psi_full_supported ||
+            (result.before.zram_present && !result.before.zram_counters_supported) ||
+            (result.before.zswap_enabled && !result.before.zswap_counters_supported)) {
+            result.kind = hit_kind::unknown;
+            result.sampled = false;
+            residency_unavailable_reason = !result.before.unavailable_reason.empty() ?
+                result.before.unavailable_reason : "hit fault/page-in telemetry unavailable";
+        }
+        return result;
+    }
+
+    void complete_hit_observation(const hit_observation & observation) {
+        if (observation.kind == hit_kind::none) return;
+        if (observation.kind == hit_kind::unknown) { unknown_residency_hits++; return; }
+        if (observation.kind == hit_kind::degraded) { degraded_hits++; return; }
+        llm_expert_uma_memory_sample after;
+        if (!observation.sampled || !config.sample_memory(after).is_ready() ||
+            !after.swap_counters_supported || !after.psi_full_supported ||
+            (after.zram_present && !after.zram_counters_supported) ||
+            (after.zswap_enabled && !after.zswap_counters_supported)) {
+            unknown_residency_hits++;
+            residency_unavailable_reason = !after.unavailable_reason.empty() ?
+                after.unavailable_reason : "hit fault/page-in telemetry unavailable";
+            return;
+        }
+        memory_sample = after;
+        const bool pressure_refill = after.process_swap_bytes > observation.before.process_swap_bytes ||
+            after.cgroup_swap_current_bytes > observation.before.cgroup_swap_current_bytes ||
+            after.pswpin_pages > observation.before.pswpin_pages ||
+            after.pswpout_pages > observation.before.pswpout_pages ||
+            after.psi_full_total_usec > observation.before.psi_full_total_usec ||
+            after.zram_write_bytes > observation.before.zram_write_bytes ||
+            after.zswap_write_pages > observation.before.zswap_write_pages;
+        const bool faulted = after.major_faults > observation.before.major_faults;
+        if (pressure_refill) pressure_circuit_open = true;
+        if (faulted || pressure_refill) degraded_hits++;
+        else if (observation.kind == hit_kind::resident_hot) resident_hot_hits++;
+        else prepared_cold_hits++;
     }
 
     void exact_slot_residency(llm_cold_reference reference, bool & supported, bool & resident) {
@@ -1035,6 +1102,7 @@ private:
     llm_expert_provider_result release_request_pins_locked() {
         while (!request_pins.empty()) {
             const auto pin = request_pins.back();
+            complete_hit_observation(pin.hit);
             auto result = policy_result(hot_policy.unpin(pin.hot_slot, pin.reference.generation));
             if (result.is_ready()) result = cache->release(pin.reference, llm_cold_reference_kind::request);
             if (!result.is_ready()) return result;

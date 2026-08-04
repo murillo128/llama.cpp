@@ -41,6 +41,9 @@ struct policy_pressure_witness {
     bool before_io = false;
     bool trim_zero_refs = false;
     bool surrender = false;
+    bool fault_degraded = false;
+    bool psi_circuit = false;
+    bool compression_circuit = false;
 } policy_witness;
 
 llm_expert_uma_memory_sample controlled_memory;
@@ -56,6 +59,11 @@ void reset_memory_sample() {
     controlled_memory.process_rss_bytes = 2*GIB;
     controlled_memory.cgroup_v2 = true;
     controlled_memory.swap_counters_supported = true;
+    controlled_memory.psi_full_supported = true;
+    controlled_memory.zram_status_reason = "unsupported: no zram block device";
+    controlled_memory.zswap_status_reason = "unsupported: zswap disabled";
+    controlled_memory.nvidia_hmm_status_reason =
+        "unsupported: no stable per-process NVIDIA HMM fault counter exposed";
     memory_sample_failure = false;
 }
 
@@ -185,7 +193,12 @@ void test_provider() {
         require(provider->remap_checkpoint(binding, &expert, 1, &execution).is_ready(), "cold-hit remap failed");
         require(storage.diagnostics().read_bytes == bytes_before && provider->hot_cache_diagnostics().cold_hits > 0,
             "hot miss did not reuse the retained cold slot");
+        controlled_memory.major_faults++;
     }
+    auto hit_diagnostics = provider->hot_cache_diagnostics();
+    require(hit_diagnostics.uma_degraded_hits == 1 && hit_diagnostics.uma_unknown_residency_hits == 0,
+        "major fault during a logical hit was not classified as degraded");
+    policy_witness.fault_degraded = true;
     const auto provider_stats = provider->get_stats();
     const auto storage_stats = storage.diagnostics();
     const auto scheduler_stats = scheduler.diagnostics();
@@ -458,6 +471,9 @@ void test_autofit_policy_pressure_trim_and_surrender() {
     memory_sample_failure = true;
     reject_initialization(config, llm_expert_provider_status::failed);
     memory_sample_failure = false;
+    controlled_memory.psi_full_supported = false;
+    reject_initialization(config, llm_expert_provider_status::failed);
+    controlled_memory.psi_full_supported = true;
     auto unsafe_config = config;
     unsafe_config.pool_bytes = UINT64_C(80)*1024*1024*1024;
     reject_initialization(unsafe_config, llm_expert_provider_status::allocation_failed);
@@ -490,16 +506,30 @@ void test_autofit_policy_pressure_trim_and_surrender() {
             "recoverable headroom rejection poisoned retry");
     }
     const uint64_t bytes_before_swap = storage.diagnostics().read_bytes;
-    controlled_memory.pswpin_pages = 1;
+    controlled_memory.psi_full_total_usec = 1;
+    controlled_memory.zram_present = true;
+    controlled_memory.zram_counters_supported = true;
+    controlled_memory.zram_write_bytes = 4096;
+    controlled_memory.zswap_enabled = true;
+    controlled_memory.zswap_counters_supported = true;
+    controlled_memory.zswap_write_pages = 1;
     logical_id = 1;
     {
         llm_expert_execution_plan plan;
         require(provider->prepare({ binding }, plan).is_ready(), "swap prepare failed");
         const auto rejected = provider->remap_checkpoint(binding, &logical_id, 1, &execution);
         require(rejected.status == llm_expert_provider_status::allocation_failed,
-            "post-activation swap did not open the pressure circuit");
+            "post-activation PSI/compression activity did not open the pressure circuit");
     }
-    controlled_memory.pswpin_pages = 0;
+    policy_witness.psi_circuit = true;
+    policy_witness.compression_circuit = true;
+    controlled_memory.psi_full_total_usec = 0;
+    controlled_memory.zram_present = false;
+    controlled_memory.zram_counters_supported = false;
+    controlled_memory.zram_write_bytes = 0;
+    controlled_memory.zswap_enabled = false;
+    controlled_memory.zswap_counters_supported = false;
+    controlled_memory.zswap_write_pages = 0;
     {
         llm_expert_execution_plan plan;
         require(provider->prepare({ binding }, plan).is_ready(), "open-circuit prepare failed");
@@ -548,12 +578,14 @@ int main() try {
         witness.cancellation_retry, (unsigned long long) witness.scheduler_active);
     printf("PHASE11_UMA_LIFECYCLE\tsafe_pool_bytes=%llu\teffective_pool_bytes=%llu"
         "\tautofit=%d\texplicit_policy=%d\tpressure_samples=%llu\tpressure_rejections=%llu"
-        "\tpressure_circuit=%d\tbefore_io=%d\ttrim_zero_refs=%d\tsurrender=%d\n",
+        "\tpressure_circuit=%d\tbefore_io=%d\ttrim_zero_refs=%d\tsurrender=%d"
+        "\tfault_degraded=%d\tpsi_circuit=%d\tcompression_circuit=%d\n",
         (unsigned long long) policy_witness.safe_pool_bytes,
         (unsigned long long) policy_witness.effective_pool_bytes, policy_witness.autofit,
         policy_witness.explicit_policy, (unsigned long long) policy_witness.pressure_samples,
         (unsigned long long) policy_witness.pressure_rejections, policy_witness.pressure_circuit,
-        policy_witness.before_io, policy_witness.trim_zero_refs, policy_witness.surrender);
+        policy_witness.before_io, policy_witness.trim_zero_refs, policy_witness.surrender,
+        policy_witness.fault_degraded, policy_witness.psi_circuit, policy_witness.compression_circuit);
     return 0;
 } catch (const std::exception & error) {
     fprintf(stderr, "test-expert-uma-provider: %s\n", error.what());
