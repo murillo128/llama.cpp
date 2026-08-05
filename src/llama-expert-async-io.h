@@ -223,7 +223,8 @@ public:
     static bool validate_ring_layout(
             const llm_expert_async_ring_layout & layout,
             uint64_t page_size,
-            llm_expert_async_mapping_sizes & sizes) noexcept;
+            llm_expert_async_mapping_sizes & sizes,
+            bool single_mmap = false) noexcept;
     static llm_expert_async_ring_probe probe_ring_for_testing(uint32_t queue_depth) noexcept;
     static uint64_t encode_user_data(uint32_t operation_slot, uint32_t operation_generation) noexcept;
     static bool decode_user_data(uint64_t user_data, uint32_t & operation_slot, uint32_t & operation_generation) noexcept;

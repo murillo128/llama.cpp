@@ -177,6 +177,17 @@ void test_ring_layout_validation() {
     GGML_ASSERT(sizes.cq_ring_bytes == 320);
     GGML_ASSERT(sizes.sqes_bytes == 512);
 
+    llm_expert_async_ring_layout combined = {
+        128, 256,
+        0, 4, 16, 24, 36, 32, 4160,
+        8, 12, 20, 28, 44, 64,
+    };
+    GGML_ASSERT(!llm_expert_async_transport::validate_ring_layout(combined, 4096, sizes));
+    GGML_ASSERT(llm_expert_async_transport::validate_ring_layout(combined, 4096, sizes, true));
+    GGML_ASSERT(sizes.sq_ring_bytes == 4672);
+    GGML_ASSERT(sizes.cq_ring_bytes == 4160);
+    GGML_ASSERT(sizes.sqes_bytes == 8192);
+
     layout.sq_entries = 7;
     GGML_ASSERT(!llm_expert_async_transport::validate_ring_layout(layout, 4096, sizes));
     layout.sq_entries = 8;
@@ -192,6 +203,12 @@ void test_ring_layout_validation() {
     } else {
         GGML_ASSERT(probe.native_error != 0);
     }
+#if defined(__linux__)
+    for (uint32_t queue_depth : { 128U, 256U }) {
+        const auto large_probe = llm_expert_async_transport::probe_ring_for_testing(queue_depth);
+        if (large_probe.supported) GGML_ASSERT(large_probe.layout_valid);
+    }
+#endif
     GGML_ASSERT(llm_expert_async_transport::probe_ring_for_testing(7).native_error == EINVAL);
 }
 

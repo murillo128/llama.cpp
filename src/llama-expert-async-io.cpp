@@ -99,7 +99,8 @@ public:
         };
         llm_expert_async_mapping_sizes sizes;
         const long page_size = sysconf(_SC_PAGESIZE);
-        if (page_size <= 0 || !llm_expert_async_transport::validate_ring_layout(layout, uint64_t(page_size), sizes)) {
+        if (page_size <= 0 || !llm_expert_async_transport::validate_ring_layout(
+                layout, uint64_t(page_size), sizes, (params.features & IORING_FEAT_SINGLE_MMAP) != 0)) {
             native_error = EINVAL;
             close_ring();
             return false;
@@ -1499,7 +1500,8 @@ llm_expert_async_transport::~llm_expert_async_transport() {
 bool llm_expert_async_transport::validate_ring_layout(
         const llm_expert_async_ring_layout & layout,
         uint64_t page_size,
-        llm_expert_async_mapping_sizes & sizes) noexcept {
+        llm_expert_async_mapping_sizes & sizes,
+        bool single_mmap) noexcept {
     sizes = {};
     if (!is_power_of_two(page_size) || !is_power_of_two(layout.sq_entries) ||
         !is_power_of_two(layout.cq_entries) || layout.sq_entries < 8 ||
@@ -1536,6 +1538,11 @@ bool llm_expert_async_transport::validate_ring_layout(
     if (!checked_add(page_size, sq_array_bytes, maximum_sq_ring) ||
         !checked_add(page_size, cqes_bytes, maximum_cq_ring)) {
         return false;
+    }
+    if (single_mmap) {
+        uint64_t maximum_combined_ring = 0;
+        if (!checked_add(maximum_sq_ring, cqes_bytes, maximum_combined_ring)) return false;
+        return sizes.sq_ring_bytes <= maximum_combined_ring && sizes.cq_ring_bytes <= maximum_combined_ring;
     }
     return sizes.sq_ring_bytes <= maximum_sq_ring && sizes.cq_ring_bytes <= maximum_cq_ring;
 }
@@ -1577,7 +1584,8 @@ llm_expert_async_ring_probe llm_expert_async_transport::probe_ring_for_testing(u
     };
     llm_expert_async_mapping_sizes sizes;
     const long page_size = sysconf(_SC_PAGESIZE);
-    result.layout_valid = page_size > 0 && validate_ring_layout(layout, uint64_t(page_size), sizes);
+    result.layout_valid = page_size > 0 && validate_ring_layout(
+        layout, uint64_t(page_size), sizes, (params.features & IORING_FEAT_SINGLE_MMAP) != 0);
     if (close(fd) != 0 && result.native_error == 0) {
         result.native_error = errno;
     }
