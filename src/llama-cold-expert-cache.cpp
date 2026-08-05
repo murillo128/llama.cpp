@@ -1,4 +1,5 @@
 #include "llama-cold-expert-cache.h"
+#include "llama-perfetto-trace.h"
 
 #include "llama-hparams.h"
 
@@ -925,6 +926,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
         llm_expert_key key,
         llm_cold_reference & reference,
         bool & hit) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.cache.cold", "lookup", "layer", key.layer, "original_expert_id", key.expert);
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     pimpl->counters.requests++;
     hit = false;
@@ -958,9 +960,12 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
         reference = { uint32_t(forward.slot), forward.generation, existing.layout_class_id };
         pimpl->counters.hits++;
         hit = true;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "hit", "layer", key.layer,
+            "original_expert_id", key.expert, "slot_id", reference.slot, "generation", reference.generation);
         return llm_expert_provider_result::success();
     }
     pimpl->counters.misses++;
+    LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "miss", "layer", key.layer, "original_expert_id", key.expert);
     int32_t victim = -1;
     auto selected = pimpl->select_slot(key, victim);
     if (!selected.is_ready()) return selected;
@@ -997,6 +1002,9 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
     slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
     reference = { uint32_t(victim), slot.generation, slot.layout_class_id };
     pimpl->counters.reservations++;
+    LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "reserve", "layer", key.layer,
+        "original_expert_id", key.expert, "slot_id", reference.slot, "generation", reference.generation,
+        "layout_class_id", reference.layout_class_id);
     return llm_expert_provider_result::success();
 }
 
@@ -1004,6 +1012,8 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
         llm_expert_key key,
         llm_cold_reference & reference,
         llm_cold_demand_lookup & lookup) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.cache.cold", "demand_lookup", "layer", key.layer,
+        "original_expert_id", key.expert);
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     pimpl->counters.requests++;
     lookup = llm_cold_demand_lookup::reserved;
@@ -1037,6 +1047,8 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
         reference = { uint32_t(forward.slot), forward.generation, existing.layout_class_id };
         pimpl->counters.hits++;
         lookup = llm_cold_demand_lookup::ready;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "hit", "layer", key.layer,
+            "original_expert_id", key.expert, "slot_id", reference.slot, "generation", reference.generation);
         return llm_expert_provider_result::success();
     }
     for (uint32_t index = 0; index < pimpl->slots.size(); ++index) {
@@ -1051,6 +1063,8 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
         }
         reference = { index, existing.generation, existing.layout_class_id };
         lookup = llm_cold_demand_lookup::joined_loading;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "join_loading", "layer", key.layer,
+            "original_expert_id", key.expert, "slot_id", reference.slot, "generation", reference.generation);
         return llm_expert_provider_result::success();
     }
     pimpl->counters.misses++;
@@ -1090,6 +1104,9 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
     slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
     reference = { uint32_t(victim), slot.generation, slot.layout_class_id };
     pimpl->counters.reservations++;
+    LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "reserve", "layer", key.layer,
+        "original_expert_id", key.expert, "slot_id", reference.slot, "generation", reference.generation,
+        "layout_class_id", reference.layout_class_id);
     return llm_expert_provider_result::success();
 }
 
@@ -1254,6 +1271,8 @@ llm_expert_provider_result llm_cold_expert_cache::reclassify(
 
 llm_expert_provider_result llm_cold_expert_cache::publish_ready(
         llm_expert_key key, llm_cold_reference reference) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.cache.cold", "publish", "layer", key.layer,
+        "original_expert_id", key.expert, "slot_id", reference.slot, "generation", reference.generation);
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (reference.slot >= pimpl->slots.size()) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
@@ -1418,6 +1437,8 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
 
 llm_expert_provider_result llm_cold_expert_cache::acquire(
         llm_cold_reference reference, llm_cold_reference_kind kind) noexcept {
+    LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "pin", "slot_id", reference.slot,
+        "generation", reference.generation, "reference_kind", uint32_t(kind));
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (!pimpl->valid_reference(reference)) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
@@ -1475,6 +1496,8 @@ llm_expert_provider_result llm_cold_expert_cache::policy_shadow_hit(
 
 llm_expert_provider_result llm_cold_expert_cache::release(
         llm_cold_reference reference, llm_cold_reference_kind kind) noexcept {
+    LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "unpin", "slot_id", reference.slot,
+        "generation", reference.generation, "reference_kind", uint32_t(kind));
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (!pimpl->valid_reference(reference)) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
@@ -1659,6 +1682,7 @@ llm_expert_provider_result llm_cold_expert_cache::trim() noexcept {
 }
 
 llm_expert_provider_result llm_cold_expert_cache::surrender() noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "cold_cache_surrender");
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->arena && pimpl->arena.use_count() != 1) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::busy);

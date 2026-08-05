@@ -1,4 +1,5 @@
 #include "llama-expert-async-io.h"
+#include "llama-perfetto-trace.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -371,6 +372,8 @@ struct llm_expert_async_transport::impl {
     void mark_request_running_locked(read_request_record & request) {
         request.state = read_state::running;
         request.started_us = uint64_t(ggml_time_us());
+        LLM_EXPERT_TRACE_INSTANT("k3.storage", "request_start", "request_slot", request.handle.slot,
+            "request_generation", request.handle.generation, "request_ordinal", request.ordinal);
         if (request.queued_us != 0 && request.started_us >= request.queued_us) {
             const uint64_t wait_us = request.started_us - request.queued_us;
             counters.read_queue_wait_samples++;
@@ -522,6 +525,11 @@ struct llm_expert_async_transport::impl {
         request.completion.complete_us = uint64_t(ggml_time_us());
         request.completion.request = request.handle;
         record_request_traces_locked(request);
+        [[maybe_unused]] const uint64_t trace_id = llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::storage,
+            request.handle.slot, uint32_t(request.handle.generation));
+        LLM_EXPERT_TRACE_ASYNC_END("k3.storage", trace_id, "bytes", request.completion.bytes_completed,
+            "result", uint32_t(request.completion.result), "native_error", request.completion.native_error,
+            "used_io_uring", used_ring);
         request.state = read_state::complete;
         request.operations_remaining = 0;
         counters.read_requests_completed++;
@@ -555,6 +563,14 @@ struct llm_expert_async_transport::impl {
                     operation.identity.request.generation != handle.generation) continue;
                 operation.submit_us = uint64_t(ggml_time_us());
                 operation.completed_bytes = 0;
+                LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation",
+                    llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::storage,
+                        operation.identity.request.slot, uint32_t(operation.identity.request.generation),
+                        operation.identity.request_operation_index),
+                    "request_slot", operation.identity.request.slot, "request_generation",
+                    operation.identity.request.generation, "operation_index",
+                    operation.identity.request_operation_index, "submitted_bytes", operation.read.byte_count,
+                    "file_offset", operation.read.file_offset, "io_uring", false);
                 for (uint8_t segment_index = 0; segment_index < operation.read.segment_count; ++segment_index) {
                     const auto & segment = operation.read.segments[segment_index];
                     uint64_t completed = 0;
@@ -582,6 +598,11 @@ struct llm_expert_async_transport::impl {
                     }
                 }
                 operation.complete_us = uint64_t(ggml_time_us());
+                LLM_EXPERT_TRACE_ASYNC_END("k3.storage",
+                    llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::storage,
+                        operation.identity.request.slot, uint32_t(operation.identity.request.generation),
+                        operation.identity.request_operation_index),
+                    "completed_bytes", operation.completed_bytes, "native_result", 0);
             }
             std::lock_guard<std::mutex> guard(mutex);
             auto * request = find_read(handle);
@@ -642,6 +663,14 @@ struct llm_expert_async_transport::impl {
                         request->completion.submit_us = submit_us;
                         request->completion.request = request->handle;
                     }
+                    [[maybe_unused]] const uint64_t operation_id = llm_perfetto_trace_operation_id(
+                        llm_perfetto_trace_domain::storage, operation.identity.request.slot,
+                        uint32_t(operation.identity.request.generation), operation.identity.request_operation_index);
+                    LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation", operation_id,
+                        "request_slot", operation.identity.request.slot, "request_generation",
+                        operation.identity.request.generation, "operation_index",
+                        operation.identity.request_operation_index, "submitted_bytes", operation.read.byte_count,
+                        "file_offset", operation.read.file_offset, "io_uring", true);
                 }
                 condition.notify_all();
             }
@@ -730,6 +759,11 @@ struct llm_expert_async_transport::impl {
                 }
                 operation.ring_completed = true;
                 operation.complete_us = uint64_t(ggml_time_us());
+                [[maybe_unused]] const uint64_t operation_id = llm_perfetto_trace_operation_id(
+                    llm_perfetto_trace_domain::storage, operation.identity.request.slot,
+                    uint32_t(operation.identity.request.generation), operation.identity.request_operation_index);
+                LLM_EXPERT_TRACE_ASYNC_END("k3.storage", operation_id, "completed_bytes",
+                    cqe.res > 0 ? uint64_t(cqe.res) : 0, "native_result", cqe.res);
                 reads_left--;
                 request->operations_remaining--;
                 if (cqe.res < 0) {
@@ -827,6 +861,14 @@ struct llm_expert_async_transport::impl {
                     operation.submit_us = submit_us;
                     operation.complete_us = 0;
                     operation.completed_bytes = 0;
+                    LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation",
+                        llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::storage,
+                            operation.identity.request.slot, uint32_t(operation.identity.request.generation),
+                            operation.identity.request_operation_index),
+                        "request_slot", operation.identity.request.slot, "request_generation",
+                        operation.identity.request.generation, "operation_index",
+                        operation.identity.request_operation_index, "submitted_bytes", operation.read.byte_count,
+                        "file_offset", operation.read.file_offset, "io_uring", true);
                 }
             }
             if (config.pause_after_ring_submit_for_testing) {
@@ -964,6 +1006,11 @@ struct llm_expert_async_transport::impl {
                 }
                 operation.ring_completed = true;
                 operation.complete_us = uint64_t(ggml_time_us());
+                LLM_EXPERT_TRACE_ASYNC_END("k3.storage",
+                    llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::storage,
+                        operation.identity.request.slot, uint32_t(operation.identity.request.generation),
+                        operation.identity.request_operation_index),
+                    "completed_bytes", cqe.res > 0 ? uint64_t(cqe.res) : 0, "native_result", cqe.res);
                 read_completions_left--;
                 if (cqe.res < 0) {
                     uint64_t ignored_offset = 0;
@@ -1148,6 +1195,14 @@ struct llm_expert_async_transport::impl {
                 stored.submit_us = uint64_t(ggml_time_us());
                 stored.complete_us = 0;
                 stored.completed_bytes = 0;
+                LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation",
+                    llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::storage,
+                        stored.identity.request.slot, uint32_t(stored.identity.request.generation),
+                        stored.identity.request_operation_index),
+                    "request_slot", stored.identity.request.slot, "request_generation",
+                    stored.identity.request.generation, "operation_index", stored.identity.request_operation_index,
+                    "submitted_bytes", stored.read.byte_count, "file_offset", stored.read.file_offset,
+                    "io_uring", false);
                 if (read_requests[handle.slot].cancel_requested) {
                     completion.result = llm_expert_async_result::closed;
                 }
@@ -1280,6 +1335,11 @@ struct llm_expert_async_transport::impl {
                     completed.complete_us = uint64_t(ggml_time_us());
                     completed.completed_bytes = completion.result == llm_expert_async_result::ready ?
                         operation.byte_count : 0;
+                    LLM_EXPERT_TRACE_ASYNC_END("k3.storage",
+                        llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::storage,
+                            completed.identity.request.slot, uint32_t(completed.identity.request.generation),
+                            completed.identity.request_operation_index),
+                        "completed_bytes", completed.completed_bytes, "native_result", completion.native_error);
                 }
                 if (completion.result != llm_expert_async_result::ready) break;
             }
@@ -1322,6 +1382,11 @@ struct llm_expert_async_transport::impl {
                 current->completion.complete_us = uint64_t(ggml_time_us());
                 current->completion.request = handle;
                 record_request_traces_locked(*current);
+                [[maybe_unused]] const uint64_t trace_id = llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::storage,
+                    handle.slot, uint32_t(handle.generation));
+                LLM_EXPERT_TRACE_ASYNC_END("k3.storage", trace_id, "bytes", completion.bytes_completed,
+                    "result", uint32_t(completion.result), "native_error", completion.native_error,
+                    "used_io_uring", false);
                 current->state = read_state::complete;
                 current->operations_remaining = 0;
                 counters.read_requests_completed++;
@@ -1680,6 +1745,11 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
         const llm_expert_storage_read_operation * reads,
         size_t read_count,
         bool defer_worker) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.storage", "request_submit", "flight_id",
+        llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight, identity.request.slot,
+            uint32_t(identity.request.generation)), "layer", identity.key.layer,
+        "original_expert_id", identity.key.expert, "layout_class_id", identity.layout_class_id,
+        "operation_count", read_count);
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->counters.admission_closed) return llm_expert_async_result::closed;
     if (!identity.request.valid() || identity.request.slot >= pimpl->read_requests.size() ||
@@ -1739,6 +1809,12 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
     pimpl->counters.active_read_requests++;
     pimpl->counters.peak_active_read_requests = std::max(
         pimpl->counters.peak_active_read_requests, pimpl->counters.active_read_requests);
+    [[maybe_unused]] const uint64_t trace_id = llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::storage,
+        identity.request.slot, uint32_t(identity.request.generation));
+    LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_request", trace_id, "request_generation",
+        identity.request.generation, "layer", identity.key.layer, "original_expert_id", identity.key.expert,
+        "layout_class_id", identity.layout_class_id, "operation_count", read_count);
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "storage_active_requests", 3, pimpl->counters.active_read_requests);
     pimpl->deferred_batch_open = defer_worker;
     if (!defer_worker) pimpl->condition.notify_one();
     return llm_expert_async_result::ready;
@@ -1788,6 +1864,8 @@ llm_expert_async_result llm_expert_async_transport::wait_read(
         llm_expert_async_read_completion & completion,
         bool (*abort_callback)(void *),
         void * abort_callback_data) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.storage", "request_wait", "request_generation", handle.generation,
+        "request_slot", handle.slot);
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     auto * request = pimpl->find_read(handle);
     if (request == nullptr) return llm_expert_async_result::stale_generation;
@@ -1865,6 +1943,8 @@ llm_expert_async_result llm_expert_async_transport::wait_any_read(
 }
 
 llm_expert_async_result llm_expert_async_transport::cancel_read(llm_expert_request_handle handle) noexcept {
+    LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "storage_request_cancel", "request_generation", handle.generation,
+        "request_slot", handle.slot);
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     auto * request = pimpl->find_read(handle);
     if (request == nullptr) return llm_expert_async_result::stale_generation;
@@ -1909,6 +1989,7 @@ bool llm_expert_async_transport::wait_until_read_submitted_for_testing(
 }
 
 bool llm_expert_async_transport::shutdown() noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "async_io_shutdown");
     {
         std::lock_guard<std::mutex> lock(pimpl->mutex);
         if (!pimpl->counters.admission_closed) {

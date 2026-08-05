@@ -4,6 +4,7 @@
 #include "llama-expert-cache-policy.h"
 #include "llama-expert-scheduler.h"
 #include "llama-expert-storage.h"
+#include "llama-perfetto-trace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -209,6 +210,7 @@ public:
     }
 
     ~llm_uma_expert_weight_provider() override {
+        LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "uma_provider_teardown");
         std::lock_guard<std::mutex> lock(mutex);
         release_pins_locked();
         if (cache) {
@@ -240,6 +242,7 @@ public:
             llm_expert_execution_plan & plan,
             uint64_t,
             bool) noexcept override {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "uma_prepare", "binding_count", bindings.size());
         plan.reset();
         std::lock_guard<std::mutex> lock(mutex);
         if (!cache || active_request || bindings.empty()) return set_plan_failure(plan,
@@ -281,6 +284,8 @@ public:
             int32_t * execution_ids,
             bool (*abort_callback)(void *),
             void * abort_data) noexcept override {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "uma_remap_checkpoint", "layer", binding.layer,
+            "selected_key_count", logical_count);
         std::lock_guard<std::mutex> lock(mutex);
         if (!active_request || !cache || binding.provider_identity != this || binding.graph_epoch != epoch ||
             binding.generation_lease.get() != cache->allocation_lease().get() || binding.layer < 0 ||
@@ -745,6 +750,7 @@ public:
     }
 
     llm_expert_provider_result surrender() noexcept override {
+        LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "uma_provider_surrender");
         std::lock_guard<std::mutex> lock(mutex);
         if (active_request) return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         if (!cache) return llm_expert_provider_result::success();

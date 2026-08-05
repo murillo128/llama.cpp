@@ -4,6 +4,7 @@
 #include "llama-expert-async-io.h"
 #include "llama-expert-weight-provider.h"
 #include "llama-model.h"
+#include "llama-perfetto-trace.h"
 #include "llama-cpp.h"
 
 #include "ggml-backend.h"
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <string>
@@ -24,6 +26,39 @@
 using json = nlohmann::json;
 
 namespace {
+
+#if defined(LLAMA_PERFETTO)
+class perfetto_evidence_owner {
+public:
+    perfetto_evidence_owner() {
+        const char * requested = std::getenv("LLAMA_PERFETTO_CAPTURE");
+        enabled = requested != nullptr && std::strcmp(requested, "1") == 0;
+        if (!enabled) return;
+        llm_perfetto_trace_config config;
+        char error[256] = {};
+        if (!llm_perfetto_trace_initialize_system(config, error, sizeof(error)) ||
+            !llm_perfetto_trace_wait_until_active(30000, error, sizeof(error))) {
+            throw std::runtime_error(std::string("Perfetto/CUPTI activation failed: ") + error);
+        }
+    }
+
+    ~perfetto_evidence_owner() {
+        if (!enabled) return;
+        char error[256] = {};
+        const bool stopped = llm_perfetto_trace_request_stop(error, sizeof(error)) &&
+            llm_perfetto_trace_wait_until_inactive(30000, error, sizeof(error)) &&
+            llm_perfetto_trace_shutdown(error, sizeof(error));
+        if (!stopped) {
+            std::fprintf(stderr, "phase9-cache-policy-probe: Perfetto/CUPTI closeout failed: %s\n", error);
+            std::fflush(stderr);
+            std::_Exit(90);
+        }
+    }
+
+private:
+    bool enabled = false;
+};
+#endif
 
 struct arguments {
     std::string model;
@@ -396,6 +431,9 @@ int main(int argc, char ** argv) {
                 argv[0]);
             return 2;
         }
+#if defined(LLAMA_PERFETTO)
+        perfetto_evidence_owner trace_owner;
+#endif
         ggml_backend_load_all();
         if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr) {
             std::fprintf(stderr, "phase9-cache-policy-probe: CUDA/GPU backend required\n");

@@ -1,4 +1,5 @@
 #include "llama-expert-storage.h"
+#include "llama-perfetto-trace.h"
 
 #include <algorithm>
 #include <array>
@@ -241,6 +242,8 @@ llm_expert_storage_result llm_expert_storage::make_read_plan(
         llm_expert_storage_read_operation * operations,
         size_t operation_capacity,
         size_t & operation_count) const noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.storage", "make_read_plan", "layer", key.layer,
+        "original_expert_id", key.expert, "destination_count", destination_count);
     operation_count = 0;
     if (!pimpl->sealed.load() || pimpl->poisoned.load() ||
         !key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer) ||
@@ -338,6 +341,9 @@ llm_expert_storage_result llm_expert_storage::make_read_plan(
         operation.segments[operation.segment_count++] = item.segment;
         operation.byte_count = total;
     }
+    LLM_EXPERT_TRACE_INSTANT("k3.storage", "read_plan_ready", "layer", key.layer,
+        "original_expert_id", key.expert, "layout_class_id", layout_class_id,
+        "operation_count", operation_count);
     return {};
 }
 
@@ -361,6 +367,8 @@ llm_expert_storage_result llm_expert_storage::copy_source_native_handles(
 
 llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key, void * destination,
         uint64_t destination_size, llm_expert_storage_abort abort, void * abort_data) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.storage", "read_bundle_contiguous", "layer", key.layer,
+        "original_expert_id", key.expert, "requested_bytes", destination_size);
     if (pimpl->poisoned.load()) {
         return { llm_expert_storage_error::poisoned, 0 };
     }
@@ -440,6 +448,8 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key, vo
 llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
         const llm_expert_storage_destination * destinations, size_t destination_count,
         llm_expert_storage_abort abort, void * abort_data) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.storage", "read_bundle_scattered", "layer", key.layer,
+        "original_expert_id", key.expert, "destination_count", destination_count);
     if (pimpl->poisoned.load()) {
         return { llm_expert_storage_error::poisoned, 0 };
     }
@@ -554,6 +564,8 @@ void llm_expert_storage::record_integrity_check(bool matches) noexcept {
 void llm_expert_storage::record_async_read(
         uint64_t chunk_count, uint64_t byte_count,
         llm_expert_storage_error error, int native_error) noexcept {
+    LLM_EXPERT_TRACE_INSTANT("k3.storage", "async_read_terminal", "operation_count", chunk_count,
+        "submitted_bytes", byte_count, "error", uint32_t(error), "native_error", native_error);
     std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
     pimpl->counters.read_requests++;
     pimpl->counters.read_chunks += chunk_count;

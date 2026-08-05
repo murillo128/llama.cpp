@@ -66,6 +66,32 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_PERFETTO)
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "LLAMA_PERFETTO requires Linux system tracing")
+    endif()
+    if (NOT GGML_CUDA)
+        message(FATAL_ERROR "LLAMA_PERFETTO requires GGML_CUDA for CUPTI activity correlation")
+    endif()
+
+    find_package(Threads REQUIRED)
+    find_package(CUDAToolkit REQUIRED)
+    if (NOT TARGET CUDA::cupti)
+        message(FATAL_ERROR "LLAMA_PERFETTO requires the CUDA Toolkit CUPTI development library")
+    endif()
+
+    add_library(llama-perfetto-sdk STATIC ../vendor/perfetto-v50.1/sdk/perfetto.cc)
+    target_include_directories(llama-perfetto-sdk PUBLIC ../vendor/perfetto-v50.1/sdk)
+    target_compile_features(llama-perfetto-sdk PRIVATE cxx_std_17)
+    target_link_libraries(llama-perfetto-sdk PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    set_target_properties(llama-perfetto-sdk PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_sources(llama PRIVATE llama-perfetto-trace.cpp)
+    target_include_directories(llama PRIVATE ../vendor/perfetto-v50.1/sdk)
+    target_compile_definitions(llama PRIVATE LLAMA_PERFETTO=1)
+    target_link_libraries(llama PRIVATE llama-perfetto-sdk CUDA::cupti CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

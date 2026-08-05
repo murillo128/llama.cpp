@@ -1,4 +1,5 @@
 #include "llama-expert-scheduler.h"
+#include "llama-perfetto-trace.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -249,6 +250,8 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
         llm_expert_priority priority,
         llm_expert_readiness readiness,
         llm_expert_request_metadata metadata) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.scheduler", "enqueue", "layer", key.layer, "original_expert_id", key.expert,
+        "layout_class_id", metadata.layout_class_id, "priority", uint32_t(priority));
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->counters.admission_closed) {
         return { llm_expert_schedule_disposition::closed, {} };
@@ -301,6 +304,9 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
                 request.readiness = readiness;
                 pimpl->counters.promotions++;
             }
+            LLM_EXPERT_TRACE_INSTANT("k3.scheduler", "single_flight_join", "flight_id",
+                llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight, slot, uint32_t(request.generation)),
+                "layer", key.layer, "original_expert_id", key.expert, "waiters", request.waiters);
             return { llm_expert_schedule_disposition::joined, { slot, request.generation } };
         }
     }
@@ -368,6 +374,13 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     if (speculative) pimpl->charge(request);
     pimpl->counters.flights_created++;
     pimpl->update_occupancy();
+    [[maybe_unused]] const uint64_t flight_id = llm_perfetto_trace_pair_id(
+        llm_perfetto_trace_domain::flight, slot, uint32_t(request.generation));
+    LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.scheduler", "flight", flight_id, "flight_id", flight_id,
+        "layer", key.layer, "original_expert_id", key.expert, "layout_class_id", metadata.layout_class_id,
+        "priority", uint32_t(priority), "queue_depth", pimpl->counters.queued_requests);
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "scheduler_active_requests", 1, pimpl->counters.active_requests);
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "scheduler_queue_depth", 2, pimpl->counters.queued_requests);
     pimpl->state_cv.notify_all();
     return { llm_expert_schedule_disposition::admitted, { slot, request.generation } };
 }
@@ -404,6 +417,12 @@ llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_sn
         request.promoted_from_speculative,
     };
     pimpl->update_occupancy();
+    [[maybe_unused]] const uint64_t flight_id = llm_perfetto_trace_pair_id(
+        llm_perfetto_trace_domain::flight, selected, uint32_t(request.generation));
+    LLM_EXPERT_TRACE_INSTANT("k3.scheduler", "dispatch", "flight_id", flight_id,
+        "layer", request.key.layer, "original_expert_id", request.key.expert,
+        "queue_depth", pimpl->counters.queued_requests);
+    LLM_EXPERT_TRACE_FLOW_BEGIN("k3.scheduler", "flight_dispatch", flight_id, "flight_id", flight_id);
     return { llm_expert_schedule_disposition::admitted, result.handle };
 }
 
@@ -423,6 +442,10 @@ llm_expert_schedule_disposition llm_expert_scheduler::transition(
     }
     request->state = next;
     pimpl->update_occupancy();
+    [[maybe_unused]] const uint64_t flight_id = llm_perfetto_trace_pair_id(
+        llm_perfetto_trace_domain::flight, handle.slot, uint32_t(handle.generation));
+    LLM_EXPERT_TRACE_INSTANT("k3.scheduler", "state_transition", "flight_id", flight_id,
+        "from_state", uint32_t(expected), "to_state", uint32_t(next));
     pimpl->state_cv.notify_all();
     return llm_expert_schedule_disposition::admitted;
 }
@@ -445,6 +468,9 @@ llm_expert_schedule_disposition llm_expert_scheduler::begin_speculative_cancella
     request->cancellation_demand_owned = false;
     request->state = llm_expert_request_state::cancelling;
     pimpl->update_occupancy();
+    LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "speculative_cancel", "flight_id",
+        llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight, handle.slot, uint32_t(handle.generation)),
+        "from_state", uint32_t(expected));
     pimpl->state_cv.notify_all();
     return llm_expert_schedule_disposition::admitted;
 }
@@ -466,6 +492,9 @@ llm_expert_schedule_disposition llm_expert_scheduler::begin_demand_cancellation(
     request->cancellation_demand_owned = true;
     request->state = llm_expert_request_state::cancelling;
     pimpl->update_occupancy();
+    LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "demand_cancel", "flight_id",
+        llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight, handle.slot, uint32_t(handle.generation)),
+        "from_state", uint32_t(expected));
     pimpl->state_cv.notify_all();
     return llm_expert_schedule_disposition::admitted;
 }
@@ -496,6 +525,11 @@ llm_expert_schedule_disposition llm_expert_scheduler::finish(
     if (terminal == llm_expert_request_state::failed) pimpl->counters.terminal_failed++;
     if (terminal == llm_expert_request_state::cancelled) pimpl->counters.terminal_cancelled++;
     pimpl->update_occupancy();
+    [[maybe_unused]] const uint64_t flight_id = llm_perfetto_trace_pair_id(
+        llm_perfetto_trace_domain::flight, handle.slot, uint32_t(handle.generation));
+    LLM_EXPERT_TRACE_FLOW_END("k3.scheduler", "flight_terminal", flight_id, "terminal_state", uint32_t(terminal));
+    LLM_EXPERT_TRACE_ASYNC_END("k3.scheduler", flight_id, "terminal_state", uint32_t(terminal));
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "scheduler_active_requests", 1, pimpl->counters.active_requests);
     pimpl->state_cv.notify_all();
     return llm_expert_schedule_disposition::admitted;
 }
@@ -593,6 +627,7 @@ llm_expert_schedule_disposition llm_expert_scheduler::cancel_queued_speculative(
 }
 
 bool llm_expert_scheduler::shutdown() noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "scheduler_shutdown");
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     pimpl->counters.admission_closed = true;
     for (const impl::request_record & request : pimpl->requests) {

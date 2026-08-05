@@ -1,4 +1,5 @@
 #include "llama-expert-weight-provider.h"
+#include "llama-perfetto-trace.h"
 #include "llama-cold-expert-cache.h"
 #include "llama-expert-storage.h"
 #include "llama-expert-async-io.h"
@@ -1932,6 +1933,7 @@ public:
     }
 
     ~llm_hot_cache_expert_weight_provider() override {
+        LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "provider_teardown");
         std::lock_guard<std::mutex> lock(mutex);
         finish_prediction_request_locked();
         const auto ring_surrendered = transfer_ring ? transfer_ring->surrender() :
@@ -2035,6 +2037,8 @@ public:
             const llm_expert_bundle_descriptor & bundle,
             const llm_expert_selection & selection,
             llm_expert_graph_binding & binding) noexcept {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "bind", "layer", bundle.layer,
+            "n_tokens", selection.n_tokens, "n_expert_used", selection.n_expert_used);
         std::lock_guard<std::mutex> lock(mutex);
         counters.bind_calls++;
         auto result = selection.validate();
@@ -2147,6 +2151,8 @@ public:
             llm_expert_execution_plan & plan,
             uint64_t sequence_owner,
             bool sequence_start) noexcept override {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "prepare", "binding_count", bindings.size(),
+            "sequence_start", sequence_start);
         plan.reset();
         try {
             plan.reserve(1);
@@ -2246,6 +2252,10 @@ public:
         request_ubatch_ordinal = 0;
         active_request_id = ++next_request_id;
         active_request = true;
+        [[maybe_unused]] const uint64_t trace_request_id = llm_perfetto_trace_id(
+            llm_perfetto_trace_domain::request, active_request_id);
+        LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.provider", "provider_request", trace_request_id,
+            "request_id", active_request_id, "graph_epoch", epoch, "binding_count", bindings.size());
         request_pin_count = 0;
         cpu_execution_pin_count = 0;
         current_token_next_layer = 0;
@@ -2305,6 +2315,8 @@ public:
             ggml_backend_t execution_backend,
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "remap_checkpoint_tensor", "layer", binding.layer,
+            "layout_class_id", binding.layout_class_id, "graph_epoch", binding.graph_epoch);
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
         if (deterministic_policy_terminals) ordered_lock.lock();
         std::unique_lock<std::mutex> lock(mutex);
@@ -2355,6 +2367,12 @@ public:
             bool (*abort_callback)(void *),
             void * abort_callback_data,
             std::unique_lock<std::mutex> * provider_lock) noexcept {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "acquire_and_remap", "request_id", active_request_id,
+            "layer", binding.layer, "layout_class_id", binding.layout_class_id,
+            "selected_key_count", logical_id_count);
+        LLM_EXPERT_TRACE_SCOPE("k3.graph", "expert_layer_execution", "request_id", active_request_id,
+            "layer", binding.layer, "selected_key_count", logical_id_count);
+        LLM_EXPERT_TRACE_CUDA_SCOPE(llm_perfetto_trace_id(llm_perfetto_trace_domain::request, active_request_id));
         if (!active_request || !pool || logical_ids == nullptr || execution_ids == nullptr ||
             binding.provider_identity != this || binding.bootstrap || binding.graph_epoch != epoch ||
             binding.generation_lease.get() != pool.get() || !binding_uses_current_pool(binding) ||
@@ -3051,6 +3069,9 @@ public:
                 }
                 const auto pinned = pin_slot_locked(uint32_t(unique_slots[index]));
                 if (!pinned.is_ready()) return fail(pinned);
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "hit", "request_id", active_request_id,
+                    "layer", unique_keys[index].layer, "original_expert_id", unique_keys[index].expert,
+                    "slot_id", uint32_t(unique_slots[index]), "generation", entry.generation);
                 hit_count++;
             }
         }
@@ -3085,6 +3106,9 @@ public:
                 if (!removed.is_ready()) return fail(removed);
                 entry.state = hot_slot_state::evicting;
                 clear_forward_locked(entry.key, slot, entry.generation);
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
                 evictions++;
                 if (config.cold_mode) no_writeback_evictions++;
             }
@@ -3102,6 +3126,10 @@ public:
                 slot, entry.generation, policy_key_for(entry.key),
                 payload_for_key(entry.key), hot_physical_slot_footprint_bytes));
             if (!loading.is_ready()) return fail(loading);
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "reserve", "request_id", active_request_id,
+                "layer", entry.key.layer, "original_expert_id", entry.key.expert,
+                "slot_id", slot, "generation", entry.generation,
+                "layout_class_id", entry.layout_class_id);
             unique_slots[unique_index] = int32_t(slot);
         }
 
@@ -3944,6 +3972,9 @@ public:
             if (!completed.is_ready()) return fail(completed);
             entry.state = hot_slot_state::ready;
             directory_forward[forward_index(entry.key)] = { int32_t(slot), entry.generation };
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "publish", "request_id", active_request_id,
+                "layer", entry.key.layer, "original_expert_id", entry.key.expert,
+                "slot_id", slot, "generation", entry.generation);
             admissions++;
             const auto pinned = pin_slot_locked(slot);
             if (!pinned.is_ready()) return fail(pinned);
@@ -4634,6 +4665,7 @@ public:
     }
 
     llm_expert_provider_result trim() noexcept override {
+        LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "provider_trim");
         std::lock_guard<std::mutex> lock(mutex);
         if (!pool) {
             counters.trims++;
@@ -4682,6 +4714,7 @@ public:
     }
 
     llm_expert_provider_result surrender() noexcept override {
+        LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "provider_surrender");
         std::lock_guard<std::mutex> lock(mutex);
         if (!pool) {
             return llm_expert_provider_result::success();
@@ -5451,6 +5484,7 @@ public:
 
 protected:
     void release_handle(uint64_t lease_id) noexcept override {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "release", "request_id", lease_id);
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
         if (deterministic_policy_terminals) ordered_lock.lock();
         std::lock_guard<std::mutex> lock(mutex);
@@ -5466,6 +5500,10 @@ protected:
                 last_remap_error == llm_expert_provider_error::none;
             const auto ended = end_policy_request_locked(success, cancelled);
             if (!ended.is_ready()) metadata_mismatches++;
+            [[maybe_unused]] const uint64_t trace_request_id = llm_perfetto_trace_id(
+                llm_perfetto_trace_domain::request, active_request_id);
+            LLM_EXPERT_TRACE_ASYNC_END("k3.provider", trace_request_id, "request_id", active_request_id,
+                "success", success, "cancelled", cancelled, "terminal_error", uint32_t(last_remap_error));
             active_request = false;
             active_request_id = 0;
             if (!success && phase10_sequence_active) {

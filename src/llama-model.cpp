@@ -14,6 +14,7 @@
 #include "llama-expert-async-io.h"
 #include "llama-expert-scheduler.h"
 #include "llama-model-loader.h"
+#include "llama-perfetto-trace.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1099,6 +1100,7 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    LLM_EXPERT_TRACE_SCOPE("k3.request", "model_create", "expert_weights_mode", uint32_t(params.expert_weights_mode));
     if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_DISABLED &&
         params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_RESIDENT &&
         params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE &&
@@ -1223,6 +1225,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 void llama_model::init_expert_weight_provider() {
+    LLM_EXPERT_TRACE_SCOPE("k3.provider", "provider_initialize", "expert_weights_mode", uint32_t(params.expert_weights_mode));
     if (params.expert_prefetch_config != nullptr) {
         const uint64_t scheduler_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
         const auto validated = llm_expert_prefetch_copy_config(
@@ -1468,6 +1471,7 @@ int routed_expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight
 } // namespace
 
 void llama_model::init_expert_storage(llama_model_loader & ml) {
+    LLM_EXPERT_TRACE_SCOPE("k3.storage", "storage_initialize", "expert_weights_mode", uint32_t(params.expert_weights_mode));
     if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
         params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) {
         return;
@@ -1647,6 +1651,7 @@ void llm_shutdown_expert_runtime(
         std::unique_ptr<llm_expert_scheduler> & scheduler,
         std::unique_ptr<llm_expert_weight_provider> & provider,
         std::unique_ptr<llm_expert_storage> & storage) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "expert_runtime_shutdown");
     // Contexts are required to be gone before model destruction. Keep the provider
     // and its cold destinations alive until every model-owned asynchronous read has
     // been cancelled, completed, and drained.
@@ -1663,6 +1668,7 @@ void llm_shutdown_expert_runtime(
 }
 
 llama_model::~llama_model() {
+    LLM_EXPERT_TRACE_SCOPE("k3.request", "model_teardown");
     llm_shutdown_expert_runtime(
         pimpl->expert_async_transport,
         pimpl->expert_scheduler,
@@ -3167,6 +3173,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+    LLM_EXPERT_TRACE_SCOPE("k3.graph", "graph_build", "n_tokens", params.ubatch.n_tokens);
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
     // add on pooling layer

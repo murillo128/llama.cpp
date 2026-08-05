@@ -1,4 +1,5 @@
 #include "llama-expert-transfer-ring.h"
+#include "llama-perfetto-trace.h"
 
 #include "ggml-cpp.h"
 
@@ -406,6 +407,11 @@ struct llm_expert_transfer_ring::impl {
                 completed.monitoring = false;
                 completed.event_complete = true;
                 completed.h2d_complete_us = completed_us;
+                [[maybe_unused]] const uint64_t trace_id = llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::transfer,
+                    selected, uint32_t(completed.generation), 0);
+                LLM_EXPERT_TRACE_ASYNC_END("k3.transfer", trace_id, "lane", selected,
+                    "event_generation", completed.generation, "hot_slot", completed.hot_slot,
+                    "hot_generation", completed.hot_generation);
                 counters.event_synchronizations++;
                 counters.h2d_event_synchronizations++;
                 if (counters.live_h2d_events > 0) counters.live_h2d_events--;
@@ -774,6 +780,9 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
         uint64_t hot_generation,
         llm_transfer_lane_reference & reference,
         llm_expert_flight_id flight) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.transfer", "lane_reserve", "cold_slot", cold.slot,
+        "cold_generation", cold.generation, "hot_slot", hot_slot, "hot_generation", hot_generation,
+        "flight_slot", flight.request_slot, "flight_generation", flight.request_generation);
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     if (!pimpl->arena) return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
     uint32_t index = 0;
@@ -820,12 +829,16 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
     lane.cold_cache = &cold_cache;
     reference = { index, lane.generation, lane.layout_class_id };
     pimpl->counters.lane_reservations++;
+    LLM_EXPERT_TRACE_INSTANT("k3.transfer", "lane_reserved", "lane", index,
+        "event_generation", lane.generation, "layout_class_id", lane.layout_class_id);
     return llm_expert_provider_result::success();
 }
 
 llm_expert_provider_result llm_expert_transfer_ring::stage(
         llm_transfer_lane_reference reference,
         const llm_expert_bundle_descriptor & cold_bundle) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.transfer", "stage", "lane", reference.lane,
+        "event_generation", reference.generation, "layout_class_id", reference.layout_class_id);
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     if (!pimpl->valid_lane(reference) || pimpl->lanes[reference.lane].state != llm_transfer_lane_state::staging) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
@@ -879,6 +892,7 @@ llm_expert_provider_result llm_expert_transfer_ring::stage(
 llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
         ggml_backend_t backend,
         const std::vector<llm_transfer_binding> & bindings) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.transfer", "h2d_wave", "lane_count", bindings.size());
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (bindings.empty() || !pimpl->arena || (pimpl->counters.pinned_or_registered_bytes > 0 && backend == nullptr)) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
@@ -948,6 +962,13 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
     }
     for (const auto & binding : bindings) {
         auto & lane = pimpl->lanes[binding.lane.lane];
+        [[maybe_unused]] const uint64_t trace_id = llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::transfer,
+            binding.lane.lane, uint32_t(binding.lane.generation), 0);
+        LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.transfer", "h2d", trace_id, "lane", binding.lane.lane,
+            "event_generation", binding.lane.generation, "hot_slot", binding.hot_slot,
+            "hot_generation", lane.hot_generation, "h2d_bytes", pimpl->payload_for(binding.lane.layout_class_id));
+        LLM_EXPERT_TRACE_CUDA_SCOPE(llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight,
+            lane.flight.request_slot, uint32_t(lane.flight.request_generation)));
         if (async) lane.state = llm_transfer_lane_state::in_flight;
         if (async) {
             lane.h2d_enqueue_us = uint64_t(start);
@@ -992,7 +1013,13 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
     pimpl->counters.h2d_bytes += bytes;
     pimpl->counters.h2d_time_us += ggml_time_us() - start;
     if (!async) {
-        for (const auto & binding : bindings) pimpl->release_lane(pimpl->lanes[binding.lane.lane]);
+        for (const auto & binding : bindings) {
+            [[maybe_unused]] const uint64_t trace_id = llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::transfer,
+                binding.lane.lane, uint32_t(binding.lane.generation), 0);
+            LLM_EXPERT_TRACE_ASYNC_END("k3.transfer", trace_id, "lane", binding.lane.lane,
+                "event_generation", binding.lane.generation, "synchronous", true);
+            pimpl->release_lane(pimpl->lanes[binding.lane.lane]);
+        }
     }
     return llm_expert_provider_result::success();
 }
@@ -1075,6 +1102,8 @@ llm_expert_provider_result llm_expert_transfer_ring::try_queue_background_transf
 
 llm_expert_provider_result llm_expert_transfer_ring::wait_background_h2d(
         llm_transfer_lane_reference reference) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.transfer", "background_h2d_wait", "lane", reference.lane,
+        "event_generation", reference.generation);
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     if (reference.lane >= pimpl->lanes.size() ||
             pimpl->lanes[reference.lane].generation != reference.generation) {
@@ -1124,6 +1153,8 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_for_hot(
         uint32_t hot_slot,
         uint64_t hot_generation,
         bool ordered_terminal) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.transfer", "event_wait", "hot_slot", hot_slot,
+        "hot_generation", hot_generation, "ordered_terminal", ordered_terminal);
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     bool conflicting_generation = false;
     for (auto & lane : pimpl->lanes) {
@@ -1284,6 +1315,8 @@ llm_expert_provider_result llm_expert_transfer_ring::poll_h2d(
 
 llm_expert_provider_result llm_expert_transfer_ring::release_terminal_background(
         llm_transfer_lane_reference reference) noexcept {
+    LLM_EXPERT_TRACE_INSTANT("k3.transfer", "lane_release", "lane", reference.lane,
+        "event_generation", reference.generation);
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (reference.lane >= pimpl->lanes.size() ||
         pimpl->lanes[reference.lane].generation != reference.generation) {
@@ -1436,6 +1469,7 @@ llm_expert_provider_result llm_expert_transfer_ring::cleanup_failed_lanes() noex
 }
 
 llm_expert_provider_result llm_expert_transfer_ring::surrender() noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "transfer_ring_surrender");
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     pimpl->background_stop = true;
     pimpl->condition.notify_all();

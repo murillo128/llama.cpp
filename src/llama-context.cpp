@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-perfetto-trace.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -98,6 +99,7 @@ llama_context::llama_context(
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    LLM_EXPERT_TRACE_SCOPE("k3.request", "context_create");
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -490,6 +492,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    LLM_EXPERT_TRACE_SCOPE("k3.request", "context_teardown");
     synchronize();
     if (expert_weight_provider) {
         const auto ended = expert_weight_provider->end_prefetch_sequence(
@@ -919,6 +922,7 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+    LLM_EXPERT_TRACE_SCOPE("k3.lifecycle", "context_synchronize");
     if (!sched) {
         if (expert_plans) {
             expert_plans->pending.reset();
@@ -1491,6 +1495,7 @@ int32_t llama_context::route_observer_begin(uint64_t request_ordinal, llama_rout
     route_observer_pending_request = request_ordinal;
     route_observer_pending_phase = phase;
     route_observer_annotation_pending = true;
+    LLM_EXPERT_TRACE_INSTANT("k3.request", "request_begin", "request_id", request_ordinal, "phase", uint32_t(phase));
     return LLAMA_ROUTE_OBSERVER_STATUS_OK;
 }
 
@@ -1529,6 +1534,8 @@ void llama_context::route_observer_end_submission() {
 }
 
 bool llama_context::route_observer_extract(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    LLM_EXPERT_TRACE_SCOPE("k3.route", "route_extract", "request_id", route_observer_request,
+        "token_index", route_observer_next_ubatch, "n_tokens", ubatch.n_tokens);
     if (route_observer_callback == nullptr || !route_observer_submission_active) {
         return true;
     }
@@ -1607,6 +1614,10 @@ bool llama_context::route_observer_extract(const llm_graph_result * res, const l
             route_observer_stats.failures++;
             return false;
         }
+
+        LLM_EXPERT_TRACE_INSTANT("k3.route", "route_publication", "request_id", route_observer_request,
+            "token_index", route_observer_next_ubatch, "layer", output.il,
+            "selected_key_count", count, "n_expert_used", output.selected_experts->ne[0]);
 
         route_observer_stats.layers++;
         route_observer_stats.copy_bytes += count*(sizeof(int32_t) + sizeof(float));
@@ -1845,6 +1856,8 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    LLM_EXPERT_TRACE_SCOPE("k3.request", "process_ubatch", "request_id", route_observer_request,
+        "token_index", route_observer_next_ubatch, "n_tokens", ubatch.n_tokens, "graph_type", uint32_t(gtype));
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2319,6 +2332,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    LLM_EXPERT_TRACE_SCOPE("k3.request", "decode", "n_tokens", batch_inp.n_tokens);
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -3161,6 +3175,10 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    [[maybe_unused]] const uint64_t trace_graph_id = llm_perfetto_trace_is_active() ?
+        llm_perfetto_trace_next_id(llm_perfetto_trace_domain::graph) : 0;
+    LLM_EXPERT_TRACE_SCOPE("k3.graph", "graph_compute", "graph_id", trace_graph_id, "batched", batched);
+    LLM_EXPERT_TRACE_CUDA_SCOPE(trace_graph_id);
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 

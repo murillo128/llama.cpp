@@ -1,4 +1,5 @@
 #include "llama-expert-prefetch.h"
+#include "llama-perfetto-trace.h"
 
 #include <nlohmann/json.hpp>
 
@@ -831,6 +832,7 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::initialize(
 }
 
 llm_expert_prefetch_result llm_expert_prefetch_predictor::request_begin(uint64_t request_ordinal) noexcept {
+    LLM_EXPERT_TRACE_INSTANT("k3.provider", "prefetch_request_begin", "request_id", request_ordinal);
     if (profile == nullptr || request_ordinal == 0) {
         return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_configuration);
     }
@@ -849,6 +851,8 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::request_begin(uint64_t
 llm_expert_prefetch_result llm_expert_prefetch_predictor::commit_token(
         uint64_t token_ordinal,
         const std::vector<std::vector<int32_t>> & routed_experts) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.route", "prefetch_commit_token", "request_id", request.request_ordinal,
+        "token_index", token_ordinal, "routed_layer_count", routed_experts.size());
     if (profile == nullptr || request.request_ordinal == 0 || token_ordinal != request.completed_tokens ||
         routed_experts.size() != profile->target.routed_layers.size()) {
         return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_profile);
@@ -893,6 +897,8 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_token_end(
         uint64_t token_ordinal,
         int32_t target_layer,
         std::vector<llm_expert_prefetch_candidate> & candidates) const noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.provider", "prefetch_predict_token_end", "request_id", request.request_ordinal,
+        "token_index", token_ordinal, "target_layer", target_layer);
     candidates.clear();
     if (profile == nullptr || request.request_ordinal == 0 || request.completed_tokens == 0 ||
         token_ordinal + 1 != request.completed_tokens) {
@@ -964,6 +970,8 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_token_end(
         }
         if (candidates.size() > config.value.candidates_per_target) candidates.resize(config.value.candidates_per_target);
         for (uint32_t rank = 0; rank < candidates.size(); ++rank) candidates[rank].rank = rank;
+        LLM_EXPERT_TRACE_INSTANT("k3.provider", "prefetch_candidates_ready", "request_id", request.request_ordinal,
+            "token_index", token_ordinal, "target_layer", target_layer, "candidate_count", candidates.size());
         return llm_expert_prefetch_result::success();
     } catch (...) {
         candidates.clear();
@@ -978,6 +986,9 @@ llm_expert_prefetch_result llm_expert_prefetch_predictor::predict_cross_layer(
         size_t source_count,
         int32_t target_layer,
         std::vector<llm_expert_prefetch_candidate> & candidates) const noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.provider", "prefetch_predict_cross_layer", "request_id", request.request_ordinal,
+        "token_index", token_ordinal, "source_layer", source_layer, "target_layer", target_layer,
+        "source_count", source_count);
     candidates.clear();
     if (profile == nullptr || config.value.policy != LLAMA_EXPERT_PREFETCH_POLICY_CROSS_LAYER_TRANSITION ||
         request.request_ordinal == 0 || token_ordinal != request.completed_tokens || source_experts == nullptr ||
