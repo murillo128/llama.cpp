@@ -25,6 +25,7 @@ class llm_expert_storage;
 struct llm_expert_prefetch_fingerprint;
 struct llm_expert_storage_diagnostics;
 struct llm_expert_async_diagnostics;
+struct llm_expert_async_read_interval;
 struct llm_expert_scheduler_diagnostics;
 
 struct llm_deferred_expert_diagnostics {
@@ -715,6 +716,7 @@ struct llama_model {
     void init_expert_storage(llama_model_loader & ml);
     llm_expert_storage * expert_storage() const;
     llm_expert_async_diagnostics expert_async_diagnostics() const;
+    std::vector<llm_expert_async_read_interval> expert_async_read_intervals() const;
     llm_expert_scheduler_diagnostics expert_scheduler_diagnostics() const;
     llm_deferred_expert_diagnostics deferred_expert_diagnostics() const;
     llm_expert_weight_provider * expert_weight_provider() const;

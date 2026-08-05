@@ -41,6 +41,7 @@ struct llm_expert_async_config {
     uint32_t hide_cqes_after_cancel_polls_for_testing = 0;
     uint32_t delay_cq_drain_ms_for_testing = 0;
     bool reverse_queued_requests_for_testing = false;
+    bool force_positional_reads = false;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {
@@ -134,6 +135,9 @@ struct llm_expert_async_diagnostics {
     uint64_t read_requests_cancelled = 0;
     uint64_t read_operations_completed = 0;
     uint64_t read_bytes_completed = 0;
+    uint64_t read_queue_wait_samples = 0;
+    uint64_t read_queue_wait_us = 0;
+    uint64_t read_queue_wait_max_us = 0;
     uint64_t synchronous_fallback_operations = 0;
     uint64_t interrupted_reads_retried = 0;
     uint64_t would_block_reads_retried = 0;
@@ -165,6 +169,7 @@ struct llm_expert_async_diagnostics {
     uint32_t peak_active_read_requests = 0;
     bool linux_uapi = false;
     bool io_uring_enabled = false;
+    bool positional_reads_forced = false;
     int io_uring_setup_error = 0;
     int io_uring_probe_error = 0;
     int io_uring_runtime_error = 0;
@@ -196,6 +201,8 @@ struct llm_expert_async_read_interval {
 
     llm_expert_flight_id flight;
     uint32_t operation_index = 0;
+    uint64_t queued_us = 0;
+    uint64_t started_us = 0;
     uint64_t submit_us = 0;
     uint64_t complete_us = 0;
     uint64_t bytes = 0;

@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "llama-context.h"
 #include "llama-expert-storage.h"
+#include "llama-expert-async-io.h"
 #include "llama-expert-weight-provider.h"
 #include "llama-model.h"
 #include "llama-cpp.h"
@@ -37,6 +38,7 @@ struct arguments {
     uint32_t hot_slots = 16;
     uint64_t cold_bytes = 64U*1024U*1024U;
     uint64_t ring_bytes = 16U*1024U*1024U;
+    uint32_t queue_depth = 0;
     uint32_t ratio = 7500;
     uint32_t window = 1024;
     uint32_t aging = 1024;
@@ -82,6 +84,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--hot-slots") { if (!parse_u32(value, result.hot_slots)) return false; }
         else if (option == "--cold-bytes") { if (!parse_u64(value, result.cold_bytes)) return false; }
         else if (option == "--ring-bytes") { if (!parse_u64(value, result.ring_bytes)) return false; }
+        else if (option == "--queue-depth") { if (!parse_u32(value, result.queue_depth)) return false; }
         else if (option == "--ratio") { if (!parse_u32(value, result.ratio)) return false; }
         else if (option == "--window") { if (!parse_u32(value, result.window)) return false; }
         else if (option == "--aging") { if (!parse_u32(value, result.aging)) return false; }
@@ -99,7 +102,8 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
             result.observe_routes = std::string(value) == "1";
         } else if (option == "--transport") {
             result.transport = value;
-            if (result.transport != "BUFFERED" && result.transport != "DIRECT_IO") return false;
+            if (result.transport != "POSITIONAL" && result.transport != "BUFFERED" &&
+                result.transport != "DIRECT_IO") return false;
         } else if (option == "--config-source") {
             result.config_source = value;
             if (result.config_source != "EXPLICIT" && result.config_source != "NULL") return false;
@@ -285,6 +289,86 @@ json diagnostics_json(const llm_expert_cache_policy_diagnostics & value) {
     };
 }
 
+json async_diagnostics_json(const llm_expert_async_diagnostics & value) {
+    return {
+        {"requested_sq_entries", value.requested_sq_entries}, {"requested_cq_entries", value.requested_cq_entries},
+        {"actual_sq_entries", value.actual_sq_entries}, {"actual_cq_entries", value.actual_cq_entries},
+        {"operation_capacity", value.operation_capacity}, {"trace_capacity", value.trace_capacity},
+        {"active_operations", value.active_operations}, {"peak_active_operations", value.peak_active_operations},
+        {"staging_ceiling_bytes", value.staging_ceiling_bytes},
+        {"administration_bytes", value.administration_bytes}, {"transport_epoch", value.transport_epoch},
+        {"fallback_reason_mask", value.fallback_reason_mask},
+        {"fallback_diagnostics_emitted", value.fallback_diagnostics_emitted},
+        {"operations_reserved", value.operations_reserved}, {"completions_consumed", value.completions_consumed},
+        {"stale_completions", value.stale_completions}, {"trace_records", value.trace_records},
+        {"trace_records_dropped", value.trace_records_dropped},
+        {"read_requests_submitted", value.read_requests_submitted},
+        {"read_requests_completed", value.read_requests_completed},
+        {"read_requests_cancelled", value.read_requests_cancelled},
+        {"read_operations_completed", value.read_operations_completed},
+        {"read_bytes_completed", value.read_bytes_completed},
+        {"read_queue_wait_samples", value.read_queue_wait_samples},
+        {"read_queue_wait_us", value.read_queue_wait_us},
+        {"read_queue_wait_max_us", value.read_queue_wait_max_us},
+        {"synchronous_fallback_operations", value.synchronous_fallback_operations},
+        {"interrupted_reads_retried", value.interrupted_reads_retried},
+        {"would_block_reads_retried", value.would_block_reads_retried},
+        {"short_positive_reads", value.short_positive_reads},
+        {"direct_read_operations", value.direct_read_operations}, {"direct_useful_bytes", value.direct_useful_bytes},
+        {"direct_aligned_bytes", value.direct_aligned_bytes}, {"direct_scatter_bytes", value.direct_scatter_bytes},
+        {"buffered_fallback_operations", value.buffered_fallback_operations},
+        {"buffered_fallback_bytes", value.buffered_fallback_bytes},
+        {"direct_capability_retries", value.direct_capability_retries},
+        {"ring_submissions", value.ring_submissions}, {"ring_completions", value.ring_completions},
+        {"peak_sq_occupancy", value.peak_sq_occupancy}, {"peak_cq_occupancy", value.peak_cq_occupancy},
+        {"ring_cancel_submissions", value.ring_cancel_submissions},
+        {"ring_cancel_completions", value.ring_cancel_completions},
+        {"ring_request_batches", value.ring_request_batches},
+        {"peak_ring_batch_requests", value.peak_ring_batch_requests},
+        {"cq_empty_waits", value.cq_empty_waits}, {"cq_empty_waits_after_cancel", value.cq_empty_waits_after_cancel},
+        {"registered_file_count", value.registered_file_count}, {"file_registration_error", value.file_registration_error},
+        {"registered_buffer_count", value.registered_buffer_count},
+        {"registered_buffer_bytes", value.registered_buffer_bytes},
+        {"buffer_registration_error", value.buffer_registration_error},
+        {"direct_staging_error", value.direct_staging_error},
+        {"active_read_requests", value.active_read_requests},
+        {"peak_active_read_requests", value.peak_active_read_requests},
+        {"linux_uapi", value.linux_uapi}, {"io_uring_enabled", value.io_uring_enabled},
+        {"positional_reads_forced", value.positional_reads_forced},
+        {"io_uring_setup_error", value.io_uring_setup_error}, {"io_uring_probe_error", value.io_uring_probe_error},
+        {"io_uring_runtime_error", value.io_uring_runtime_error}, {"opcode_read", value.opcode_read},
+        {"opcode_readv", value.opcode_readv}, {"opcode_async_cancel", value.opcode_async_cancel},
+        {"opcode_read_fixed", value.opcode_read_fixed}, {"worker_started", value.worker_started},
+        {"admission_closed", value.admission_closed},
+    };
+}
+
+json async_read_intervals_json(const std::vector<llm_expert_async_read_interval> & intervals) {
+    json result = json::array();
+    for (const auto & interval : intervals) {
+        json segments = json::array();
+        for (uint32_t index = 0; index < interval.source_segment_count; ++index) {
+            segments.push_back({
+                {"file_offset", interval.source_segments[index].file_offset},
+                {"byte_count", interval.source_segments[index].byte_count},
+            });
+        }
+        result.push_back({
+            {"transport_epoch", interval.flight.transport_epoch},
+            {"request_slot", interval.flight.request_slot},
+            {"request_generation", interval.flight.request_generation},
+            {"layer", interval.flight.key.layer}, {"expert", interval.flight.key.expert},
+            {"layout_class_id", interval.flight.layout_class_id},
+            {"operation_index", interval.operation_index}, {"queued_us", interval.queued_us},
+            {"started_us", interval.started_us}, {"submit_us", interval.submit_us},
+            {"complete_us", interval.complete_us}, {"bytes", interval.bytes},
+            {"useful_bytes", interval.useful_bytes},
+            {"operation_file_offset", interval.operation_file_offset}, {"source_segments", segments},
+        });
+    }
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -316,6 +400,8 @@ int main(int argc, char ** argv) {
         };
         auto model_params = llama_model_default_params();
         model_params.load_mode = args.transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
+        model_params.expert_io_queue_depth = args.queue_depth;
+        model_params.expert_io_force_positional_reads = args.transport == "POSITIONAL";
         model_params.n_gpu_layers = -1;
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_weights_mode = args.mode == "disabled" ? LLAMA_EXPERT_WEIGHTS_MODE_DISABLED :
@@ -504,6 +590,8 @@ int main(int argc, char ** argv) {
         }
         const auto diagnostics = provider->hot_cache_diagnostics();
         const auto storage_diagnostics = model->expert_storage()->diagnostics();
+        const auto async_diagnostics = model->expert_async_diagnostics();
+        const auto async_read_intervals = model->expert_async_read_intervals();
         if (diagnostics.policy.transcript_dropped != 0 || diagnostics.cold_policy.transcript_dropped != 0) {
             std::fprintf(stderr, "phase9-cache-policy-probe: policy transcript dropped events\n");
             return 11;
@@ -583,6 +671,11 @@ int main(int argc, char ** argv) {
                 {"ring_lane_footprint", diagnostics.ring_lane_footprint},
                 {"ring_unused_budget_bytes", diagnostics.ring_requested_bytes - diagnostics.ring_actual_bytes},
                 {"ring_pinned_or_registered_bytes", diagnostics.ring_pinned_or_registered_bytes},
+                {"io_queue_depth_requested", args.queue_depth},
+            }},
+            {"async_io", {
+                {"diagnostics", async_diagnostics_json(async_diagnostics)},
+                {"read_intervals", async_read_intervals_json(async_read_intervals)},
             }},
             {"cold_residency", {
                 {"supported", diagnostics.cold_residency_supported},

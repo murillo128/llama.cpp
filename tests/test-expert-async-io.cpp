@@ -155,6 +155,14 @@ void test_configuration() {
     GGML_ASSERT(undersized_transport.diagnostics().direct_staging_error == ENOBUFS);
     GGML_ASSERT((undersized_transport.diagnostics().fallback_reason_mask &
         fallback_bit(llm_expert_async_fallback_reason::direct_staging)) != 0);
+
+    auto positional = config(8);
+    positional.force_positional_reads = true;
+    llm_expert_async_transport positional_transport(positional);
+    const auto positional_diagnostics = positional_transport.diagnostics();
+    GGML_ASSERT(positional_diagnostics.positional_reads_forced);
+    GGML_ASSERT(!positional_diagnostics.io_uring_enabled);
+    GGML_ASSERT(positional_diagnostics.fallback_reason_mask == 0);
 }
 
 void test_ring_layout_validation() {
@@ -304,6 +312,9 @@ void test_worker_read_and_drain() {
             intervals[index].flight.key.expert == identity.key.expert);
         GGML_ASSERT(intervals[index].flight.layout_class_id == identity.layout_class_id);
         GGML_ASSERT(intervals[index].operation_index == index);
+        GGML_ASSERT(intervals[index].queued_us != 0);
+        GGML_ASSERT(intervals[index].started_us >= intervals[index].queued_us);
+        GGML_ASSERT(intervals[index].submit_us >= intervals[index].started_us);
         GGML_ASSERT(intervals[index].complete_us >= intervals[index].submit_us);
         GGML_ASSERT(intervals[index].bytes == read.byte_count);
     }
@@ -311,6 +322,8 @@ void test_worker_read_and_drain() {
     GGML_ASSERT(diagnostics.read_requests_submitted == 1 && diagnostics.read_requests_completed == 1);
     GGML_ASSERT(diagnostics.read_operations_completed == 1);
     GGML_ASSERT(diagnostics.read_bytes_completed == first.size() + second.size());
+    GGML_ASSERT(diagnostics.read_queue_wait_samples == 1);
+    GGML_ASSERT(diagnostics.read_queue_wait_max_us <= diagnostics.read_queue_wait_us);
     GGML_ASSERT(diagnostics.active_read_requests == 0);
     GGML_ASSERT(std::fclose(file) == 0);
 #endif

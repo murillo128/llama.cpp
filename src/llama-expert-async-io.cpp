@@ -311,6 +311,8 @@ struct llm_expert_async_transport::impl {
         read_state state = read_state::free;
         bool cancel_requested = false;
         uint32_t operations_remaining = 0;
+        uint64_t queued_us = 0;
+        uint64_t started_us = 0;
         llm_expert_async_read_completion completion;
     };
 
@@ -363,6 +365,17 @@ struct llm_expert_async_transport::impl {
         if (!handle.valid() || handle.slot >= read_requests.size()) return nullptr;
         auto & request = read_requests[handle.slot];
         return request.state != read_state::free && request.handle.generation == handle.generation ? &request : nullptr;
+    }
+
+    void mark_request_running_locked(read_request_record & request) {
+        request.state = read_state::running;
+        request.started_us = uint64_t(ggml_time_us());
+        if (request.queued_us != 0 && request.started_us >= request.queued_us) {
+            const uint64_t wait_us = request.started_us - request.queued_us;
+            counters.read_queue_wait_samples++;
+            counters.read_queue_wait_us += wait_us;
+            counters.read_queue_wait_max_us = std::max(counters.read_queue_wait_max_us, wait_us);
+        }
     }
 
     bool direct_is_disabled(intptr_t handle) const {
@@ -456,6 +469,8 @@ struct llm_expert_async_transport::impl {
                     operation.identity.request.generation, operation.identity.key,
                     operation.identity.layout_class_id };
                 trace.read.operation_index = operation.identity.request_operation_index;
+                trace.read.queued_us = request.queued_us;
+                trace.read.started_us = request.started_us;
                 trace.read.submit_us = operation.submit_us;
                 trace.read.complete_us = operation.complete_us;
                 trace.read.bytes = operation.completed_bytes;
@@ -1042,7 +1057,7 @@ struct llm_expert_async_transport::impl {
                 size_t handle_count = 0;
                 for (auto & queued : read_requests) {
                     if (queued.state != read_state::queued) continue;
-                    queued.state = read_state::running;
+                    mark_request_running_locked(queued);
                     group_handles[handle_count++] = queued.handle;
                 }
                 if (handle_count != 0) {
@@ -1070,7 +1085,7 @@ struct llm_expert_async_transport::impl {
                 continue;
             }
             auto & request = read_requests[selected];
-            request.state = read_state::running;
+            mark_request_running_locked(request);
             const auto handle = request.handle;
             lock.unlock();
 
@@ -1373,6 +1388,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     pimpl->counters.operation_capacity = cq_entries;
     pimpl->counters.trace_capacity = config.trace_capacity;
     pimpl->counters.staging_ceiling_bytes = staging_ceiling;
+    pimpl->counters.positional_reads_forced = config.force_positional_reads;
     if (config.direct_io_requested && config.maximum_direct_alignment != 0 && staging_ceiling == 0) {
         pimpl->counters.direct_staging_error = ENOBUFS;
     }
@@ -1416,7 +1432,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     static_assert(sizeof(io_uring_cqe) == 16, "unexpected io_uring CQE size");
     pimpl->counters.linux_uapi = true;
     int ring_error = 0;
-    if (pimpl->ring.open_ring(sq_entries, ring_error)) {
+    if (!config.force_positional_reads && pimpl->ring.open_ring(sq_entries, ring_error)) {
         pimpl->counters.actual_sq_entries = pimpl->ring.actual_sq_entries();
         pimpl->counters.actual_cq_entries = pimpl->ring.actual_cq_entries();
         int probe_error = 0;
@@ -1466,7 +1482,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
             pimpl->record_fallback(llm_expert_async_fallback_reason::buffer_registration,
                 EOPNOTSUPP, "buffer-registration");
         }
-    } else {
+    } else if (!config.force_positional_reads) {
         pimpl->counters.io_uring_setup_error = ring_error;
         pimpl->record_fallback(llm_expert_async_fallback_reason::ring_setup,
             ring_error, "ring-setup");
@@ -1706,6 +1722,8 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
     request.state = impl::read_state::queued;
     request.cancel_requested = false;
     request.operations_remaining = uint32_t(read_count);
+    request.queued_us = uint64_t(ggml_time_us());
+    request.started_us = 0;
     request.completion = {};
     request.completion.result = llm_expert_async_result::ready;
     request.completion.request = identity.request;
@@ -1857,6 +1875,8 @@ llm_expert_async_result llm_expert_async_transport::release_read(llm_expert_requ
     request->ordinal = 0;
     request->cancel_requested = false;
     request->operations_remaining = 0;
+    request->queued_us = 0;
+    request->started_us = 0;
     pimpl->counters.active_read_requests--;
     return llm_expert_async_result::ready;
 }

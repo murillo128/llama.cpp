@@ -1589,6 +1589,13 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         0,
         0,
         uint32_t(storage_diagnostics.source_file_count),
+        false,
+        false,
+        0,
+        0,
+        0,
+        false,
+        params.expert_io_force_positional_reads,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;
@@ -1606,6 +1613,10 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
 llm_expert_storage * llama_model::expert_storage() const { return pimpl->expert_storage.get(); }
 llm_expert_async_diagnostics llama_model::expert_async_diagnostics() const {
     return pimpl->expert_async_transport ? pimpl->expert_async_transport->diagnostics() : llm_expert_async_diagnostics{};
+}
+std::vector<llm_expert_async_read_interval> llama_model::expert_async_read_intervals() const {
+    return pimpl->expert_async_transport ? pimpl->expert_async_transport->completed_read_intervals() :
+        std::vector<llm_expert_async_read_interval>{};
 }
 llm_expert_scheduler_diagnostics llama_model::expert_scheduler_diagnostics() const {
     return pimpl->expert_scheduler ? pimpl->expert_scheduler->diagnostics() : llm_expert_scheduler_diagnostics{};
@@ -3188,6 +3199,7 @@ llama_model_params llama_model_default_params() {
         /*.expert_transfer_ring_bytes  =*/ 0,
         /*.expert_io_queue_depth       =*/ 0,
         /*.expert_io_staging_bytes     =*/ 0,
+        /*.expert_io_force_positional_reads =*/ false,
         /*.expert_miss_policy          =*/ LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU,
         /*.expert_background_promotion =*/ false,
         /*.expert_auto_cost_model      =*/ nullptr,
