@@ -27,6 +27,7 @@ struct llm_expert_storage_destination {
     llm_expert_storage_sidecar sidecar = llm_expert_storage_sidecar::weight;
     void * data = nullptr;
     uint64_t extent = 0;
+    llm_expert_layout_class_id layout_class_id = 0;
 };
 
 struct llm_expert_storage_read_segment {
@@ -35,6 +36,7 @@ struct llm_expert_storage_read_segment {
     uint64_t file_offset = 0;
     llm_expert_storage_projection projection = llm_expert_storage_projection::up;
     llm_expert_storage_sidecar sidecar = llm_expert_storage_sidecar::weight;
+    llm_expert_layout_class_id layout_class_id = 0;
 };
 
 struct llm_expert_storage_read_operation {
@@ -47,6 +49,7 @@ struct llm_expert_storage_read_operation {
     uint64_t byte_count = 0;
     uint8_t segment_count = 0;
     std::array<llm_expert_storage_read_segment, 12> segments;
+    llm_expert_layout_class_id layout_class_id = 0;
 };
 
 struct llm_expert_storage_source {

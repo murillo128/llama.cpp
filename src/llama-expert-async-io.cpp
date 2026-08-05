@@ -453,7 +453,8 @@ struct llm_expert_async_transport::impl {
                 trace.sequence = counters.trace_records;
                 trace.read = {};
                 trace.read.flight = { operation.identity.transport_epoch, operation.identity.request.slot,
-                    operation.identity.request.generation, operation.identity.key };
+                    operation.identity.request.generation, operation.identity.key,
+                    operation.identity.layout_class_id };
                 trace.read.operation_index = operation.identity.request_operation_index;
                 trace.read.submit_us = operation.submit_us;
                 trace.read.complete_us = operation.complete_us;
@@ -1594,7 +1595,8 @@ llm_expert_async_operation llm_expert_async_transport::reserve_operation(
         return { llm_expert_async_result::closed, 0 };
     }
     if (!identity.request.valid() || identity.transport_epoch != pimpl->counters.transport_epoch ||
-        !identity.key.is_valid(std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max())) {
+        !identity.key.is_valid(std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max()) ||
+        identity.layout_class_id >= LLM_EXPERT_LAYOUT_CLASS_MAX) {
         return { llm_expert_async_result::invalid, 0 };
     }
     for (uint32_t slot = 0; slot < pimpl->operations.size(); ++slot) {
@@ -1658,7 +1660,14 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
     if (pimpl->counters.admission_closed) return llm_expert_async_result::closed;
     if (!identity.request.valid() || identity.request.slot >= pimpl->read_requests.size() ||
         identity.transport_epoch != pimpl->counters.transport_epoch || reads == nullptr || read_count == 0 ||
-        read_count > pimpl->operations.size()) return llm_expert_async_result::invalid;
+        read_count > pimpl->operations.size() || identity.layout_class_id >= LLM_EXPERT_LAYOUT_CLASS_MAX) {
+        return llm_expert_async_result::invalid;
+    }
+    for (size_t index = 0; index < read_count; ++index) {
+        if (reads[index].layout_class_id != identity.layout_class_id) {
+            return llm_expert_async_result::invalid;
+        }
+    }
     auto & request = pimpl->read_requests[identity.request.slot];
     if (request.state != impl::read_state::free) return llm_expert_async_result::busy;
     size_t inactive_operations = 0;

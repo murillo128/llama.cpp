@@ -298,7 +298,8 @@ uint32_t llm_expert_cache_policy::key_domain(llm_expert_cache_policy_key key) co
 bool llm_expert_cache_policy::key_matches(
         llm_expert_cache_policy_key lhs,
         llm_expert_cache_policy_key rhs) const noexcept {
-    return lhs.layer == rhs.layer && lhs.expert == rhs.expert;
+    return lhs.layer == rhs.layer && lhs.expert == rhs.expert &&
+        lhs.layout_class_id == rhs.layout_class_id;
 }
 
 llm_expert_cache_policy_result llm_expert_cache_policy::append_event(
@@ -1143,6 +1144,7 @@ uint64_t llm_expert_cache_policy::hash_state() const noexcept {
     for (const auto & slot : slots) {
         hash_append(hash, uint32_t(slot.key.layer));
         hash_append(hash, uint32_t(slot.key.expert));
+        if (slot.key.layout_class_id != 0) hash_append(hash, slot.key.layout_class_id);
         hash_append(hash, slot.generation);
         hash_append(hash, slot.last_touch_sequence);
         hash_append(hash, slot.last_touch_demand);

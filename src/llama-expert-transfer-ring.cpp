@@ -11,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 
@@ -47,6 +48,14 @@ bool round_up(uint64_t value, uint64_t alignment, uint64_t & result) {
     return remainder == 0 ? (result = value, true) : checked_add(value, alignment - remainder, result);
 }
 
+bool checked_lcm_size(size_t lhs, size_t rhs, size_t & result) {
+    if (lhs == 0 || rhs == 0) return false;
+    const size_t reduced = lhs/std::gcd(lhs, rhs);
+    if (reduced > SIZE_MAX/rhs) return false;
+    result = reduced*rhs;
+    return true;
+}
+
 bool device_is_cuda(ggml_backend_dev_t device) {
     if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) return false;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
@@ -56,7 +65,7 @@ bool device_is_cuda(ggml_backend_dev_t device) {
 bool same_flight(const llm_expert_flight_id & lhs, const llm_expert_flight_id & rhs) {
     return lhs.transport_epoch == rhs.transport_epoch && lhs.request_slot == rhs.request_slot &&
         lhs.request_generation == rhs.request_generation && lhs.key.layer == rhs.key.layer &&
-        lhs.key.expert == rhs.key.expert;
+        lhs.key.expert == rhs.key.expert && lhs.layout_class_id == rhs.layout_class_id;
 }
 
 uint64_t interval_union_intersection_us(
@@ -141,6 +150,60 @@ bool derive_layout(
     return !spans.empty() && round_up(footprint, alignment, footprint);
 }
 
+bool derive_registry_layout(
+        const llm_expert_layout_registry & registry,
+        size_t alignment,
+        std::vector<std::vector<span_layout>> & spans_by_class,
+        std::vector<uint64_t> & payloads,
+        uint64_t & footprint) {
+    if (!registry.sealed() || registry.classes.size() > LLM_EXPERT_LAYOUT_CLASS_MAX) return false;
+    std::array<uint64_t, 12> maximum_bytes = {};
+    std::array<uint64_t, 12> offsets = {};
+    size_t lane_alignment = alignment;
+    payloads.assign(registry.classes.size(), 0);
+    spans_by_class.assign(registry.classes.size(), {});
+    for (size_t class_index = 0; class_index < registry.classes.size(); ++class_index) {
+        const auto & layout_class = registry.classes[class_index];
+        if (layout_class.id != class_index || !layout_class.prototype.validate().is_ready()) return false;
+        for (uint8_t projection = 0; projection < 4; ++projection) {
+            for (uint8_t member_index = 0; member_index < 3; ++member_index) {
+                const auto * tensor = member(layout_class.prototype, projection, member_index);
+                if (tensor == nullptr) continue;
+                const int axis = expert_axis(tensor, layout_class.prototype.n_expert, member_index == 0);
+                const size_t role = size_t(projection)*3 + member_index;
+                if (axis < 0 || tensor->nb[axis] > SIZE_MAX ||
+                    !checked_add(payloads[class_index], tensor->nb[axis], payloads[class_index])) return false;
+                maximum_bytes[role] = std::max<uint64_t>(maximum_bytes[role], tensor->nb[axis]);
+                if (!checked_lcm_size(lane_alignment, ggml_type_size(tensor->type), lane_alignment)) return false;
+            }
+        }
+        if (payloads[class_index] == 0 || payloads[class_index] != layout_class.payload_bytes) return false;
+    }
+    footprint = 0;
+    for (size_t role = 0; role < maximum_bytes.size(); ++role) {
+        if (maximum_bytes[role] == 0) continue;
+        uint64_t aligned = 0;
+        if (!round_up(footprint, lane_alignment, aligned) || aligned > SIZE_MAX ||
+            !checked_add(aligned, maximum_bytes[role], footprint)) return false;
+        offsets[role] = aligned;
+    }
+    if (footprint == 0 || !round_up(footprint, lane_alignment, footprint)) return false;
+    for (size_t class_index = 0; class_index < registry.classes.size(); ++class_index) {
+        const auto & prototype = registry.classes[class_index].prototype;
+        for (uint8_t projection = 0; projection < 4; ++projection) {
+            for (uint8_t member_index = 0; member_index < 3; ++member_index) {
+                const auto * tensor = member(prototype, projection, member_index);
+                if (tensor == nullptr) continue;
+                const int axis = expert_axis(tensor, prototype.n_expert, member_index == 0);
+                const size_t role = size_t(projection)*3 + member_index;
+                spans_by_class[class_index].push_back(
+                    { projection, member_index, size_t(offsets[role]), tensor->nb[axis] });
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 struct llm_expert_transfer_ring::impl {
@@ -163,6 +226,7 @@ struct llm_expert_transfer_ring::impl {
         llm_expert_bundle_descriptor background_cold;
         llm_expert_bundle_descriptor background_destination;
         uint64_t failed_generation = 0;
+        llm_expert_layout_class_id failed_layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
         uint32_t failed_hot_slot = UINT32_MAX;
         uint64_t failed_hot_generation = 0;
         uint64_t h2d_enqueue_us = 0;
@@ -183,8 +247,17 @@ struct llm_expert_transfer_ring::impl {
 
     bool valid_lane(llm_transfer_lane_reference reference) const {
         return reference.lane < lanes.size() && lanes[reference.lane].generation == reference.generation &&
+            lanes[reference.lane].layout_class_id == reference.layout_class_id &&
             (lanes[reference.lane].state == llm_transfer_lane_state::staging ||
              lanes[reference.lane].state == llm_transfer_lane_state::in_flight);
+    }
+
+    const std::vector<span_layout> * spans_for(llm_expert_layout_class_id class_id) const {
+        return class_id < spans_by_class.size() ? &spans_by_class[class_id] : nullptr;
+    }
+
+    uint64_t payload_for(llm_expert_layout_class_id class_id) const {
+        return class_id < payloads.size() ? payloads[class_id] : 0;
     }
 
     void release_lane(lane_state & lane) {
@@ -194,6 +267,7 @@ struct llm_expert_transfer_ring::impl {
         }
         lane.cold_cache = nullptr;
         lane.cold = {};
+        lane.layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
         lane.hot_slot = 0;
         lane.hot_generation = 0;
         lane.flight = {};
@@ -243,9 +317,9 @@ struct llm_expert_transfer_ring::impl {
         if (traces.size() != 0) {
             if (counters.trace_records < traces.size()) {
                 traces[counters.trace_records++] = { lane.flight, lane.cold,
-                    { uint32_t(&lane - lanes.data()), lane.generation }, lane.hot_slot, lane.hot_generation,
+                    { uint32_t(&lane - lanes.data()), lane.generation, lane.layout_class_id }, lane.hot_slot, lane.hot_generation,
                     lane.h2d_enqueue_us, lane.h2d_complete_us, lane.compute_begin_us,
-                    lane.compute_complete_us, counters.lane_payload_bytes,
+                    lane.compute_complete_us, payload_for(lane.layout_class_id),
                     lane.compute_work_id, lane.compute_work, lane.cancelled };
             } else {
                 counters.trace_records_dropped++;
@@ -411,7 +485,10 @@ struct llm_expert_transfer_ring::impl {
     ggml_backend_buffer_ptr arena;
     ggml_backend_ptr transfer_backend;
     uint8_t * base = nullptr;
-    std::vector<span_layout> spans;
+    std::vector<std::vector<span_layout>> spans_by_class;
+    std::vector<uint64_t> payloads;
+    std::array<uint64_t, 12> role_offsets = {};
+    std::array<uint64_t, 12> role_extents = {};
     std::vector<lane_state> lanes;
     std::vector<llm_transfer_binding> background_bindings;
     llm_transfer_ring_diagnostics counters;
@@ -454,9 +531,23 @@ llm_expert_transfer_ring::~llm_expert_transfer_ring() {
 
 llm_expert_provider_result llm_expert_transfer_ring::initialize(
         const llm_expert_bundle_descriptor & prototype) noexcept {
+    std::vector<span_layout> spans;
+    uint64_t payload = 0;
+    uint64_t footprint = 0;
+    if (!prototype.validate().is_ready() || !derive_layout(prototype, 1, spans, payload, footprint)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
+    llm_expert_layout_registry registry;
+    registry.classes.push_back({ 0, 0, payload, prototype });
+    registry.layer_ids.push_back(0);
+    return initialize(registry);
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::initialize(
+        const llm_expert_layout_registry & registry) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->arena) return llm_expert_provider_result::success();
-    if (!prototype.validate().is_ready() || pimpl->faults.fail_allocation) {
+    if (!registry.sealed() || pimpl->faults.fail_allocation) {
         return llm_expert_provider_result::failure(pimpl->faults.fail_allocation ?
             llm_expert_provider_error::allocation_failed : llm_expert_provider_error::invalid_descriptor);
     }
@@ -464,10 +555,21 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
         ggml_backend_buffer_type_t native_buft = ggml_backend_dev_host_buffer_type(pimpl->config.target_device);
         if (native_buft == nullptr) native_buft = ggml_backend_cpu_buffer_type();
         const size_t native_alignment = ggml_backend_buft_get_alignment(native_buft);
-        uint64_t payload = 0, footprint = 0;
-        if (!derive_layout(prototype, native_alignment, pimpl->spans, payload, footprint) || footprint == 0) {
+        uint64_t footprint = 0;
+        if (!derive_registry_layout(registry, native_alignment, pimpl->spans_by_class,
+                pimpl->payloads, footprint) || footprint == 0) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
         }
+        pimpl->role_offsets.fill(0);
+        pimpl->role_extents.fill(0);
+        for (const auto & spans : pimpl->spans_by_class) {
+            for (const auto & span : spans) {
+                const size_t role = size_t(span.projection)*3 + span.member;
+                pimpl->role_offsets[role] = span.offset;
+                pimpl->role_extents[role] = std::max<uint64_t>(pimpl->role_extents[role], span.bytes);
+            }
+        }
+        const uint64_t payload = *std::max_element(pimpl->payloads.begin(), pimpl->payloads.end());
         uint64_t lane_count64 = pimpl->config.byte_budget/footprint;
         if (lane_count64 < pimpl->config.minimum_lanes || lane_count64 > UINT32_MAX) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
@@ -507,11 +609,16 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
         for (auto & lane : pimpl->lanes) lane.generation = pimpl->config.initial_lane_generation_for_testing;
         pimpl->base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(candidate.get()));
         if (pimpl->base == nullptr) return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+        std::memset(pimpl->base, 0xa5, size_t(requested));
         pimpl->counters.requested_bytes = pimpl->config.byte_budget;
         pimpl->counters.actual_bytes = actual;
         pimpl->counters.unused_budget_bytes = pimpl->config.byte_budget - actual;
         pimpl->counters.lane_payload_bytes = payload;
         pimpl->counters.lane_footprint = footprint;
+        pimpl->counters.class_stage_bundles.assign(pimpl->payloads.size(), 0);
+        pimpl->counters.class_stage_bytes.assign(pimpl->payloads.size(), 0);
+        pimpl->counters.class_h2d_bundles.assign(pimpl->payloads.size(), 0);
+        pimpl->counters.class_h2d_bytes.assign(pimpl->payloads.size(), 0);
         pimpl->counters.alignment = native_alignment;
         pimpl->counters.effective_lanes = lane_count;
         bool event_capable = false;
@@ -581,7 +688,8 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
                         continue;
                     }
                     auto & lane = pimpl->lanes[selected];
-                    const llm_transfer_lane_reference reference = { selected, lane.generation };
+                    const llm_transfer_lane_reference reference = {
+                        selected, lane.generation, lane.layout_class_id };
                     const auto cold_bundle = lane.background_cold;
                     const auto destination = lane.background_destination;
                     const uint32_t hot_slot = lane.hot_slot;
@@ -628,8 +736,10 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
                                  completed.state == llm_transfer_lane_state::staging)) {
                                 const uint32_t failed_hot_slot = completed.hot_slot;
                                 const uint64_t failed_hot_generation = completed.hot_generation;
+                                const auto failed_layout_class_id = completed.layout_class_id;
                                 pimpl->release_lane(completed);
                                 completed.failed_generation = reference.generation;
+                                completed.failed_layout_class_id = failed_layout_class_id;
                                 completed.failed_hot_slot = failed_hot_slot;
                                 completed.failed_hot_generation = failed_hot_generation;
                             }
@@ -645,14 +755,14 @@ llm_expert_provider_result llm_expert_transfer_ring::initialize(
             pimpl->free_event_objects(lane);
         }
         pimpl->transfer_backend.reset(); pimpl->arena.reset();
-        pimpl->spans.clear(); pimpl->lanes.clear(); pimpl->base = nullptr;
+        pimpl->spans_by_class.clear(); pimpl->payloads.clear(); pimpl->lanes.clear(); pimpl->base = nullptr;
         return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
     } catch (...) {
         for (auto & lane : pimpl->lanes) {
             pimpl->free_event_objects(lane);
         }
         pimpl->transfer_backend.reset(); pimpl->arena.reset();
-        pimpl->spans.clear(); pimpl->lanes.clear(); pimpl->base = nullptr;
+        pimpl->spans_by_class.clear(); pimpl->payloads.clear(); pimpl->lanes.clear(); pimpl->base = nullptr;
         return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
     }
 }
@@ -695,14 +805,20 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
     }
     const auto acquired = cold_cache.acquire(cold, llm_cold_reference_kind::transfer);
     if (!acquired.is_ready()) return acquired;
+    if (cold.layout_class_id >= pimpl->spans_by_class.size() ||
+        (flight.valid() && flight.layout_class_id != cold.layout_class_id)) {
+        (void) cold_cache.release(cold, llm_cold_reference_kind::transfer);
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
     lane.generation++;
     lane.state = llm_transfer_lane_state::staging;
+    lane.layout_class_id = cold.layout_class_id;
     lane.cold = cold;
     lane.hot_slot = hot_slot;
     lane.hot_generation = hot_generation;
     lane.flight = flight;
     lane.cold_cache = &cold_cache;
-    reference = { index, lane.generation };
+    reference = { index, lane.generation, lane.layout_class_id };
     pimpl->counters.lane_reservations++;
     return llm_expert_provider_result::success();
 }
@@ -715,6 +831,11 @@ llm_expert_provider_result llm_expert_transfer_ring::stage(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
+    const auto * spans = pimpl->spans_for(lane.layout_class_id);
+    if (spans == nullptr || reference.layout_class_id != lane.layout_class_id ||
+        lane.cold.layout_class_id != lane.layout_class_id) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
     const auto fault_key = lane.flight.key;
     const uint64_t fault_generation = lane.hot_generation;
     if (pimpl->config.phase8_test_control != nullptr &&
@@ -728,17 +849,17 @@ llm_expert_provider_result llm_expert_transfer_ring::stage(
     uint64_t copied_bytes = 0;
     const int64_t start = ggml_time_us();
     lock.unlock();
-    for (const auto & span : pimpl->spans) {
+    for (const auto & span : *spans) {
         const auto * source = member(cold_bundle, span.projection, span.member);
         const int axis = expert_axis(source, cold_bundle.n_expert, span.member == 0);
         if (copied >= pimpl->faults.fail_stage_after_spans || source == nullptr || axis < 0 ||
-            source->nb[axis] != span.bytes || lane.cold.slot >= uint32_t(source->ne[axis]) || source->data == nullptr) {
+            source->nb[axis] < span.bytes || lane.cold.slot >= uint32_t(source->ne[axis]) || source->data == nullptr) {
             lock.lock();
             if (pimpl->valid_lane(reference)) lane.state = llm_transfer_lane_state::failed;
             pimpl->condition.notify_all();
             return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
         }
-        const auto * source_data = static_cast<const uint8_t *>(source->data) + size_t(lane.cold.slot)*span.bytes;
+        const auto * source_data = static_cast<const uint8_t *>(source->data) + size_t(lane.cold.slot)*source->nb[axis];
         std::memcpy(pimpl->base + size_t(reference.lane)*pimpl->counters.lane_footprint + span.offset,
             source_data, span.bytes);
         copied_bytes += span.bytes;
@@ -749,6 +870,8 @@ llm_expert_provider_result llm_expert_transfer_ring::stage(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     pimpl->counters.stage_bytes += copied_bytes;
+    pimpl->counters.class_stage_bundles[reference.layout_class_id]++;
+    pimpl->counters.class_stage_bytes[reference.layout_class_id] += copied_bytes;
     pimpl->counters.stage_time_us += ggml_time_us() - start;
     return llm_expert_provider_result::success();
 }
@@ -793,10 +916,15 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
                 return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
             }
         }
-        for (const auto & span : pimpl->spans) {
+        const auto * spans = pimpl->spans_for(binding.lane.layout_class_id);
+        if (spans == nullptr) {
+            fail_bindings();
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        for (const auto & span : *spans) {
             const auto * target = member(binding.destination, span.projection, span.member);
             const int axis = expert_axis(target, binding.destination.n_expert, span.member == 0);
-            if (target == nullptr || axis < 0 || target->nb[axis] != span.bytes ||
+            if (target == nullptr || axis < 0 || target->nb[axis] < span.bytes ||
                 binding.hot_slot >= uint32_t(target->ne[axis]) || target->data == nullptr) {
                 fail_bindings();
                 return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
@@ -827,11 +955,13 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
                 pimpl->counters.first_h2d_enqueue_us = uint64_t(start);
             }
         }
-        for (const auto & span : pimpl->spans) {
+        const auto * spans = pimpl->spans_for(binding.lane.layout_class_id);
+        for (const auto & span : *spans) {
             auto destination = binding.destination;
             auto * target = member(destination, span.projection, span.member);
             const auto * data = pimpl->base + size_t(binding.lane.lane)*pimpl->counters.lane_footprint + span.offset;
-            const size_t offset = size_t(binding.hot_slot)*span.bytes;
+            const int axis = expert_axis(target, binding.destination.n_expert, span.member == 0);
+            const size_t offset = size_t(binding.hot_slot)*target->nb[axis];
             if (async) {
                 ggml_backend_tensor_set_async(pimpl->transfer_backend.get(), target, data, offset, span.bytes);
                 pimpl->counters.async_enqueues++;
@@ -841,6 +971,9 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
             }
             bytes += span.bytes;
         }
+        pimpl->counters.class_h2d_bundles[binding.lane.layout_class_id]++;
+        pimpl->counters.class_h2d_bytes[binding.lane.layout_class_id] +=
+            pimpl->payload_for(binding.lane.layout_class_id);
         if (async) {
             ggml_backend_event_record(lane.event, pimpl->transfer_backend.get());
             pimpl->counters.event_records++;
@@ -917,8 +1050,14 @@ llm_expert_provider_result llm_expert_transfer_ring::try_queue_background_transf
     }
     const auto acquired = cold_cache.acquire(cold, llm_cold_reference_kind::transfer);
     if (!acquired.is_ready()) return acquired;
+    if (cold.layout_class_id >= pimpl->spans_by_class.size() ||
+        (flight.valid() && flight.layout_class_id != cold.layout_class_id)) {
+        (void) cold_cache.release(cold, llm_cold_reference_kind::transfer);
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
     selected.generation++;
     selected.state = llm_transfer_lane_state::staging;
+    selected.layout_class_id = cold.layout_class_id;
     selected.cold = cold;
     selected.hot_slot = hot_slot;
     selected.hot_generation = hot_generation;
@@ -928,7 +1067,7 @@ llm_expert_provider_result llm_expert_transfer_ring::try_queue_background_transf
     selected.background_destination = destination;
     selected.background_queued = true;
     selected.hold_after_h2d = true;
-    reference = { index, selected.generation };
+    reference = { index, selected.generation, selected.layout_class_id };
     pimpl->counters.lane_reservations++;
     pimpl->condition.notify_all();
     return llm_expert_provider_result::success();
@@ -942,6 +1081,13 @@ llm_expert_provider_result llm_expert_transfer_ring::wait_background_h2d(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
+    if (lane.state == llm_transfer_lane_state::free && lane.failed_generation == reference.generation &&
+            lane.failed_layout_class_id == reference.layout_class_id) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
+    }
+    if (lane.layout_class_id != reference.layout_class_id) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
     const uint64_t generation = lane.generation;
     if (lane.state == llm_transfer_lane_state::staging) {
         pimpl->condition.wait(lock, [&] {
@@ -1078,7 +1224,8 @@ llm_expert_provider_result llm_expert_transfer_ring::monitor_h2d(
         llm_transfer_lane_reference reference) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (reference.lane >= pimpl->lanes.size() ||
-        pimpl->lanes[reference.lane].generation != reference.generation) {
+        pimpl->lanes[reference.lane].generation != reference.generation ||
+        pimpl->lanes[reference.lane].layout_class_id != reference.layout_class_id) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
@@ -1107,9 +1254,13 @@ llm_expert_provider_result llm_expert_transfer_ring::poll_h2d(
     auto & lane = pimpl->lanes[reference.lane];
     const auto lane_state = lane.state;
     if (lane_state == llm_transfer_lane_state::free) {
-        if (lane.failed_generation == reference.generation) {
+        if (lane.failed_generation == reference.generation &&
+                lane.failed_layout_class_id == reference.layout_class_id) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
         }
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    if (lane.layout_class_id != reference.layout_class_id) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     if (lane_state == llm_transfer_lane_state::in_flight) {
@@ -1119,13 +1270,13 @@ llm_expert_provider_result llm_expert_transfer_ring::poll_h2d(
             // Event-granularity accounting is deterministic: an incomplete
             // submitted copy retains its full immutable payload.
             state = llm_expert_same_key_h2d_state::h2d_in_flight;
-            remaining_bytes = pimpl->counters.lane_payload_bytes;
+            remaining_bytes = pimpl->payload_for(lane.layout_class_id);
         }
         return llm_expert_provider_result::success();
     }
     if (lane_state == llm_transfer_lane_state::staging) {
         state = llm_expert_same_key_h2d_state::queued_or_staging;
-        remaining_bytes = pimpl->counters.lane_payload_bytes;
+        remaining_bytes = pimpl->payload_for(lane.layout_class_id);
         return llm_expert_provider_result::success();
     }
     return llm_expert_provider_result::failure(llm_expert_provider_error::copy_failed);
@@ -1140,12 +1291,19 @@ llm_expert_provider_result llm_expert_transfer_ring::release_terminal_background
     }
     auto & lane = pimpl->lanes[reference.lane];
     if (lane.state == llm_transfer_lane_state::free) {
-        if (lane.failed_generation == reference.generation) {
+        if (lane.failed_generation == reference.generation &&
+                lane.failed_layout_class_id == reference.layout_class_id) {
             lane.failed_generation = 0;
+            lane.failed_layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
             lane.failed_hot_slot = UINT32_MAX;
             lane.failed_hot_generation = 0;
+        } else {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
         }
         return llm_expert_provider_result::success();
+    }
+    if (lane.layout_class_id != reference.layout_class_id) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     const bool completed = lane.state == llm_transfer_lane_state::in_flight && lane.event_complete;
     const bool failed = lane.state == llm_transfer_lane_state::failed;
@@ -1182,7 +1340,8 @@ llm_expert_provider_result llm_expert_transfer_ring::cancel_after_h2d(
         llm_transfer_lane_reference reference) noexcept {
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     if (reference.lane >= pimpl->lanes.size() ||
-        pimpl->lanes[reference.lane].generation != reference.generation) {
+        pimpl->lanes[reference.lane].generation != reference.generation ||
+        pimpl->lanes[reference.lane].layout_class_id != reference.layout_class_id) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & lane = pimpl->lanes[reference.lane];
@@ -1309,7 +1468,8 @@ llm_expert_provider_result llm_expert_transfer_ring::surrender() noexcept {
         pimpl->free_event_objects(lane);
     }
     pimpl->transfer_backend.reset();
-    pimpl->arena.reset(); pimpl->base = nullptr; pimpl->spans.clear(); pimpl->lanes.clear();
+    pimpl->arena.reset(); pimpl->base = nullptr;
+    pimpl->spans_by_class.clear(); pimpl->payloads.clear(); pimpl->lanes.clear();
     pimpl->background_bindings.clear();
     pimpl->counters.actual_bytes = 0;
     pimpl->counters.pinned_or_registered_bytes = 0;
@@ -1382,6 +1542,15 @@ std::vector<llm_transfer_interval> llm_expert_transfer_ring::completed_intervals
 llm_transfer_ring_diagnostics llm_expert_transfer_ring::diagnostics() const {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     auto result = pimpl->counters;
+    result.layout_class_count = uint32_t(pimpl->payloads.size());
+    result.class_payload_bytes = pimpl->payloads;
+    result.role_offsets.assign(pimpl->role_offsets.begin(), pimpl->role_offsets.end());
+    result.role_extents.assign(pimpl->role_extents.begin(), pimpl->role_extents.end());
+    result.class_padding_bytes.reserve(pimpl->payloads.size());
+    for (uint64_t payload : pimpl->payloads) {
+        result.class_padding_bytes.push_back(
+            pimpl->counters.lane_footprint >= payload ? pimpl->counters.lane_footprint - payload : 0);
+    }
     result.lanes.assign(pimpl->lanes.begin(), pimpl->lanes.end());
     result.h2d_compute_overlap_us = 0;
     result.h2d_compute_overlap_bytes = 0;

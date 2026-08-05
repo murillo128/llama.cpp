@@ -19,6 +19,7 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -105,7 +106,8 @@ struct tensor_fixture {
             int64_t n_expert = 4,
             int64_t n_tokens = 1,
             int64_t n_expert_used = 2,
-            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type()) :
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type(),
+            ggml_type type = GGML_TYPE_F32) :
         n_expert(n_expert), n_expert_used(n_expert_used), n_tokens(n_tokens) {
         ggml_init_params params = {
             /*.mem_size   =*/ ggml_tensor_overhead()*16,
@@ -114,15 +116,15 @@ struct tensor_fixture {
         };
         ctx.reset(ggml_init(params));
         GGML_ASSERT(ctx);
-        up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_in, n_hidden, n_expert);
-        up_bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_hidden, n_expert);
-        up_scale = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_expert);
-        gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_in, n_hidden, n_expert);
-        gate_bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_hidden, n_expert);
-        gate_scale = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_expert);
-        down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_hidden, n_in, n_expert);
-        down_bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_in, n_expert);
-        down_scale = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_expert);
+        up = ggml_new_tensor_3d(ctx.get(), type, n_in, n_hidden, n_expert);
+        up_bias = ggml_new_tensor_2d(ctx.get(), type, n_hidden, n_expert);
+        up_scale = ggml_new_tensor_2d(ctx.get(), type, 1, n_expert);
+        gate = ggml_new_tensor_3d(ctx.get(), type, n_in, n_hidden, n_expert);
+        gate_bias = ggml_new_tensor_2d(ctx.get(), type, n_hidden, n_expert);
+        gate_scale = ggml_new_tensor_2d(ctx.get(), type, 1, n_expert);
+        down = ggml_new_tensor_3d(ctx.get(), type, n_hidden, n_in, n_expert);
+        down_bias = ggml_new_tensor_2d(ctx.get(), type, n_in, n_expert);
+        down_scale = ggml_new_tensor_2d(ctx.get(), type, 1, n_expert);
         ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, n_tokens);
         buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
         GGML_ASSERT(buffer);
@@ -162,7 +164,10 @@ struct metadata_only_tensor_fixture {
     int64_t n_expert = 4;
     int64_t n_expert_used = 2;
 
-    metadata_only_tensor_fixture(int64_t n_in = 8, int64_t n_hidden = 16) {
+    metadata_only_tensor_fixture(
+            int64_t n_in = 8,
+            int64_t n_hidden = 16,
+            ggml_type type = GGML_TYPE_F16) {
         ggml_init_params params = {
             /*.mem_size   =*/ ggml_tensor_overhead()*8,
             /*.mem_buffer =*/ nullptr,
@@ -170,9 +175,9 @@ struct metadata_only_tensor_fixture {
         };
         ctx.reset(ggml_init(params));
         GGML_ASSERT(ctx);
-        up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, n_in, n_hidden, n_expert);
-        gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, n_in, n_hidden, n_expert);
-        down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, n_hidden, n_in, n_expert);
+        up = ggml_new_tensor_3d(ctx.get(), type, n_in, n_hidden, n_expert);
+        gate = ggml_new_tensor_3d(ctx.get(), type, n_in, n_hidden, n_expert);
+        down = ggml_new_tensor_3d(ctx.get(), type, n_hidden, n_in, n_expert);
         ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, 1);
         GGML_ASSERT(up->data == nullptr && up->buffer == nullptr);
         GGML_ASSERT(gate->data == nullptr && gate->buffer == nullptr);
@@ -1882,9 +1887,9 @@ void assert_tensor_slot_matches(
     }
     const int axis = source_expert_axis(source, n_expert, weight);
     const size_t span = source->nb[axis];
-    GGML_ASSERT(target->nb[axis] == span);
+    GGML_ASSERT(target->nb[axis] >= span);
     const auto * source_bytes = static_cast<const uint8_t *>(source->data) + size_t(expert)*span;
-    const auto * target_bytes = static_cast<const uint8_t *>(target->data) + size_t(slot)*span;
+    const auto * target_bytes = static_cast<const uint8_t *>(target->data) + size_t(slot)*target->nb[axis];
     GGML_ASSERT(std::memcmp(source_bytes, target_bytes, span) == 0);
 }
 
@@ -2034,7 +2039,7 @@ void test_initialization_stage_and_descriptor_only_scale() {
     graph_ctx.reset();
     GGML_ASSERT(bounded->surrender().is_ready());
 
-    // Incomplete, duplicate-identity, and incompatible-layout discovery all
+    // Incomplete, duplicate-identity, and incompatible-logical discovery all
     // fail before persistent allocation.
     auto incomplete = llm_create_cold_cache_expert_weight_provider(descriptor_only_cold_test_config(2));
     owner = false;
@@ -2055,8 +2060,16 @@ void test_initialization_stage_and_descriptor_only_scale() {
     GGML_ASSERT(incompatible->bind(small.bundle(0), small.selection(0), binding).is_ready());
     binding = {};
     GGML_ASSERT(incompatible->bind(
-        incompatible_layout.bundle(1), incompatible_layout.selection(1), binding).error ==
-        llm_expert_provider_error::invalid_descriptor);
+        incompatible_layout.bundle(1), incompatible_layout.selection(1), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(incompatible->bind(small.bundle(0), small.selection(0), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(incompatible->bind(
+        incompatible_layout.bundle(1), incompatible_layout.selection(1), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(incompatible->complete_descriptor_discovery(
+        2, 4, 0, { 0, 0 }, { 0, 0 }).error ==
+        llm_expert_provider_error::unsupported_configuration);
     GGML_ASSERT(incompatible->hot_cache_diagnostics().pool_bytes == 0);
     GGML_ASSERT(incompatible->finish_initialization(false).is_ready());
 
@@ -2103,6 +2116,75 @@ void test_initialization_stage_and_descriptor_only_scale() {
     }
 }
 
+void test_layout_class_determinism_and_bounded_cap() {
+    metadata_only_tensor_fixture f32(8, 16, GGML_TYPE_F32);
+    metadata_only_tensor_fixture f16(8, 16, GGML_TYPE_F16);
+    metadata_only_tensor_fixture bf16(8, 16, GGML_TYPE_BF16);
+    const std::array<const metadata_only_tensor_fixture *, 3> fixtures = { &f32, &f16, &bf16 };
+    const auto discover = [&](const std::array<int32_t, 3> & order) {
+        auto provider = llm_create_cold_cache_expert_weight_provider(
+            descriptor_only_cold_test_config(3));
+        bool owner = false;
+        GGML_ASSERT(provider->begin_initialization(
+            llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve,
+            owner).is_ready() && owner);
+        llm_expert_graph_binding binding;
+        for (uint32_t graph = 0; graph < 2; ++graph) {
+            for (int32_t layer : order) {
+                GGML_ASSERT(provider->bind(
+                    fixtures[size_t(layer)]->bundle(layer),
+                    fixtures[size_t(layer)]->selection(layer), binding).is_ready());
+                binding = {};
+            }
+        }
+        GGML_ASSERT(provider->complete_descriptor_discovery(
+            2, 6, 0, { 0, 0, 0 }, { 0, 0, 0 }).is_ready());
+        auto diagnostics = provider->hot_cache_diagnostics();
+        GGML_ASSERT(provider->finish_initialization(false).is_ready());
+        return diagnostics;
+    };
+    const auto forward = discover({ 0, 1, 2 });
+    const auto reverse = discover({ 2, 1, 0 });
+    GGML_ASSERT(forward.layout_class_count == 3 && reverse.layout_class_count == 3);
+    GGML_ASSERT(forward.layout_class_digests == reverse.layout_class_digests);
+    GGML_ASSERT(forward.layout_class_payload_bytes == reverse.layout_class_payload_bytes);
+    GGML_ASSERT(forward.layout_layer_ids == reverse.layout_layer_ids);
+
+    const std::array<ggml_type, 9> types = {
+        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+        GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K,
+    };
+    std::array<std::unique_ptr<metadata_only_tensor_fixture>, 9> too_many;
+    auto provider = llm_create_cold_cache_expert_weight_provider(
+        descriptor_only_cold_test_config(uint32_t(too_many.size())));
+    bool owner = false;
+    GGML_ASSERT(provider->begin_initialization(
+        llm_expert_provider_initialization_stage::descriptors_before_scheduler_reserve,
+        owner).is_ready() && owner);
+    llm_expert_graph_binding binding;
+    for (size_t layer = 0; layer < too_many.size(); ++layer) {
+        too_many[layer] = std::make_unique<metadata_only_tensor_fixture>(256, 256, types[layer]);
+        GGML_ASSERT(provider->bind(
+            too_many[layer]->bundle(int32_t(layer)),
+            too_many[layer]->selection(int32_t(layer)), binding).is_ready());
+        binding = {};
+    }
+    for (size_t layer = 0; layer < too_many.size(); ++layer) {
+        GGML_ASSERT(provider->bind(
+            too_many[layer]->bundle(int32_t(layer)),
+            too_many[layer]->selection(int32_t(layer)), binding).is_ready());
+        binding = {};
+    }
+    GGML_ASSERT(provider->complete_descriptor_discovery(
+        2, 2*too_many.size(), 0,
+        std::vector<uint64_t>(too_many.size(), 0),
+        std::vector<uint64_t>(too_many.size(), 0)).error ==
+        llm_expert_provider_error::unsupported_configuration);
+    GGML_ASSERT(provider->hot_cache_diagnostics().layout_class_count == 0);
+    GGML_ASSERT(provider->finish_initialization(false).is_ready());
+}
+
 void test_configuration_matrix() {
     expect_invalid([] { llm_create_hot_cache_expert_weight_provider(test_config(0)); });
     expect_invalid([] { llm_create_hot_cache_expert_weight_provider(test_config(1)); });
@@ -2121,6 +2203,58 @@ void test_configuration_matrix() {
     auto cold_without_budget = cold_test_config();
     cold_without_budget.transfer_ring_bytes = 0;
     expect_invalid([&] { llm_create_cold_cache_expert_weight_provider(cold_without_budget); });
+}
+
+void test_cold_provider_uses_bounded_transfer_waves() {
+    tensor_fixture tensors(8, 16, 8, 1, 6);
+    auto source = tensors.bundle(0);
+    for (auto * projection : { &source.up, &source.gate, &source.down }) {
+        projection->bias = nullptr;
+        projection->scale = nullptr;
+    }
+    auto config = cold_test_config(6);
+    config.n_expert_used = 6;
+    config.total_expert_keys = 8;
+    uint64_t lane_footprint = 0;
+    {
+        auto sizing_provider = llm_create_cold_cache_expert_weight_provider(config);
+        llm_expert_graph_binding sizing_binding;
+        GGML_ASSERT(sizing_provider->bind(
+            source, tensors.selection(0), sizing_binding).is_ready());
+        const auto initialized = sizing_provider->initialize_after_reserve();
+        if (!initialized.is_ready()) {
+            std::fprintf(stderr, "bounded-wave sizing initialization failed: status=%u error=%u\n",
+                unsigned(initialized.status), unsigned(initialized.error));
+        }
+        GGML_ASSERT(initialized.is_ready());
+        GGML_ASSERT(sizing_provider->bind(
+            source, tensors.selection(0), sizing_binding).is_ready());
+        GGML_ASSERT(sizing_binding.layout_class_id == 0);
+        lane_footprint = sizing_provider->hot_cache_diagnostics().ring_lane_footprint;
+        GGML_ASSERT(lane_footprint > 0);
+    }
+
+    config.transfer_ring_bytes = lane_footprint*2;
+    auto provider = llm_create_cold_cache_expert_weight_provider(config);
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(provider->bind(source, tensors.selection(0), binding).is_ready());
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+    GGML_ASSERT(provider->bind(source, tensors.selection(0), binding).is_ready());
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.ring_effective_lanes == 2);
+    GGML_ASSERT(diagnostics.ring_actual_bytes == config.transfer_ring_bytes);
+
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1, 2, 3, 4, 5 };
+    int32_t execution_ids[] = { -1, -1, -1, -1, -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 6, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.ring_waves == 3);
+    GGML_ASSERT(diagnostics.ring_peak_in_flight_lanes <= 2);
+    GGML_ASSERT(diagnostics.ring_live_events == 0);
+    plan.reset();
 }
 
 void test_context_extent_matrix_and_prepare_revalidation() {
@@ -2264,9 +2398,11 @@ void test_layout_host_and_partial_initialization_rejection() {
     auto provider = llm_create_hot_cache_expert_weight_provider(test_config(2, 2, 8));
     llm_expert_graph_binding binding;
     GGML_ASSERT(provider->bind(first.bundle(0), first.selection(0), binding).is_ready());
-    GGML_ASSERT(provider->bind(incompatible.bundle(1), incompatible.selection(1), binding).error ==
-        llm_expert_provider_error::invalid_descriptor);
-    GGML_ASSERT(provider->initialize_after_reserve().error == llm_expert_provider_error::initialization_failed);
+    binding = {};
+    GGML_ASSERT(provider->bind(incompatible.bundle(1), incompatible.selection(1), binding).is_ready());
+    binding = {};
+    GGML_ASSERT(provider->initialize_after_reserve().error ==
+        llm_expert_provider_error::unsupported_configuration);
     GGML_ASSERT(provider->hot_cache_diagnostics().effective_capacity == 0);
 
     ggml_init_params params = {
@@ -2424,6 +2560,110 @@ void test_cold_provider_inclusive_promotion_and_hits() {
     diagnostics = provider->hot_cache_diagnostics();
     GGML_ASSERT(diagnostics.cold_current_hot_refs == 0);
     GGML_ASSERT(provider->surrender().error == llm_expert_provider_error::busy);
+}
+
+void test_three_layout_classes_share_one_cache_and_full_data_path() {
+    tensor_fixture f32(8, 16, 4, 1, 2, ggml_backend_cpu_buffer_type(), GGML_TYPE_F32);
+    tensor_fixture f16(8, 16, 4, 1, 2, ggml_backend_cpu_buffer_type(), GGML_TYPE_F16);
+    tensor_fixture bf16(8, 16, 4, 1, 2, ggml_backend_cpu_buffer_type(), GGML_TYPE_BF16);
+    const std::array<const tensor_fixture *, 3> sources = { &f32, &f16, &bf16 };
+
+    auto config = cold_test_config(2);
+    config.routed_layer_count = 3;
+    config.total_expert_keys = 12;
+    config.routed_layers = { 0, 1, 2 };
+    auto provider = llm_create_cold_cache_expert_weight_provider(config);
+
+    llm_expert_graph_binding binding;
+    for (int32_t layer = 0; layer < 3; ++layer) {
+        GGML_ASSERT(provider->bind(
+            sources[size_t(layer)]->bundle(layer),
+            sources[size_t(layer)]->selection(layer), binding).is_ready());
+        GGML_ASSERT(binding.bootstrap);
+        binding = {};
+    }
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+
+    ggml_init_params graph_params = { ggml_tensor_overhead()*64, nullptr, true };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    GGML_ASSERT(graph_ctx);
+    std::array<llm_expert_graph_binding, 3> bindings;
+    for (int32_t layer = 0; layer < 3; ++layer) {
+        GGML_ASSERT(provider->bind_graph(
+            graph_ctx.get(), sources[size_t(layer)]->bundle(layer),
+            sources[size_t(layer)]->selection(layer), bindings[size_t(layer)]).is_ready());
+        GGML_ASSERT(!bindings[size_t(layer)].bootstrap);
+    }
+
+    auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.layout_class_count == 3);
+    GGML_ASSERT(diagnostics.layout_class_digests.size() == 3);
+    GGML_ASSERT(diagnostics.layout_class_payload_bytes.size() == 3);
+    GGML_ASSERT(diagnostics.layout_class_hot_padding_bytes.size() == 3);
+    GGML_ASSERT(diagnostics.layout_class_cold_padding_bytes.size() == 3);
+    GGML_ASSERT(diagnostics.layout_class_lane_padding_bytes.size() == 3);
+    GGML_ASSERT(diagnostics.layout_layer_ids.size() == LLAMA_MAX_LAYERS);
+    GGML_ASSERT(diagnostics.layout_layer_ids[0] != diagnostics.layout_layer_ids[1]);
+    GGML_ASSERT(diagnostics.layout_layer_ids[0] != diagnostics.layout_layer_ids[2]);
+    GGML_ASSERT(diagnostics.layout_layer_ids[1] != diagnostics.layout_layer_ids[2]);
+    GGML_ASSERT(diagnostics.layout_registry_administration_bytes < (1U << 20));
+    GGML_ASSERT(diagnostics.layout_preflight_passed);
+    GGML_ASSERT(diagnostics.layout_preflight_consumer_count == 9);
+    GGML_ASSERT(diagnostics.layout_hot_role_offsets.size() == 12);
+    GGML_ASSERT(diagnostics.layout_hot_role_extents.size() == 12);
+    GGML_ASSERT(diagnostics.layout_cold_role_offsets.size() == 12);
+    GGML_ASSERT(diagnostics.layout_cold_role_extents.size() == 12);
+    GGML_ASSERT(diagnostics.layout_lane_role_offsets.size() == 12);
+    GGML_ASSERT(diagnostics.layout_lane_role_extents.size() == 12);
+    for (const auto payload : diagnostics.layout_class_payload_bytes) {
+        GGML_ASSERT(payload > 0 && payload <= diagnostics.hot_slot_stride);
+    }
+    GGML_ASSERT(bindings[0].up.weight->data == bindings[1].up.weight->data);
+    GGML_ASSERT(bindings[0].up.weight->data == bindings[2].up.weight->data);
+
+    const int32_t logical_ids[] = { 0, 1 };
+    for (int32_t layer = 0; layer < 3; ++layer) {
+        llm_expert_execution_plan plan;
+        GGML_ASSERT(provider->prepare({ bindings[size_t(layer)] }, plan).is_ready());
+        int32_t execution_ids[] = { -1, -1 };
+        GGML_ASSERT(provider->remap_checkpoint(
+            bindings[size_t(layer)], logical_ids, 2, execution_ids).is_ready());
+        GGML_ASSERT(execution_ids[0] != execution_ids[1]);
+        assert_bundle_slot_matches(
+            *sources[size_t(layer)], bindings[size_t(layer)], 0, execution_ids[0]);
+        plan.reset();
+
+        std::vector<uint8_t> cold_bytes;
+        std::vector<uint8_t> hot_bytes;
+        GGML_ASSERT(provider->debug_copy_cold_bundle({ layer, 0 }, cold_bytes).is_ready());
+        GGML_ASSERT(provider->debug_copy_hot_bundle({ layer, 0 }, hot_bytes).is_ready());
+        GGML_ASSERT(!cold_bytes.empty() && cold_bytes == hot_bytes);
+        diagnostics = provider->hot_cache_diagnostics();
+        GGML_ASSERT(diagnostics.evictions == uint64_t(layer*2));
+        bool class_observed = false;
+        uint32_t ready_slots = 0;
+        for (const auto & slot : diagnostics.slots) {
+            if (slot.layer == layer && slot.expert == 0) {
+                class_observed = slot.layout_class_id == bindings[size_t(layer)].layout_class_id;
+            }
+            if (slot.state == llm_hot_cache_diagnostics::slot::ready) {
+                ready_slots++;
+                GGML_ASSERT(slot.layout_class_id == bindings[size_t(layer)].layout_class_id);
+            }
+        }
+        GGML_ASSERT(class_observed && ready_slots == config.capacity);
+    }
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.evictions >= 4);
+    GGML_ASSERT(diagnostics.slots.size() == config.capacity);
+    GGML_ASSERT(diagnostics.policy.config.scope == LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL);
+    GGML_ASSERT(diagnostics.cold_invariant_failures == 0);
+    GGML_ASSERT(diagnostics.ring_stage_bytes == diagnostics.ring_h2d_bytes);
+
+    bindings = {};
+    graph_ctx.reset();
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
 }
 
 void test_cold_provider_copy_failure_cleanup_and_retry() {
@@ -2885,14 +3125,17 @@ int main(int argc, char ** argv) {
     test_predictor_runtime_has_no_heap_allocations();
     test_initialization_stage_and_descriptor_only_scale();
     test_configuration_matrix();
+    test_cold_provider_uses_bounded_transfer_waves();
     test_context_extent_matrix_and_prepare_revalidation();
     test_cold_provider_rejects_cuda_host_source();
     test_pool_lifetime_trim_surrender_and_epoch();
     test_layout_host_and_partial_initialization_rejection();
+    test_layout_class_determinism_and_bounded_cap();
     test_allocation_failure_is_recoverable_and_empty_prepare_is_safe();
     test_directory_hit_eviction_generation_and_copy();
     test_directory_multi_token_atomic_dedup_and_no_allocation();
     test_cold_provider_inclusive_promotion_and_hits();
+    test_three_layout_classes_share_one_cache_and_full_data_path();
     test_cold_provider_copy_failure_cleanup_and_retry();
     test_directory_composite_layer_expert_keys();
     test_directory_lru_pin_exclusion_and_request_exclusivity();

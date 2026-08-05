@@ -253,7 +253,8 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     if (pimpl->counters.admission_closed) {
         return { llm_expert_schedule_disposition::closed, {} };
     }
-    if (!key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer)) {
+    if (!key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer) ||
+        metadata.layout_class_id >= LLM_EXPERT_LAYOUT_CLASS_MAX) {
         return { llm_expert_schedule_disposition::invalid, {} };
     }
     const bool speculative = priority >= llm_expert_priority::prefetch_next;
@@ -269,6 +270,9 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     for (uint32_t slot = 0; slot < pimpl->requests.size(); ++slot) {
         impl::request_record & request = pimpl->requests[slot];
         if (request.state != llm_expert_request_state::free && !is_terminal(request.state) && same_key(request.key, key)) {
+            if (request.metadata.layout_class_id != metadata.layout_class_id) {
+                return { llm_expert_schedule_disposition::invalid, {} };
+            }
             // Cancellation ownership is already committed once a speculative
             // request reaches cancelling/draining. Exact demand must retry with
             // a new generation after that drain; it must never be attached to

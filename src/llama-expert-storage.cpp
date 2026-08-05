@@ -263,6 +263,15 @@ llm_expert_storage_result llm_expert_storage::make_read_plan(
     std::array<candidate, 12> candidates;
     size_t candidate_count = 0;
     std::array<bool, 12> seen{};
+    const llm_expert_layout_class_id layout_class_id = destinations[0].layout_class_id;
+    if (layout_class_id >= LLM_EXPERT_LAYOUT_CLASS_MAX) {
+        return { llm_expert_storage_error::invalid_destination, 0 };
+    }
+    for (size_t index = 1; index < destination_count; ++index) {
+        if (destinations[index].layout_class_id != layout_class_id) {
+            return { llm_expert_storage_error::invalid_destination, 0 };
+        }
+    }
     for (const auto & span : entry.spans) {
         const size_t identity = identity_index(span.projection, span.sidecar);
         const llm_expert_storage_destination * destination = nullptr;
@@ -284,7 +293,8 @@ llm_expert_storage_result llm_expert_storage::make_read_plan(
             source->direct_handle.native_handle(),
             source->direct_alignment,
             source->handle.size(),
-            { destination->data, span.byte_count, span.file_offset, span.projection, span.sidecar },
+            { destination->data, span.byte_count, span.file_offset, span.projection, span.sidecar,
+                layout_class_id },
         };
     }
     std::sort(candidates.begin(), candidates.begin() + candidate_count, [](const candidate & lhs, const candidate & rhs) {
@@ -312,9 +322,14 @@ llm_expert_storage_result llm_expert_storage::make_read_plan(
             operations[operation_count].direct_alignment = item.direct_alignment;
             operations[operation_count].source_size = item.source_size;
             operations[operation_count].file_offset = item.segment.file_offset;
+            operations[operation_count].layout_class_id = layout_class_id;
             operation_count++;
         }
         auto & operation = operations[operation_count - 1];
+        if (operation.layout_class_id != layout_class_id) {
+            operation_count = 0;
+            return { llm_expert_storage_error::invalid_destination, 0 };
+        }
         uint64_t total = 0;
         if (!checked_add(operation.byte_count, item.segment.byte_count, total)) {
             operation_count = 0;
@@ -436,9 +451,14 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
         return { llm_expert_storage_error::invalid_destination, 0 };
     }
     std::array<bool, 12> seen{};
+    const auto layout_class_id = destinations[0].layout_class_id;
+    if (layout_class_id >= LLM_EXPERT_LAYOUT_CLASS_MAX) {
+        return { llm_expert_storage_error::invalid_destination, 0 };
+    }
     for (size_t index = 0; index < destination_count; ++index) {
         const size_t identity = identity_index(destinations[index].projection, destinations[index].sidecar);
-        if (identity >= seen.size() || seen[identity] || destinations[index].data == nullptr || destinations[index].extent == 0) {
+        if (identity >= seen.size() || seen[identity] || destinations[index].data == nullptr ||
+            destinations[index].extent == 0 || destinations[index].layout_class_id != layout_class_id) {
             return { llm_expert_storage_error::invalid_destination, 0 };
         }
         seen[identity] = true;

@@ -34,6 +34,7 @@ struct llm_expert_request_metadata {
     uint64_t reserved_h2d_bytes = 0;
     uint32_t speculative_cold_slots = 0;
     uint32_t speculative_hot_slots = 0;
+    llm_expert_layout_class_id layout_class_id = 0;
 };
 
 enum class llm_expert_request_state : uint8_t {

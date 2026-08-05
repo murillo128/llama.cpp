@@ -172,6 +172,39 @@ void test_stale_completion_and_generation_exhaustion() {
         llm_expert_schedule_disposition::generation_exhausted);
 }
 
+void test_layout_class_identity_is_part_of_join_state() {
+    llm_expert_scheduler scheduler(config(2));
+    llm_expert_request_metadata class_two;
+    class_two.layout_class_id = 2;
+    const auto admitted = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, class_two);
+    GGML_ASSERT(admitted.disposition == llm_expert_schedule_disposition::admitted);
+
+    llm_expert_request_metadata class_three;
+    class_three.layout_class_id = 3;
+    GGML_ASSERT(scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, class_three).disposition ==
+        llm_expert_schedule_disposition::invalid);
+    const auto joined = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, class_two);
+    GGML_ASSERT(joined.disposition == llm_expert_schedule_disposition::joined);
+    GGML_ASSERT(joined.handle.slot == admitted.handle.slot &&
+        joined.handle.generation == admitted.handle.generation);
+
+    llm_expert_request_snapshot snapshot;
+    GGML_ASSERT(scheduler.take_next(snapshot).accepted());
+    GGML_ASSERT(snapshot.metadata.layout_class_id == class_two.layout_class_id);
+    GGML_ASSERT(scheduler.transition(snapshot.handle, llm_expert_request_state::submitting,
+        llm_expert_request_state::host_ready) == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.finish(snapshot.handle, llm_expert_request_state::complete) ==
+        llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(scheduler.release_terminal(snapshot.handle) ==
+        llm_expert_schedule_disposition::admitted);
+}
+
 void test_quiescent_shutdown() {
     llm_expert_scheduler scheduler(config());
     GGML_ASSERT(scheduler.enqueue(
@@ -563,6 +596,7 @@ int main() {
     test_priority_fifo_and_promotion();
     test_saturation_and_preemption();
     test_stale_completion_and_generation_exhaustion();
+    test_layout_class_identity_is_part_of_join_state();
     test_quiescent_shutdown();
     test_post_h2d_cancellation_path();
     test_cold_hit_reaches_host_ready_without_io();

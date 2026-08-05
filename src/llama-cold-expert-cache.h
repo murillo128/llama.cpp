@@ -27,6 +27,7 @@ enum class llm_cold_reference_kind {
 struct llm_cold_reference {
     uint32_t slot = 0;
     uint64_t generation = 0;
+    llm_expert_layout_class_id layout_class_id = 0;
 };
 
 enum class llm_cold_demand_lookup {
@@ -39,6 +40,7 @@ struct llm_cold_hot_backing {
     llm_expert_key key = { -1, -1 };
     uint32_t cold_slot = 0;
     uint64_t cold_generation = 0;
+    llm_expert_layout_class_id layout_class_id = 0;
 };
 
 struct llm_cold_cache_config {
@@ -67,6 +69,11 @@ struct llm_cold_cache_diagnostics {
     uint64_t unused_budget_bytes = 0;
     uint64_t bundle_payload_bytes = 0;
     uint64_t aligned_slot_footprint = 0;
+    uint32_t layout_class_count = 0;
+    std::vector<uint64_t> class_payload_bytes;
+    std::vector<uint64_t> class_padding_bytes;
+    std::vector<uint64_t> role_offsets;
+    std::vector<uint64_t> role_extents;
     uint64_t alignment = 0;
     uint32_t effective_slots = 0;
     bool pageable = false;
@@ -111,6 +118,7 @@ struct llm_cold_cache_diagnostics {
 
     struct slot {
         llm_expert_key key = { -1, -1 };
+        llm_expert_layout_class_id layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
         uint64_t generation = 0;
         uint64_t origin_operation_ordinal = 0;
         uint64_t last_use = 0;
@@ -138,6 +146,7 @@ public:
     llm_cold_expert_cache & operator=(llm_cold_expert_cache &&) noexcept;
 
     llm_expert_provider_result initialize(const llm_expert_bundle_descriptor & prototype) noexcept;
+    llm_expert_provider_result initialize(const llm_expert_layout_registry & registry) noexcept;
     static llm_expert_provider_result calculate_slot_footprint(
             const llm_expert_bundle_descriptor & prototype,
             ggml_backend_buffer_type_t buffer_type,
@@ -207,6 +216,8 @@ public:
             const std::vector<llm_cold_hot_backing> & hot_backings = {}) noexcept;
 
     const llm_expert_bundle_descriptor & bundle() const noexcept;
+    const llm_expert_bundle_descriptor & bundle(llm_expert_layout_class_id layout_class_id) const noexcept;
+    const llm_expert_bundle_descriptor & bundle_for_key(llm_expert_key key) const noexcept;
     ggml_backend_buffer_t buffer() const noexcept;
     std::shared_ptr<void> allocation_lease() const noexcept;
     llm_cold_cache_diagnostics diagnostics() const;

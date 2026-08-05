@@ -63,6 +63,7 @@ struct llm_expert_cache_policy_result {
 struct llm_expert_cache_policy_key {
     int32_t layer = -1;
     int32_t expert = -1;
+    uint8_t layout_class_id = 0;
 };
 
 struct llm_expert_cache_policy_config_internal {

@@ -12,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -134,7 +135,26 @@ struct cold_allocation {
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr buffer;
     llm_expert_bundle_descriptor bundle = {};
+    std::vector<llm_expert_bundle_descriptor> bundles;
+    std::vector<llm_expert_layout_class_id> layer_ids;
+    std::vector<uint64_t> payload_bytes;
+    uint64_t slot_stride = 0;
+    std::array<uint64_t, 12> role_offsets = {};
+    std::array<uint64_t, 12> role_extents = {};
 };
+
+ggml_tensor * bundle_member(
+        llm_expert_bundle_descriptor & bundle,
+        size_t projection_index,
+        size_t member_index) {
+    llm_expert_projection_descriptor * projection = nullptr;
+    if (projection_index == 0) projection = &bundle.up;
+    else if (projection_index == 1) projection = &bundle.gate;
+    else if (projection_index == 2) projection = &bundle.gate_up;
+    else if (projection_index == 3) projection = &bundle.down;
+    if (projection == nullptr) return nullptr;
+    return member_index == 0 ? projection->weight : member_index == 1 ? projection->bias : projection->scale;
+}
 
 #ifdef __linux__
 void add_tensor_slot_pages(
@@ -164,21 +184,23 @@ void sample_ready_residency(
     const uintptr_t page_size = uintptr_t(page_size_value);
     const uintptr_t page_mask = ~(page_size - 1);
     std::unordered_set<uintptr_t> page_set;
-    const auto add_projection = [&](const llm_expert_projection_descriptor & projection, uint32_t slot) {
-        add_tensor_slot_pages(page_set, projection.weight, slot, arena.bundle.n_expert, true, page_mask);
-        add_tensor_slot_pages(page_set, projection.bias, slot, arena.bundle.n_expert, false, page_mask);
-        add_tensor_slot_pages(page_set, projection.scale, slot, arena.bundle.n_expert, false, page_mask);
+    const auto add_projection = [&](const llm_expert_projection_descriptor & projection,
+                                    uint32_t slot, int32_t capacity) {
+        add_tensor_slot_pages(page_set, projection.weight, slot, capacity, true, page_mask);
+        add_tensor_slot_pages(page_set, projection.bias, slot, capacity, false, page_mask);
+        add_tensor_slot_pages(page_set, projection.scale, slot, capacity, false, page_mask);
     };
-    uint64_t ready_slots = 0;
     for (uint32_t slot = 0; slot < slots.size(); ++slot) {
         if (slots[slot].state != llm_cold_slot_state::ready) continue;
-        ready_slots++;
-        add_projection(arena.bundle.up, slot);
-        add_projection(arena.bundle.gate, slot);
-        add_projection(arena.bundle.gate_up, slot);
-        add_projection(arena.bundle.down, slot);
+        const auto class_id = slots[slot].layout_class_id;
+        if (class_id >= arena.bundles.size()) continue;
+        const auto & bundle = arena.bundles[class_id];
+        result.ready_logical_bytes += arena.payload_bytes[class_id];
+        add_projection(bundle.up, slot, bundle.n_expert);
+        add_projection(bundle.gate, slot, bundle.n_expert);
+        add_projection(bundle.gate_up, slot, bundle.n_expert);
+        add_projection(bundle.down, slot, bundle.n_expert);
     }
-    result.ready_logical_bytes = ready_slots*result.aligned_slot_footprint;
     result.ready_page_count = page_set.size();
     if (page_set.empty()) {
         result.residency_supported = true;
@@ -209,6 +231,114 @@ void sample_ready_residency(
 size_t align_up(size_t value, size_t alignment) {
     if (alignment == 0 || value > SIZE_MAX - (alignment - 1)) return SIZE_MAX;
     return (value + alignment - 1)/alignment*alignment;
+}
+
+bool checked_lcm_size(size_t lhs, size_t rhs, size_t & result) {
+    if (lhs == 0 || rhs == 0) return false;
+    const size_t reduced = lhs/std::gcd(lhs, rhs);
+    if (reduced > SIZE_MAX/rhs) return false;
+    result = reduced*rhs;
+    return true;
+}
+
+size_t universal_slot_stride(
+        const llm_expert_layout_registry & registry,
+        ggml_backend_buffer_type_t buffer_type,
+        std::array<size_t, 12> * offsets = nullptr,
+        std::array<size_t, 12> * extents = nullptr) {
+    if (!registry.sealed() || registry.classes.size() > LLM_EXPERT_LAYOUT_CLASS_MAX) return SIZE_MAX;
+    const auto buft = buffer_type == nullptr ? ggml_backend_cpu_buffer_type() : buffer_type;
+    const size_t buffer_alignment = ggml_backend_buft_get_alignment(buft);
+    std::array<size_t, 12> role_offsets = {};
+    std::array<size_t, 12> role_extents = {};
+    size_t slot_alignment = std::max<size_t>(4096, buffer_alignment);
+    size_t within_slot = 0;
+    for (size_t projection = 0; projection < 4; ++projection) {
+        for (size_t member_index = 0; member_index < 3; ++member_index) {
+            const size_t role = projection*3 + member_index;
+            size_t role_alignment = std::max<size_t>(64, buffer_alignment);
+            for (const auto & layout_class : registry.classes) {
+                auto source = layout_class.prototype;
+                const auto * tensor = bundle_member(source, projection, member_index);
+                if (tensor == nullptr) continue;
+                const int axis = expert_axis(tensor, source.n_expert, member_index == 0);
+                if (axis < 0) return SIZE_MAX;
+                role_extents[role] = std::max(role_extents[role], tensor->nb[axis]);
+                role_alignment = std::max(role_alignment, ggml_type_size(tensor->type));
+                if (!checked_lcm_size(slot_alignment, ggml_type_size(tensor->type), slot_alignment)) return SIZE_MAX;
+            }
+            if (role_extents[role] == 0) continue;
+            role_offsets[role] = align_up(within_slot, role_alignment);
+            if (role_offsets[role] == SIZE_MAX || role_extents[role] > SIZE_MAX - role_offsets[role]) return SIZE_MAX;
+            within_slot = role_offsets[role] + role_extents[role];
+        }
+    }
+    const size_t stride = align_up(within_slot, slot_alignment);
+    if (offsets != nullptr) *offsets = role_offsets;
+    if (extents != nullptr) *extents = role_extents;
+    return stride;
+}
+
+std::shared_ptr<cold_allocation> make_universal_allocation(
+        const llm_expert_layout_registry & registry,
+        uint32_t capacity,
+        ggml_backend_buffer_type_t buffer_type) {
+    const auto buft = buffer_type == nullptr ? ggml_backend_cpu_buffer_type() : buffer_type;
+    std::array<size_t, 12> offsets;
+    std::array<size_t, 12> extents;
+    const size_t slot_stride = universal_slot_stride(registry, buft, &offsets, &extents);
+    if (slot_stride == SIZE_MAX || slot_stride == 0 || capacity > SIZE_MAX/slot_stride) return nullptr;
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*32*registry.classes.size(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    auto result = std::make_shared<cold_allocation>();
+    result->ctx.reset(ggml_init(params));
+    if (!result->ctx) return nullptr;
+    result->buffer.reset(ggml_backend_buft_alloc_buffer(buft, slot_stride*capacity));
+    if (!result->buffer || !ggml_backend_buffer_is_host(result->buffer.get())) return nullptr;
+    auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(result->buffer.get()));
+    if (base == nullptr) return nullptr;
+    std::memset(base, 0xa5, slot_stride*capacity);
+    result->bundles.reserve(registry.classes.size());
+    result->payload_bytes.reserve(registry.classes.size());
+    for (const auto & layout_class : registry.classes) {
+        const auto & source = layout_class.prototype;
+        llm_expert_bundle_descriptor bundle = {};
+        bundle.layer = -1;
+        bundle.n_expert = capacity;
+        bundle.up = make_slot_projection(result->ctx.get(), source.up, source.n_expert, capacity, "cold.up");
+        bundle.gate = make_slot_projection(result->ctx.get(), source.gate, source.n_expert, capacity, "cold.gate");
+        bundle.gate_up = make_slot_projection(result->ctx.get(), source.gate_up, source.n_expert, capacity, "cold.gate_up");
+        bundle.down = make_slot_projection(result->ctx.get(), source.down, source.n_expert, capacity, "cold.down");
+        for (size_t projection = 0; projection < 4; ++projection) {
+            for (size_t member_index = 0; member_index < 3; ++member_index) {
+                ggml_tensor * tensor = bundle_member(bundle, projection, member_index);
+                if (tensor == nullptr) continue;
+                const int axis = expert_axis(tensor, capacity, member_index == 0);
+                if (axis < 0) return nullptr;
+                tensor->nb[axis] = slot_stride;
+                for (int upper = axis + 1; upper < GGML_MAX_DIMS; ++upper) {
+                    if (tensor->nb[upper - 1] > SIZE_MAX/tensor->ne[upper - 1]) return nullptr;
+                    tensor->nb[upper] = tensor->nb[upper - 1]*tensor->ne[upper - 1];
+                }
+                if (ggml_backend_tensor_alloc(result->buffer.get(), tensor,
+                        base + offsets[projection*3 + member_index]) != GGML_STATUS_SUCCESS) return nullptr;
+            }
+        }
+        for (auto * projection : { &bundle.up, &bundle.gate, &bundle.gate_up, &bundle.down }) {
+            if (projection->weight != nullptr) projection->buffer_type = buft;
+        }
+        result->bundles.push_back(bundle);
+        result->payload_bytes.push_back(layout_class.payload_bytes);
+    }
+    result->bundle = result->bundles.front();
+    result->layer_ids = registry.layer_ids;
+    result->slot_stride = slot_stride;
+    std::copy(offsets.begin(), offsets.end(), result->role_offsets.begin());
+    std::copy(extents.begin(), extents.end(), result->role_extents.begin());
+    return result;
 }
 
 std::shared_ptr<cold_allocation> make_allocation(
@@ -343,7 +473,7 @@ bool copy_tensor(
     }
     const int axis = expert_axis(source, n_expert, weight);
     if (axis < 0 || target->ne[axis] != capacity || source->data == nullptr || target->data == nullptr ||
-        source->nb[axis] != target->nb[axis]) {
+        target->nb[axis] < source->nb[axis]) {
         return false;
     }
     for (int upper = axis + 1; upper < ggml_n_dims(source); ++upper) {
@@ -353,7 +483,7 @@ bool copy_tensor(
     }
     const size_t span = source->nb[axis];
     const auto * source_data = static_cast<const uint8_t *>(source->data) + size_t(expert)*span;
-    std::memcpy(static_cast<uint8_t *>(target->data) + size_t(slot)*span, source_data, span);
+    std::memcpy(static_cast<uint8_t *>(target->data) + size_t(slot)*target->nb[axis], source_data, span);
     bytes += span;
     return true;
 }
@@ -417,8 +547,30 @@ struct llm_cold_expert_cache::impl {
         return size_t(key.layer)*n_expert + uint32_t(key.expert);
     }
 
+    llm_expert_layout_class_id class_for_key(llm_expert_key key) const {
+        if (!arena || key.layer < 0 || size_t(key.layer) >= arena->layer_ids.size()) {
+            return LLM_EXPERT_LAYOUT_CLASS_INVALID;
+        }
+        return arena->layer_ids[size_t(key.layer)];
+    }
+
+    llm_expert_cache_policy_key policy_key(llm_expert_key key) const {
+        return { key.layer, key.expert, class_for_key(key) };
+    }
+
+    uint64_t payload_for_key(llm_expert_key key) const {
+        const auto class_id = class_for_key(key);
+        return arena && class_id < arena->payload_bytes.size() ? arena->payload_bytes[class_id] : 0;
+    }
+
+    const llm_expert_bundle_descriptor * bundle_for_key(llm_expert_key key) const {
+        const auto class_id = class_for_key(key);
+        return arena && class_id < arena->bundles.size() ? &arena->bundles[class_id] : nullptr;
+    }
+
     bool valid_reference(llm_cold_reference reference) const {
         return reference.slot < slots.size() && slots[reference.slot].generation == reference.generation &&
+            slots[reference.slot].layout_class_id == reference.layout_class_id &&
             slots[reference.slot].state == llm_cold_slot_state::ready;
     }
 
@@ -459,7 +611,7 @@ struct llm_cold_expert_cache::impl {
                 const auto & candidate = slots[index];
                 if (candidate.state != llm_cold_slot_state::loading ||
                     !policy.validate_resident(index, candidate.generation,
-                        { candidate.key.layer, candidate.key.expert })) {
+                        policy_key(candidate.key))) {
                     continue;
                 }
                 if (candidate.origin_operation_ordinal == 0) {
@@ -501,8 +653,8 @@ struct llm_cold_expert_cache::impl {
     llm_expert_provider_result observe_demand(llm_expert_key key, uint64_t occurrence_count = 1) {
         auto result = ensure_policy_request();
         if (!result.is_ready()) return result;
-        return policy_result(policy.demand({ key.layer, key.expert }, occurrence_count,
-            counters.bundle_payload_bytes, counters.aligned_slot_footprint));
+        return policy_result(policy.demand(policy_key(key), occurrence_count,
+            payload_for_key(key), counters.aligned_slot_footprint));
     }
 
     llm_expert_provider_result select_slot(llm_expert_key key, int32_t & selected) {
@@ -511,13 +663,14 @@ struct llm_cold_expert_cache::impl {
         for (uint32_t index = 0; index < slots.size(); ++index) {
             const auto & slot = slots[index];
             auto & candidate = policy_candidates[index];
-            candidate = { index, slot.generation, { slot.key.layer, slot.key.expert },
-                counters.bundle_payload_bytes, counters.aligned_slot_footprint,
+            candidate = { index, slot.generation, policy_key(slot.key),
+                slot.state == llm_cold_slot_state::free ? payload_for_key(key) : payload_for_key(slot.key),
+                counters.aligned_slot_footprint,
                 slot.state == llm_cold_slot_state::free,
                 slot.state == llm_cold_slot_state::ready && no_refs(slot) };
         }
         llm_expert_cache_policy_decision decision;
-        auto result = policy_result(policy.select({ key.layer, key.expert },
+        auto result = policy_result(policy.select(policy_key(key),
             policy_candidates.data(), policy_candidates.size(), decision));
         if (!result.is_ready()) return result;
         if (decision.slot >= slots.size()) {
@@ -529,7 +682,7 @@ struct llm_cold_expert_cache::impl {
             slot.state == llm_cold_slot_state::ready && no_refs(slot) &&
                 slot.generation == decision.generation &&
                 policy.validate_resident(decision.slot, decision.generation,
-                    { slot.key.layer, slot.key.expert });
+                    policy_key(slot.key));
         if (!valid) {
             counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
@@ -570,27 +723,71 @@ llm_expert_provider_result llm_cold_expert_cache::calculate_slot_footprint(
 
 llm_expert_provider_result llm_cold_expert_cache::initialize(
         const llm_expert_bundle_descriptor & prototype) noexcept {
+    llm_expert_layout_registry registry;
+    uint64_t payload = 0;
+    if (!prototype.validate().is_ready() || !bundle_payload(prototype, payload)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
+    registry.classes.push_back({ 0, 0, payload, prototype });
+    registry.layer_ids.assign(LLAMA_MAX_LAYERS, LLM_EXPERT_LAYOUT_CLASS_INVALID);
+    for (int32_t layer : pimpl->config.routed_layers) {
+        if (layer < 0 || layer >= LLAMA_MAX_LAYERS) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+        }
+        registry.layer_ids[size_t(layer)] = 0;
+    }
+    return initialize(registry);
+}
+
+llm_expert_provider_result llm_cold_expert_cache::initialize(
+        const llm_expert_layout_registry & registry) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->arena) {
         return llm_expert_provider_result::success();
     }
-    if (!prototype.validate().is_ready()) {
+    if (!registry.sealed() || registry.classes.size() > LLM_EXPERT_LAYOUT_CLASS_MAX ||
+        registry.layer_ids.size() != LLAMA_MAX_LAYERS) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
     }
     try {
         uint64_t payload = 0;
-        if (!bundle_payload(prototype, payload)) {
-            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        for (size_t index = 0; index < registry.classes.size(); ++index) {
+            const auto & layout_class = registry.classes[index];
+            uint64_t actual_payload = 0;
+            if (layout_class.id != index || !layout_class.prototype.validate().is_ready() ||
+                !bundle_payload(layout_class.prototype, actual_payload) ||
+                actual_payload != layout_class.payload_bytes) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+            }
+            payload = std::max(payload, actual_payload);
+        }
+        for (int32_t layer : pimpl->config.routed_layers) {
+            if (layer < 0 || layer >= LLAMA_MAX_LAYERS ||
+                registry.layer_ids[size_t(layer)] >= registry.classes.size()) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+            }
         }
         uint32_t low = 0;
-        uint32_t high = pimpl->config.total_expert_keys;
-        while (low < high) {
-            const uint32_t middle = low + (high - low + 1)/2;
-            if (allocation_size(prototype, middle, pimpl->config.buffer_type) <= pimpl->config.byte_budget) {
-                low = middle;
-            } else {
-                high = middle - 1;
+        size_t stride = 0;
+        std::shared_ptr<cold_allocation> candidate;
+        if (registry.classes.size() == 1) {
+            uint32_t high = pimpl->config.total_expert_keys;
+            while (low < high) {
+                const uint32_t middle = low + (high - low + 1)/2;
+                if (allocation_size(registry.classes.front().prototype, middle,
+                        pimpl->config.buffer_type) <= pimpl->config.byte_budget) {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
             }
+        } else {
+            stride = universal_slot_stride(registry, pimpl->config.buffer_type);
+            if (stride == SIZE_MAX || stride == 0) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+            }
+            const uint64_t available_slots = pimpl->config.byte_budget/stride;
+            low = uint32_t(std::min<uint64_t>(available_slots, pimpl->config.total_expert_keys));
         }
         if (low < pimpl->config.minimum_slots) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
@@ -599,7 +796,20 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
             uint64_t(low) < uint64_t(pimpl->config.routed_layer_count)*pimpl->config.minimum_domain_slots) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
         }
-        auto candidate = make_allocation(prototype, low, true, pimpl->config.buffer_type);
+        if (registry.classes.size() == 1) {
+            candidate = make_allocation(
+                registry.classes.front().prototype, low, true, pimpl->config.buffer_type);
+            if (candidate && candidate->buffer) {
+                candidate->bundles = { candidate->bundle };
+                candidate->layer_ids = registry.layer_ids;
+                candidate->payload_bytes = { registry.classes.front().payload_bytes };
+                const uint64_t actual = ggml_backend_buffer_get_size(candidate->buffer.get());
+                candidate->slot_stride = actual/low + (actual % low != 0);
+                stride = candidate->slot_stride;
+            }
+        } else {
+            candidate = make_universal_allocation(registry, low, pimpl->config.buffer_type);
+        }
         if (!candidate || !candidate->buffer) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
         }
@@ -616,7 +826,7 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
         pimpl->counters.actual_bytes = actual;
         pimpl->counters.unused_budget_bytes = pimpl->config.byte_budget - actual;
         pimpl->counters.bundle_payload_bytes = payload;
-        pimpl->counters.aligned_slot_footprint = actual/low + (actual % low != 0);
+        pimpl->counters.aligned_slot_footprint = stride;
         pimpl->counters.alignment = ggml_backend_buft_get_alignment(
             pimpl->config.buffer_type ? pimpl->config.buffer_type : ggml_backend_cpu_buffer_type());
         pimpl->counters.effective_slots = low;
@@ -663,7 +873,12 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit_with_loader(
     if (!reserved.is_ready() || hit) {
         return reserved;
     }
-    const auto result = loader(loader_data, key, pimpl->arena->bundle, reference.slot);
+    const auto * destination = pimpl->bundle_for_key(key);
+    if (destination == nullptr) {
+        (void) fail_reservation(key, reference);
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
+    const auto result = loader(loader_data, key, *destination, reference.slot);
     if (!result.is_ready()) {
         (void) fail_reservation(key, reference);
         return result;
@@ -686,7 +901,12 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit_speculative_with
     bool hit = false;
     auto reserved = reserve_or_find_speculative(key, deadline, utility, reference, hit);
     if (!reserved.is_ready() || hit) return reserved;
-    const auto loaded = loader(loader_data, key, pimpl->arena->bundle, reference.slot);
+    const auto * destination = pimpl->bundle_for_key(key);
+    if (destination == nullptr) {
+        (void) fail_reservation(key, reference);
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
+    const auto loaded = loader(loader_data, key, *destination, reference.slot);
     if (!loaded.is_ready()) {
         (void) fail_reservation(key, reference);
         return loaded;
@@ -735,7 +955,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
             existing.speculative_utility = 0;
             pimpl->counters.speculative_demand_consumptions++;
         }
-        reference = { uint32_t(forward.slot), forward.generation };
+        reference = { uint32_t(forward.slot), forward.generation, existing.layout_class_id };
         pimpl->counters.hits++;
         hit = true;
         return llm_expert_provider_result::success();
@@ -757,6 +977,10 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
     }
     slot.state = llm_cold_slot_state::reserved;
     slot.key = key;
+    slot.layout_class_id = pimpl->class_for_key(key);
+    if (slot.layout_class_id == LLM_EXPERT_LAYOUT_CLASS_INVALID) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
     slot.generation++;
     slot.last_use = 0;
     slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
@@ -767,11 +991,11 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     const auto loading = policy_result(pimpl->policy.load_begin(uint32_t(victim), slot.generation,
-        { key.layer, key.expert }, pimpl->counters.bundle_payload_bytes,
+        pimpl->policy_key(key), pimpl->payload_for_key(key),
         pimpl->counters.aligned_slot_footprint));
     if (!loading.is_ready()) return loading;
     slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
-    reference = { uint32_t(victim), slot.generation };
+    reference = { uint32_t(victim), slot.generation, slot.layout_class_id };
     pimpl->counters.reservations++;
     return llm_expert_provider_result::success();
 }
@@ -810,7 +1034,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
             existing.speculative_utility = 0;
             pimpl->counters.speculative_demand_consumptions++;
         }
-        reference = { uint32_t(forward.slot), forward.generation };
+        reference = { uint32_t(forward.slot), forward.generation, existing.layout_class_id };
         pimpl->counters.hits++;
         lookup = llm_cold_demand_lookup::ready;
         return llm_expert_provider_result::success();
@@ -825,7 +1049,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
             existing.speculative_utility = 0;
             pimpl->counters.speculative_demand_consumptions++;
         }
-        reference = { index, existing.generation };
+        reference = { index, existing.generation, existing.layout_class_id };
         lookup = llm_cold_demand_lookup::joined_loading;
         return llm_expert_provider_result::success();
     }
@@ -846,6 +1070,10 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
     }
     slot.state = llm_cold_slot_state::reserved;
     slot.key = key;
+    slot.layout_class_id = pimpl->class_for_key(key);
+    if (slot.layout_class_id == LLM_EXPERT_LAYOUT_CLASS_INVALID) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
     slot.generation++;
     slot.last_use = 0;
     slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
@@ -856,11 +1084,11 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     const auto loading = policy_result(pimpl->policy.load_begin(uint32_t(victim), slot.generation,
-        { key.layer, key.expert }, pimpl->counters.bundle_payload_bytes,
+        pimpl->policy_key(key), pimpl->payload_for_key(key),
         pimpl->counters.aligned_slot_footprint));
     if (!loading.is_ready()) return loading;
     slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
-    reference = { uint32_t(victim), slot.generation };
+    reference = { uint32_t(victim), slot.generation, slot.layout_class_id };
     pimpl->counters.reservations++;
     return llm_expert_provider_result::success();
 }
@@ -869,13 +1097,14 @@ llm_expert_provider_result llm_cold_expert_cache::wait_until_ready(
         llm_cold_reference reference) noexcept {
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     if (reference.slot >= pimpl->slots.size() ||
-        pimpl->slots[reference.slot].generation != reference.generation) {
+        pimpl->slots[reference.slot].generation != reference.generation ||
+        pimpl->slots[reference.slot].layout_class_id != reference.layout_class_id) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     pimpl->ready_cv.wait(lock, [&] {
         if (reference.slot >= pimpl->slots.size()) return true;
         const auto & slot = pimpl->slots[reference.slot];
-        return slot.generation != reference.generation ||
+        return slot.generation != reference.generation || slot.layout_class_id != reference.layout_class_id ||
             slot.state == llm_cold_slot_state::ready ||
             slot.state == llm_cold_slot_state::failed ||
             slot.state == llm_cold_slot_state::free;
@@ -884,7 +1113,7 @@ llm_expert_provider_result llm_cold_expert_cache::wait_until_ready(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     const auto & slot = pimpl->slots[reference.slot];
-    if (slot.generation != reference.generation) {
+    if (slot.generation != reference.generation || slot.layout_class_id != reference.layout_class_id) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     return slot.state == llm_cold_slot_state::ready ?
@@ -918,7 +1147,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find_speculative(
             pimpl->counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
-        reference = { uint32_t(forward.slot), forward.generation };
+        reference = { uint32_t(forward.slot), forward.generation, existing.layout_class_id };
         pimpl->counters.hits++;
         hit = true;
         return llm_expert_provider_result::success();
@@ -944,15 +1173,16 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find_speculative(
     for (uint32_t index = 0; index < pimpl->slots.size(); ++index) {
         const auto & slot = pimpl->slots[index];
         pimpl->policy_candidates[index] = {
-            index, slot.generation, { slot.key.layer, slot.key.expert },
-            pimpl->counters.bundle_payload_bytes, pimpl->counters.aligned_slot_footprint,
+            index, slot.generation, pimpl->policy_key(slot.key),
+            slot.state == llm_cold_slot_state::free ? pimpl->payload_for_key(key) : pimpl->payload_for_key(slot.key),
+            pimpl->counters.aligned_slot_footprint,
             slot.state == llm_cold_slot_state::free,
             speculative_victim == int32_t(index),
         };
     }
     llm_expert_cache_policy_decision decision;
     auto selected = policy_result(pimpl->policy.optional_admission(
-        { key.layer, key.expert }, llm_expert_cache_policy_admission::optional_background,
+        pimpl->policy_key(key), llm_expert_cache_policy_admission::optional_background,
         pimpl->policy_candidates.data(), pimpl->policy_candidates.size(), decision));
     if (!selected.is_ready() || !decision.accept || decision.slot >= pimpl->slots.size()) {
         pimpl->counters.speculative_rejections++;
@@ -983,6 +1213,10 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find_speculative(
     }
     slot.state = llm_cold_slot_state::reserved;
     slot.key = key;
+    slot.layout_class_id = pimpl->class_for_key(key);
+    if (slot.layout_class_id == LLM_EXPERT_LAYOUT_CLASS_INVALID) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
     slot.generation++;
     slot.last_use = 0;
     slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
@@ -993,12 +1227,12 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find_speculative(
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     const auto loading = policy_result(pimpl->policy.load_begin(decision.slot, slot.generation,
-        { key.layer, key.expert }, pimpl->counters.bundle_payload_bytes,
+        pimpl->policy_key(key), pimpl->payload_for_key(key),
         pimpl->counters.aligned_slot_footprint, false));
     if (!loading.is_ready()) return loading;
     slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
     pimpl->counters.reservations++;
-    reference = { decision.slot, slot.generation };
+    reference = { decision.slot, slot.generation, slot.layout_class_id };
     return llm_expert_provider_result::success();
 }
 
@@ -1025,7 +1259,8 @@ llm_expert_provider_result llm_cold_expert_cache::publish_ready(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & slot = pimpl->slots[reference.slot];
-    if (slot.generation != reference.generation || slot.state != llm_cold_slot_state::loading ||
+    if (slot.generation != reference.generation || slot.layout_class_id != reference.layout_class_id ||
+        slot.state != llm_cold_slot_state::loading ||
         !key_matches(slot.key, key)) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
@@ -1048,7 +1283,8 @@ llm_expert_provider_result llm_cold_expert_cache::fail_reservation(
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
     auto & slot = pimpl->slots[reference.slot];
-    if (slot.generation != reference.generation || slot.state != llm_cold_slot_state::loading ||
+    if (slot.generation != reference.generation || slot.layout_class_id != reference.layout_class_id ||
+        slot.state != llm_cold_slot_state::loading ||
         !key_matches(slot.key, key)) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
     }
@@ -1098,7 +1334,7 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
             slot.speculative_utility = 0;
             pimpl->counters.speculative_demand_consumptions++;
         }
-        reference = { uint32_t(forward.slot), forward.generation };
+        reference = { uint32_t(forward.slot), forward.generation, slot.layout_class_id };
         pimpl->counters.hits++;
         return llm_expert_provider_result::success();
     }
@@ -1119,6 +1355,10 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
     }
     slot.state = llm_cold_slot_state::reserved;
     slot.key = key;
+    slot.layout_class_id = pimpl->class_for_key(key);
+    if (slot.layout_class_id == LLM_EXPERT_LAYOUT_CLASS_INVALID) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
     slot.generation++;
     slot.last_use = 0;
     slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
@@ -1129,16 +1369,22 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
     pimpl->counters.generation_changes++;
     slot.state = llm_cold_slot_state::loading;
     const auto loading = policy_result(pimpl->policy.load_begin(uint32_t(victim), slot.generation,
-        { key.layer, key.expert }, pimpl->counters.bundle_payload_bytes,
+        pimpl->policy_key(key), pimpl->payload_for_key(key),
         pimpl->counters.aligned_slot_footprint));
     if (!loading.is_ready()) return loading;
     slot.origin_operation_ordinal = pimpl->policy.diagnostics().operation_ordinal;
-    reference = { uint32_t(victim), slot.generation };
+    reference = { uint32_t(victim), slot.generation, slot.layout_class_id };
 
     size_t bytes = 0;
     size_t copies = 0;
     const int64_t start = ggml_time_us();
-    const auto & target = pimpl->arena->bundle;
+    const auto * target_ptr = pimpl->bundle_for_key(key);
+    if (target_ptr == nullptr) {
+        slot.state = llm_cold_slot_state::failed;
+        (void) pimpl->policy.load_failed(uint32_t(victim), slot.generation);
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
+    const auto & target = *target_ptr;
     const bool copied =
         copy_projection(target.up, source.up, source.n_expert, target.n_expert, key.expert, victim,
             bytes, copies, fail_copy_after_tensors) &&
@@ -1165,7 +1411,7 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
     pimpl->counters.admissions++;
     pimpl->counters.source_copy_bundles++;
     pimpl->counters.source_copy_bytes += bytes;
-    reference = { uint32_t(victim), slot.generation };
+    reference = { uint32_t(victim), slot.generation, slot.layout_class_id };
     pimpl->ready_cv.notify_all();
     return llm_expert_provider_result::success();
 }
@@ -1215,7 +1461,7 @@ llm_expert_provider_result llm_cold_expert_cache::policy_shadow_hit(
         return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
     if (!pimpl->policy.validate_resident(
-            reference.slot, reference.generation, { key.layer, key.expert })) {
+            reference.slot, reference.generation, pimpl->policy_key(key))) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
     auto result = pimpl->ensure_policy_request();
@@ -1331,6 +1577,7 @@ llm_expert_provider_result llm_cold_expert_cache::retire_ready(llm_cold_referenc
     if (!removed.is_ready()) return removed;
     pimpl->clear_forward(reference.slot);
     slot.key = { -1, -1 };
+    slot.layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
     slot.state = llm_cold_slot_state::free;
     return llm_expert_provider_result::success();
 }
@@ -1340,6 +1587,7 @@ llm_expert_provider_result llm_cold_expert_cache::cleanup_failed_slots() noexcep
     for (auto & slot : pimpl->slots) {
         if (slot.state == llm_cold_slot_state::failed && pimpl->no_refs(slot)) {
             slot.key = { -1, -1 };
+            slot.layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
             slot.state = llm_cold_slot_state::free;
             pimpl->counters.failed_cleanups++;
         }
@@ -1387,6 +1635,7 @@ llm_expert_provider_result llm_cold_expert_cache::trim() noexcept {
             if (!removed.is_ready()) return removed;
             pimpl->clear_forward(index);
             slot.key = { -1, -1 };
+            slot.layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
             slot.state = llm_cold_slot_state::free;
             if (pimpl->config.reclaim_free_pages) {
 #ifdef __linux__
@@ -1456,13 +1705,19 @@ llm_expert_provider_result llm_cold_expert_cache::validate_invariants(
         }
         const auto & slot = pimpl->slots[backing.cold_slot];
         if (slot.state != llm_cold_slot_state::ready || slot.generation != backing.cold_generation ||
-            !key_matches(slot.key, backing.key)) {
+            slot.layout_class_id != backing.layout_class_id || !key_matches(slot.key, backing.key)) {
             pimpl->counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
     }
     for (uint32_t index = 0; index < pimpl->slots.size(); ++index) {
         const auto & slot = pimpl->slots[index];
+        const bool occupied = slot.state != llm_cold_slot_state::free;
+        if ((occupied && slot.layout_class_id != pimpl->class_for_key(slot.key)) ||
+            (!occupied && slot.layout_class_id != LLM_EXPERT_LAYOUT_CLASS_INVALID)) {
+            pimpl->counters.invariant_failures++;
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
         if (slot.state == llm_cold_slot_state::ready || slot.state == llm_cold_slot_state::loading) {
             const bool speculative = slot.origin == llm_expert_residency_origin::speculative;
             if ((speculative && (slot.speculative_consumed || slot.speculative_deadline == 0)) ||
@@ -1490,13 +1745,13 @@ llm_expert_provider_result llm_cold_expert_cache::validate_invariants(
                 return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
             }
             if (!pimpl->policy.validate_resident(index, slot.generation,
-                    { slot.key.layer, slot.key.expert })) {
+                    pimpl->policy_key(slot.key))) {
                 pimpl->counters.invariant_failures++;
                 return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
             }
         } else if (slot.state == llm_cold_slot_state::loading &&
                    !pimpl->policy.validate_loading(index, slot.generation,
-                       { slot.key.layer, slot.key.expert })) {
+                       pimpl->policy_key(slot.key))) {
             pimpl->counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
@@ -1526,6 +1781,20 @@ const llm_expert_bundle_descriptor & llm_cold_expert_cache::bundle() const noexc
     return pimpl->arena ? pimpl->arena->bundle : empty;
 }
 
+const llm_expert_bundle_descriptor & llm_cold_expert_cache::bundle(
+        llm_expert_layout_class_id layout_class_id) const noexcept {
+    static const llm_expert_bundle_descriptor empty = {};
+    return pimpl->arena && layout_class_id < pimpl->arena->bundles.size() ?
+        pimpl->arena->bundles[layout_class_id] : empty;
+}
+
+const llm_expert_bundle_descriptor & llm_cold_expert_cache::bundle_for_key(
+        llm_expert_key key) const noexcept {
+    static const llm_expert_bundle_descriptor empty = {};
+    const auto * result = pimpl->bundle_for_key(key);
+    return result == nullptr ? empty : *result;
+}
+
 ggml_backend_buffer_t llm_cold_expert_cache::buffer() const noexcept {
     return pimpl->arena ? pimpl->arena->buffer.get() : nullptr;
 }
@@ -1537,6 +1806,19 @@ std::shared_ptr<void> llm_cold_expert_cache::allocation_lease() const noexcept {
 llm_cold_cache_diagnostics llm_cold_expert_cache::diagnostics() const {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     auto result = pimpl->counters;
+    if (pimpl->arena) {
+        result.layout_class_count = uint32_t(pimpl->arena->payload_bytes.size());
+        result.class_payload_bytes = pimpl->arena->payload_bytes;
+        result.role_offsets.assign(pimpl->arena->role_offsets.begin(), pimpl->arena->role_offsets.end());
+        result.role_extents.assign(pimpl->arena->role_extents.begin(), pimpl->arena->role_extents.end());
+        result.class_padding_bytes.reserve(pimpl->arena->payload_bytes.size());
+        for (uint64_t payload : pimpl->arena->payload_bytes) {
+            result.class_padding_bytes.push_back(
+                pimpl->arena->payload_bytes.size() == 1 ? 0 :
+                pimpl->counters.aligned_slot_footprint >= payload ?
+                    pimpl->counters.aligned_slot_footprint - payload : 0);
+        }
+    }
     result.policy = pimpl->policy.diagnostics();
     result.policy_domains = pimpl->policy.domain_diagnostics();
     result.policy_events.assign(

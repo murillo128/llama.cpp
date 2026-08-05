@@ -95,6 +95,7 @@ struct llm_expert_async_operation_identity {
     llm_expert_key key = { -1, -1 };
     llm_expert_readiness readiness = llm_expert_readiness::host_ready;
     llm_expert_priority priority = llm_expert_priority::prefetch_speculative;
+    llm_expert_layout_class_id layout_class_id = 0;
 };
 
 enum class llm_expert_async_result {

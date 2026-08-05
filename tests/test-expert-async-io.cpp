@@ -275,11 +275,18 @@ void test_worker_read_and_drain() {
         llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
     read.segments[1] = { second.data(), second.size(), 10,
         llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight };
+    read.layout_class_id = 2;
+    read.segments[0].layout_class_id = 2;
+    read.segments[1].layout_class_id = 2;
     llm_expert_async_transport transport(config(8));
     const llm_expert_async_operation_identity identity = {
         1, { 1, 7 }, 0, { 0, 2 }, llm_expert_readiness::host_ready,
-        llm_expert_priority::demand_current_layer,
+        llm_expert_priority::demand_current_layer, 2,
     };
+    auto mismatched_read = read;
+    mismatched_read.layout_class_id = 1;
+    GGML_ASSERT(transport.submit_read_plan(identity, &mismatched_read, 1) ==
+        llm_expert_async_result::invalid);
     GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
     llm_expert_async_read_completion completion;
     GGML_ASSERT(transport.wait_read(identity.request, completion) == llm_expert_async_result::ready);
@@ -295,6 +302,7 @@ void test_worker_read_and_drain() {
         GGML_ASSERT(intervals[index].flight.request_generation == identity.request.generation);
         GGML_ASSERT(intervals[index].flight.key.layer == identity.key.layer &&
             intervals[index].flight.key.expert == identity.key.expert);
+        GGML_ASSERT(intervals[index].flight.layout_class_id == identity.layout_class_id);
         GGML_ASSERT(intervals[index].operation_index == index);
         GGML_ASSERT(intervals[index].complete_us >= intervals[index].submit_us);
         GGML_ASSERT(intervals[index].bytes == read.byte_count);

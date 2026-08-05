@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "llama-context.h"
+#include "llama-expert-storage.h"
 #include "llama-expert-weight-provider.h"
 #include "llama-model.h"
 #include "llama-cpp.h"
@@ -27,6 +28,7 @@ struct arguments {
     std::string model;
     std::string output;
     std::string mode = "cold";
+    std::string prompt = "According to all known laws";
     std::string hot_policy = "LRU";
     std::string cold_policy = "LRU";
     std::string scope = "GLOBAL";
@@ -69,6 +71,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         if (option == "--model") result.model = value;
         else if (option == "--output") result.output = value;
         else if (option == "--mode") result.mode = value;
+        else if (option == "--prompt") result.prompt = value;
         else if (option == "--hot-policy") result.hot_policy = value;
         else if (option == "--cold-policy") result.cold_policy = value;
         else if (option == "--scope") result.scope = value;
@@ -99,7 +102,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         } else return false;
     }
     return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ubatch > 0 &&
-        (result.mode == "hot" || result.mode == "cold");
+        (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold");
 }
 
 llama_expert_cache_policy policy_enum(const std::string & value) {
@@ -181,6 +184,7 @@ json event_json(const llm_expert_cache_policy_event & event) {
         {"demand_ordinal", event.demand_ordinal}, {"origin_operation_ordinal", event.origin_operation_ordinal},
         {"phase", event.phase == llm_expert_cache_policy_phase::prefill ? "PREFILL" : "DECODE"},
         {"layer", event.key.layer}, {"expert", event.key.expert},
+        {"layout_class_id", event.key.layout_class_id},
         {"occurrence_count", event.occurrence_count}, {"logical_payload_bytes", event.logical_bundle_bytes},
         {"physical_slot_footprint_bytes", event.physical_slot_footprint_bytes},
         {"slot", event.slot == UINT32_MAX ? -1 : int64_t(event.slot)}, {"generation", event.generation},
@@ -282,7 +286,9 @@ int main(int argc, char ** argv) {
     try {
         arguments args;
         if (!parse_arguments(argc, argv, args)) {
-            std::fprintf(stderr, "usage: %s --model GGUF --output JSON [--mode hot|cold] [policy/capacity options]\n", argv[0]);
+            std::fprintf(stderr,
+                "usage: %s --model GGUF --output JSON [--mode disabled|hot|cold] [policy/capacity options]\n",
+                argv[0]);
             return 2;
         }
         ggml_backend_load_all();
@@ -307,10 +313,12 @@ int main(int argc, char ** argv) {
         model_params.load_mode = args.transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         model_params.n_gpu_layers = -1;
         model_params.tensor_buft_overrides = overrides;
-        model_params.expert_weights_mode = args.mode == "cold" ?
-            LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
-        model_params.expert_hot_cache_capacity = args.hot_slots;
-        model_params.expert_hot_cache_policy = args.config_source == "NULL" ? nullptr : &hot_config;
+        model_params.expert_weights_mode = args.mode == "disabled" ? LLAMA_EXPERT_WEIGHTS_MODE_DISABLED :
+            args.mode == "cold" ? LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
+        if (args.mode != "disabled") {
+            model_params.expert_hot_cache_capacity = args.hot_slots;
+            model_params.expert_hot_cache_policy = args.config_source == "NULL" ? nullptr : &hot_config;
+        }
         if (args.mode == "cold") {
             model_params.expert_cold_cache_bytes = args.cold_bytes;
             model_params.expert_transfer_ring_bytes = args.ring_bytes;
@@ -324,9 +332,9 @@ int main(int argc, char ** argv) {
         llama_model_ptr model(llama_model_load_from_file(args.model.c_str(), model_params));
         if (!model) return 3;
         auto * provider = model->expert_weight_provider();
-        if (!provider) return 4;
+        if ((args.mode == "disabled") == (provider != nullptr)) return 4;
         const auto * vocab = llama_model_get_vocab(model.get());
-        const std::string prompt_text = "According to all known laws";
+        const std::string & prompt_text = args.prompt;
         const int prompt_count = -llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), nullptr, 0, true, true);
         if (prompt_count <= 0) return 5;
         std::vector<llama_token> prompt(prompt_count);
@@ -353,6 +361,11 @@ int main(int argc, char ** argv) {
             const auto begin = std::chrono::steady_clock::now();
             const int decode_status = llama_decode(context.get(), batch);
             if (decode_status != 0) {
+                if (provider == nullptr) {
+                    std::fprintf(stderr, "phase9-cache-policy-probe: provider-disabled decode failed status=%d\n",
+                        decode_status);
+                    return 9;
+                }
                 const auto failed = provider->hot_cache_diagnostics();
                 std::fprintf(stderr,
                     "phase9-cache-policy-probe: decode failed status=%d provider_error=%u remap_error=%u "
@@ -373,9 +386,81 @@ int main(int argc, char ** argv) {
             llama_synchronize(context.get());
             const auto end = std::chrono::steady_clock::now();
             const float * logits = llama_get_logits_ith(context.get(), -1);
-            if (!logits) return 10;
+            if (!logits) {
+                std::fprintf(stderr, "phase9-cache-policy-probe: missing logits at step=%d\n", step);
+                return 10;
+            }
             const int next = finite_argmax(logits, n_vocab);
-            if (next < 0) return 10;
+            if (next < 0) {
+                int bad_logit = -1;
+                for (int index = 0; index < n_vocab; ++index) {
+                    if (!std::isfinite(logits[index])) {
+                        bad_logit = index;
+                        break;
+                    }
+                }
+                int bad_route = -1;
+                int bad_layer = -1;
+                for (size_t index = 0; index < routes.records.size() && bad_route < 0; ++index) {
+                    for (float weight : routes.records[index].weights) {
+                        if (!std::isfinite(weight)) {
+                            bad_route = int(index);
+                            bad_layer = routes.records[index].layer;
+                            break;
+                        }
+                    }
+                }
+                if (provider == nullptr) {
+                    std::fprintf(stderr,
+                        "phase9-cache-policy-probe: provider-disabled non-finite logits step=%d first_bad=%d "
+                        "first_bad_route=%d first_bad_layer=%d\n",
+                        step, bad_logit, bad_route, bad_layer);
+                    return 10;
+                }
+                const auto failed = provider->hot_cache_diagnostics();
+                bool source_read = false;
+                bool cold_read = false;
+                bool hot_read = false;
+                bool source_cold_equal = false;
+                bool cold_hot_equal = false;
+                uint64_t source_digest = 0;
+                uint64_t cold_digest = 0;
+                uint64_t hot_digest = 0;
+                if (!routes.records.empty() && !routes.records.back().ids.empty()) {
+                    const llm_expert_key key = {
+                        routes.records.back().layer,
+                        routes.records.back().ids.front(),
+                    };
+                    std::vector<uint8_t> cold_bytes;
+                    std::vector<uint8_t> hot_bytes;
+                    cold_read = provider->debug_copy_cold_bundle(key, cold_bytes).is_ready();
+                    hot_read = provider->debug_copy_hot_bundle(key, hot_bytes).is_ready();
+                    std::vector<uint8_t> source_bytes(cold_bytes.size());
+                    auto * storage = model->expert_storage();
+                    source_read = storage != nullptr && !source_bytes.empty() &&
+                        storage->read_bundle(key, source_bytes.data(), source_bytes.size(), nullptr, nullptr).is_ready();
+                    source_cold_equal = source_read && cold_read && source_bytes == cold_bytes;
+                    cold_hot_equal = cold_read && hot_read && cold_bytes == hot_bytes;
+                    if (source_read) source_digest = hash_bytes(1469598103934665603ULL,
+                        source_bytes.data(), source_bytes.size());
+                    if (cold_read) cold_digest = hash_bytes(1469598103934665603ULL,
+                        cold_bytes.data(), cold_bytes.size());
+                    if (hot_read) hot_digest = hash_bytes(1469598103934665603ULL,
+                        hot_bytes.data(), hot_bytes.size());
+                }
+                std::fprintf(stderr,
+                    "phase9-cache-policy-probe: non-finite logits step=%d first_bad=%d "
+                    "first_bad_route=%d first_bad_layer=%d classes=%u hot_events=%llu cold_events=%llu "
+                    "source_read=%d cold_read=%d hot_read=%d source_cold_equal=%d cold_hot_equal=%d "
+                    "source_digest=%llu cold_digest=%llu hot_digest=%llu\n",
+                    step, bad_logit, bad_route, bad_layer, failed.layout_class_count,
+                    (unsigned long long) failed.policy.events,
+                    (unsigned long long) failed.cold_policy.events,
+                    source_read, cold_read, hot_read, source_cold_equal, cold_hot_equal,
+                    (unsigned long long) source_digest, (unsigned long long) cold_digest,
+                    (unsigned long long) hot_digest);
+                return 10;
+            }
             generated.push_back(next);
             logits_digests.push_back(hash_bytes(1469598103934665603ULL, logits, size_t(n_vocab)*sizeof(float)));
             latency_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count());
@@ -386,6 +471,26 @@ int main(int argc, char ** argv) {
         // every background flight, and emits all reserved policy terminals.
         // Evidence must never accept a live provisional transcript prefix.
         context.reset();
+        struct rusage usage {};
+        getrusage(RUSAGE_SELF, &usage);
+        json command = json::array();
+        for (int index = 0; index < argc; ++index) command.push_back(argv[index]);
+        if (provider == nullptr) {
+            json output = {
+                {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
+                {"command", command}, {"model_path", args.model}, {"mode", args.mode},
+                {"provider_enabled", false}, {"prompt", prompt_text},
+                {"prompt_ids", prompt}, {"generated_ids", generated}, {"logits_fnv64", logits_digests},
+                {"latency_us", latency_us}, {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
+            };
+            std::ofstream destination(args.output, std::ios::binary | std::ios::trunc);
+            if (!destination) return 12;
+            destination << output.dump(2) << '\n';
+            destination.close();
+            if (!destination) return 12;
+            std::printf("PHASE9_POLICY_PROBE status=pass provider=disabled output=%s\n", args.output.c_str());
+            return 0;
+        }
         const auto diagnostics = provider->hot_cache_diagnostics();
         if (diagnostics.policy.transcript_dropped != 0 || diagnostics.cold_policy.transcript_dropped != 0) {
             std::fprintf(stderr, "phase9-cache-policy-probe: policy transcript dropped events\n");
@@ -395,8 +500,6 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "phase9-cache-policy-probe: background transcript is not terminal\n");
             return 11;
         }
-        struct rusage usage {};
-        getrusage(RUSAGE_SELF, &usage);
         std::vector<int32_t> routed_layers;
         for (const auto & record : routes.records) routed_layers.push_back(record.layer);
         if (routed_layers.empty()) {
@@ -413,11 +516,10 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
-        json command = json::array();
-        for (int index = 0; index < argc; ++index) command.push_back(argv[index]);
         json output = {
             {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
             {"command", command}, {"model_path", args.model}, {"mode", args.mode},
+            {"prompt", prompt_text},
             {"transport_requested", args.transport},
             {"config_source", args.config_source},
             {"miss_policy", args.miss_policy}, {"background", args.background},
@@ -427,12 +529,42 @@ int main(int argc, char ** argv) {
                 {"routed_layers", routed_layers}, {"experts_per_layer", diagnostics.n_expert},
                 {"hot_physical_slot_footprint_bytes", hot_footprint},
                 {"cold_physical_slot_footprint_bytes", diagnostics.cold_slot_footprint},
+                {"layout_registry", {
+                    {"class_count", diagnostics.layout_class_count},
+                    {"class_digests", diagnostics.layout_class_digests},
+                    {"class_payload_bytes", diagnostics.layout_class_payload_bytes},
+                    {"class_hot_padding_bytes", diagnostics.layout_class_hot_padding_bytes},
+                    {"class_cold_padding_bytes", diagnostics.layout_class_cold_padding_bytes},
+                    {"class_lane_padding_bytes", diagnostics.layout_class_lane_padding_bytes},
+                    {"class_stage_bundles", diagnostics.layout_class_stage_bundles},
+                    {"class_stage_bytes", diagnostics.layout_class_stage_bytes},
+                    {"class_h2d_bundles", diagnostics.layout_class_h2d_bundles},
+                    {"class_h2d_bytes", diagnostics.layout_class_h2d_bytes},
+                    {"layer_class_ids", diagnostics.layout_layer_ids},
+                    {"administration_bytes", diagnostics.layout_registry_administration_bytes},
+                    {"preflight_consumer_count", diagnostics.layout_preflight_consumer_count},
+                    {"preflight_passed", diagnostics.layout_preflight_passed},
+                    {"hot_role_offsets", diagnostics.layout_hot_role_offsets},
+                    {"hot_role_extents", diagnostics.layout_hot_role_extents},
+                    {"cold_role_offsets", diagnostics.layout_cold_role_offsets},
+                    {"cold_role_extents", diagnostics.layout_cold_role_extents},
+                    {"lane_role_offsets", diagnostics.layout_lane_role_offsets},
+                    {"lane_role_extents", diagnostics.layout_lane_role_extents},
+                }},
+                {"universal_hot_slot_stride", diagnostics.hot_slot_stride},
             }},
             {"capacities", {
                 {"hot_requested_slots", args.hot_slots}, {"hot_effective_slots", diagnostics.effective_capacity},
                 {"hot_pool_bytes", diagnostics.pool_bytes}, {"cold_requested_bytes", diagnostics.cold_requested_bytes},
                 {"cold_actual_bytes", diagnostics.cold_actual_bytes}, {"cold_effective_slots", diagnostics.cold_effective_slots},
+                {"cold_unused_budget_bytes", diagnostics.cold_unused_budget_bytes},
                 {"cold_slot_footprint", diagnostics.cold_slot_footprint},
+                {"ring_requested_bytes", diagnostics.ring_requested_bytes},
+                {"ring_actual_bytes", diagnostics.ring_actual_bytes},
+                {"ring_effective_lanes", diagnostics.ring_effective_lanes},
+                {"ring_lane_footprint", diagnostics.ring_lane_footprint},
+                {"ring_unused_budget_bytes", diagnostics.ring_requested_bytes - diagnostics.ring_actual_bytes},
+                {"ring_pinned_or_registered_bytes", diagnostics.ring_pinned_or_registered_bytes},
             }},
             {"cold_residency", {
                 {"supported", diagnostics.cold_residency_supported},
@@ -458,6 +590,40 @@ int main(int argc, char ** argv) {
                 {"h2d_bytes", diagnostics.h2d_bytes}, {"background_useful", diagnostics.background_useful},
                 {"background_wasted", diagnostics.background_wasted},
                 {"active_background_flights", diagnostics.active_background_flights},
+            }},
+            {"transfer", {
+                {"acquisition_method", diagnostics.ring_acquisition_method},
+                {"pageable_fallback", diagnostics.ring_pageable_fallback},
+                {"fallback_reason", diagnostics.ring_fallback_reason},
+                {"lane_reservations", diagnostics.ring_lane_reservations},
+                {"stage_bytes", diagnostics.ring_stage_bytes},
+                {"stage_time_us", diagnostics.ring_stage_time_us},
+                {"h2d_bytes", diagnostics.ring_h2d_bytes},
+                {"h2d_time_us", diagnostics.ring_h2d_time_us},
+                {"waves", diagnostics.ring_waves},
+                {"peak_in_flight_lanes", diagnostics.ring_peak_in_flight_lanes},
+                {"h2d_event_capacity", diagnostics.ring_h2d_event_capacity},
+                {"compute_event_capacity", diagnostics.ring_compute_event_capacity},
+                {"peak_live_h2d_events", diagnostics.ring_peak_live_h2d_events},
+                {"peak_live_compute_events", diagnostics.ring_peak_live_compute_events},
+                {"live_h2d_events", diagnostics.ring_live_h2d_events},
+                {"live_compute_events", diagnostics.ring_live_compute_events},
+                {"trace_capacity", diagnostics.ring_trace_capacity},
+                {"trace_records", diagnostics.ring_trace_records},
+                {"trace_records_dropped", diagnostics.ring_trace_records_dropped},
+                {"failed_cleanup", diagnostics.ring_failed_cleanup},
+            }},
+            {"lifecycle", {
+                {"current_hot_pins", diagnostics.current_pins},
+                {"cold_current_hot_refs", diagnostics.cold_current_hot_refs},
+                {"cold_current_transfer_refs", diagnostics.cold_current_transfer_refs},
+                {"cold_current_request_refs", diagnostics.cold_current_request_refs},
+                {"cold_current_cpu_execution_refs", diagnostics.cold_current_cpu_execution_refs},
+                {"active_background_flights", diagnostics.active_background_flights},
+                {"hot_failed_cleanups", diagnostics.failed_cleanups},
+                {"cold_failed_cleanups", diagnostics.cold_failed_cleanups},
+                {"hot_transcript_dropped", diagnostics.policy.transcript_dropped},
+                {"cold_transcript_dropped", diagnostics.cold_policy.transcript_dropped},
             }},
         };
         std::ofstream destination(args.output, std::ios::binary | std::ios::trunc);

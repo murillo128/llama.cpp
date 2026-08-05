@@ -18,6 +18,7 @@ enum class llm_transfer_lane_state {
 struct llm_transfer_lane_reference {
     uint32_t lane = 0;
     uint64_t generation = 0;
+    llm_expert_layout_class_id layout_class_id = 0;
 };
 
 struct llm_transfer_ring_config {
@@ -71,6 +72,11 @@ struct llm_transfer_ring_diagnostics {
     uint64_t unused_budget_bytes = 0;
     uint64_t lane_payload_bytes = 0;
     uint64_t lane_footprint = 0;
+    uint32_t layout_class_count = 0;
+    std::vector<uint64_t> class_payload_bytes;
+    std::vector<uint64_t> class_padding_bytes;
+    std::vector<uint64_t> role_offsets;
+    std::vector<uint64_t> role_extents;
     uint64_t alignment = 0;
     uint32_t effective_lanes = 0;
     std::string acquisition_method;
@@ -80,6 +86,8 @@ struct llm_transfer_ring_diagnostics {
     uint64_t fallback_count = 0;
     uint64_t lane_reservations = 0;
     uint64_t stage_bytes = 0;
+    std::vector<uint64_t> class_stage_bundles;
+    std::vector<uint64_t> class_stage_bytes;
     uint64_t stage_time_us = 0;
     uint64_t async_enqueues = 0;
     uint64_t synchronous_copies = 0;
@@ -123,11 +131,14 @@ struct llm_transfer_ring_diagnostics {
     uint64_t h2d_compute_overlap_work = 0;
     uint64_t h2d_compute_overlap_flights = 0;
     uint64_t h2d_bytes = 0;
+    std::vector<uint64_t> class_h2d_bundles;
+    std::vector<uint64_t> class_h2d_bytes;
     uint64_t h2d_time_us = 0;
     uint64_t failed_cleanups = 0;
 
     struct lane {
         uint64_t generation = 0;
+        llm_expert_layout_class_id layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
         llm_transfer_lane_state state = llm_transfer_lane_state::free;
         llm_cold_reference cold;
         uint32_t hot_slot = 0;
@@ -155,6 +166,7 @@ public:
     llm_expert_transfer_ring & operator=(const llm_expert_transfer_ring &) = delete;
 
     llm_expert_provider_result initialize(const llm_expert_bundle_descriptor & prototype) noexcept;
+    llm_expert_provider_result initialize(const llm_expert_layout_registry & registry) noexcept;
     llm_expert_provider_result reserve(
         llm_cold_expert_cache & cold_cache,
         llm_cold_reference cold,

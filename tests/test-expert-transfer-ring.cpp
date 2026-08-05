@@ -1,8 +1,11 @@
 #include "llama-expert-transfer-ring.h"
 #include "llama-expert-scheduler.h"
+#include "llama-hparams.h"
 
 #include "ggml-cpp.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -24,13 +27,14 @@ struct fixture {
     int32_t n_expert;
 
     explicit fixture(int32_t n_expert, bool fill = true,
-            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type()) : n_expert(n_expert) {
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type(),
+            ggml_type type = GGML_TYPE_F32) : n_expert(n_expert) {
         ggml_init_params params = { ggml_tensor_overhead()*8, nullptr, true };
         ctx.reset(ggml_init(params));
         GGML_ASSERT(ctx);
-        up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 8, 16, n_expert);
-        gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 8, 16, n_expert);
-        down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 16, 8, n_expert);
+        up = ggml_new_tensor_3d(ctx.get(), type, 8, 16, n_expert);
+        gate = ggml_new_tensor_3d(ctx.get(), type, 8, 16, n_expert);
+        down = ggml_new_tensor_3d(ctx.get(), type, 16, 8, n_expert);
         buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
         GGML_ASSERT(buffer);
         if (fill) {
@@ -66,7 +70,12 @@ ggml_backend_dev_t cpu_device() {
 }
 
 llm_cold_expert_cache make_cold(const fixture & source) {
-    llm_cold_expert_cache cache({ 1U << 20, 2, 1, uint32_t(source.n_expert), 0 });
+    llm_cold_cache_config config;
+    config.byte_budget = 1U << 20;
+    config.minimum_slots = 2;
+    config.routed_layer_count = 1;
+    config.total_expert_keys = uint32_t(source.n_expert);
+    llm_cold_expert_cache cache(config);
     GGML_ASSERT(cache.initialize(source.bundle()).is_ready());
     return cache;
 }
@@ -127,6 +136,70 @@ void test_budget_fallback_and_wave() {
     GGML_ASSERT(diagnostics.synchronous_copies == 6);
     GGML_ASSERT(diagnostics.h2d_bytes == diagnostics.lane_payload_bytes*2);
     GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+    GGML_ASSERT(ring.validate_invariants().is_ready());
+}
+
+void test_three_layout_classes_reuse_universal_lanes() {
+    fixture f32(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_F32);
+    fixture f16(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_F16);
+    fixture bf16(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_BF16);
+    const std::array<const fixture *, 3> sources = { &f32, &f16, &bf16 };
+
+    llm_expert_layout_registry registry;
+    registry.layer_ids.assign(LLAMA_MAX_LAYERS, LLM_EXPERT_LAYOUT_CLASS_INVALID);
+    for (size_t index = 0; index < sources.size(); ++index) {
+        const auto bundle = sources[index]->bundle(int32_t(index));
+        const uint64_t payload = bundle.up.weight->nb[2] +
+            bundle.gate.weight->nb[2] + bundle.down.weight->nb[2];
+        registry.classes.push_back({ llm_expert_layout_class_id(index), index + 1, payload, bundle });
+        registry.layer_ids[index] = llm_expert_layout_class_id(index);
+    }
+
+    llm_cold_cache_config cold_config;
+    cold_config.byte_budget = 1U << 20;
+    cold_config.minimum_slots = 2;
+    cold_config.routed_layer_count = 3;
+    cold_config.total_expert_keys = 12;
+    cold_config.routed_layers = { 0, 1, 2 };
+    llm_cold_expert_cache cold(cold_config);
+    GGML_ASSERT(cold.initialize(registry).is_ready());
+
+    llm_expert_transfer_ring ring(ring_config(1U << 20));
+    GGML_ASSERT(ring.initialize(registry).is_ready());
+    const auto initial = ring.diagnostics();
+    GGML_ASSERT(initial.layout_class_count == 3);
+    GGML_ASSERT(initial.class_payload_bytes.size() == 3);
+    GGML_ASSERT(initial.role_offsets.size() == 12);
+    GGML_ASSERT(initial.role_extents.size() == 12);
+    GGML_ASSERT(initial.lane_footprint >= *std::max_element(
+        initial.class_payload_bytes.begin(), initial.class_payload_bytes.end()));
+
+    uint64_t expected_useful_bytes = 0;
+    for (int32_t layer = 0; layer < 3; ++layer) {
+        fixture hot(2, false, ggml_backend_cpu_buffer_type(),
+            sources[size_t(layer)]->up->type);
+        llm_cold_reference cold_reference;
+        GGML_ASSERT(cold.find_or_admit(
+            { layer, 0 }, sources[size_t(layer)]->bundle(layer), cold_reference).is_ready());
+        GGML_ASSERT(cold_reference.layout_class_id == registry.layer_ids[size_t(layer)]);
+        llm_transfer_lane_reference lane;
+        GGML_ASSERT(ring.reserve(cold, cold_reference, 0, uint64_t(layer + 1), lane).is_ready());
+        GGML_ASSERT(lane.layout_class_id == cold_reference.layout_class_id);
+        GGML_ASSERT(ring.stage(lane, cold.bundle(cold_reference.layout_class_id)).is_ready());
+        GGML_ASSERT(ring.transfer_wave(nullptr, {
+            { lane, hot.bundle(layer), 0 },
+        }).is_ready());
+        assert_slot_matches(*sources[size_t(layer)], hot, 0, 0);
+        expected_useful_bytes += registry.classes[size_t(lane.layout_class_id)].payload_bytes;
+    }
+    const auto diagnostics = ring.diagnostics();
+    GGML_ASSERT(diagnostics.h2d_bytes == expected_useful_bytes);
+    GGML_ASSERT(diagnostics.h2d_bytes < diagnostics.lane_footprint*3);
+    GGML_ASSERT(diagnostics.waves == 3);
+    GGML_ASSERT(diagnostics.class_stage_bundles == std::vector<uint64_t>({ 1, 1, 1 }));
+    GGML_ASSERT(diagnostics.class_stage_bytes == diagnostics.class_payload_bytes);
+    GGML_ASSERT(diagnostics.class_h2d_bundles == std::vector<uint64_t>({ 1, 1, 1 }));
+    GGML_ASSERT(diagnostics.class_h2d_bytes == diagnostics.class_payload_bytes);
     GGML_ASSERT(ring.validate_invariants().is_ready());
 }
 
@@ -335,6 +408,7 @@ void test_native_event_ordering_reuse_and_unload() {
         llm_transfer_ring_config cancel_config = { diagnostics.lane_footprint, 1, device };
         cancel_config.trace_capacity = 32;
         cancel_config.h2d_gate_event_for_testing = gate_event;
+        cancel_config.delay_event_monitor_ms_for_testing = 100;
         llm_expert_transfer_ring cancelling(cancel_config);
         GGML_ASSERT(cancelling.initialize(source.bundle()).is_ready());
         llm_expert_scheduler scheduler({ 1, 4, 2, 1, 0 });
@@ -448,6 +522,7 @@ void test_native_event_ordering_reuse_and_unload() {
 
 int main() {
     test_budget_fallback_and_wave();
+    test_three_layout_classes_reuse_universal_lanes();
     test_failures_cleanup_and_busy_surrender();
     test_budget_and_generation_rejection();
     test_native_event_ordering_reuse_and_unload();

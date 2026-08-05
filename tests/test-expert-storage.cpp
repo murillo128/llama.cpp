@@ -163,9 +163,9 @@ void test_configuration_directory_and_real_reads() {
     std::array<uint8_t, 6> gate{};
     std::array<uint8_t, 4> down{};
     const std::array<llm_expert_storage_destination, 3> scattered = {{
-        { llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight, up.data(), up.size() },
-        { llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight, gate.data(), gate.size() },
-        { llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight, down.data(), down.size() },
+        { llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight, up.data(), up.size(), 2 },
+        { llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight, gate.data(), gate.size(), 2 },
+        { llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight, down.data(), down.size(), 2 },
     }};
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size()).is_ready());
     const auto scattered_read = storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size());
@@ -189,10 +189,17 @@ void test_configuration_directory_and_real_reads() {
     GGML_ASSERT(read_operation_count == 3);
     for (size_t index = 0; index < read_operation_count; ++index) {
         GGML_ASSERT(read_plan[index].native_handle >= 0);
+        GGML_ASSERT(read_plan[index].layout_class_id == 2);
         GGML_ASSERT(read_plan[index].segment_count == 1);
+        GGML_ASSERT(read_plan[index].segments[0].layout_class_id == 2);
         GGML_ASSERT(read_plan[index].byte_count == read_plan[index].segments[0].byte_count);
     }
     auto malformed_destination = scattered;
+    malformed_destination[1].layout_class_id = 3;
+    GGML_ASSERT(storage.make_read_plan({ 0, 0 }, malformed_destination.data(), malformed_destination.size(),
+        read_plan.data(), read_plan.size(), read_operation_count).error ==
+        llm_expert_storage_error::invalid_destination);
+    malformed_destination = scattered;
     malformed_destination[1].extent--;
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, malformed_destination.data(), malformed_destination.size()).error ==
         llm_expert_storage_error::invalid_destination);

@@ -62,6 +62,11 @@ struct llm_expert_key {
     bool is_valid(int32_t n_layer, int32_t n_expert) const;
 };
 
+using llm_expert_layout_class_id = uint8_t;
+
+static constexpr llm_expert_layout_class_id LLM_EXPERT_LAYOUT_CLASS_INVALID = UINT8_MAX;
+static constexpr uint32_t LLM_EXPERT_LAYOUT_CLASS_MAX = 8;
+
 // Internal, caller-owned Phase 8 evidence controller. Model-facing production
 // construction leaves this absent. It can hold exactly one key/generation-bound
 // directive and is deliberately not part of llama.h or the public ABI.
@@ -174,6 +179,7 @@ struct llm_expert_flight_id {
     uint32_t request_slot = UINT32_MAX;
     uint64_t request_generation = 0;
     llm_expert_key key = { -1, -1 };
+    llm_expert_layout_class_id layout_class_id = 0;
 
     bool valid() const {
         return transport_epoch != 0 && request_slot != UINT32_MAX && request_generation != 0 &&
@@ -206,6 +212,20 @@ struct llm_expert_bundle_descriptor {
     llm_expert_provider_result validate() const;
 };
 
+struct llm_expert_layout_class_descriptor {
+    llm_expert_layout_class_id id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
+    uint64_t canonical_digest = 0;
+    uint64_t payload_bytes = 0;
+    llm_expert_bundle_descriptor prototype = {};
+};
+
+struct llm_expert_layout_registry {
+    std::vector<llm_expert_layout_class_descriptor> classes;
+    std::vector<llm_expert_layout_class_id> layer_ids;
+
+    bool sealed() const { return !classes.empty() && !layer_ids.empty(); }
+};
+
 struct llm_expert_selection {
     int32_t layer;
     int32_t n_expert;
@@ -228,6 +248,7 @@ llm_expert_provider_result llm_validate_hybrid_execution_ids(
 struct llm_expert_graph_binding {
     const void * provider_identity = nullptr;
     int32_t layer = -1;
+    llm_expert_layout_class_id layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
 
     llm_expert_projection_descriptor up;
     llm_expert_projection_descriptor gate;
@@ -504,6 +525,27 @@ struct llm_hot_cache_diagnostics {
     uint32_t requested_capacity = 0;
     uint32_t effective_capacity = 0;
     uint64_t pool_bytes = 0;
+    uint32_t layout_class_count = 0;
+    uint64_t layout_registry_administration_bytes = 0;
+    uint32_t layout_preflight_consumer_count = 0;
+    bool layout_preflight_passed = false;
+    uint64_t hot_slot_stride = 0;
+    std::vector<uint64_t> layout_class_digests;
+    std::vector<uint64_t> layout_class_payload_bytes;
+    std::vector<uint64_t> layout_class_hot_padding_bytes;
+    std::vector<uint64_t> layout_class_cold_padding_bytes;
+    std::vector<uint64_t> layout_class_lane_padding_bytes;
+    std::vector<uint64_t> layout_class_stage_bundles;
+    std::vector<uint64_t> layout_class_stage_bytes;
+    std::vector<uint64_t> layout_class_h2d_bundles;
+    std::vector<uint64_t> layout_class_h2d_bytes;
+    std::vector<uint64_t> layout_hot_role_offsets;
+    std::vector<uint64_t> layout_hot_role_extents;
+    std::vector<uint64_t> layout_cold_role_offsets;
+    std::vector<uint64_t> layout_cold_role_extents;
+    std::vector<uint64_t> layout_lane_role_offsets;
+    std::vector<uint64_t> layout_lane_role_extents;
+    std::vector<llm_expert_layout_class_id> layout_layer_ids;
     uint64_t descriptor_discovery_graphs = 0;
     uint64_t descriptor_discovery_bindings = 0;
     uint64_t descriptor_discovery_scheduler_reserve_calls = 0;
@@ -557,6 +599,7 @@ struct llm_hot_cache_diagnostics {
     struct slot {
         int32_t layer = -1;
         int32_t expert = -1;
+        llm_expert_layout_class_id layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
         uint64_t generation = 0;
         uint64_t last_use = 0;
         uint32_t refcount = 0;
@@ -581,6 +624,7 @@ struct llm_hot_cache_diagnostics {
     struct cold_slot {
         int32_t layer = -1;
         int32_t expert = -1;
+        llm_expert_layout_class_id layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
         uint64_t generation = 0;
         uint64_t last_use = 0;
         llm_expert_residency_origin origin = llm_expert_residency_origin::demand;
