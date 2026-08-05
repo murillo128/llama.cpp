@@ -131,6 +131,13 @@ bool valid_interval(uint64_t start, uint64_t end) noexcept {
         end != CUPTI_TIMESTAMP_UNKNOWN && end >= start;
 }
 
+perfetto::TraceTimestamp monotonic_raw_timestamp(uint64_t value) noexcept {
+    return {
+        static_cast<uint32_t>(perfetto::protos::pbzero::BUILTIN_CLOCK_MONOTONIC_RAW),
+        value,
+    };
+}
+
 void retain_cupti_record(trace_state & value, const retained_cupti_record & record) noexcept {
     if (value.cupti_records.size() == value.cupti_records.capacity()) {
         record_callback_failure(value, "CUPTI retained-record bound exhausted");
@@ -340,67 +347,73 @@ void emit_retained_cupti_records(trace_state & value) {
         switch (record.kind) {
             case cupti_record_kind::runtime: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA runtime API"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "runtime_api", track, record.start, "correlation_id",
-                    record.correlation_id, "application_correlation_id", external_id, "cbid", record.subtype,
-                    "thread_id", record.thread_id);
-                TRACE_EVENT_END("k3.cuda", track, record.end, "return_value", record.return_value);
+                TRACE_EVENT_BEGIN("k3.cuda", "runtime_api", track, monotonic_raw_timestamp(record.start),
+                    "correlation_id", record.correlation_id, "application_correlation_id", external_id,
+                    "cbid", record.subtype, "thread_id", record.thread_id);
+                TRACE_EVENT_END(
+                    "k3.cuda", track, monotonic_raw_timestamp(record.end), "return_value", record.return_value);
                 break;
             }
             case cupti_record_kind::driver: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA driver API"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "driver_api", track, record.start, "correlation_id",
-                    record.correlation_id, "application_correlation_id", external_id, "cbid", record.subtype,
-                    "thread_id", record.thread_id);
-                TRACE_EVENT_END("k3.cuda", track, record.end, "return_value", record.return_value);
+                TRACE_EVENT_BEGIN("k3.cuda", "driver_api", track, monotonic_raw_timestamp(record.start),
+                    "correlation_id", record.correlation_id, "application_correlation_id", external_id,
+                    "cbid", record.subtype, "thread_id", record.thread_id);
+                TRACE_EVENT_END(
+                    "k3.cuda", track, monotonic_raw_timestamp(record.end), "return_value", record.return_value);
                 break;
             }
             case cupti_record_kind::kernel: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA kernels"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "kernel", track, record.start, "correlation_id",
-                    record.correlation_id, "application_correlation_id", external_id, "kernel_name",
+                TRACE_EVENT_BEGIN("k3.cuda", "kernel", track, monotonic_raw_timestamp(record.start),
+                    "correlation_id", record.correlation_id, "application_correlation_id", external_id, "kernel_name",
                     record.name.data(), "device_id", record.device_id, "context_id", record.context_id,
                     "stream_id", record.stream_id, "grid_id", record.grid_id, "grid_x", record.grid_x,
                     "grid_y", record.grid_y, "grid_z", record.grid_z, "block_x", record.block_x,
                     "block_y", record.block_y, "block_z", record.block_z, "queued_ns", record.queued,
                     "submitted_ns", record.submitted);
-                TRACE_EVENT_END("k3.cuda", track, record.end);
+                TRACE_EVENT_END("k3.cuda", track, monotonic_raw_timestamp(record.end));
                 if (record.queued != CUPTI_TIMESTAMP_UNKNOWN && record.submitted != CUPTI_TIMESTAMP_UNKNOWN &&
                     record.queued != 0 && record.submitted >= record.queued) {
                     const uint64_t latency_track_id = llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::cuda,
                         record.context_id, record.correlation_id, 0xfe);
                     const perfetto::NamedTrack latency_track(
                         perfetto::StaticString("CUDA kernel launch latency"), latency_track_id);
-                    TRACE_EVENT_BEGIN("k3.cuda", "kernel_queued", latency_track, record.queued,
-                        "correlation_id", record.correlation_id, "application_correlation_id", external_id);
-                    TRACE_EVENT_END("k3.cuda", latency_track, record.submitted);
+                    TRACE_EVENT_BEGIN("k3.cuda", "kernel_queued", latency_track,
+                        monotonic_raw_timestamp(record.queued), "correlation_id", record.correlation_id,
+                        "application_correlation_id", external_id);
+                    TRACE_EVENT_END("k3.cuda", latency_track, monotonic_raw_timestamp(record.submitted));
                 }
                 break;
             }
             case cupti_record_kind::memcpy: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA memcpy"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "memcpy", track, record.start, "correlation_id",
-                    record.correlation_id, "runtime_correlation_id", record.runtime_correlation_id,
+                TRACE_EVENT_BEGIN("k3.cuda", "memcpy", track, monotonic_raw_timestamp(record.start),
+                    "correlation_id", record.correlation_id, "runtime_correlation_id", record.runtime_correlation_id,
                     "application_correlation_id", external_id, "copy_kind", record.subtype,
                     "bytes", record.bytes, "device_id", record.device_id, "context_id", record.context_id,
                     "stream_id", record.stream_id);
-                TRACE_EVENT_END("k3.cuda", track, record.end);
+                TRACE_EVENT_END("k3.cuda", track, monotonic_raw_timestamp(record.end));
                 break;
             }
             case cupti_record_kind::memset: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA memset"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "memset", track, record.start, "correlation_id",
-                    record.correlation_id, "application_correlation_id", external_id, "value", record.subtype,
+                TRACE_EVENT_BEGIN("k3.cuda", "memset", track, monotonic_raw_timestamp(record.start),
+                    "correlation_id", record.correlation_id, "application_correlation_id", external_id,
+                    "value", record.subtype,
                     "bytes", record.bytes, "device_id", record.device_id, "context_id", record.context_id,
                     "stream_id", record.stream_id);
-                TRACE_EVENT_END("k3.cuda", track, record.end);
+                TRACE_EVENT_END("k3.cuda", track, monotonic_raw_timestamp(record.end));
                 break;
             }
             case cupti_record_kind::synchronization: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA synchronization"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "synchronization", track, record.start, "correlation_id",
-                    record.correlation_id, "application_correlation_id", external_id, "sync_type", record.subtype,
+                TRACE_EVENT_BEGIN("k3.cuda", "synchronization", track, monotonic_raw_timestamp(record.start),
+                    "correlation_id", record.correlation_id, "application_correlation_id", external_id,
+                    "sync_type", record.subtype,
                     "context_id", record.context_id, "stream_id", record.stream_id);
-                TRACE_EVENT_END("k3.cuda", track, record.end, "return_value", record.return_value);
+                TRACE_EVENT_END(
+                    "k3.cuda", track, monotonic_raw_timestamp(record.end), "return_value", record.return_value);
                 break;
             }
             case cupti_record_kind::external_correlation:

@@ -372,13 +372,15 @@ struct llm_expert_async_transport::impl {
     void mark_request_running_locked(read_request_record & request) {
         request.state = read_state::running;
         request.started_us = uint64_t(ggml_time_us());
+        const uint64_t queue_wait_us = request.queued_us != 0 && request.started_us >= request.queued_us ?
+            request.started_us - request.queued_us : 0;
         LLM_EXPERT_TRACE_INSTANT("k3.storage", "request_start", "request_slot", request.handle.slot,
-            "request_generation", request.handle.generation, "request_ordinal", request.ordinal);
+            "request_generation", request.handle.generation, "request_ordinal", request.ordinal,
+            "queue_wait_us", queue_wait_us);
         if (request.queued_us != 0 && request.started_us >= request.queued_us) {
-            const uint64_t wait_us = request.started_us - request.queued_us;
             counters.read_queue_wait_samples++;
-            counters.read_queue_wait_us += wait_us;
-            counters.read_queue_wait_max_us = std::max(counters.read_queue_wait_max_us, wait_us);
+            counters.read_queue_wait_us += queue_wait_us;
+            counters.read_queue_wait_max_us = std::max(counters.read_queue_wait_max_us, queue_wait_us);
         }
     }
 
@@ -1812,7 +1814,8 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
     [[maybe_unused]] const uint64_t trace_id = llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::storage,
         identity.request.slot, uint32_t(identity.request.generation));
     LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_request", trace_id, "request_generation",
-        identity.request.generation, "layer", identity.key.layer, "original_expert_id", identity.key.expert,
+        identity.request.generation, "request_slot", identity.request.slot, "request_ordinal", request.ordinal,
+        "layer", identity.key.layer, "original_expert_id", identity.key.expert,
         "layout_class_id", identity.layout_class_id, "operation_count", read_count);
     LLM_EXPERT_TRACE_COUNTER("k3.resource", "storage_active_requests", 3, pimpl->counters.active_read_requests);
     pimpl->deferred_batch_open = defer_worker;
