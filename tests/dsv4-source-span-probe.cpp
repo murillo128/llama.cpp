@@ -4,17 +4,23 @@
 
 #include "llama.h"
 
+#include "ggml-backend.h"
+#include "ggml-cpp.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <numeric>
 #include <set>
 #include <string>
 #include <unistd.h>
@@ -70,6 +76,159 @@ bool pread_all(int fd, void * destination, size_t bytes, uint64_t offset) {
         completed += size_t(result);
     }
     return true;
+}
+
+size_t align_up(size_t value, size_t alignment) {
+    if (alignment == 0 || value > SIZE_MAX - (alignment - 1)) return SIZE_MAX;
+    return (value + alignment - 1)/alignment*alignment;
+}
+
+bool checked_lcm(size_t lhs, size_t rhs, size_t & result) {
+    if (lhs == 0 || rhs == 0) return false;
+    const size_t reduced = lhs/std::gcd(lhs, rhs);
+    if (reduced > SIZE_MAX/rhs) return false;
+    result = reduced*rhs;
+    return true;
+}
+
+std::string routed_layout_signature(const llama_layer & layer) {
+    std::string result;
+    for (const ggml_tensor * tensor : {
+            layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps }) {
+        if (tensor == nullptr) return {};
+        result += std::to_string(unsigned(tensor->type)) + ":" +
+            std::to_string(tensor->ne[0]) + ":" + std::to_string(tensor->ne[1]) + ":" +
+            std::to_string(tensor->nb[0]) + ":" + std::to_string(tensor->nb[1]) + ":" +
+            std::to_string(tensor->nb[2]) + ";";
+    }
+    return result;
+}
+
+bool derive_universal_hot_stride(
+        const llama_model & model,
+        ggml_backend_buffer_type_t target_buft,
+        size_t & stride,
+        std::array<size_t, 3> & role_offsets,
+        std::array<size_t, 3> & role_extents) {
+    if (target_buft == nullptr) return false;
+    const size_t buffer_alignment = ggml_backend_buft_get_alignment(target_buft);
+    size_t slot_alignment = std::max<size_t>(64, buffer_alignment);
+    size_t within_slot = 0;
+    for (size_t role = 0; role < role_extents.size(); ++role) {
+        size_t role_alignment = std::max<size_t>(64, buffer_alignment);
+        for (const auto & layer : model.layers) {
+            const ggml_tensor * tensor = role == 0 ? layer.ffn_up_exps :
+                role == 1 ? layer.ffn_gate_exps : layer.ffn_down_exps;
+            if (tensor == nullptr) continue;
+            role_extents[role] = std::max(role_extents[role], tensor->nb[2]);
+            role_alignment = std::max(role_alignment, ggml_type_size(tensor->type));
+            if (!checked_lcm(slot_alignment, ggml_type_size(tensor->type), slot_alignment)) return false;
+        }
+        if (role_extents[role] == 0) return false;
+        role_offsets[role] = align_up(within_slot, role_alignment);
+        if (role_offsets[role] == SIZE_MAX ||
+                role_extents[role] > SIZE_MAX - role_offsets[role]) return false;
+        within_slot = role_offsets[role] + role_extents[role];
+    }
+    stride = align_up(within_slot, slot_alignment);
+    return stride != 0 && stride != SIZE_MAX;
+}
+
+json compare_cuda_projection(
+        ggml_backend_t backend,
+        ggml_backend_buffer_type_t buft,
+        const ggml_tensor * source,
+        const uint8_t * source_bytes,
+        size_t source_size,
+        size_t universal_stride,
+        int32_t layer,
+        const char * projection) {
+    if (backend == nullptr || buft == nullptr || source == nullptr || source_bytes == nullptr ||
+            source_size != source->nb[2] || universal_stride < source_size) {
+        throw std::runtime_error("invalid CUDA projection comparison input");
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) throw std::runtime_error("cannot create CUDA comparison context");
+    ggml_tensor * compact = ggml_new_tensor_3d(
+        ctx.get(), source->type, source->ne[0], source->ne[1], 1);
+    ggml_tensor * universal = ggml_new_tensor_3d(
+        ctx.get(), source->type, source->ne[0], source->ne[1], 2);
+    universal->nb[2] = universal_stride;
+    universal->nb[3] = universal->nb[2]*universal->ne[2];
+    ggml_tensor * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, source->ne[0], 1, 1);
+    ggml_tensor * compact_ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
+    ggml_tensor * universal_ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
+    ggml_tensor * compact_output = ggml_mul_mat_id(ctx.get(), compact, input, compact_ids);
+    ggml_tensor * universal_output = ggml_mul_mat_id(ctx.get(), universal, input, universal_ids);
+    if (!ggml_backend_dev_supports_op(ggml_backend_get_device(backend), compact_output) ||
+            !ggml_backend_dev_supports_op(ggml_backend_get_device(backend), universal_output)) {
+        throw std::runtime_error("CUDA comparison operation is unsupported");
+    }
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buffer) throw std::runtime_error("cannot allocate CUDA comparison tensors");
+
+    ggml_backend_tensor_set(compact, source_bytes, 0, source_size);
+    std::vector<uint8_t> poisoned(ggml_nbytes(universal), 0xa5);
+    ggml_backend_tensor_set(universal, poisoned.data(), 0, poisoned.size());
+    ggml_backend_tensor_set(universal, source_bytes, universal_stride, source_size);
+    std::vector<float> activation(size_t(source->ne[0]));
+    for (size_t index = 0; index < activation.size(); ++index) {
+        activation[index] = float(int(index % 31) - 15)/32.0f;
+    }
+    ggml_backend_tensor_set(input, activation.data(), 0, activation.size()*sizeof(float));
+    const int32_t compact_id = 0;
+    const int32_t universal_id = 1;
+    ggml_backend_tensor_set(compact_ids, &compact_id, 0, sizeof(compact_id));
+    ggml_backend_tensor_set(universal_ids, &universal_id, 0, sizeof(universal_id));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, compact_output);
+    ggml_build_forward_expand(graph, universal_output);
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("CUDA projection comparison failed");
+    }
+    ggml_backend_synchronize(backend);
+    std::vector<float> compact_values(size_t(ggml_nelements(compact_output)));
+    std::vector<float> universal_values(compact_values.size());
+    ggml_backend_tensor_get(
+        compact_output, compact_values.data(), 0, compact_values.size()*sizeof(float));
+    ggml_backend_tensor_get(
+        universal_output, universal_values.data(), 0, universal_values.size()*sizeof(float));
+    double max_abs_error = 0.0;
+    double max_scaled_abs_error = 0.0;
+    bool finite = true;
+    for (size_t index = 0; index < compact_values.size(); ++index) {
+        finite = finite && std::isfinite(compact_values[index]) && std::isfinite(universal_values[index]);
+        max_abs_error = std::max(max_abs_error,
+            std::abs(double(compact_values[index]) - double(universal_values[index])));
+        max_scaled_abs_error = std::max(max_scaled_abs_error,
+            std::abs(double(compact_values[index])*0.25 - double(universal_values[index])*0.25));
+    }
+    std::vector<uint8_t> slot_zero(source_size);
+    ggml_backend_tensor_get(universal, slot_zero.data(), 0, slot_zero.size());
+    const bool padding_guard = std::all_of(
+        slot_zero.begin(), slot_zero.end(), [](uint8_t value) { return value == 0xa5; });
+    const uint64_t compact_digest = digest_bytes(
+        reinterpret_cast<const uint8_t *>(compact_values.data()), compact_values.size()*sizeof(float));
+    const uint64_t universal_digest = digest_bytes(
+        reinterpret_cast<const uint8_t *>(universal_values.data()), universal_values.size()*sizeof(float));
+    return {
+        { "layer", layer }, { "projection", projection },
+        { "ggml_type", ggml_type_name(source->type) }, { "source_bytes", source_size },
+        { "input_elements", activation.size() }, { "output_elements", compact_values.size() },
+        { "compact_expert_id", compact_id }, { "universal_slot_id", universal_id },
+        { "routing_weight_f32", 0.25 }, { "finite", finite },
+        { "compact_output_fnv1a64", compact_digest },
+        { "universal_output_fnv1a64", universal_digest },
+        { "bit_exact", compact_values == universal_values },
+        { "max_abs_error", max_abs_error }, { "max_scaled_abs_error", max_scaled_abs_error },
+        { "padding_guard_intact", padding_guard },
+    };
 }
 
 } // namespace
@@ -133,11 +292,28 @@ int main(int argc, char ** argv) {
 
         const int32_t n_layer = int32_t(model->layers.size());
         const int32_t n_expert = int32_t(model->hparams.n_expert);
+        std::vector<int32_t> representative_layers;
+        std::set<std::string> observed_layouts;
+        for (int32_t layer = 0; layer < n_layer; ++layer) {
+            const std::string signature = routed_layout_signature(model->layers[size_t(layer)]);
+            if (!signature.empty() && observed_layouts.insert(signature).second) {
+                representative_layers.push_back(layer);
+            }
+        }
+        if (representative_layers.size() != 3) {
+            throw std::runtime_error("expected exactly three routed layout classes");
+        }
         std::vector<llm_expert_key> samples;
         for (int32_t layer : { 0, n_layer/2, n_layer - 1 }) {
             for (int32_t expert : { 0, n_expert/2, n_expert - 1 }) {
                 samples.push_back({ layer, expert });
             }
+        }
+        for (int32_t layer : representative_layers) {
+            const bool already_sampled = std::any_of(samples.begin(), samples.end(), [&](const auto & key) {
+                return key.layer == layer && key.expert == 0;
+            });
+            if (!already_sampled) samples.push_back({ layer, 0 });
         }
         bool cross_split_sample_added = false;
         for (int32_t layer = 0; layer < n_layer && !cross_split_sample_added; ++layer) {
@@ -181,6 +357,7 @@ int main(int argc, char ** argv) {
         json sample_results = json::array();
         bool all_equal = true;
         uint64_t total_sample_bytes = 0;
+        std::map<int32_t, std::vector<uint8_t>> representative_bundles;
         for (size_t sample_index = 0; sample_index < samples.size(); ++sample_index) {
             const auto key = samples[sample_index];
             const auto * spans = storage->find(key);
@@ -240,6 +417,10 @@ int main(int argc, char ** argv) {
             const bool async_matches_source = async_bytes == source_bytes;
             const bool sync_matches_async = sync_bytes == async_bytes;
             all_equal = all_equal && sync_matches_source && async_matches_source && sync_matches_async;
+            if (key.expert == 0 && std::find(representative_layers.begin(), representative_layers.end(), key.layer) !=
+                    representative_layers.end()) {
+                representative_bundles.emplace(key.layer, sync_bytes);
+            }
             total_sample_bytes += bundle_bytes;
             sample_results.push_back({
                 { "layer", key.layer },
@@ -256,6 +437,59 @@ int main(int argc, char ** argv) {
             });
         }
 
+        auto * gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (gpu_device == nullptr) throw std::runtime_error("CUDA device unavailable for layout comparison");
+        ggml_backend_ptr gpu_backend(ggml_backend_dev_init(gpu_device, nullptr));
+        if (!gpu_backend) throw std::runtime_error("CUDA backend initialization failed");
+        auto * target_buft = ggml_backend_get_default_buffer_type(gpu_backend.get());
+        size_t universal_hot_stride = 0;
+        std::array<size_t, 3> hot_role_offsets = {};
+        std::array<size_t, 3> hot_role_extents = {};
+        if (!derive_universal_hot_stride(
+                *model, target_buft, universal_hot_stride, hot_role_offsets, hot_role_extents)) {
+            throw std::runtime_error("cannot derive universal CUDA layout");
+        }
+        json kernel_comparisons = json::array();
+        bool all_kernel_comparisons_pass = true;
+        for (int32_t layer_index : representative_layers) {
+            const auto bundle_it = representative_bundles.find(layer_index);
+            const auto * spans = storage->find({ layer_index, 0 });
+            if (bundle_it == representative_bundles.end() || spans == nullptr) {
+                throw std::runtime_error("representative class bytes unavailable");
+            }
+            const auto & layer = model->layers[size_t(layer_index)];
+            struct projection_input {
+                llm_expert_storage_projection projection;
+                const char * name;
+                const ggml_tensor * tensor;
+            };
+            const std::array<projection_input, 3> projections = {{
+                { llm_expert_storage_projection::up, "up", layer.ffn_up_exps },
+                { llm_expert_storage_projection::gate, "gate", layer.ffn_gate_exps },
+                { llm_expert_storage_projection::down, "down", layer.ffn_down_exps },
+            }};
+            for (const auto & projection : projections) {
+                const auto span_it = std::find_if(spans->begin(), spans->end(), [&](const auto & span) {
+                    return span.projection == projection.projection &&
+                        span.sidecar == llm_expert_storage_sidecar::weight;
+                });
+                if (span_it == spans->end() ||
+                        span_it->destination_offset > bundle_it->second.size() ||
+                        span_it->byte_count > bundle_it->second.size() - span_it->destination_offset) {
+                    throw std::runtime_error("representative projection span unavailable");
+                }
+                json comparison = compare_cuda_projection(
+                    gpu_backend.get(), target_buft, projection.tensor,
+                    bundle_it->second.data() + span_it->destination_offset,
+                    size_t(span_it->byte_count), universal_hot_stride,
+                    layer_index, projection.name);
+                all_kernel_comparisons_pass = all_kernel_comparisons_pass &&
+                    comparison["finite"].get<bool>() && comparison["bit_exact"].get<bool>() &&
+                    comparison["padding_guard_intact"].get<bool>();
+                kernel_comparisons.push_back(std::move(comparison));
+            }
+        }
+
         const auto final_storage = storage->diagnostics();
         const auto async_diagnostics = async.diagnostics();
         const bool shutdown = async.shutdown();
@@ -265,6 +499,15 @@ int main(int argc, char ** argv) {
             { "schema", "dsv4-source-span-proof-v1" },
             { "model_path", model_path },
             { "samples", std::move(sample_results) },
+            { "kernel_comparison", {
+                { "status", all_kernel_comparisons_pass ? "pass" : "fail" },
+                { "representative_layers", representative_layers },
+                { "universal_hot_stride", universal_hot_stride },
+                { "hot_role_offsets", hot_role_offsets },
+                { "hot_role_extents", hot_role_extents },
+                { "comparison_count", kernel_comparisons.size() },
+                { "comparisons", std::move(kernel_comparisons) },
+            } },
             { "summary", {
                 { "sample_count", samples.size() },
                 { "cross_split_sample_present", cross_split_sample_added },
@@ -283,6 +526,9 @@ int main(int argc, char ** argv) {
                 { "async_active_operations", async_diagnostics.active_operations },
                 { "async_active_read_requests", async_diagnostics.active_read_requests },
                 { "async_shutdown", shutdown },
+                { "layout_class_count", representative_layers.size() },
+                { "cuda_kernel_comparisons", representative_layers.size()*3 },
+                { "all_cuda_kernel_comparisons_pass", all_kernel_comparisons_pass },
             } },
         };
         std::ofstream stream(output_path);
@@ -298,8 +544,10 @@ int main(int argc, char ** argv) {
                   << "\tbytes_per_path=" << total_sample_bytes
                   << "\tio_uring=" << async_diagnostics.io_uring_enabled
                   << "\tfallback_mask=" << async_diagnostics.fallback_reason_mask
+                  << "\tkernel_comparisons=" << representative_layers.size()*3
+                  << "\tkernel_pass=" << all_kernel_comparisons_pass
                   << '\n';
-        result_code = all_equal && cross_split_sample_added && shutdown ? 0 : 5;
+        result_code = all_equal && cross_split_sample_added && shutdown && all_kernel_comparisons_pass ? 0 : 5;
     } catch (const std::exception & error) {
         std::cerr << "dsv4-source-span-probe: " << error.what() << '\n';
     }
