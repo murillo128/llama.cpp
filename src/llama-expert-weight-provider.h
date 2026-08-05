@@ -646,6 +646,10 @@ struct llm_hot_cache_diagnostics {
     uint64_t uma_process_swap_bytes = 0;
     uint64_t uma_safe_pool_bytes = 0;
     uint64_t uma_effective_pool_bytes = 0;
+    uint64_t uma_model_capacity_bytes = 0;
+    uint64_t uma_model_cap_unused_safe_bytes = 0;
+    uint64_t uma_alignment_remainder_bytes = 0;
+    uint64_t uma_effective_slot_count = 0;
     uint64_t uma_system_reserve_bytes = 0;
     uint64_t uma_runtime_reserve_bytes = 0;
     uint64_t uma_runtime_delta_bytes = 0;

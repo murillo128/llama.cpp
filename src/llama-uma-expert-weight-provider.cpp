@@ -481,6 +481,10 @@ public:
         result.uma_process_swap_bytes = memory_sample.process_swap_bytes;
         result.uma_safe_pool_bytes = headroom.safe_pool_bytes;
         result.uma_effective_pool_bytes = headroom.effective_pool_bytes;
+        result.uma_model_capacity_bytes = model_capacity_bytes;
+        result.uma_model_cap_unused_safe_bytes = model_cap_unused_safe_bytes;
+        result.uma_alignment_remainder_bytes = alignment_remainder_bytes;
+        result.uma_effective_slot_count = headroom.slot_count;
         result.uma_system_reserve_bytes = headroom.system_reserve_bytes;
         result.uma_runtime_reserve_bytes = headroom.runtime_reserve_bytes;
         result.uma_runtime_delta_bytes = runtime_delta_bytes;
@@ -616,6 +620,9 @@ public:
         }
         const uint64_t topology_bytes = calculated_slot_footprint*config.total_expert_keys;
         const uint64_t selected_pool_bytes = std::min(headroom.effective_pool_bytes, topology_bytes);
+        model_capacity_bytes = topology_bytes;
+        model_cap_unused_safe_bytes = headroom.safe_pool_bytes - selected_pool_bytes;
+        alignment_remainder_bytes = headroom.remainder_bytes;
         if (selected_pool_bytes/calculated_slot_footprint < config.n_expert_used ||
             selected_pool_bytes/calculated_slot_footprint < config.hot_capacity) {
             return failure(llm_expert_provider_error::allocation_failed);
@@ -1160,6 +1167,9 @@ private:
     uint64_t bundle_payload_bytes = 0;
     uint64_t slot_footprint_bytes = 0;
     uint64_t runtime_delta_bytes = 0;
+    uint64_t model_capacity_bytes = 0;
+    uint64_t model_cap_unused_safe_bytes = 0;
+    uint64_t alignment_remainder_bytes = 0;
     uint64_t pressure_samples = 0;
     uint64_t pressure_rejections = 0;
     uint64_t storage_misses = 0;

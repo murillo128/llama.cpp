@@ -742,6 +742,10 @@ int run_live(int argc, char ** argv) {
               << "\tuma_process_swap_bytes=" << diagnostics.uma_process_swap_bytes
               << "\tuma_safe_pool_bytes=" << diagnostics.uma_safe_pool_bytes
               << "\tuma_effective_pool_bytes=" << diagnostics.uma_effective_pool_bytes
+              << "\tuma_model_capacity_bytes=" << diagnostics.uma_model_capacity_bytes
+              << "\tuma_model_cap_unused_safe_bytes=" << diagnostics.uma_model_cap_unused_safe_bytes
+              << "\tuma_alignment_remainder_bytes=" << diagnostics.uma_alignment_remainder_bytes
+              << "\tuma_effective_slot_count=" << diagnostics.uma_effective_slot_count
               << "\tuma_system_reserve_bytes=" << diagnostics.uma_system_reserve_bytes
               << "\tuma_runtime_reserve_bytes=" << diagnostics.uma_runtime_reserve_bytes
               << "\tuma_runtime_delta_bytes=" << diagnostics.uma_runtime_delta_bytes

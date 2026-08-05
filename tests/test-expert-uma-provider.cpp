@@ -483,6 +483,12 @@ void test_autofit_policy_pressure_trim_and_surrender() {
     require(diagnostics.uma_autofit && diagnostics.uma_safe_pool_bytes >= diagnostics.uma_effective_pool_bytes &&
         diagnostics.uma_effective_pool_bytes == diagnostics.cold_actual_bytes,
         "autofit did not select the safe topology-bounded whole-slot arena");
+    require(diagnostics.uma_model_capacity_bytes == diagnostics.cold_slot_footprint*2 &&
+        diagnostics.uma_effective_slot_count == diagnostics.cold_effective_slots &&
+        diagnostics.uma_model_cap_unused_safe_bytes ==
+            diagnostics.uma_safe_pool_bytes - diagnostics.uma_effective_pool_bytes &&
+        diagnostics.uma_alignment_remainder_bytes == diagnostics.uma_headroom_remainder_bytes,
+        "autofit model-cap telemetry is incomplete");
     require(diagnostics.policy.config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING &&
         diagnostics.cold_policy.config.policy == LLAMA_EXPERT_CACHE_POLICY_LFU_AGING &&
         diagnostics.policy.config.admission == LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS &&
