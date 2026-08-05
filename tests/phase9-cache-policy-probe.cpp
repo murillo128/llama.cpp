@@ -40,6 +40,8 @@ struct arguments {
     uint32_t ratio = 7500;
     uint32_t window = 1024;
     uint32_t aging = 1024;
+    uint32_t n_ctx = 64;
+    uint32_t n_batch = 64;
     uint32_t n_ubatch = 1;
     int max_generate = 2;
     bool background = false;
@@ -83,6 +85,8 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--ratio") { if (!parse_u32(value, result.ratio)) return false; }
         else if (option == "--window") { if (!parse_u32(value, result.window)) return false; }
         else if (option == "--aging") { if (!parse_u32(value, result.aging)) return false; }
+        else if (option == "--n-ctx") { if (!parse_u32(value, result.n_ctx)) return false; }
+        else if (option == "--n-batch") { if (!parse_u32(value, result.n_batch)) return false; }
         else if (option == "--n-ubatch") { if (!parse_u32(value, result.n_ubatch)) return false; }
         else if (option == "--max-generate") {
             uint32_t parsed = 0; if (!parse_u32(value, parsed) || parsed == 0 || parsed > 128) return false;
@@ -101,7 +105,8 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
             if (result.config_source != "EXPLICIT" && result.config_source != "NULL") return false;
         } else return false;
     }
-    return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ubatch > 0 &&
+    return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ctx > 0 &&
+        result.n_batch > 0 && result.n_ubatch > 0 && result.n_ubatch <= result.n_batch &&
         (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold");
 }
 
@@ -340,8 +345,8 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> prompt(prompt_count);
         if (llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), prompt.data(), prompt.size(), true, true) != prompt_count) return 5;
         auto context_params = llama_context_default_params();
-        context_params.n_ctx = 64;
-        context_params.n_batch = 64;
+        context_params.n_ctx = args.n_ctx;
+        context_params.n_batch = args.n_batch;
         context_params.n_ubatch = args.n_ubatch;
         context_params.no_perf = false;
         llama_context_ptr context(llama_init_from_model(model.get(), context_params));
@@ -480,6 +485,12 @@ int main(int argc, char ** argv) {
                 {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
                 {"command", command}, {"model_path", args.model}, {"mode", args.mode},
                 {"provider_enabled", false}, {"prompt", prompt_text},
+                {"runtime", {
+                    {"n_ctx", args.n_ctx},
+                    {"n_batch", args.n_batch},
+                    {"n_ubatch", args.n_ubatch},
+                    {"max_generate", args.max_generate},
+                }},
                 {"prompt_ids", prompt}, {"generated_ids", generated}, {"logits_fnv64", logits_digests},
                 {"latency_us", latency_us}, {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
             };
@@ -492,6 +503,7 @@ int main(int argc, char ** argv) {
             return 0;
         }
         const auto diagnostics = provider->hot_cache_diagnostics();
+        const auto storage_diagnostics = model->expert_storage()->diagnostics();
         if (diagnostics.policy.transcript_dropped != 0 || diagnostics.cold_policy.transcript_dropped != 0) {
             std::fprintf(stderr, "phase9-cache-policy-probe: policy transcript dropped events\n");
             return 11;
@@ -523,6 +535,12 @@ int main(int argc, char ** argv) {
             {"transport_requested", args.transport},
             {"config_source", args.config_source},
             {"miss_policy", args.miss_policy}, {"background", args.background},
+            {"runtime", {
+                {"n_ctx", args.n_ctx},
+                {"n_batch", args.n_batch},
+                {"n_ubatch", args.n_ubatch},
+                {"max_generate", args.max_generate},
+            }},
             {"prompt_ids", prompt}, {"generated_ids", generated}, {"logits_fnv64", logits_digests},
             {"latency_us", latency_us}, {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
             {"topology", {
@@ -587,6 +605,9 @@ int main(int argc, char ** argv) {
                 {"hot_admissions", diagnostics.admissions}, {"hot_evictions", diagnostics.evictions},
                 {"cold_hits", diagnostics.cold_hits}, {"cold_misses", diagnostics.cold_misses},
                 {"cold_admissions", diagnostics.cold_admissions}, {"cold_evictions", diagnostics.cold_evictions},
+                {"cold_source_copy_bundles", diagnostics.cold_source_copy_bundles},
+                {"cold_source_copy_bytes", diagnostics.cold_source_copy_bytes},
+                {"cold_source_copy_time_us", diagnostics.cold_source_copy_time_us},
                 {"h2d_bytes", diagnostics.h2d_bytes}, {"background_useful", diagnostics.background_useful},
                 {"background_wasted", diagnostics.background_wasted},
                 {"active_background_flights", diagnostics.active_background_flights},
@@ -612,6 +633,39 @@ int main(int argc, char ** argv) {
                 {"trace_records", diagnostics.ring_trace_records},
                 {"trace_records_dropped", diagnostics.ring_trace_records_dropped},
                 {"failed_cleanup", diagnostics.ring_failed_cleanup},
+            }},
+            {"storage", {
+                {"source_file_count", storage_diagnostics.source_file_count},
+                {"directory_entry_count", storage_diagnostics.directory_entry_count},
+                {"span_count", storage_diagnostics.span_count},
+                {"administration_bytes", storage_diagnostics.administration_bytes},
+                {"read_requests", storage_diagnostics.read_requests},
+                {"read_operations", storage_diagnostics.read_chunks},
+                {"read_bytes", storage_diagnostics.read_bytes},
+                {"cancelled_reads", storage_diagnostics.cancelled_reads},
+                {"short_reads", storage_diagnostics.short_reads},
+                {"io_errors", storage_diagnostics.io_errors},
+                {"sealed", storage_diagnostics.sealed},
+                {"poisoned", storage_diagnostics.poisoned},
+            }},
+            {"high_water", {
+                {"hot_pins", diagnostics.peak_pins},
+                {"cold_hot_refs", diagnostics.cold_peak_hot_refs},
+                {"cold_transfer_refs", diagnostics.cold_peak_transfer_refs},
+                {"cold_request_refs", diagnostics.cold_peak_request_refs},
+                {"cold_cpu_execution_refs", diagnostics.cold_peak_cpu_execution_refs},
+                {"background_flights", diagnostics.peak_background_flights},
+                {"ring_in_flight_lanes", diagnostics.ring_peak_in_flight_lanes},
+                {"ring_h2d_events", diagnostics.ring_peak_live_h2d_events},
+                {"ring_compute_events", diagnostics.ring_peak_live_compute_events},
+            }},
+            {"context_validation", {
+                {"last_n_ctx", diagnostics.last_context_n_ctx},
+                {"last_n_ubatch", diagnostics.last_context_n_ubatch},
+                {"last_extent", diagnostics.last_context_extent},
+                {"conservative_required_capacity", diagnostics.conservative_required_capacity},
+                {"validations", diagnostics.context_validations},
+                {"rejections", diagnostics.context_rejections},
             }},
             {"lifecycle", {
                 {"current_hot_pins", diagnostics.current_pins},
