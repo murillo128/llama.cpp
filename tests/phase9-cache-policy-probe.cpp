@@ -39,6 +39,7 @@ struct arguments {
     uint64_t cold_bytes = 64U*1024U*1024U;
     uint64_t ring_bytes = 16U*1024U*1024U;
     uint32_t queue_depth = 0;
+    uint32_t trace_capacity = 0;
     uint32_t ratio = 7500;
     uint32_t window = 1024;
     uint32_t aging = 1024;
@@ -85,6 +86,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--cold-bytes") { if (!parse_u64(value, result.cold_bytes)) return false; }
         else if (option == "--ring-bytes") { if (!parse_u64(value, result.ring_bytes)) return false; }
         else if (option == "--queue-depth") { if (!parse_u32(value, result.queue_depth)) return false; }
+        else if (option == "--trace-capacity") { if (!parse_u32(value, result.trace_capacity)) return false; }
         else if (option == "--ratio") { if (!parse_u32(value, result.ratio)) return false; }
         else if (option == "--window") { if (!parse_u32(value, result.window)) return false; }
         else if (option == "--aging") { if (!parse_u32(value, result.aging)) return false; }
@@ -401,6 +403,7 @@ int main(int argc, char ** argv) {
         auto model_params = llama_model_default_params();
         model_params.load_mode = args.transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         model_params.expert_io_queue_depth = args.queue_depth;
+        model_params.expert_io_trace_capacity = args.trace_capacity;
         model_params.expert_io_force_positional_reads = args.transport == "POSITIONAL";
         model_params.n_gpu_layers = -1;
         model_params.tensor_buft_overrides = overrides;
@@ -672,6 +675,7 @@ int main(int argc, char ** argv) {
                 {"ring_unused_budget_bytes", diagnostics.ring_requested_bytes - diagnostics.ring_actual_bytes},
                 {"ring_pinned_or_registered_bytes", diagnostics.ring_pinned_or_registered_bytes},
                 {"io_queue_depth_requested", args.queue_depth},
+                {"io_trace_capacity_requested", args.trace_capacity},
             }},
             {"async_io", {
                 {"diagnostics", async_diagnostics_json(async_diagnostics)},

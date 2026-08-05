@@ -508,6 +508,7 @@ extern "C" {
         uint64_t expert_cold_cache_bytes; // pageable routed-expert cache budget [EXPERIMENTAL]
         uint64_t expert_transfer_ring_bytes; // bounded transfer staging budget [EXPERIMENTAL]
         uint32_t expert_io_queue_depth; // bounded asynchronous I/O queue depth [EXPERIMENTAL]
+        uint32_t expert_io_trace_capacity; // bounded asynchronous I/O evidence records [EXPERIMENTAL, EVIDENCE ONLY]
         uint64_t expert_io_staging_bytes; // bounded direct-I/O staging budget [EXPERIMENTAL]
         bool expert_io_force_positional_reads; // force the existing pread path [EXPERIMENTAL, EVIDENCE ONLY]
         enum llama_expert_miss_policy expert_miss_policy; // explicit demand-miss execution policy [EXPERIMENTAL]

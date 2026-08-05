@@ -1553,7 +1553,12 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     const uint64_t request_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
     if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
     const uint32_t request_capacity = uint32_t(request_capacity_64);
-    const uint64_t trace_capacity_64 = std::min<uint64_t>(65536, std::max<uint64_t>(1024, request_capacity_64*16));
+    if (params.expert_io_trace_capacity != 0 &&
+        (params.expert_io_trace_capacity < 1024 || params.expert_io_trace_capacity > 65536)) {
+        throw std::invalid_argument("invalid expert async trace capacity");
+    }
+    const uint64_t trace_capacity_64 = params.expert_io_trace_capacity != 0 ? params.expert_io_trace_capacity :
+        std::min<uint64_t>(65536, std::max<uint64_t>(1024, request_capacity_64*16));
     const auto & prefetch = pimpl->expert_prefetch_config.value;
     const bool predictive_prefetch = pimpl->expert_prefetch_config.supplied &&
         prefetch.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF;
@@ -3198,6 +3203,7 @@ llama_model_params llama_model_default_params() {
         /*.expert_cold_cache_bytes     =*/ 0,
         /*.expert_transfer_ring_bytes  =*/ 0,
         /*.expert_io_queue_depth       =*/ 0,
+        /*.expert_io_trace_capacity    =*/ 0,
         /*.expert_io_staging_bytes     =*/ 0,
         /*.expert_io_force_positional_reads =*/ false,
         /*.expert_miss_policy          =*/ LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU,
