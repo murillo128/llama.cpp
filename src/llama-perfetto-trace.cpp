@@ -7,7 +7,9 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
@@ -16,6 +18,7 @@
 #include <new>
 #include <vector>
 #include <time.h>
+#include <unistd.h>
 
 PERFETTO_TRACK_EVENT_STATIC_STORAGE();
 
@@ -645,6 +648,26 @@ bool llm_perfetto_trace_request_stop(char * error, size_t error_capacity) noexce
                 "Perfetto stop trigger requires one active session");
             return false;
         }
+    }
+    const char * stop_fd_value = std::getenv("LLAMA_PERFETTO_STOP_FD");
+    if (stop_fd_value != nullptr) {
+        char * end = nullptr;
+        errno = 0;
+        const long stop_fd = std::strtol(stop_fd_value, &end, 10);
+        if (errno != 0 || end == stop_fd_value || *end != '\0' || stop_fd < 0 || stop_fd > INT_MAX) {
+            set_error(error, error_capacity, "invalid Perfetto stop descriptor");
+            return false;
+        }
+        const uint8_t marker = 1;
+        ssize_t result = -1;
+        do {
+            result = ::write(int(stop_fd), &marker, sizeof(marker));
+        } while (result < 0 && errno == EINTR);
+        if (result != 1) {
+            set_error(error, error_capacity, "Perfetto stop descriptor write failed");
+            return false;
+        }
+        return true;
     }
     try {
         perfetto::Tracing::ActivateTriggers({ "k3.stop" }, 5000);
