@@ -23,6 +23,7 @@ namespace {
 struct arguments {
     std::string output;
     uint64_t budget_bytes = 0;
+    uint64_t safe_limit_bytes = 0;
     uint64_t projection_bytes = 5849088;
     uint32_t layers = 92;
     uint32_t experts = 896;
@@ -69,6 +70,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         const char * value = argv[++index];
         if (option == "--output") result.output = value;
         else if (option == "--budget-bytes") { if (!parse_u64(value, result.budget_bytes)) return false; }
+        else if (option == "--safe-limit-bytes") { if (!parse_u64(value, result.safe_limit_bytes)) return false; }
         else if (option == "--projection-bytes") { if (!parse_u64(value, result.projection_bytes)) return false; }
         else if (option == "--layers") { if (!parse_u32(value, result.layers)) return false; }
         else if (option == "--experts-per-layer") { if (!parse_u32(value, result.experts)) return false; }
@@ -164,6 +166,17 @@ json kib_json(const std::map<std::string, uint64_t> & values) {
 int main(int argc, char ** argv) {
     arguments args;
     if (!parse_arguments(argc, argv, args)) return 2;
+    if (args.safe_limit_bytes != 0 && args.budget_bytes > args.safe_limit_bytes) {
+        const json output = {
+            {"schema_version", "phase11-full-k3-capacity-negative-v1"}, {"status", "rejected"},
+            {"reason", "requested_above_safe_limit"}, {"requested_bytes", args.budget_bytes},
+            {"safe_limit_bytes", args.safe_limit_bytes}, {"io_started", false},
+        };
+        std::ofstream destination(args.output, std::ios::binary | std::ios::trunc);
+        if (!destination) return 10;
+        destination << output.dump(2) << '\n';
+        return 13;
+    }
     try {
         prototype tensors(args.projection_bytes, args.experts);
         llm_cold_cache_config config;

@@ -496,6 +496,22 @@ int run_live(int argc, char ** argv) {
     uint64_t logits_hash = 1469598103934665603ULL;
     std::vector<llama_token> generated;
     std::vector<uint64_t> decode_us;
+    std::vector<uint64_t> epoch_cold_hits;
+    std::vector<uint64_t> epoch_cold_misses;
+    std::vector<uint64_t> epoch_cold_actual_bytes;
+    std::vector<uint64_t> epoch_process_rss_bytes;
+    std::vector<uint64_t> epoch_process_swap_bytes;
+    std::vector<uint64_t> epoch_major_faults;
+    std::vector<uint64_t> epoch_degraded_hits;
+    std::vector<uint64_t> epoch_unknown_hits;
+    std::vector<uint64_t> epoch_storage_read_bytes;
+    std::vector<uint64_t> epoch_policy_drops;
+    std::vector<uint64_t> epoch_scheduler_active;
+    std::vector<uint64_t> epoch_cold_hot_refs;
+    std::vector<uint64_t> epoch_cold_transfer_refs;
+    std::vector<uint64_t> epoch_cold_request_refs;
+    std::vector<uint64_t> epoch_ring_live_events;
+    std::vector<uint64_t> epoch_io_active_operations;
     llama_batch batch = llama_batch_get_one(prompt.data(), prompt.size());
     for (int step = 0; step < args.steps; ++step) {
         const auto phase = step == 0 ? LLAMA_ROUTE_PHASE_PREFILL : LLAMA_ROUTE_PHASE_DECODE;
@@ -519,7 +535,29 @@ int run_live(int argc, char ** argv) {
                       << '\n';
             return 25;
         }
+        llama_synchronize(context);
         decode_us.push_back(uint64_t(ggml_time_us() - begin_us));
+        const auto epoch_cache = model->expert_weight_provider() ?
+            model->expert_weight_provider()->hot_cache_diagnostics() : llm_hot_cache_diagnostics {};
+        const auto epoch_storage = model->expert_storage() ?
+            model->expert_storage()->diagnostics() : llm_expert_storage_diagnostics {};
+        const auto epoch_scheduler = model->expert_scheduler_diagnostics();
+        epoch_cold_hits.push_back(epoch_cache.cold_hits);
+        epoch_cold_misses.push_back(epoch_cache.cold_misses);
+        epoch_cold_actual_bytes.push_back(epoch_cache.cold_actual_bytes);
+        epoch_process_rss_bytes.push_back(epoch_cache.uma_process_rss_bytes);
+        epoch_process_swap_bytes.push_back(epoch_cache.uma_process_swap_bytes);
+        epoch_major_faults.push_back(epoch_cache.uma_major_faults);
+        epoch_degraded_hits.push_back(epoch_cache.uma_degraded_hits);
+        epoch_unknown_hits.push_back(epoch_cache.uma_unknown_residency_hits);
+        epoch_storage_read_bytes.push_back(epoch_storage.read_bytes);
+        epoch_policy_drops.push_back(epoch_cache.policy.transcript_dropped + epoch_cache.cold_policy.transcript_dropped);
+        epoch_scheduler_active.push_back(epoch_scheduler.active_requests);
+        epoch_cold_hot_refs.push_back(epoch_cache.cold_current_hot_refs);
+        epoch_cold_transfer_refs.push_back(epoch_cache.cold_current_transfer_refs);
+        epoch_cold_request_refs.push_back(epoch_cache.cold_current_request_refs);
+        epoch_ring_live_events.push_back(epoch_cache.ring_live_events);
+        epoch_io_active_operations.push_back(model->expert_async_diagnostics().active_operations);
         const float * logits = llama_get_logits_ith(context, -1);
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         if (!logits) return 26;
@@ -617,6 +655,14 @@ int run_live(int argc, char ** argv) {
         if (index) token_samples << ',';
         token_samples << decode_us[index];
     }
+    const auto series = [](const std::vector<uint64_t> & values) {
+        std::ostringstream output;
+        for (size_t index = 0; index < values.size(); ++index) {
+            if (index) output << ',';
+            output << values[index];
+        }
+        return output.str();
+    };
     std::cout << (args.mode == "uma" ? "PHASE11_UMA_LIVE" : "PHASE5_LIVE")
               << "\tmode=" << args.mode
               << "\tload_mode=" << llama_load_mode_name(args.load_mode)
@@ -633,6 +679,22 @@ int run_live(int argc, char ** argv) {
               << "\ttoken_p99_us=" << percentile(99, 100)
               << "\ttoken_max_us=" << (sorted_us.empty() ? 0 : sorted_us.back())
               << "\ttoken_samples_us=" << token_samples.str()
+              << "\tepoch_cold_hits=" << series(epoch_cold_hits)
+              << "\tepoch_cold_misses=" << series(epoch_cold_misses)
+              << "\tepoch_cold_actual_bytes=" << series(epoch_cold_actual_bytes)
+              << "\tepoch_process_rss_bytes=" << series(epoch_process_rss_bytes)
+              << "\tepoch_process_swap_bytes=" << series(epoch_process_swap_bytes)
+              << "\tepoch_major_faults=" << series(epoch_major_faults)
+              << "\tepoch_degraded_hits=" << series(epoch_degraded_hits)
+              << "\tepoch_unknown_hits=" << series(epoch_unknown_hits)
+              << "\tepoch_storage_read_bytes=" << series(epoch_storage_read_bytes)
+              << "\tepoch_policy_drops=" << series(epoch_policy_drops)
+              << "\tepoch_scheduler_active=" << series(epoch_scheduler_active)
+              << "\tepoch_cold_hot_refs=" << series(epoch_cold_hot_refs)
+              << "\tepoch_cold_transfer_refs=" << series(epoch_cold_transfer_refs)
+              << "\tepoch_cold_request_refs=" << series(epoch_cold_request_refs)
+              << "\tepoch_ring_live_events=" << series(epoch_ring_live_events)
+              << "\tepoch_io_active_operations=" << series(epoch_io_active_operations)
               << "\thot_requested_capacity=" << diagnostics.requested_capacity
               << "\thot_effective_capacity=" << diagnostics.effective_capacity
               << "\thot_slots=" << diagnostics.slots.size()
