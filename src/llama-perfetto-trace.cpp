@@ -27,6 +27,7 @@ std::atomic<bool> g_trace_active { false };
 std::atomic<uint64_t> g_next_trace_id { 1 };
 std::atomic<uint64_t> g_cupti_active_buffer_bytes { 0 };
 std::atomic<uint64_t> g_cupti_buffer_limit { k_cupti_retained_bytes_max };
+std::atomic<uint64_t> g_cupti_retained_capacity_bytes { 0 };
 
 enum class cupti_record_kind : uint8_t {
     runtime,
@@ -131,11 +132,11 @@ bool valid_interval(uint64_t start, uint64_t end) noexcept {
 }
 
 void retain_cupti_record(trace_state & value, const retained_cupti_record & record) noexcept {
-    const uint64_t next_bytes = uint64_t(value.cupti_records.size() + 1)*sizeof(retained_cupti_record);
-    if (next_bytes > value.config.cupti_retained_bytes) {
+    if (value.cupti_records.size() == value.cupti_records.capacity()) {
         record_callback_failure(value, "CUPTI retained-record bound exhausted");
         return;
     }
+    const uint64_t next_bytes = uint64_t(value.cupti_records.size() + 1)*sizeof(retained_cupti_record);
     try {
         value.cupti_records.push_back(record);
         value.diagnostics.cupti_records++;
@@ -149,8 +150,15 @@ void CUPTIAPI cupti_buffer_requested(uint8_t ** buffer, size_t * size, size_t * 
     *buffer = nullptr;
     *size = 0;
     *max_records = 0;
+    const uint64_t buffer_limit = g_cupti_buffer_limit.load(std::memory_order_acquire);
+    if (buffer_limit < k_cupti_buffer_bytes) {
+        auto & value = state();
+        std::lock_guard<std::mutex> lock(value.mutex);
+        record_callback_failure(value, "CUPTI shared memory budget exhausted");
+        return;
+    }
     const uint64_t prior = g_cupti_active_buffer_bytes.fetch_add(k_cupti_buffer_bytes, std::memory_order_acq_rel);
-    if (prior > g_cupti_buffer_limit.load(std::memory_order_acquire) - k_cupti_buffer_bytes) {
+    if (prior > buffer_limit - k_cupti_buffer_bytes) {
         g_cupti_active_buffer_bytes.fetch_sub(k_cupti_buffer_bytes, std::memory_order_acq_rel);
         auto & value = state();
         std::lock_guard<std::mutex> lock(value.mutex);
@@ -171,6 +179,8 @@ void CUPTIAPI cupti_buffer_requested(uint8_t ** buffer, size_t * size, size_t * 
     std::lock_guard<std::mutex> lock(value.mutex);
     value.diagnostics.cupti_peak_buffer_bytes = std::max(
         value.diagnostics.cupti_peak_buffer_bytes, prior + k_cupti_buffer_bytes);
+    value.diagnostics.cupti_peak_total_bytes = std::max(value.diagnostics.cupti_peak_total_bytes,
+        g_cupti_retained_capacity_bytes.load(std::memory_order_acquire) + prior + k_cupti_buffer_bytes);
 }
 
 void CUPTIAPI cupti_buffer_completed(
@@ -444,6 +454,31 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
         return;
     }
 
+    state.cupti_records.clear();
+    try {
+        const uint64_t retained_budget = state.config.cupti_retained_bytes/2;
+        state.cupti_records.reserve(size_t(retained_budget/sizeof(retained_cupti_record)));
+    } catch (...) {
+        record_callback_failure(state, "CUPTI retained-record reserve failed");
+        (void) cuptiActivityEnableAllSyncRecords(0);
+        state.changed.notify_all();
+        return;
+    }
+    const uint64_t retained_capacity_bytes =
+        uint64_t(state.cupti_records.capacity())*sizeof(retained_cupti_record);
+    if (retained_capacity_bytes > state.config.cupti_retained_bytes - k_cupti_buffer_bytes) {
+        record_callback_failure(state, "CUPTI retained allocation exceeds shared memory budget");
+        std::vector<retained_cupti_record>().swap(state.cupti_records);
+        (void) cuptiActivityEnableAllSyncRecords(0);
+        state.changed.notify_all();
+        return;
+    }
+    state.diagnostics.cupti_retained_capacity_bytes = retained_capacity_bytes;
+    state.diagnostics.cupti_peak_total_bytes = retained_capacity_bytes;
+    g_cupti_retained_capacity_bytes.store(retained_capacity_bytes, std::memory_order_release);
+    g_cupti_buffer_limit.store(
+        state.config.cupti_retained_bytes - retained_capacity_bytes, std::memory_order_release);
+
     state.enabled_kinds = {
         CUPTI_ACTIVITY_KIND_RUNTIME,
         CUPTI_ACTIVITY_KIND_DRIVER,
@@ -468,22 +503,6 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
         }
         state.enabled_kind_count++;
     }
-    state.cupti_records.clear();
-    try {
-        state.cupti_records.reserve(std::min<size_t>(65536,
-            size_t(state.config.cupti_retained_bytes/sizeof(retained_cupti_record))));
-    } catch (...) {
-        record_callback_failure(state, "CUPTI retained-record reserve failed");
-        for (size_t index = 0; index < state.enabled_kind_count; ++index) {
-            (void) cuptiActivityDisable(state.enabled_kinds[index]);
-        }
-        state.enabled_kind_count = 0;
-        (void) cuptiActivityEnableAllSyncRecords(0);
-        state.changed.notify_all();
-        return;
-    }
-    g_cupti_buffer_limit.store(state.config.cupti_retained_bytes, std::memory_order_release);
-
     state.diagnostics.track_event_active = true;
     state.diagnostics.cupti_active = true;
     g_trace_active.store(true, std::memory_order_release);
@@ -525,6 +544,8 @@ void trace_observer::OnStop(const perfetto::DataSourceBase::StopArgs &) {
         state.diagnostics.clock_stop_ns, "cupti_errors", state.diagnostics.cupti_errors,
         "cupti_records", state.diagnostics.cupti_records,
         "cupti_dropped_records", state.diagnostics.cupti_dropped_records,
+        "cupti_retained_capacity_bytes", state.diagnostics.cupti_retained_capacity_bytes,
+        "cupti_peak_total_bytes", state.diagnostics.cupti_peak_total_bytes,
         "cupti_unknown_timestamps", state.diagnostics.cupti_unknown_timestamps,
         "cupti_unmatched_correlations", state.diagnostics.cupti_unmatched_correlations);
     state.diagnostics.cupti_active = false;
@@ -644,6 +665,8 @@ bool llm_perfetto_trace_shutdown(char * error, size_t error_capacity) noexcept {
         std::lock_guard<std::mutex> lock(value.mutex);
         std::vector<retained_cupti_record>().swap(value.cupti_records);
         value.diagnostics.cupti_retained_bytes = 0;
+        value.diagnostics.cupti_retained_capacity_bytes = 0;
+        g_cupti_retained_capacity_bytes.store(0, std::memory_order_release);
         value.diagnostics.shutdown = true;
     }
     return true;

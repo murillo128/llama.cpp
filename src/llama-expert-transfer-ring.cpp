@@ -261,6 +261,12 @@ struct llm_expert_transfer_ring::impl {
         return class_id < payloads.size() ? payloads[class_id] : 0;
     }
 
+    uint64_t occupied_lanes() const {
+        return std::count_if(lanes.begin(), lanes.end(), [](const auto & candidate) {
+            return candidate.state != llm_transfer_lane_state::free;
+        });
+    }
+
     void release_lane(lane_state & lane) {
         if (lane.cold_cache != nullptr) {
             const auto released = lane.cold_cache->release(lane.cold, llm_cold_reference_kind::transfer);
@@ -292,6 +298,7 @@ struct llm_expert_transfer_ring::impl {
         lane.compute_work = 0;
         lane.compute_work_id = 0;
         lane.state = llm_transfer_lane_state::free;
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "transfer_lane_occupancy", 6, occupied_lanes());
     }
 
     void refresh_total_event_counters() {
@@ -831,6 +838,7 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
     pimpl->counters.lane_reservations++;
     LLM_EXPERT_TRACE_INSTANT("k3.transfer", "lane_reserved", "lane", index,
         "event_generation", lane.generation, "layout_class_id", lane.layout_class_id);
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "transfer_lane_occupancy", 6, pimpl->occupied_lanes());
     return llm_expert_provider_result::success();
 }
 

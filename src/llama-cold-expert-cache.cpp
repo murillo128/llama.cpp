@@ -637,6 +637,11 @@ struct llm_cold_expert_cache::impl {
             forward = { int32_t(index), slot.generation };
             counters.admissions++;
             counters.publications++;
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "admission", "layer", slot.key.layer,
+                "original_expert_id", slot.key.expert, "slot_id", index,
+                "generation", slot.generation);
+            LLM_EXPERT_TRACE_COUNTER("k3.resource", "cold_cache_occupancy", 5,
+                counters.admissions - counters.evictions);
         }
         return llm_expert_provider_result::success();
     }
@@ -974,11 +979,19 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
         return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
     }
     if (slot.state == llm_cold_slot_state::ready) {
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "victim", "layer", slot.key.layer,
+            "original_expert_id", slot.key.expert, "slot_id", uint32_t(victim),
+            "generation", slot.generation);
         auto removed = policy_result(pimpl->policy.evict(uint32_t(victim), slot.generation));
         if (!removed.is_ready()) return removed;
         slot.state = llm_cold_slot_state::evicting;
         pimpl->clear_forward(victim);
         pimpl->counters.evictions++;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "eviction", "layer", slot.key.layer,
+            "original_expert_id", slot.key.expert, "slot_id", uint32_t(victim),
+            "generation", slot.generation);
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "cold_cache_occupancy", 5,
+            pimpl->counters.admissions - pimpl->counters.evictions);
     }
     slot.state = llm_cold_slot_state::reserved;
     slot.key = key;
@@ -1076,11 +1089,19 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
         return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
     }
     if (slot.state == llm_cold_slot_state::ready) {
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "victim", "layer", slot.key.layer,
+            "original_expert_id", slot.key.expert, "slot_id", uint32_t(victim),
+            "generation", slot.generation);
         auto removed = policy_result(pimpl->policy.evict(uint32_t(victim), slot.generation));
         if (!removed.is_ready()) return removed;
         slot.state = llm_cold_slot_state::evicting;
         pimpl->clear_forward(victim);
         pimpl->counters.evictions++;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "eviction", "layer", slot.key.layer,
+            "original_expert_id", slot.key.expert, "slot_id", uint32_t(victim),
+            "generation", slot.generation);
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "cold_cache_occupancy", 5,
+            pimpl->counters.admissions - pimpl->counters.evictions);
     }
     slot.state = llm_cold_slot_state::reserved;
     slot.key = key;
@@ -1218,12 +1239,20 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find_speculative(
         return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
     if (!decision.free) {
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "victim", "layer", slot.key.layer,
+            "original_expert_id", slot.key.expert, "slot_id", decision.slot,
+            "generation", slot.generation);
         auto removed = policy_result(pimpl->policy.evict(decision.slot, slot.generation));
         if (!removed.is_ready()) return removed;
         slot.state = llm_cold_slot_state::evicting;
         pimpl->clear_forward(decision.slot);
         pimpl->counters.evictions++;
         pimpl->counters.speculative_replacements++;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "eviction", "layer", slot.key.layer,
+            "original_expert_id", slot.key.expert, "slot_id", decision.slot,
+            "generation", slot.generation);
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "cold_cache_occupancy", 5,
+            pimpl->counters.admissions - pimpl->counters.evictions);
     }
     if (slot.generation == UINT64_MAX) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
@@ -1366,11 +1395,19 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
         return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
     }
     if (slot.state == llm_cold_slot_state::ready) {
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "victim", "layer", slot.key.layer,
+            "original_expert_id", slot.key.expert, "slot_id", uint32_t(victim),
+            "generation", slot.generation);
         auto removed = policy_result(pimpl->policy.evict(uint32_t(victim), slot.generation));
         if (!removed.is_ready()) return removed;
         slot.state = llm_cold_slot_state::evicting;
         pimpl->clear_forward(victim);
         pimpl->counters.evictions++;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "eviction", "layer", slot.key.layer,
+            "original_expert_id", slot.key.expert, "slot_id", uint32_t(victim),
+            "generation", slot.generation);
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "cold_cache_occupancy", 5,
+            pimpl->counters.admissions - pimpl->counters.evictions);
     }
     slot.state = llm_cold_slot_state::reserved;
     slot.key = key;
@@ -1428,6 +1465,11 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
     slot.last_use = ++pimpl->use_clock;
     pimpl->directory[pimpl->forward_index(key)] = { victim, slot.generation };
     pimpl->counters.admissions++;
+    LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "admission", "layer", key.layer,
+        "original_expert_id", key.expert, "slot_id", uint32_t(victim),
+        "generation", slot.generation);
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "cold_cache_occupancy", 5,
+        pimpl->counters.admissions - pimpl->counters.evictions);
     pimpl->counters.source_copy_bundles++;
     pimpl->counters.source_copy_bytes += bytes;
     reference = { uint32_t(victim), slot.generation, slot.layout_class_id };

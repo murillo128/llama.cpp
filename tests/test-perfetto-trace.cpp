@@ -48,10 +48,13 @@ int main() {
         const auto captured = llm_perfetto_trace_get_diagnostics();
         if (captured.perfetto_sessions_started != 1 || captured.perfetto_sessions_stopped != 1 ||
             captured.cupti_records == 0 || captured.cupti_dropped_records != 0 ||
-            captured.cupti_unknown_timestamps != 0 || captured.cupti_errors != 0) return 29;
+            captured.cupti_unknown_timestamps != 0 || captured.cupti_errors != 0 ||
+            captured.cupti_retained_capacity_bytes == 0 ||
+            captured.cupti_peak_total_bytes > config.cupti_retained_bytes) return 29;
         if (!llm_perfetto_trace_shutdown(error, sizeof(error))) return 30;
         const auto stopped = llm_perfetto_trace_get_diagnostics();
-        if (!stopped.shutdown || stopped.cupti_retained_bytes != 0) return 31;
+        if (!stopped.shutdown || stopped.cupti_retained_bytes != 0 ||
+            stopped.cupti_retained_capacity_bytes != 0) return 31;
     }
 #endif
     return 0;

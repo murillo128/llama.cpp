@@ -1615,6 +1615,14 @@ bool llama_context::route_observer_extract(const llm_graph_result * res, const l
             return false;
         }
 
+        [[maybe_unused]] const size_t n_expert_used = size_t(output.selected_experts->ne[0]);
+        for (size_t selected_index = 0; selected_index < count; ++selected_index) {
+            LLM_EXPERT_TRACE_INSTANT("k3.route", "selected_key", "request_id", route_observer_request,
+                "phase", uint32_t(route_observer_phase), "token_index", selected_index/n_expert_used,
+                "layer", output.il, "original_expert_id", route_observer_ids[offset + selected_index],
+                "selection_rank", selected_index%n_expert_used);
+        }
+
         LLM_EXPERT_TRACE_INSTANT("k3.route", "route_publication", "request_id", route_observer_request,
             "token_index", route_observer_next_ubatch, "layer", output.il,
             "selected_key_count", count, "n_expert_used", output.selected_experts->ne[0]);
@@ -3062,6 +3070,8 @@ ggml_cgraph * llama_context::graph_discover(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    LLM_EXPERT_TRACE_SCOPE("k3.graph", "graph_reserve", "n_tokens", n_tokens,
+        "n_sequences", n_seqs, "n_outputs", n_outputs, "split_only", split_only);
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 

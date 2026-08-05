@@ -2514,8 +2514,12 @@ public:
         for (size_t policy_index = 0; policy_index < unique_count; ++policy_index) {
             const size_t index = policy_unique_indices[policy_index];
             const auto & key = unique_keys[index];
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "lookup", "request_id", active_request_id,
+                "layer", key.layer, "original_expert_id", key.expert);
             const auto & forward = directory_forward[forward_index(key)];
             if (forward.slot < 0) {
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "miss", "request_id", active_request_id,
+                    "layer", key.layer, "original_expert_id", key.expert);
                 miss_unique_indices[miss_count++] = uint32_t(index);
                 continue;
             }
@@ -2541,6 +2545,9 @@ public:
             const auto touched = cache_policy_result(hot_policy.hit(
                 uint32_t(unique_slots[index]), entry.generation));
             if (!touched.is_ready()) return fail(touched);
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "hit", "request_id", active_request_id,
+                "layer", unique_keys[index].layer, "original_expert_id", unique_keys[index].expert,
+                "slot_id", uint32_t(unique_slots[index]), "generation", entry.generation);
         }
         const auto prior_pins_released = release_request_pins_locked();
         if (!prior_pins_released.is_ready()) return fail(prior_pins_released);
@@ -3069,9 +3076,6 @@ public:
                 }
                 const auto pinned = pin_slot_locked(uint32_t(unique_slots[index]));
                 if (!pinned.is_ready()) return fail(pinned);
-                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "hit", "request_id", active_request_id,
-                    "layer", unique_keys[index].layer, "original_expert_id", unique_keys[index].expert,
-                    "slot_id", uint32_t(unique_slots[index]), "generation", entry.generation);
                 hit_count++;
             }
         }
@@ -3085,6 +3089,9 @@ public:
             const uint32_t slot = candidate_slots[index];
             auto & entry = directory_slots[slot];
             if (entry.state != hot_slot_state::free) {
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
                 const auto policy_valid = cache_policy_result(hot_policy.validate_evictable(slot, entry.generation));
                 if (!policy_valid.is_ready()) return fail(policy_valid);
                 if (config.cold_mode) {
@@ -3110,6 +3117,7 @@ public:
                     "generation", entry.generation, "layer", entry.key.layer,
                     "original_expert_id", entry.key.expert);
                 evictions++;
+                LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4, admissions - evictions);
                 if (config.cold_mode) no_writeback_evictions++;
             }
             entry.state = hot_slot_state::reserved;
@@ -3976,6 +3984,10 @@ public:
                 "layer", entry.key.layer, "original_expert_id", entry.key.expert,
                 "slot_id", slot, "generation", entry.generation);
             admissions++;
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "admission", "request_id", active_request_id,
+                "layer", entry.key.layer, "original_expert_id", entry.key.expert,
+                "slot_id", slot, "generation", entry.generation);
+            LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4, admissions - evictions);
             const auto pinned = pin_slot_locked(slot);
             if (!pinned.is_ready()) return fail(pinned);
         }
@@ -7355,6 +7367,8 @@ private:
                 request_pins[index].slot, request_pins[index].generation));
             if (!unpinned.is_ready()) return unpinned;
             entry.refcount--;
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "unpin", "slot_id", request_pins[index].slot,
+                "generation", request_pins[index].generation, "refcount", entry.refcount);
             if (entry.refcount == 0) {
                 entry.state = hot_slot_state::ready;
             }
@@ -7380,6 +7394,8 @@ private:
         const auto pinned = cache_policy_result(hot_policy.pin(slot, entry.generation));
         if (!pinned.is_ready()) return pinned;
         entry.refcount++;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "pin", "slot_id", slot,
+            "generation", entry.generation, "refcount", entry.refcount);
         entry.state = hot_slot_state::pinned;
         entry.last_use = ++use_clock;
         request_pins[request_pin_count++] = { slot, entry.generation };
