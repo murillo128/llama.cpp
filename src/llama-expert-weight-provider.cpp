@@ -5666,7 +5666,10 @@ private:
     }
 
     bool binding_uses_current_pool(const llm_expert_graph_binding & binding) const noexcept {
-        if (binding.layout_class_id >= pool->bundles.size()) return false;
+        if (binding.layout_class_id != layout_class_for_layer(binding.layer) ||
+            binding.layout_class_id >= pool->bundles.size()) {
+            return false;
+        }
         const auto & bundle = pool->bundles[binding.layout_class_id];
         return projection_identity_matches(binding.up, bundle.up) &&
             projection_identity_matches(binding.gate, bundle.gate) &&

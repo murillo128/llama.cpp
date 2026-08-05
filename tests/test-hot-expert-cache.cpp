@@ -2621,6 +2621,17 @@ void test_three_layout_classes_share_one_cache_and_full_data_path() {
     GGML_ASSERT(bindings[0].up.weight->data == bindings[1].up.weight->data);
     GGML_ASSERT(bindings[0].up.weight->data == bindings[2].up.weight->data);
 
+    auto mismatched_binding = bindings[0];
+    mismatched_binding.layout_class_id = bindings[1].layout_class_id;
+    mismatched_binding.up = bindings[1].up;
+    mismatched_binding.gate = bindings[1].gate;
+    mismatched_binding.gate_up = bindings[1].gate_up;
+    mismatched_binding.down = bindings[1].down;
+    llm_expert_execution_plan mismatched_plan;
+    GGML_ASSERT(provider->prepare({ mismatched_binding }, mismatched_plan).error ==
+        llm_expert_provider_error::invalid_binding);
+    mismatched_binding = {};
+
     const int32_t logical_ids[] = { 0, 1 };
     for (int32_t layer = 0; layer < 3; ++layer) {
         llm_expert_execution_plan plan;
