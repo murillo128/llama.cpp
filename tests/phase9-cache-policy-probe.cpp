@@ -68,6 +68,20 @@ bool parse_u32(const char * text, uint32_t & value) {
     return true;
 }
 
+std::string token_piece(const llama_vocab * vocab, llama_token token) {
+    std::string piece(16, '\0');
+    int size = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, true);
+    if (size < 0) {
+        piece.resize(size_t(-size));
+        size = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, true);
+    }
+    if (size < 0) {
+        return {};
+    }
+    piece.resize(size_t(size));
+    return piece;
+}
+
 bool parse_arguments(int argc, char ** argv, arguments & result) {
     for (int index = 1; index < argc; ++index) {
         if (index + 1 >= argc) return false;
@@ -444,6 +458,7 @@ int main(int argc, char ** argv) {
         if (args.observe_routes &&
             llama_set_route_observer(context.get(), capture_route, &routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 7;
         std::vector<llama_token> generated;
+        std::string generated_text;
         std::vector<uint64_t> logits_digests;
         std::vector<uint64_t> latency_us;
         llama_batch batch = llama_batch_get_one(prompt.data(), prompt.size());
@@ -556,6 +571,7 @@ int main(int argc, char ** argv) {
                 return 10;
             }
             generated.push_back(next);
+            generated_text += token_piece(vocab, next);
             logits_digests.push_back(hash_bytes(1469598103934665603ULL, logits, size_t(n_vocab)*sizeof(float)));
             latency_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count());
             if (llama_vocab_is_eog(vocab, next)) break;
@@ -567,6 +583,8 @@ int main(int argc, char ** argv) {
         context.reset();
         struct rusage usage {};
         getrusage(RUSAGE_SELF, &usage);
+        const uint64_t cpu_user_time_us = uint64_t(usage.ru_utime.tv_sec)*1000000ULL + uint64_t(usage.ru_utime.tv_usec);
+        const uint64_t cpu_system_time_us = uint64_t(usage.ru_stime.tv_sec)*1000000ULL + uint64_t(usage.ru_stime.tv_usec);
         json command = json::array();
         for (int index = 0; index < argc; ++index) command.push_back(argv[index]);
         if (provider == nullptr) {
@@ -580,8 +598,10 @@ int main(int argc, char ** argv) {
                     {"n_ubatch", args.n_ubatch},
                     {"max_generate", args.max_generate},
                 }},
-                {"prompt_ids", prompt}, {"generated_ids", generated}, {"logits_fnv64", logits_digests},
-                {"latency_us", latency_us}, {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
+                {"prompt_ids", prompt}, {"generated_ids", generated}, {"generated_text", generated_text},
+                {"logits_fnv64", logits_digests}, {"latency_us", latency_us},
+                {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},
+                {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
             };
             std::ofstream destination(args.output, std::ios::binary | std::ios::trunc);
             if (!destination) return 12;
@@ -632,8 +652,10 @@ int main(int argc, char ** argv) {
                 {"n_ubatch", args.n_ubatch},
                 {"max_generate", args.max_generate},
             }},
-            {"prompt_ids", prompt}, {"generated_ids", generated}, {"logits_fnv64", logits_digests},
-            {"latency_us", latency_us}, {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
+            {"prompt_ids", prompt}, {"generated_ids", generated}, {"generated_text", generated_text},
+            {"logits_fnv64", logits_digests}, {"latency_us", latency_us},
+            {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},
+            {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
             {"topology", {
                 {"routed_layers", routed_layers}, {"experts_per_layer", diagnostics.n_expert},
                 {"hot_physical_slot_footprint_bytes", hot_footprint},
