@@ -402,10 +402,14 @@ struct llm_expert_transfer_ring::impl {
             lane.monitoring = true;
             const uint64_t generation = lane.generation;
             ggml_backend_event_t event = lane.event;
+            [[maybe_unused]] const uint64_t correlation_id = llm_perfetto_trace_pair_id(
+                llm_perfetto_trace_domain::flight, lane.flight.request_slot,
+                uint32_t(lane.flight.request_generation));
             lock.unlock();
             if (config.delay_event_monitor_ms_for_testing != 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.delay_event_monitor_ms_for_testing));
             }
+            LLM_EXPERT_TRACE_CUDA_SCOPE(correlation_id);
             ggml_backend_event_synchronize(event);
             const uint64_t completed_us = uint64_t(ggml_time_us());
             lock.lock();
@@ -468,7 +472,11 @@ struct llm_expert_transfer_ring::impl {
             lane.compute_monitoring = true;
             const uint64_t generation = lane.generation;
             ggml_backend_event_t event = lane.compute_event;
+            [[maybe_unused]] const uint64_t correlation_id = llm_perfetto_trace_pair_id(
+                llm_perfetto_trace_domain::flight, lane.flight.request_slot,
+                uint32_t(lane.flight.request_generation));
             lock.unlock();
+            LLM_EXPERT_TRACE_CUDA_SCOPE(correlation_id);
             ggml_backend_event_synchronize(event);
             const uint64_t completed_us = uint64_t(ggml_time_us());
             lock.lock();
