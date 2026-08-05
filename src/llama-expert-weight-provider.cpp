@@ -1963,7 +1963,13 @@ public:
             if (entry.state == hot_slot_state::loading) {
                 (void) hot_policy.load_failed(slot, entry.generation);
             } else if (entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned) {
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
                 (void) hot_policy.remove_resident(slot, entry.generation);
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
             }
             clear_forward_locked(entry.key, slot, entry.generation);
             if (entry.has_cold_backing && cold_cache) {
@@ -1973,6 +1979,7 @@ public:
                 entry.has_cold_backing = false;
             }
         }
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4, 0);
         active_background_flights = 0;
         const auto cold_surrendered = cold_cache ? cold_cache->surrender() :
             llm_expert_provider_result::success();
@@ -2863,6 +2870,12 @@ public:
                             background_useful++;
                             background_later_joins++;
                             admissions++;
+                            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "admission",
+                                "request_id", active_request_id, "layer", entry.key.layer,
+                                "original_expert_id", entry.key.expert,
+                                "slot_id", background->hot_slot, "generation", entry.generation);
+                            LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                                hot_cache_occupancy_locked());
                         }
                     } else {
                         unique_gpu_assignment[unique_index] = 1;
@@ -2943,6 +2956,12 @@ public:
                         entry.last_use = ++use_clock;
                         directory_forward[forward_index(entry.key)] = { int32_t(hot_slot), entry.generation };
                         admissions++;
+                        LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "admission",
+                            "request_id", active_request_id, "layer", entry.key.layer,
+                            "original_expert_id", entry.key.expert,
+                            "slot_id", hot_slot, "generation", entry.generation);
+                        LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                            hot_cache_occupancy_locked());
                         result = pin_slot_locked(hot_slot);
                         if (!result.is_ready()) break;
                     }
@@ -2961,6 +2980,13 @@ public:
                     const uint32_t unique_index = gpu_unique_indices[index];
                     auto & entry = directory_slots[uint32_t(unique_slots[unique_index])];
                     const uint32_t hot_slot = uint32_t(unique_slots[unique_index]);
+                    const bool was_resident = entry.state == hot_slot_state::ready ||
+                        entry.state == hot_slot_state::pinned;
+                    if (was_resident) {
+                        LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", hot_slot,
+                            "generation", entry.generation, "layer", entry.key.layer,
+                            "original_expert_id", entry.key.expert);
+                    }
                     llm_expert_cache_policy_result policy_cleanup;
                     if (hot_policy.validate_resident(hot_slot, entry.generation,
                             policy_key_for(entry.key))) {
@@ -2977,6 +3003,13 @@ public:
                     const uint64_t generation = entry.generation;
                     entry = {};
                     entry.generation = generation;
+                    if (was_resident) {
+                        LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", hot_slot,
+                            "generation", generation, "layer", unique_keys[unique_index].layer,
+                            "original_expert_id", unique_keys[unique_index].expert);
+                        LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                            hot_cache_occupancy_locked());
+                    }
                     unique_slots[unique_index] = -1;
                 }
                 const auto released = release_request_pins_locked();
@@ -3117,7 +3150,8 @@ public:
                     "generation", entry.generation, "layer", entry.key.layer,
                     "original_expert_id", entry.key.expert);
                 evictions++;
-                LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4, admissions - evictions);
+                LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                    hot_cache_occupancy_locked());
                 if (config.cold_mode) no_writeback_evictions++;
             }
             entry.state = hot_slot_state::reserved;
@@ -3987,7 +4021,8 @@ public:
             LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "admission", "request_id", active_request_id,
                 "layer", entry.key.layer, "original_expert_id", entry.key.expert,
                 "slot_id", slot, "generation", entry.generation);
-            LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4, admissions - evictions);
+            LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                hot_cache_occupancy_locked());
             const auto pinned = pin_slot_locked(slot);
             if (!pinned.is_ready()) return fail(pinned);
         }
@@ -4665,6 +4700,17 @@ public:
             pool = std::move(candidate);
             cold_cache = std::move(cold_candidate);
             transfer_ring = std::move(ring_candidate);
+            if (llm_perfetto_trace_is_active()) {
+                for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+                    const auto & entry = directory_slots[slot];
+                    if (entry.state != hot_slot_state::ready) continue;
+                    LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "admission",
+                        "layer", entry.key.layer, "original_expert_id", entry.key.expert,
+                        "slot_id", slot, "generation", entry.generation);
+                }
+            }
+            LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                hot_cache_occupancy_locked());
             epoch++;
             counters.allocations++;
             counters.pool_generations++;
@@ -4693,6 +4739,9 @@ public:
         for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
             auto & entry = directory_slots[slot];
             if (entry.state == hot_slot_state::ready && entry.refcount == 0) {
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
                 const auto policy_valid = cache_policy_result(hot_policy.validate_evictable(slot, entry.generation));
                 if (!policy_valid.is_ready()) return fail(policy_valid);
                 if (entry.origin == llm_expert_residency_origin::speculative &&
@@ -4711,9 +4760,14 @@ public:
                 const auto policy_removed = cache_policy_result(hot_policy.remove_resident(slot, entry.generation));
                 if (!policy_removed.is_ready()) return fail(policy_removed);
                 clear_forward_locked(entry.key, slot, entry.generation);
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
                 entry.key = { -1, -1 };
                 entry.layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
                 entry.state = hot_slot_state::free;
+                LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                    hot_cache_occupancy_locked());
             }
         }
         if (config.cold_mode) {
@@ -4763,8 +4817,14 @@ public:
                 auto result = cache_policy_result(hot_policy.load_failed(slot, entry.generation));
                 if (!result.is_ready()) return fail(result);
             } else if (entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned) {
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
                 auto result = cache_policy_result(hot_policy.remove_resident(slot, entry.generation));
                 if (!result.is_ready()) return fail(result);
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
             }
         }
         auto policy_surrendered = cache_policy_result(hot_policy.surrender());
@@ -4774,6 +4834,7 @@ public:
         transfer_ring.reset();
         directory_forward.clear();
         directory_slots.clear();
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4, 0);
         unique_keys.clear();
         unique_slots.clear();
         unique_cpu_slots.clear();
@@ -5530,6 +5591,12 @@ protected:
     }
 
 private:
+    uint64_t hot_cache_occupancy_locked() const noexcept {
+        return std::count_if(directory_slots.begin(), directory_slots.end(), [](const auto & entry) {
+            return entry.state == hot_slot_state::ready || entry.state == hot_slot_state::pinned;
+        });
+    }
+
     void reset_phase10_capture_locked() noexcept {
         phase10_prediction_events = 0;
         phase10_prediction_events_dropped = 0;
@@ -6281,7 +6348,11 @@ private:
         }
         const uint32_t slot = uint32_t(selected);
         auto & entry = directory_slots[slot];
-        if (entry.state != hot_slot_state::free) {
+        const bool replacing = entry.state != hot_slot_state::free;
+        if (replacing) {
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", slot,
+                "generation", entry.generation, "layer", entry.key.layer,
+                "original_expert_id", entry.key.expert);
             if (entry.origin == llm_expert_residency_origin::speculative &&
                     !entry.background_useful) {
                 background_wasted++;
@@ -6291,6 +6362,9 @@ private:
             if (!removed.is_ready()) return removed;
             clear_forward_locked(entry.key, slot, entry.generation);
             evictions++;
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", slot,
+                "generation", entry.generation, "layer", entry.key.layer,
+                "original_expert_id", entry.key.expert);
         }
         if (entry.generation == UINT64_MAX) {
             resolve_prediction_event_locked(event, llm_expert_prefetch_outcome::rejected);
@@ -6299,6 +6373,10 @@ private:
         }
         const uint64_t next_generation = entry.generation + 1;
         entry = {};
+        if (replacing) {
+            LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                hot_cache_occupancy_locked());
+        }
         entry.key = event.key;
         entry.layout_class_id = layout_class_for_layer(event.key.layer);
         entry.generation = next_generation;
@@ -6343,6 +6421,11 @@ private:
         directory_forward[forward_index(entry.key)] = {
             int32_t(slot), entry.generation };
         admissions++;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "admission",
+            "layer", entry.key.layer, "original_expert_id", entry.key.expert,
+            "slot_id", slot, "generation", entry.generation);
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+            hot_cache_occupancy_locked());
         generation_changes++;
         h2d_bytes = bytes > UINT64_MAX - h2d_bytes ? UINT64_MAX : h2d_bytes + bytes;
         event.admitted = true;
@@ -6495,6 +6578,9 @@ private:
                     entry.origin == llm_expert_residency_origin::speculative &&
                     !entry.background_useful && entry.refcount == 0 &&
                     entry.state == hot_slot_state::ready) {
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
                 const auto removed = cache_policy_result(
                     hot_policy.evict(slot, entry.generation));
                 if (!removed.is_ready()) {
@@ -6514,9 +6600,14 @@ private:
                     entry.has_cold_backing = false;
                 }
                 clear_forward_locked(entry.key, slot, entry.generation);
+                LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", slot,
+                    "generation", entry.generation, "layer", entry.key.layer,
+                    "original_expert_id", entry.key.expert);
                 const uint64_t generation = entry.generation;
                 entry = {};
                 entry.generation = generation;
+                LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                    hot_cache_occupancy_locked());
             }
         }
     }
@@ -6750,6 +6841,13 @@ private:
         if (record.hot_slot < directory_slots.size()) {
             auto & entry = directory_slots[record.hot_slot];
             if (entry.generation == record.hot_generation && expert_key_matches(entry.key, record.key)) {
+                const bool was_resident = entry.state == hot_slot_state::ready ||
+                    entry.state == hot_slot_state::pinned;
+                if (was_resident) {
+                    LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", record.hot_slot,
+                        "generation", entry.generation, "layer", entry.key.layer,
+                        "original_expert_id", entry.key.expert);
+                }
                 llm_expert_cache_policy_result policy_result_value;
                 if (entry.state == hot_slot_state::loading) {
                     policy_result_value = hot_policy.load_failed(record.hot_slot, entry.generation);
@@ -6763,9 +6861,18 @@ private:
                         { entry.cold_slot, entry.cold_generation, entry.layout_class_id },
                         llm_cold_reference_kind::hot);
                 }
+                if (was_resident) {
+                    LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", record.hot_slot,
+                        "generation", entry.generation, "layer", entry.key.layer,
+                        "original_expert_id", entry.key.expert);
+                }
                 const uint64_t generation = entry.generation;
                 entry = {};
                 entry.generation = generation;
+                if (was_resident) {
+                    LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                        hot_cache_occupancy_locked());
+                }
             }
         }
         finish_background_scheduler_locked(record, false);
@@ -6869,6 +6976,11 @@ private:
         entry.speculative_utility = record.speculative_utility;
         directory_forward[forward_index(entry.key)] = { int32_t(record.hot_slot), entry.generation };
         admissions++;
+        LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "admission",
+            "layer", entry.key.layer, "original_expert_id", entry.key.expert,
+            "slot_id", record.hot_slot, "generation", entry.generation);
+        LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+            hot_cache_occupancy_locked());
         if (record.predictive) {
             if (auto * event = prediction_event_locked(record.prediction_sequence)) {
                 event->device_ready = true;
@@ -7144,6 +7256,9 @@ private:
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
         if (entry.state != hot_slot_state::free) {
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "victim", "slot_id", slot,
+                "generation", entry.generation, "layer", entry.key.layer,
+                "original_expert_id", entry.key.expert);
             const auto policy_valid = cache_policy_result(hot_policy.validate_evictable(slot, entry.generation));
             if (!policy_valid.is_ready()) return policy_valid;
             if (entry.origin == llm_expert_residency_origin::speculative &&
@@ -7162,12 +7277,20 @@ private:
             clear_forward_locked(entry.key, slot, entry.generation);
             evictions++;
             no_writeback_evictions++;
+            LLM_EXPERT_TRACE_INSTANT("k3.cache.hot", "eviction", "slot_id", slot,
+                "generation", entry.generation, "layer", entry.key.layer,
+                "original_expert_id", entry.key.expert);
         }
         if (entry.generation == UINT64_MAX) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
         }
         const uint64_t next_generation = entry.generation + 1;
+        const bool replaced = entry.state != hot_slot_state::free;
         entry = {};
+        if (replaced) {
+            LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4,
+                hot_cache_occupancy_locked());
+        }
         entry.key = key;
         entry.layout_class_id = layout_class_id;
         entry.generation = next_generation;
