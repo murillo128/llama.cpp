@@ -425,6 +425,47 @@ void emit_retained_cupti_records(trace_state & value) {
     }
 }
 
+bool finalize_cupti_activity(trace_state & value) {
+    g_trace_active.store(false, std::memory_order_release);
+    CUptiResult first_error = cuptiActivityFlushAll(0);
+    for (size_t index = 0; index < value.enabled_kind_count; ++index) {
+        const CUptiResult result = cuptiActivityDisable(value.enabled_kinds[index]);
+        if (first_error == CUPTI_SUCCESS && result != CUPTI_SUCCESS) first_error = result;
+    }
+    const CUptiResult final_flush = cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+    if (first_error == CUPTI_SUCCESS && final_flush != CUPTI_SUCCESS) first_error = final_flush;
+    const CUptiResult sync_disable = cuptiActivityEnableAllSyncRecords(0);
+    if (first_error == CUPTI_SUCCESS && sync_disable != CUPTI_SUCCESS) first_error = sync_disable;
+    (void) cuptiActivityEnableLatencyTimestamps(0);
+
+    std::lock_guard<std::mutex> lock(value.mutex);
+    if (!value.diagnostics.track_event_active || !value.diagnostics.cupti_active) {
+        record_callback_failure(value, "CUPTI finalization requires one active trace session");
+        return false;
+    }
+    value.enabled_kind_count = 0;
+    if (first_error != CUPTI_SUCCESS) record_cupti_error(value, "CUPTI activity shutdown", first_error);
+    if (g_cupti_active_buffer_bytes.load(std::memory_order_acquire) != 0) {
+        record_callback_failure(value, "CUPTI activity buffers remained active after flush");
+    }
+    try {
+        emit_retained_cupti_records(value);
+    } catch (...) {
+        record_callback_failure(value, "CUPTI TrackEvent emission failed");
+    }
+    value.diagnostics.clock_stop_ns = monotonic_raw_ns();
+    LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "trace_session_stop", "clock_monotonic_raw_ns",
+        value.diagnostics.clock_stop_ns, "cupti_errors", value.diagnostics.cupti_errors,
+        "cupti_records", value.diagnostics.cupti_records,
+        "cupti_dropped_records", value.diagnostics.cupti_dropped_records,
+        "cupti_retained_capacity_bytes", value.diagnostics.cupti_retained_capacity_bytes,
+        "cupti_peak_total_bytes", value.diagnostics.cupti_peak_total_bytes,
+        "cupti_unknown_timestamps", value.diagnostics.cupti_unknown_timestamps,
+        "cupti_unmatched_correlations", value.diagnostics.cupti_unmatched_correlations);
+    value.diagnostics.cupti_active = false;
+    return !value.callback_failed;
+}
+
 void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.diagnostics.track_event_active || state.diagnostics.perfetto_sessions_started != 0) {
@@ -532,50 +573,21 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
 
 void trace_observer::OnStop(const perfetto::DataSourceBase::StopArgs & args) {
     auto stop = args.HandleStopAsynchronously();
-    bool completed = false;
-    g_trace_active.store(false, std::memory_order_release);
-    CUptiResult first_error = cuptiActivityFlushAll(0);
-    for (size_t index = 0; index < state.enabled_kind_count; ++index) {
-        const CUptiResult result = cuptiActivityDisable(state.enabled_kinds[index]);
-        if (first_error == CUPTI_SUCCESS && result != CUPTI_SUCCESS) first_error = result;
-    }
-    const CUptiResult final_flush = cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
-    if (first_error == CUPTI_SUCCESS && final_flush != CUPTI_SUCCESS) first_error = final_flush;
-    const CUptiResult sync_disable = cuptiActivityEnableAllSyncRecords(0);
-    if (first_error == CUPTI_SUCCESS && sync_disable != CUPTI_SUCCESS) first_error = sync_disable;
-    (void) cuptiActivityEnableLatencyTimestamps(0);
-
+    bool needs_finalization = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (!state.diagnostics.track_event_active) {
-            record_callback_failure(state, "trace session stopped before activation");
-        } else {
-            state.enabled_kind_count = 0;
-            if (first_error != CUPTI_SUCCESS) record_cupti_error(state, "CUPTI activity shutdown", first_error);
-            if (g_cupti_active_buffer_bytes.load(std::memory_order_acquire) != 0) {
-                record_callback_failure(state, "CUPTI activity buffers remained active after flush");
-            }
-            emit_retained_cupti_records(state);
-            state.diagnostics.clock_stop_ns = monotonic_raw_ns();
-            LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "trace_session_stop", "clock_monotonic_raw_ns",
-                state.diagnostics.clock_stop_ns, "cupti_errors", state.diagnostics.cupti_errors,
-                "cupti_records", state.diagnostics.cupti_records,
-                "cupti_dropped_records", state.diagnostics.cupti_dropped_records,
-                "cupti_retained_capacity_bytes", state.diagnostics.cupti_retained_capacity_bytes,
-                "cupti_peak_total_bytes", state.diagnostics.cupti_peak_total_bytes,
-                "cupti_unknown_timestamps", state.diagnostics.cupti_unknown_timestamps,
-                "cupti_unmatched_correlations", state.diagnostics.cupti_unmatched_correlations);
-            state.diagnostics.cupti_active = false;
-            completed = true;
-        }
+        needs_finalization = state.diagnostics.cupti_active;
     }
+    if (needs_finalization) (void) finalize_cupti_activity(state);
     perfetto::TrackEvent::Flush();
     if (stop) stop();
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (completed) {
+        if (state.diagnostics.track_event_active) {
             state.diagnostics.track_event_active = false;
             state.diagnostics.perfetto_sessions_stopped++;
+        } else {
+            record_callback_failure(state, "trace session stopped before activation");
         }
         state.changed.notify_all();
     }
@@ -660,6 +672,12 @@ bool llm_perfetto_trace_request_stop(char * error, size_t error_capacity) noexce
             return false;
         }
     }
+    if (!finalize_cupti_activity(value)) {
+        std::lock_guard<std::mutex> lock(value.mutex);
+        set_error(error, error_capacity, value.callback_error);
+        return false;
+    }
+    perfetto::TrackEvent::Flush();
     const char * stop_fd_value = std::getenv("LLAMA_PERFETTO_STOP_FD");
     if (stop_fd_value != nullptr) {
         char * end = nullptr;
