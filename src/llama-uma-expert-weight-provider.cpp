@@ -63,6 +63,7 @@ int expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight) {
 struct uma_load_context {
     llm_expert_storage * storage = nullptr;
     llm_expert_scheduler * scheduler = nullptr;
+    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
     bool (*abort_callback)(void *) = nullptr;
     void * abort_data = nullptr;
     llm_expert_provider_result (*preflight)(void *, uint64_t) = nullptr;
@@ -159,16 +160,36 @@ llm_expert_provider_result load_uma_bundle(
     const auto read = context.storage->read_bundle(key, destinations.data(), destination_count,
         context.abort_callback, context.abort_data);
     if (!read.is_ready()) return fail_scheduler(context, read.error == llm_expert_storage_error::cancelled);
+    if (context.integrity_mode == llm_expert_integrity_mode::none) {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_finalize", "integrity_checked", false);
+        if (read.integrity_status != llm_expert_integrity_status::not_checked || read.digest != 0) {
+            context.storage->poison();
+            return fail_scheduler(context, false);
+        }
+        context.storage->record_integrity_status(llm_expert_integrity_status::not_checked);
+        return llm_expert_provider_result::success();
+    }
     uint64_t destination_digest = UINT64_C(1469598103934665603);
-    for (size_t index = 0; index < destination_count; ++index) {
-        const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);
-        for (uint64_t offset = 0; offset < destinations[index].extent; ++offset) {
-            destination_digest ^= bytes[offset];
-            destination_digest *= UINT64_C(1099511628211);
+    uint64_t digest_bytes = 0;
+    {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_digest", "destination_count", destination_count);
+        for (size_t index = 0; index < destination_count; ++index) {
+            const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);
+            digest_bytes += destinations[index].extent;
+            for (uint64_t offset = 0; offset < destinations[index].extent; ++offset) {
+                destination_digest ^= bytes[offset];
+                destination_digest *= UINT64_C(1099511628211);
+            }
         }
     }
-    const bool integrity_matches = destination_digest == read.digest;
-    context.storage->record_integrity_check(integrity_matches);
+    const bool integrity_matches = read.integrity_status == llm_expert_integrity_status::passed &&
+        destination_digest == read.digest;
+    {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_finalize", "integrity_checked", true,
+            "integrity_matches", integrity_matches, "digest_bytes", digest_bytes);
+        context.storage->record_integrity_status(integrity_matches ? llm_expert_integrity_status::passed :
+            llm_expert_integrity_status::failed, digest_bytes);
+    }
     if (!integrity_matches) return fail_scheduler(context, false);
     return llm_expert_provider_result::success();
 }
@@ -188,6 +209,8 @@ public:
             !this->config.is_uma_buffer_type(this->config.buffer_type) ||
             this->config.target_device == nullptr || this->config.storage == nullptr || this->config.scheduler == nullptr ||
             this->config.prefetch == nullptr || this->config.checksum == nullptr ||
+            (this->config.integrity_mode != llm_expert_integrity_mode::none &&
+             this->config.integrity_mode != llm_expert_integrity_mode::fnv64_end_to_end) ||
             this->config.routed_layers.size() != this->config.routed_layer_count) {
             throw std::invalid_argument("invalid UMA expert provider configuration");
         }
@@ -326,7 +349,7 @@ public:
                     return failure(result.error);
                 }
             }
-            uma_load_context load = { config.storage, config.scheduler, abort_callback, abort_data,
+            uma_load_context load = { config.storage, config.scheduler, config.integrity_mode, abort_callback, abort_data,
                 preflight_trampoline, this, slot_footprint_bytes, {}, false };
             result = cache->find_or_admit_with_loader(unique[index], references[index], load_uma_bundle, &load);
             if (!result.is_ready()) {

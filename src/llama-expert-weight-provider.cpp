@@ -629,6 +629,7 @@ struct storage_load_context {
     llm_expert_storage * storage = nullptr;
     llm_expert_async_transport * transport = nullptr;
     llm_expert_scheduler * scheduler = nullptr;
+    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
     std::unique_lock<std::mutex> * provider_lock = nullptr;
     llm_expert_request_handle completed_io_handle;
     bool completed_io_pending_publication = false;
@@ -637,6 +638,50 @@ struct storage_load_context {
     const std::vector<llm_expert_layout_class_id> * layer_ids = nullptr;
     const llm_expert_layout_registry * layout_registry = nullptr;
 };
+
+bool finalize_payload_integrity(
+        llm_expert_integrity_mode mode,
+        llm_expert_storage & storage,
+        const llm_expert_storage_destination * destinations,
+        size_t destination_count,
+        llm_expert_integrity_status transport_status,
+        uint64_t transport_digest) {
+    if (mode == llm_expert_integrity_mode::none) {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_finalize", "integrity_checked", false);
+        if (transport_status != llm_expert_integrity_status::not_checked || transport_digest != 0) {
+            storage.poison();
+            return false;
+        }
+        storage.record_integrity_status(llm_expert_integrity_status::not_checked);
+        return true;
+    }
+
+    if (transport_status != llm_expert_integrity_status::passed) {
+        storage.record_integrity_status(llm_expert_integrity_status::failed);
+        return false;
+    }
+    uint64_t destination_digest = 1469598103934665603ULL;
+    uint64_t digest_bytes = 0;
+    {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_digest", "destination_count", destination_count);
+        for (size_t index = 0; index < destination_count; ++index) {
+            const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);
+            digest_bytes += destinations[index].extent;
+            for (uint64_t offset = 0; offset < destinations[index].extent; ++offset) {
+                destination_digest ^= bytes[offset];
+                destination_digest *= 1099511628211ULL;
+            }
+        }
+    }
+    const bool matches = destination_digest == transport_digest;
+    {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_finalize", "integrity_checked", true,
+            "integrity_matches", matches, "digest_bytes", digest_bytes);
+        storage.record_integrity_status(matches ? llm_expert_integrity_status::passed :
+            llm_expert_integrity_status::failed, digest_bytes);
+    }
+    return matches;
+}
 
 struct storage_async_flight {
     llm_expert_key key = { -1, -1 };
@@ -866,25 +911,14 @@ llm_expert_provider_result load_storage_bundle(
         context->storage->record_async_read(count, completion.bytes_completed, storage_error, completion.native_error);
         bool integrity_matches = false;
         if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready) {
-            uint64_t destination_digest = 1469598103934665603ULL;
-            for (size_t index = 0; index < count; ++index) {
-                const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);
-                for (uint64_t offset = 0; offset < destinations[index].extent; ++offset) {
-                    destination_digest ^= bytes[offset];
-                    destination_digest *= 1099511628211ULL;
-                }
-            }
-            integrity_matches = destination_digest == completion.digest;
+            integrity_matches = finalize_payload_integrity(context->integrity_mode, *context->storage,
+                destinations.data(), count, completion.integrity_status, completion.digest);
         }
         if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready &&
             integrity_matches) {
-            context->storage->record_integrity_check(true);
             context->completed_io_handle = selected.handle;
             context->completed_io_pending_publication = true;
             return llm_expert_provider_result::success();
-        }
-        if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready) {
-            context->storage->record_integrity_check(false);
         }
         if (waited == llm_expert_async_result::closed) {
             (void) context->scheduler->begin_demand_cancellation(
@@ -909,16 +943,8 @@ llm_expert_provider_result load_storage_bundle(
     const auto result = context->storage->read_bundle(
         key, destinations.data(), count, context->abort_callback, context->abort_callback_data);
     if (result.is_ready()) {
-        uint64_t destination_digest = 1469598103934665603ULL;
-        for (size_t index = 0; index < count; ++index) {
-            const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);
-            for (uint64_t offset = 0; offset < destinations[index].extent; ++offset) {
-                destination_digest ^= bytes[offset];
-                destination_digest *= 1099511628211ULL;
-            }
-        }
-        const bool matches = destination_digest == result.digest;
-        context->storage->record_integrity_check(matches);
+        const bool matches = finalize_payload_integrity(context->integrity_mode, *context->storage,
+            destinations.data(), count, result.integrity_status, result.digest);
         return matches ? llm_expert_provider_result::success() :
             llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
@@ -1833,7 +1859,9 @@ public:
         }
         if (config.capacity < config.n_expert_used || config.capacity > config.total_expert_keys ||
             config.n_expert_used == 0 || config.routed_layer_count == 0 || config.total_expert_keys == 0 ||
-            config.total_expert_keys % config.routed_layer_count != 0 || config.target_buffer_type == nullptr) {
+            config.total_expert_keys % config.routed_layer_count != 0 || config.target_buffer_type == nullptr ||
+            (config.integrity_mode != llm_expert_integrity_mode::none &&
+             config.integrity_mode != llm_expert_integrity_mode::fnv64_end_to_end)) {
             throw std::invalid_argument("invalid hot-cache capacity or topology");
         }
         n_expert = config.total_expert_keys/config.routed_layer_count;
@@ -2615,7 +2643,7 @@ public:
             }
 
             storage_load_context storage_context = {
-                config.storage, nullptr, nullptr, provider_lock, {}, false,
+                config.storage, nullptr, nullptr, config.integrity_mode, provider_lock, {}, false,
                 abort_callback, abort_callback_data,
             };
             storage_context.layer_ids = &layout_registry.layer_ids;
@@ -3479,20 +3507,11 @@ public:
                     config.storage->record_async_read(
                         flight.destination_count, completion.bytes_completed, storage_error,
                         completion.native_error);
-                    uint64_t digest = 1469598103934665603ULL;
-                    if (waited == llm_expert_async_result::ready &&
-                        released == llm_expert_async_result::ready) {
-                        for (size_t destination = 0; destination < flight.destination_count; ++destination) {
-                            const auto * bytes = static_cast<const uint8_t *>(flight.destinations[destination].data);
-                            for (uint64_t offset = 0; offset < flight.destinations[destination].extent; ++offset) {
-                                digest ^= bytes[offset];
-                                digest *= 1099511628211ULL;
-                            }
-                        }
-                    }
                     const bool integrity_matches = waited == llm_expert_async_result::ready &&
-                        released == llm_expert_async_result::ready && digest == completion.digest;
-                    config.storage->record_integrity_check(integrity_matches);
+                        released == llm_expert_async_result::ready &&
+                        finalize_payload_integrity(config.integrity_mode, *config.storage,
+                            flight.destinations.data(), flight.destination_count,
+                            completion.integrity_status, completion.digest);
                     if (!integrity_matches) {
                         return llm_expert_provider_result::failure(
                             waited == llm_expert_async_result::closed ? llm_expert_provider_error::cancelled :
@@ -3876,7 +3895,7 @@ public:
                 }
             } else {
                 storage_load_context storage_context = {
-                    config.storage, nullptr, nullptr, provider_lock, {}, false,
+                    config.storage, nullptr, nullptr, config.integrity_mode, provider_lock, {}, false,
                     abort_callback, abort_callback_data,
                 };
                 storage_context.layer_ids = &layout_registry.layer_ids;
@@ -4443,7 +4462,7 @@ public:
                 }
                 storage_load_context storage_context = {
                     config.storage, config.async_transport, config.scheduler,
-                    nullptr, {}, false, nullptr, nullptr,
+                    config.integrity_mode, nullptr, {}, false, nullptr, nullptr,
                 };
                 storage_context.layer_ids = &layout_registry.layer_ids;
                 storage_context.layout_registry = &layout_registry;
@@ -5993,22 +6012,11 @@ private:
         config.storage->record_async_read(
             flight.destination_count, completion.bytes_completed,
             storage_error, completion.native_error);
-        uint64_t digest = 1469598103934665603ULL;
-        if (waited == llm_expert_async_result::ready &&
-                released == llm_expert_async_result::ready) {
-            for (size_t destination = 0; destination < flight.destination_count; ++destination) {
-                const auto * bytes = static_cast<const uint8_t *>(
-                    flight.destinations[destination].data);
-                for (uint64_t offset = 0;
-                        offset < flight.destinations[destination].extent; ++offset) {
-                    digest ^= bytes[offset];
-                    digest *= 1099511628211ULL;
-                }
-            }
-        }
         const bool integrity_matches = waited == llm_expert_async_result::ready &&
-            released == llm_expert_async_result::ready && digest == completion.digest;
-        config.storage->record_integrity_check(integrity_matches);
+            released == llm_expert_async_result::ready &&
+            finalize_payload_integrity(config.integrity_mode, *config.storage,
+                flight.destinations.data(), flight.destination_count,
+                completion.integrity_status, completion.digest);
         if (!integrity_matches) {
             if (flight.reserved) {
                 (void) cold_cache->fail_reservation(flight.key, flight.cold);
@@ -6084,23 +6092,11 @@ private:
         config.storage->record_async_read(
             speculative.destination_count, completion.bytes_completed,
             storage_error, completion.native_error);
-        uint64_t digest = 1469598103934665603ULL;
-        if (waited == llm_expert_async_result::ready &&
-                released == llm_expert_async_result::ready) {
-            for (size_t destination = 0;
-                    destination < speculative.destination_count; ++destination) {
-                const auto * bytes = static_cast<const uint8_t *>(
-                    speculative.destinations[destination].data);
-                for (uint64_t offset = 0;
-                        offset < speculative.destinations[destination].extent; ++offset) {
-                    digest ^= bytes[offset];
-                    digest *= 1099511628211ULL;
-                }
-            }
-        }
         const bool integrity_matches = waited == llm_expert_async_result::ready &&
-            released == llm_expert_async_result::ready && digest == completion.digest;
-        config.storage->record_integrity_check(integrity_matches);
+            released == llm_expert_async_result::ready &&
+            finalize_payload_integrity(config.integrity_mode, *config.storage,
+                speculative.destinations.data(), speculative.destination_count,
+                completion.integrity_status, completion.digest);
         if (!integrity_matches) {
             if (speculative.reserved) {
                 (void) cold_cache->fail_reservation(

@@ -86,6 +86,7 @@ struct arguments {
     bool observe_routes = true;
     std::string transport = "BUFFERED";
     std::string config_source = "EXPLICIT";
+    std::string integrity = "NONE";
 };
 
 bool parse_u64(const char * text, uint64_t & value) {
@@ -158,6 +159,9 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         } else if (option == "--config-source") {
             result.config_source = value;
             if (result.config_source != "EXPLICIT" && result.config_source != "NULL") return false;
+        } else if (option == "--integrity") {
+            result.integrity = value;
+            if (result.integrity != "NONE" && result.integrity != "FNV64_END_TO_END") return false;
         } else return false;
     }
     return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ctx > 0 &&
@@ -216,6 +220,19 @@ const char * scope_name(llama_expert_cache_policy_scope value) {
 
 const char * admission_name(llama_expert_cache_admission value) {
     return value == LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS ? "ALWAYS" : "FREQUENCY_WINDOW";
+}
+
+const char * integrity_mode_name(llm_expert_integrity_mode value) {
+    return value == llm_expert_integrity_mode::none ? "none" : "fnv64_end_to_end";
+}
+
+const char * integrity_status_name(llm_expert_integrity_status value) {
+    switch (value) {
+        case llm_expert_integrity_status::not_checked: return "not_checked";
+        case llm_expert_integrity_status::passed:      return "passed";
+        case llm_expert_integrity_status::failed:      return "failed";
+    }
+    return "invalid";
 }
 
 json config_json(const llm_expert_cache_policy_diagnostics & diagnostics) {
@@ -361,6 +378,9 @@ json async_diagnostics_json(const llm_expert_async_diagnostics & value) {
         {"read_queue_wait_samples", value.read_queue_wait_samples},
         {"read_queue_wait_us", value.read_queue_wait_us},
         {"read_queue_wait_max_us", value.read_queue_wait_max_us},
+        {"integrity_mode", integrity_mode_name(value.integrity_mode)},
+        {"integrity_digest_requests", value.integrity_digest_requests},
+        {"integrity_digest_bytes", value.integrity_digest_bytes},
         {"synchronous_fallback_operations", value.synchronous_fallback_operations},
         {"interrupted_reads_retried", value.interrupted_reads_retried},
         {"would_block_reads_retried", value.would_block_reads_retried},
@@ -427,10 +447,16 @@ int main(int argc, char ** argv) {
         arguments args;
         if (!parse_arguments(argc, argv, args)) {
             std::fprintf(stderr,
-                "usage: %s --model GGUF --output JSON [--mode disabled|hot|cold] [policy/capacity options]\n",
+                "usage: %s --model GGUF --output JSON [--mode disabled|hot|cold] "
+                "[--integrity NONE|FNV64_END_TO_END (internal evidence only)] [policy/capacity options]\n",
                 argv[0]);
             return 2;
         }
+#if defined(_WIN32)
+        if (_putenv_s("LLAMA_EXPERT_INTEGRITY_MODE", args.integrity.c_str()) != 0) return 2;
+#else
+        if (setenv("LLAMA_EXPERT_INTEGRITY_MODE", args.integrity.c_str(), 1) != 0) return 2;
+#endif
 #if defined(LLAMA_PERFETTO)
         perfetto_evidence_owner trace_owner;
 #endif
@@ -804,6 +830,10 @@ int main(int argc, char ** argv) {
                 {"io_errors", storage_diagnostics.io_errors},
                 {"integrity_checks", storage_diagnostics.integrity_checks},
                 {"integrity_mismatches", storage_diagnostics.integrity_mismatches},
+                {"integrity_not_checked", storage_diagnostics.integrity_not_checked},
+                {"integrity_digest_bytes", storage_diagnostics.integrity_digest_bytes},
+                {"integrity_mode", integrity_mode_name(storage_diagnostics.integrity_mode)},
+                {"integrity_status", integrity_status_name(storage_diagnostics.integrity_status)},
                 {"direct_source_count", storage_diagnostics.direct_source_count},
                 {"direct_unsupported_source_count", storage_diagnostics.direct_unsupported_source_count},
                 {"maximum_direct_alignment", storage_diagnostics.maximum_direct_alignment},

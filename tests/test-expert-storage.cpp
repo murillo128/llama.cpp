@@ -106,7 +106,7 @@ void test_configuration_directory_and_real_reads() {
         llm_expert_storage storage({ 1, 2, 2, 8 }, { sources[1] });
     });
 
-    llm_expert_storage storage({ 1, 2, 2, 4 }, sources);
+    llm_expert_storage storage({ 1, 2, 2, 4, llm_expert_integrity_mode::fnv64_end_to_end }, sources);
     auto malformed = separate_bundle();
     malformed[0].split_index = 7;
     GGML_ASSERT(storage.add_bundle({ 0, 0 }, malformed).error == llm_expert_storage_error::invalid_directory);
@@ -167,6 +167,15 @@ void test_configuration_directory_and_real_reads() {
         { llm_expert_storage_projection::gate, llm_expert_storage_sidecar::weight, gate.data(), gate.size(), 2 },
         { llm_expert_storage_projection::down, llm_expert_storage_sidecar::weight, down.data(), down.size(), 2 },
     }};
+    llm_expert_storage unchecked_storage({ 1, 2, 2, 4 }, sources);
+    populate_and_seal(unchecked_storage);
+    const auto unchecked_read = unchecked_storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size());
+    const auto unchecked_diagnostics = unchecked_storage.diagnostics();
+    GGML_ASSERT(unchecked_read.is_ready() && unchecked_read.digest == 0 &&
+        unchecked_read.integrity_status == llm_expert_integrity_status::not_checked);
+    GGML_ASSERT(unchecked_diagnostics.integrity_mode == llm_expert_integrity_mode::none &&
+        unchecked_diagnostics.integrity_status == llm_expert_integrity_status::not_checked &&
+        unchecked_diagnostics.integrity_checks == 0 && unchecked_diagnostics.integrity_digest_bytes == 0);
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size()).is_ready());
     const auto scattered_read = storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size());
     uint64_t independent_digest = 1469598103934665603ULL;
@@ -177,8 +186,11 @@ void test_configuration_directory_and_real_reads() {
         }
     }
     GGML_ASSERT(scattered_read.digest == independent_digest);
-    storage.record_integrity_check(true);
-    GGML_ASSERT(storage.diagnostics().integrity_checks == 1);
+    GGML_ASSERT(scattered_read.integrity_status == llm_expert_integrity_status::passed);
+    storage.record_integrity_status(llm_expert_integrity_status::passed, 15);
+    GGML_ASSERT(storage.diagnostics().integrity_checks == 1 &&
+        storage.diagnostics().integrity_digest_bytes == 15 &&
+        storage.diagnostics().integrity_status == llm_expert_integrity_status::passed);
     GGML_ASSERT(std::memcmp(up.data(), first.bytes.data() + 3, up.size()) == 0);
     GGML_ASSERT(std::memcmp(gate.data(), second.bytes.data() + 7, gate.size()) == 0);
     GGML_ASSERT(std::memcmp(down.data(), first.bytes.data() + 124, down.size()) == 0);
@@ -214,7 +226,7 @@ void test_configuration_directory_and_real_reads() {
         }
     }
     GGML_ASSERT(corrupted_digest != scattered_read.digest);
-    storage.record_integrity_check(false);
+    storage.record_integrity_status(llm_expert_integrity_status::failed, 15);
     GGML_ASSERT(storage.diagnostics().integrity_mismatches == 1 && storage.diagnostics().poisoned);
     GGML_ASSERT(storage.read_bundle({ 0, 0 }, scattered.data(), scattered.size()).error ==
         llm_expert_storage_error::poisoned);

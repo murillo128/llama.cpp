@@ -35,6 +35,7 @@
 #include <cctype>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1039,6 +1040,7 @@ struct llama_model::impl {
     std::unique_ptr<llm_expert_storage> expert_storage;
     std::unique_ptr<llm_expert_async_transport> expert_async_transport;
     std::unique_ptr<llm_expert_scheduler> expert_scheduler;
+    llm_expert_integrity_mode expert_integrity_mode = llm_expert_integrity_mode::none;
     llm_deferred_expert_diagnostics deferred_expert_diagnostics;
 
     // Declared after model buffers so provider leases and borrowed tensor references are destroyed first.
@@ -1371,6 +1373,7 @@ void llama_model::init_expert_weight_provider() {
             config.routed_layer_count = routed_layer_count;
             config.total_expert_keys = uint32_t(directory_entries);
             config.target_buffer_type = ggml_backend_dev_buffer_type(target);
+            config.integrity_mode = pimpl->expert_integrity_mode;
             config.hot_cache_policy_config = pimpl->expert_hot_cache_policy_config;
             config.cold_cache_policy_config = pimpl->expert_cold_cache_policy_config;
             config.phase10_lead_trace = params.expert_prefetch_config != nullptr &&
@@ -1409,6 +1412,7 @@ void llama_model::init_expert_weight_provider() {
                 uma.target_device = target;
                 uma.storage = pimpl->expert_storage.get();
                 uma.scheduler = pimpl->expert_scheduler.get();
+                uma.integrity_mode = pimpl->expert_integrity_mode;
                 uma.readiness = pimpl->expert_uma_config.value.readiness;
                 uma.min_system_headroom_bytes = pimpl->expert_uma_config.value.min_system_headroom_bytes;
                 uma.min_runtime_headroom_bytes = pimpl->expert_uma_config.value.min_runtime_headroom_bytes;
@@ -1453,6 +1457,17 @@ bool checked_storage_add(uint64_t lhs, uint64_t rhs, uint64_t & result) {
     return true;
 }
 
+llm_expert_integrity_mode expert_integrity_mode_from_environment() {
+    const char * requested = std::getenv("LLAMA_EXPERT_INTEGRITY_MODE");
+    if (requested == nullptr || requested[0] == '\0' || std::strcmp(requested, "NONE") == 0) {
+        return llm_expert_integrity_mode::none;
+    }
+    if (std::strcmp(requested, "FNV64_END_TO_END") == 0) {
+        return llm_expert_integrity_mode::fnv64_end_to_end;
+    }
+    throw std::invalid_argument("invalid internal expert integrity mode");
+}
+
 int routed_expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight) {
     if (tensor == nullptr) return -1;
     if (weight) {
@@ -1480,6 +1495,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         !pimpl->deferred_expert_ctx || hparams.n_expert <= 0) {
         throw std::runtime_error("cold-cache routed tensor deferral is incomplete");
     }
+    pimpl->expert_integrity_mode = expert_integrity_mode_from_environment();
 
     std::vector<llm_expert_storage_source> sources;
     sources.reserve(ml.files.size());
@@ -1496,6 +1512,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     }
     auto storage = std::make_unique<llm_expert_storage>(llm_expert_storage_config{
         uint32_t(layers.size()), uint32_t(hparams.n_expert), uint32_t(expected), 8U*1024U*1024U,
+        pimpl->expert_integrity_mode,
     }, sources);
 
     for (uint32_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
@@ -1605,6 +1622,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         0,
         false,
         params.expert_io_force_positional_reads,
+        pimpl->expert_integrity_mode,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;

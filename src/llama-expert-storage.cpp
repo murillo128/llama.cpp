@@ -72,12 +72,15 @@ struct llm_expert_storage::impl {
 llm_expert_storage::llm_expert_storage(llm_expert_storage_config config,
         const std::vector<llm_expert_storage_source> & sources,
         llm_expert_storage_read_override * read_override) : pimpl(std::make_unique<impl>()) {
+    const bool integrity_mode_valid = config.integrity_mode == llm_expert_integrity_mode::none ||
+        config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end;
     if (config.layer_count == 0 || config.experts_per_layer == 0 || config.expected_bundle_count == 0 ||
         config.expected_bundle_count > uint64_t(config.layer_count)*config.experts_per_layer || config.maximum_read_chunk == 0 ||
-        config.maximum_read_chunk > 8U*1024U*1024U || sources.empty()) {
+        config.maximum_read_chunk > 8U*1024U*1024U || sources.empty() || !integrity_mode_valid) {
         throw std::invalid_argument("invalid expert storage configuration");
     }
     pimpl->config = config;
+    pimpl->counters.integrity_mode = config.integrity_mode;
     pimpl->read_override = read_override;
     pimpl->directory.resize(size_t(config.layer_count)*config.experts_per_layer);
     pimpl->sources.reserve(sources.size());
@@ -477,7 +480,8 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
         std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
         pimpl->counters.read_requests++;
     }
-    uint64_t digest = 1469598103934665603ULL;
+    uint64_t digest = pimpl->config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end ?
+        1469598103934665603ULL : 0;
     const auto & spans = pimpl->directory[pimpl->index(key)].spans;
     for (const auto & span : spans) {
         const llm_expert_storage_destination * destination = nullptr;
@@ -528,7 +532,9 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
                     return { llm_expert_storage_error::short_read, 0 };
                 }
                 chunk_completed += size_t(result);
-                digest = digest_bytes(digest, target, size_t(result));
+                if (pimpl->config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end) {
+                    digest = digest_bytes(digest, target, size_t(result));
+                }
                 {
                     std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
                     pimpl->counters.read_bytes += uint64_t(result);
@@ -544,7 +550,9 @@ llm_expert_storage_result llm_expert_storage::read_bundle(llm_expert_key key,
             pimpl->counters.read_chunks++;
         }
     }
-    return { llm_expert_storage_error::none, 0, digest };
+    return { llm_expert_storage_error::none, 0, digest,
+        pimpl->config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end ?
+            llm_expert_integrity_status::passed : llm_expert_integrity_status::not_checked };
 }
 
 void llm_expert_storage::poison() noexcept {
@@ -552,10 +560,17 @@ void llm_expert_storage::poison() noexcept {
     pimpl->poisoned.store(true);
 }
 
-void llm_expert_storage::record_integrity_check(bool matches) noexcept {
+void llm_expert_storage::record_integrity_status(
+        llm_expert_integrity_status status, uint64_t digest_bytes) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->diagnostics_mutex);
+    pimpl->counters.integrity_status = status;
+    if (status == llm_expert_integrity_status::not_checked) {
+        pimpl->counters.integrity_not_checked++;
+        return;
+    }
     pimpl->counters.integrity_checks++;
-    if (!matches) {
+    pimpl->counters.integrity_digest_bytes += digest_bytes;
+    if (status == llm_expert_integrity_status::failed) {
         pimpl->counters.integrity_mismatches++;
         pimpl->poisoned.store(true);
     }

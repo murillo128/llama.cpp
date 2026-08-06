@@ -495,7 +495,10 @@ struct llm_expert_async_transport::impl {
 
     void finalize_group_request_locked(read_request_record & request, bool used_ring) {
         if (request.cancel_requested) request.completion.result = llm_expert_async_result::closed;
-        if (request.completion.result == llm_expert_async_result::ready) {
+        if (request.completion.result == llm_expert_async_result::ready &&
+            config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end) {
+            LLM_EXPERT_TRACE_SCOPE("k3.storage", "integrity_digest", "request_slot", request.handle.slot,
+                "request_generation", request.handle.generation);
             std::array<const llm_expert_storage_read_segment *, 12> completed_segments{};
             size_t completed_segment_count = 0;
             for (const auto & operation : operations) {
@@ -515,8 +518,11 @@ struct llm_expert_async_transport::impl {
                     return lhs_identity < rhs_identity;
                 });
             request.completion.digest = 1469598103934665603ULL;
+            request.completion.integrity_status = llm_expert_integrity_status::passed;
+            counters.integrity_digest_requests++;
             for (size_t segment_index = 0; segment_index < completed_segment_count; ++segment_index) {
                 const auto & segment = *completed_segments[segment_index];
+                counters.integrity_digest_bytes += segment.byte_count;
                 const auto * bytes = static_cast<const uint8_t *>(segment.data);
                 for (uint64_t byte_index = 0; byte_index < segment.byte_count; ++byte_index) {
                     request.completion.digest ^= bytes[byte_index];
@@ -1351,7 +1357,10 @@ struct llm_expert_async_transport::impl {
             auto * current = find_read(handle);
             if (current != nullptr) {
                 if (current->cancel_requested) completion.result = llm_expert_async_result::closed;
-                if (completion.result == llm_expert_async_result::ready) {
+                if (completion.result == llm_expert_async_result::ready &&
+                    config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end) {
+                    LLM_EXPERT_TRACE_SCOPE("k3.storage", "integrity_digest", "request_slot", handle.slot,
+                        "request_generation", handle.generation);
                     std::array<const llm_expert_storage_read_segment *, 12> completed_segments{};
                     size_t completed_segment_count = 0;
                     for (const auto & operation : operations) {
@@ -1371,8 +1380,11 @@ struct llm_expert_async_transport::impl {
                             return lhs_identity < rhs_identity;
                         });
                     completion.digest = 1469598103934665603ULL;
+                    completion.integrity_status = llm_expert_integrity_status::passed;
+                    counters.integrity_digest_requests++;
                     for (size_t segment_index = 0; segment_index < completed_segment_count; ++segment_index) {
                         const auto & segment = *completed_segments[segment_index];
+                        counters.integrity_digest_bytes += segment.byte_count;
                         const auto * bytes = static_cast<const uint8_t *>(segment.data);
                         for (uint64_t byte_index = 0; byte_index < segment.byte_count; ++byte_index) {
                             completion.digest ^= bytes[byte_index];
@@ -1417,8 +1429,10 @@ struct llm_expert_async_transport::impl {
 };
 
 llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config config) : pimpl(std::make_unique<impl>()) {
+    const bool integrity_mode_valid = config.integrity_mode == llm_expert_integrity_mode::none ||
+        config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end;
     if (config.effective_hot_capacity == 0 || config.request_capacity == 0 || config.trace_capacity == 0 ||
-        config.cold_cache_bytes == 0 ||
+        config.cold_cache_bytes == 0 || !integrity_mode_valid ||
         (config.requested_queue_depth != 0 &&
          (config.requested_queue_depth < 8 || config.requested_queue_depth > 4096))) {
         throw std::invalid_argument("invalid expert async transport configuration");
@@ -1457,6 +1471,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     pimpl->counters.trace_capacity = config.trace_capacity;
     pimpl->counters.staging_ceiling_bytes = staging_ceiling;
     pimpl->counters.positional_reads_forced = config.force_positional_reads;
+    pimpl->counters.integrity_mode = config.integrity_mode;
     if (config.direct_io_requested && config.maximum_direct_alignment != 0 && staging_ceiling == 0) {
         pimpl->counters.direct_staging_error = ENOBUFS;
     }

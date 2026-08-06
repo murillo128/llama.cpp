@@ -65,6 +65,7 @@ struct llm_expert_storage_config {
     uint32_t experts_per_layer = 0;
     uint32_t expected_bundle_count = 0;
     uint64_t maximum_read_chunk = 8U*1024U*1024U;
+    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
 };
 
 enum class llm_expert_storage_error {
@@ -82,7 +83,8 @@ enum class llm_expert_storage_error {
 struct llm_expert_storage_result {
     llm_expert_storage_error error = llm_expert_storage_error::none;
     int native_error = 0;
-    uint64_t digest = 1469598103934665603ULL;
+    uint64_t digest = 0;
+    llm_expert_integrity_status integrity_status = llm_expert_integrity_status::not_checked;
     bool is_ready() const { return error == llm_expert_storage_error::none; }
 };
 
@@ -106,6 +108,8 @@ struct llm_expert_storage_diagnostics {
     uint64_t io_errors = 0;
     uint64_t integrity_checks = 0;
     uint64_t integrity_mismatches = 0;
+    uint64_t integrity_not_checked = 0;
+    uint64_t integrity_digest_bytes = 0;
     uint64_t direct_source_count = 0;
     uint64_t direct_unsupported_source_count = 0;
     uint64_t maximum_direct_alignment = 0;
@@ -114,6 +118,8 @@ struct llm_expert_storage_diagnostics {
     int first_native_error = 0;
     bool sealed = false;
     bool poisoned = false;
+    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
+    llm_expert_integrity_status integrity_status = llm_expert_integrity_status::not_checked;
 };
 
 class llm_expert_storage {
@@ -147,7 +153,9 @@ public:
             const llm_expert_storage_destination * destinations, size_t destination_count,
             llm_expert_storage_abort abort = nullptr, void * abort_data = nullptr) noexcept;
     void poison() noexcept;
-    void record_integrity_check(bool matches) noexcept;
+    void record_integrity_status(
+            llm_expert_integrity_status status,
+            uint64_t digest_bytes = 0) noexcept;
     void record_async_read(
             uint64_t chunk_count,
             uint64_t byte_count,

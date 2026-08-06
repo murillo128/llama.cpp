@@ -42,6 +42,7 @@ struct llm_expert_async_config {
     uint32_t delay_cq_drain_ms_for_testing = 0;
     bool reverse_queued_requests_for_testing = false;
     bool force_positional_reads = false;
+    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {
@@ -138,6 +139,8 @@ struct llm_expert_async_diagnostics {
     uint64_t read_queue_wait_samples = 0;
     uint64_t read_queue_wait_us = 0;
     uint64_t read_queue_wait_max_us = 0;
+    uint64_t integrity_digest_requests = 0;
+    uint64_t integrity_digest_bytes = 0;
     uint64_t synchronous_fallback_operations = 0;
     uint64_t interrupted_reads_retried = 0;
     uint64_t would_block_reads_retried = 0;
@@ -181,13 +184,15 @@ struct llm_expert_async_diagnostics {
     uint32_t actual_cq_entries = 0;
     bool worker_started = false;
     bool admission_closed = false;
+    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
 };
 
 struct llm_expert_async_read_completion {
     llm_expert_async_result result = llm_expert_async_result::invalid;
     int native_error = 0;
     uint64_t bytes_completed = 0;
-    uint64_t digest = 1469598103934665603ULL;
+    uint64_t digest = 0;
+    llm_expert_integrity_status integrity_status = llm_expert_integrity_status::not_checked;
     uint64_t submit_us = 0;
     uint64_t complete_us = 0;
     llm_expert_request_handle request;

@@ -20,6 +20,17 @@ class llm_expert_storage;
 class llm_expert_async_transport;
 class llm_expert_scheduler;
 
+enum class llm_expert_integrity_mode : uint8_t {
+    none,
+    fnv64_end_to_end,
+};
+
+enum class llm_expert_integrity_status : uint8_t {
+    not_checked,
+    passed,
+    failed,
+};
+
 enum class llm_expert_provider_status {
     ready,
     allocation_failed,
@@ -1161,6 +1172,7 @@ struct llm_hot_cache_config {
     llm_expert_storage * storage = nullptr;
     llm_expert_async_transport * async_transport = nullptr;
     llm_expert_scheduler * scheduler = nullptr;
+    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
     uint32_t trace_capacity = 256;
     llama_expert_miss_policy miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
     bool background_promotion = false;
@@ -1196,6 +1208,7 @@ struct llm_uma_cache_config {
     ggml_backend_dev_t target_device = nullptr;
     llm_expert_storage * storage = nullptr;
     llm_expert_scheduler * scheduler = nullptr;
+    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
     is_buffer_type_fn is_uma_buffer_type = nullptr;
     prepare_fn prefetch = nullptr;
     checksum_fn checksum = nullptr;

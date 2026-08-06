@@ -116,9 +116,16 @@ void test_configuration() {
     expect_invalid([] { llm_expert_async_transport transport({}); });
     expect_invalid([] { llm_expert_async_transport transport(config(7)); });
     expect_invalid([] { llm_expert_async_transport transport(config(4097)); });
+    expect_invalid([] {
+        auto invalid = config(8);
+        invalid.integrity_mode = static_cast<llm_expert_integrity_mode>(UINT8_MAX);
+        llm_expert_async_transport transport(invalid);
+    });
 
     llm_expert_async_transport transport(config());
     const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(diagnostics.integrity_mode == llm_expert_integrity_mode::none);
+    GGML_ASSERT(diagnostics.integrity_digest_requests == 0 && diagnostics.integrity_digest_bytes == 0);
     GGML_ASSERT(diagnostics.requested_sq_entries == 64);
     GGML_ASSERT(diagnostics.requested_cq_entries == 128);
     GGML_ASSERT(diagnostics.operation_capacity == 128);
@@ -316,6 +323,8 @@ void test_worker_read_and_drain() {
     llm_expert_async_read_completion completion;
     GGML_ASSERT(transport.wait_read(identity.request, completion) == llm_expert_async_result::ready);
     GGML_ASSERT(completion.bytes_completed == first.size() + second.size());
+    GGML_ASSERT(completion.integrity_status == llm_expert_integrity_status::not_checked &&
+        completion.digest == 0);
     GGML_ASSERT(std::memcmp(first.data(), source.data() + 3, first.size()) == 0);
     GGML_ASSERT(std::memcmp(second.data(), source.data() + 10, second.size()) == 0);
     GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
@@ -342,6 +351,37 @@ void test_worker_read_and_drain() {
     GGML_ASSERT(diagnostics.read_queue_wait_samples == 1);
     GGML_ASSERT(diagnostics.read_queue_wait_max_us <= diagnostics.read_queue_wait_us);
     GGML_ASSERT(diagnostics.active_read_requests == 0);
+
+    first.fill(0);
+    second.fill(0);
+    auto checked_config = config(8);
+    checked_config.force_positional_reads = true;
+    checked_config.integrity_mode = llm_expert_integrity_mode::fnv64_end_to_end;
+    llm_expert_async_transport checked_transport(checked_config);
+    GGML_ASSERT(checked_transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
+    llm_expert_async_read_completion checked_completion;
+    GGML_ASSERT(checked_transport.wait_read(identity.request, checked_completion) == llm_expert_async_result::ready);
+    uint64_t expected_digest = 1469598103934665603ULL;
+    auto append_digest = [](uint64_t & digest, const auto & destination) {
+        for (uint8_t byte : destination) {
+            digest ^= byte;
+            digest *= 1099511628211ULL;
+        }
+    };
+    append_digest(expected_digest, first);
+    append_digest(expected_digest, second);
+    GGML_ASSERT(checked_completion.integrity_status == llm_expert_integrity_status::passed &&
+        checked_completion.digest == expected_digest);
+    const auto checked_diagnostics = checked_transport.diagnostics();
+    GGML_ASSERT(checked_diagnostics.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end &&
+        checked_diagnostics.integrity_digest_requests == 1 &&
+        checked_diagnostics.integrity_digest_bytes == first.size() + second.size());
+    first[0] ^= 0xff;
+    uint64_t corrupted_digest = 1469598103934665603ULL;
+    append_digest(corrupted_digest, first);
+    append_digest(corrupted_digest, second);
+    GGML_ASSERT(corrupted_digest != checked_completion.digest);
+    GGML_ASSERT(checked_transport.release_read(identity.request) == llm_expert_async_result::ready);
     GGML_ASSERT(std::fclose(file) == 0);
 #endif
 }
