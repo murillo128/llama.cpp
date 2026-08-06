@@ -330,7 +330,6 @@ struct llm_expert_async_transport::impl {
     std::vector<uint32_t> batch_slots;
     std::vector<llm_expert_request_handle> group_handles;
     mutable std::mutex mutex;
-    std::mutex positional_digest_mutex;
     std::condition_variable condition;
     std::vector<std::thread> workers;
     llm_expert_async_diagnostics counters;
@@ -1371,18 +1370,14 @@ struct llm_expert_async_transport::impl {
             }
             lock.unlock();
             if (completion.result == llm_expert_async_result::ready && completed_segment_count != 0) {
+                LLM_EXPERT_TRACE_SCOPE("k3.storage", "integrity_digest", "request_slot", handle.slot,
+                    "request_generation", handle.generation, "segment_count", completed_segment_count);
                 std::sort(completed_segments.begin(), completed_segments.begin() + completed_segment_count,
                     [](const auto & lhs, const auto & rhs) {
                         const uint8_t lhs_identity = uint8_t(lhs.projection)*3 + uint8_t(lhs.sidecar);
                         const uint8_t rhs_identity = uint8_t(rhs.projection)*3 + uint8_t(rhs.sidecar);
                         return lhs_identity < rhs_identity;
                     });
-                // Keep positional reads independently dispatchable without allowing multiple
-                // full-bundle integrity scans to contend for memory bandwidth. This mutex is
-                // deliberately separate from the transport control mutex above.
-                std::lock_guard<std::mutex> digest_lock(positional_digest_mutex);
-                LLM_EXPERT_TRACE_SCOPE("k3.storage", "integrity_digest", "request_slot", handle.slot,
-                    "request_generation", handle.generation, "segment_count", completed_segment_count);
                 completion.digest = 1469598103934665603ULL;
                 for (size_t segment_index = 0; segment_index < completed_segment_count; ++segment_index) {
                     const auto & segment = completed_segments[segment_index];
