@@ -91,6 +91,8 @@ struct llm_perfetto_trace_diagnostics {
     bool shutdown = false;
     uint32_t perfetto_sessions_started = 0;
     uint32_t perfetto_sessions_stopped = 0;
+    uint32_t perfetto_redundant_starts = 0;
+    uint32_t perfetto_redundant_stops = 0;
     uint32_t cupti_version = 0;
     uint64_t clock_start_ns = 0;
     uint64_t clock_stop_ns = 0;

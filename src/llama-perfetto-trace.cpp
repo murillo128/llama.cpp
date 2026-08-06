@@ -109,6 +109,7 @@ struct trace_state {
     std::vector<retained_cupti_record> cupti_records;
     std::array<CUpti_ActivityKind, 7> enabled_kinds {};
     size_t enabled_kind_count = 0;
+    bool stop_in_progress = false;
 };
 
 trace_state & state() {
@@ -459,6 +460,7 @@ bool finalize_cupti_activity(trace_state & value) {
     LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "trace_session_stop", "clock_monotonic_raw_ns",
         value.diagnostics.clock_stop_ns, "cupti_errors", value.diagnostics.cupti_errors,
         "cupti_records", value.diagnostics.cupti_records,
+        "perfetto_redundant_starts", value.diagnostics.perfetto_redundant_starts,
         "cupti_dropped_records", value.diagnostics.cupti_dropped_records,
         "cupti_retained_capacity_bytes", value.diagnostics.cupti_retained_capacity_bytes,
         "cupti_peak_total_bytes", value.diagnostics.cupti_peak_total_bytes,
@@ -470,6 +472,11 @@ bool finalize_cupti_activity(trace_state & value) {
 
 void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
     std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.diagnostics.track_event_active && state.diagnostics.perfetto_sessions_started == 1) {
+        state.diagnostics.perfetto_redundant_starts++;
+        state.changed.notify_all();
+        return;
+    }
     if (state.diagnostics.track_event_active || state.diagnostics.perfetto_sessions_started != 0) {
         state.callback_failed = true;
         std::snprintf(state.callback_error, sizeof(state.callback_error), "%s", "multiple tracing sessions are unsupported");
@@ -578,12 +585,31 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
 void trace_observer::OnStop(const perfetto::DataSourceBase::StopArgs & args) {
     auto stop = args.HandleStopAsynchronously();
     bool needs_finalization = false;
+    bool redundant_stop = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        needs_finalization = state.diagnostics.cupti_active;
+        if (state.stop_in_progress || (!state.diagnostics.track_event_active &&
+                state.diagnostics.perfetto_sessions_started == 1 &&
+                state.diagnostics.perfetto_sessions_stopped == 1)) {
+            state.diagnostics.perfetto_redundant_stops++;
+            redundant_stop = true;
+        } else if (!state.diagnostics.track_event_active) {
+            record_callback_failure(state, "trace session stopped before activation");
+            redundant_stop = true;
+        } else {
+            state.stop_in_progress = true;
+            needs_finalization = state.diagnostics.cupti_active;
+        }
     }
-    if (needs_finalization) (void) finalize_cupti_activity(state);
-    perfetto::TrackEvent::Flush();
+    if (redundant_stop) {
+        if (stop) stop();
+        state.changed.notify_all();
+        return;
+    }
+    if (needs_finalization) {
+        (void) finalize_cupti_activity(state);
+        perfetto::TrackEvent::Flush();
+    }
     if (stop) stop();
     {
         std::lock_guard<std::mutex> lock(state.mutex);
@@ -593,6 +619,7 @@ void trace_observer::OnStop(const perfetto::DataSourceBase::StopArgs & args) {
         } else {
             record_callback_failure(state, "trace session stopped before activation");
         }
+        state.stop_in_progress = false;
         state.changed.notify_all();
     }
 }
@@ -681,7 +708,6 @@ bool llm_perfetto_trace_request_stop(char * error, size_t error_capacity) noexce
         set_error(error, error_capacity, value.callback_error);
         return false;
     }
-    perfetto::TrackEvent::Flush();
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     const char * stop_fd_value = std::getenv("LLAMA_PERFETTO_STOP_FD");
     if (stop_fd_value != nullptr) {
