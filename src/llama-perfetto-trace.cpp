@@ -16,7 +16,6 @@
 #include <cstring>
 #include <mutex>
 #include <new>
-#include <utility>
 #include <vector>
 #include <time.h>
 #include <unistd.h>
@@ -109,6 +108,8 @@ struct trace_state {
     std::vector<retained_cupti_record> cupti_records;
     std::array<CUpti_ActivityKind, 7> enabled_kinds {};
     size_t enabled_kind_count = 0;
+    uint64_t flush_requested = 0;
+    uint64_t flush_acknowledged = 0;
 };
 
 trace_state & state() {
@@ -577,34 +578,59 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
 
 void trace_observer::OnStop(const perfetto::DataSourceBase::StopArgs & args) {
     auto stop = args.HandleStopAsynchronously();
-    const bool asynchronous_stop = bool(stop);
     bool needs_finalization = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         needs_finalization = state.diagnostics.cupti_active;
     }
     if (needs_finalization) (void) finalize_cupti_activity(state);
-    auto complete_stop = [stop = std::move(stop), &value = state]() mutable {
-        if (stop) stop();
-        {
-            std::lock_guard<std::mutex> lock(value.mutex);
-            if (value.diagnostics.track_event_active) {
-                value.diagnostics.track_event_active = false;
-                value.diagnostics.perfetto_sessions_stopped++;
-            } else {
-                record_callback_failure(value, "trace session stopped before activation");
-            }
-            value.changed.notify_all();
+    perfetto::TrackEvent::Flush();
+    if (stop) stop();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.diagnostics.track_event_active) {
+            state.diagnostics.track_event_active = false;
+            state.diagnostics.perfetto_sessions_stopped++;
+        } else {
+            record_callback_failure(state, "trace session stopped before activation");
         }
-    };
-    if (asynchronous_stop) {
-        perfetto::TrackEvent::Trace([complete_stop = std::move(complete_stop)](auto context) mutable {
-            context.Flush(std::move(complete_stop));
-        });
-    } else {
-        perfetto::TrackEvent::Flush();
-        complete_stop();
+        state.changed.notify_all();
     }
+}
+
+bool flush_track_event_and_wait(
+        trace_state & value, uint32_t timeout_ms, char * error, size_t error_capacity) noexcept {
+    uint64_t request = 0;
+    {
+        std::lock_guard<std::mutex> lock(value.mutex);
+        request = ++value.flush_requested;
+    }
+    bool writer_found = false;
+    perfetto::TrackEvent::Trace([&](auto context) {
+        writer_found = true;
+        context.Flush([&value, request] {
+            std::lock_guard<std::mutex> lock(value.mutex);
+            value.flush_acknowledged = std::max(value.flush_acknowledged, request);
+            value.changed.notify_all();
+        });
+    });
+    if (!writer_found) {
+        set_error(error, error_capacity, "Perfetto TrackEvent flush found no active writer");
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(value.mutex);
+    const bool acknowledged = value.changed.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+        return value.flush_acknowledged >= request || value.callback_failed;
+    });
+    if (!acknowledged) {
+        set_error(error, error_capacity, "timed out waiting for Perfetto TrackEvent flush acknowledgement");
+        return false;
+    }
+    if (value.callback_failed) {
+        set_error(error, error_capacity, value.callback_error);
+        return false;
+    }
+    return true;
 }
 
 bool wait_for_state(
@@ -691,7 +717,7 @@ bool llm_perfetto_trace_request_stop(char * error, size_t error_capacity) noexce
         set_error(error, error_capacity, value.callback_error);
         return false;
     }
-    perfetto::TrackEvent::Flush();
+    if (!flush_track_event_and_wait(value, 30000, error, error_capacity)) return false;
     const char * stop_fd_value = std::getenv("LLAMA_PERFETTO_STOP_FD");
     if (stop_fd_value != nullptr) {
         char * end = nullptr;
