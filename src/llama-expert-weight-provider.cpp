@@ -866,8 +866,6 @@ llm_expert_provider_result load_storage_bundle(
         context->storage->record_async_read(count, completion.bytes_completed, storage_error, completion.native_error);
         bool integrity_matches = false;
         if (waited == llm_expert_async_result::ready && released == llm_expert_async_result::ready) {
-            LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_digest", "request_slot", selected.handle.slot,
-                "request_generation", selected.handle.generation, "segment_count", count);
             uint64_t destination_digest = 1469598103934665603ULL;
             for (size_t index = 0; index < count; ++index) {
                 const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);

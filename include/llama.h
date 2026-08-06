@@ -511,7 +511,6 @@ extern "C" {
         uint32_t expert_io_trace_capacity; // bounded asynchronous I/O evidence records [EXPERIMENTAL, EVIDENCE ONLY]
         uint64_t expert_io_staging_bytes; // bounded direct-I/O staging budget [EXPERIMENTAL]
         bool expert_io_force_positional_reads; // force the existing pread path [EXPERIMENTAL, EVIDENCE ONLY]
-        uint32_t expert_io_positional_workers; // bounded positional read workers [EXPERIMENTAL, EVIDENCE ONLY]
         enum llama_expert_miss_policy expert_miss_policy; // explicit demand-miss execution policy [EXPERIMENTAL]
         bool expert_background_promotion; // promote CPU-served demand keys for later use [EXPERIMENTAL]
         const struct llama_expert_auto_cost_model * expert_auto_cost_model; // copied at model load [EXPERIMENTAL]
