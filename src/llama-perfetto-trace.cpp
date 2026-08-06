@@ -16,6 +16,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <utility>
 #include <vector>
 #include <time.h>
 #include <unistd.h>
@@ -576,23 +577,33 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
 
 void trace_observer::OnStop(const perfetto::DataSourceBase::StopArgs & args) {
     auto stop = args.HandleStopAsynchronously();
+    const bool asynchronous_stop = bool(stop);
     bool needs_finalization = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         needs_finalization = state.diagnostics.cupti_active;
     }
     if (needs_finalization) (void) finalize_cupti_activity(state);
-    perfetto::TrackEvent::Flush();
-    if (stop) stop();
-    {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        if (state.diagnostics.track_event_active) {
-            state.diagnostics.track_event_active = false;
-            state.diagnostics.perfetto_sessions_stopped++;
-        } else {
-            record_callback_failure(state, "trace session stopped before activation");
+    auto complete_stop = [stop = std::move(stop), &value = state]() mutable {
+        if (stop) stop();
+        {
+            std::lock_guard<std::mutex> lock(value.mutex);
+            if (value.diagnostics.track_event_active) {
+                value.diagnostics.track_event_active = false;
+                value.diagnostics.perfetto_sessions_stopped++;
+            } else {
+                record_callback_failure(value, "trace session stopped before activation");
+            }
+            value.changed.notify_all();
         }
-        state.changed.notify_all();
+    };
+    if (asynchronous_stop) {
+        perfetto::TrackEvent::Trace([complete_stop = std::move(complete_stop)](auto context) mutable {
+            context.Flush(std::move(complete_stop));
+        });
+    } else {
+        perfetto::TrackEvent::Flush();
+        complete_stop();
     }
 }
 
