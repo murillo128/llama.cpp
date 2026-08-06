@@ -472,7 +472,7 @@ bool finalize_cupti_activity(trace_state & value) {
 
 void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
     std::lock_guard<std::mutex> lock(state.mutex);
-    if (state.diagnostics.track_event_active && state.diagnostics.perfetto_sessions_started == 1) {
+    if (state.diagnostics.perfetto_sessions_started == 1) {
         state.diagnostics.perfetto_redundant_starts++;
         state.changed.notify_all();
         return;
@@ -609,6 +609,7 @@ void trace_observer::OnStop(const perfetto::DataSourceBase::StopArgs & args) {
     if (needs_finalization) {
         (void) finalize_cupti_activity(state);
         perfetto::TrackEvent::Flush();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     }
     if (stop) stop();
     {
@@ -695,19 +696,28 @@ bool llm_perfetto_trace_wait_until_inactive(
 
 bool llm_perfetto_trace_request_stop(char * error, size_t error_capacity) noexcept {
     auto & value = state();
+    bool needs_finalization = false;
     {
         std::lock_guard<std::mutex> lock(value.mutex);
-        if (!value.diagnostics.track_event_active || value.callback_failed) {
-            set_error(error, error_capacity, value.callback_failed ? value.callback_error :
-                "Perfetto stop trigger requires one active session");
+        if (value.callback_failed) {
+            set_error(error, error_capacity, value.callback_error);
             return false;
         }
+        const bool already_stopped = !value.diagnostics.track_event_active &&
+            value.diagnostics.perfetto_sessions_started == 1 &&
+            value.diagnostics.perfetto_sessions_stopped == 1 && !value.diagnostics.cupti_active;
+        if (!value.diagnostics.track_event_active && !already_stopped) {
+            set_error(error, error_capacity, "Perfetto stop trigger requires one active or finalized session");
+            return false;
+        }
+        needs_finalization = value.diagnostics.cupti_active;
     }
-    if (!finalize_cupti_activity(value)) {
+    if (needs_finalization && !finalize_cupti_activity(value)) {
         std::lock_guard<std::mutex> lock(value.mutex);
         set_error(error, error_capacity, value.callback_error);
         return false;
     }
+    perfetto::TrackEvent::Flush();
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     const char * stop_fd_value = std::getenv("LLAMA_PERFETTO_STOP_FD");
     if (stop_fd_value != nullptr) {
