@@ -43,7 +43,6 @@ struct llm_expert_async_config {
     bool reverse_queued_requests_for_testing = false;
     bool force_positional_reads = false;
     llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
-    uint32_t positional_worker_count = 1;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {
@@ -183,7 +182,6 @@ struct llm_expert_async_diagnostics {
     bool opcode_read_fixed = false;
     uint32_t actual_sq_entries = 0;
     uint32_t actual_cq_entries = 0;
-    uint32_t worker_count = 0;
     bool worker_started = false;
     bool admission_closed = false;
     llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;

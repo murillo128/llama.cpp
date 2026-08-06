@@ -1041,7 +1041,6 @@ struct llama_model::impl {
     std::unique_ptr<llm_expert_async_transport> expert_async_transport;
     std::unique_ptr<llm_expert_scheduler> expert_scheduler;
     llm_expert_integrity_mode expert_integrity_mode = llm_expert_integrity_mode::none;
-    uint32_t expert_positional_worker_count = 1;
     llm_deferred_expert_diagnostics deferred_expert_diagnostics;
 
     // Declared after model buffers so provider leases and borrowed tensor references are destroyed first.
@@ -1469,15 +1468,6 @@ llm_expert_integrity_mode expert_integrity_mode_from_environment() {
     throw std::invalid_argument("invalid internal expert integrity mode");
 }
 
-uint32_t expert_positional_worker_count_from_environment() {
-    const char * requested = std::getenv("LLAMA_EXPERT_POSITIONAL_WORKERS");
-    if (requested == nullptr || requested[0] == '\0' || std::strcmp(requested, "1") == 0) return 1;
-    if (std::strcmp(requested, "2") == 0) return 2;
-    if (std::strcmp(requested, "3") == 0) return 3;
-    if (std::strcmp(requested, "4") == 0) return 4;
-    throw std::invalid_argument("invalid internal expert positional worker count");
-}
-
 int routed_expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight) {
     if (tensor == nullptr) return -1;
     if (weight) {
@@ -1506,7 +1496,6 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         throw std::runtime_error("cold-cache routed tensor deferral is incomplete");
     }
     pimpl->expert_integrity_mode = expert_integrity_mode_from_environment();
-    pimpl->expert_positional_worker_count = expert_positional_worker_count_from_environment();
 
     std::vector<llm_expert_storage_source> sources;
     sources.reserve(ml.files.size());
@@ -1634,7 +1623,6 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         false,
         params.expert_io_force_positional_reads,
         pimpl->expert_integrity_mode,
-        pimpl->expert_positional_worker_count,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;
