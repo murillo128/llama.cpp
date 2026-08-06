@@ -1867,7 +1867,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     LLM_EXPERT_TRACE_SCOPE("k3.request", "process_ubatch", "request_id", route_observer_request,
         "token_index", route_observer_next_ubatch, "n_tokens", ubatch.n_tokens, "graph_type", uint32_t(gtype));
     LLM_EXPERT_TRACE_CUDA_SCOPE(
-        llm_perfetto_trace_id(llm_perfetto_trace_domain::request, route_observer_request));
+        route_observer_has_request ?
+            llm_perfetto_trace_id(llm_perfetto_trace_domain::request, route_observer_request) : 0);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
