@@ -331,7 +331,7 @@ struct llm_expert_async_transport::impl {
     std::vector<llm_expert_request_handle> group_handles;
     mutable std::mutex mutex;
     std::condition_variable condition;
-    std::thread worker;
+    std::vector<std::thread> workers;
     llm_expert_async_diagnostics counters;
     uint64_t next_read_ordinal = 1;
     bool worker_stop = false;
@@ -514,6 +514,8 @@ struct llm_expert_async_transport::impl {
                     const uint8_t rhs_identity = uint8_t(rhs->projection)*3 + uint8_t(rhs->sidecar);
                     return lhs_identity < rhs_identity;
                 });
+            LLM_EXPERT_TRACE_SCOPE("k3.storage", "integrity_digest", "request_slot", request.handle.slot,
+                "request_generation", request.handle.generation, "segment_count", completed_segment_count);
             request.completion.digest = 1469598103934665603ULL;
             for (size_t segment_index = 0; segment_index < completed_segment_count; ++segment_index) {
                 const auto & segment = *completed_segments[segment_index];
@@ -1347,39 +1349,49 @@ struct llm_expert_async_transport::impl {
             }
             }
 
+            std::array<llm_expert_storage_read_segment, 12> completed_segments{};
+            size_t completed_segment_count = 0;
             lock.lock();
             auto * current = find_read(handle);
-            if (current != nullptr) {
-                if (current->cancel_requested) completion.result = llm_expert_async_result::closed;
-                if (completion.result == llm_expert_async_result::ready) {
-                    std::array<const llm_expert_storage_read_segment *, 12> completed_segments{};
-                    size_t completed_segment_count = 0;
-                    for (const auto & operation : operations) {
-                        if (!operation.active || !operation.read_operation ||
-                            operation.identity.request.slot != handle.slot ||
-                            operation.identity.request.generation != handle.generation) continue;
-                        for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
-                            if (completed_segment_count < completed_segments.size()) {
-                                completed_segments[completed_segment_count++] = &operation.read.segments[index];
-                            }
-                        }
-                    }
-                    std::sort(completed_segments.begin(), completed_segments.begin() + completed_segment_count,
-                        [](const auto * lhs, const auto * rhs) {
-                            const uint8_t lhs_identity = uint8_t(lhs->projection)*3 + uint8_t(lhs->sidecar);
-                            const uint8_t rhs_identity = uint8_t(rhs->projection)*3 + uint8_t(rhs->sidecar);
-                            return lhs_identity < rhs_identity;
-                        });
-                    completion.digest = 1469598103934665603ULL;
-                    for (size_t segment_index = 0; segment_index < completed_segment_count; ++segment_index) {
-                        const auto & segment = *completed_segments[segment_index];
-                        const auto * bytes = static_cast<const uint8_t *>(segment.data);
-                        for (uint64_t byte_index = 0; byte_index < segment.byte_count; ++byte_index) {
-                            completion.digest ^= bytes[byte_index];
-                            completion.digest *= 1099511628211ULL;
+            if (current != nullptr && current->cancel_requested) {
+                completion.result = llm_expert_async_result::closed;
+            }
+            if (current != nullptr && completion.result == llm_expert_async_result::ready) {
+                for (const auto & operation : operations) {
+                    if (!operation.active || !operation.read_operation ||
+                        operation.identity.request.slot != handle.slot ||
+                        operation.identity.request.generation != handle.generation) continue;
+                    for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
+                        if (completed_segment_count < completed_segments.size()) {
+                            completed_segments[completed_segment_count++] = operation.read.segments[index];
                         }
                     }
                 }
+            }
+            lock.unlock();
+            if (completion.result == llm_expert_async_result::ready && completed_segment_count != 0) {
+                LLM_EXPERT_TRACE_SCOPE("k3.storage", "integrity_digest", "request_slot", handle.slot,
+                    "request_generation", handle.generation, "segment_count", completed_segment_count);
+                std::sort(completed_segments.begin(), completed_segments.begin() + completed_segment_count,
+                    [](const auto & lhs, const auto & rhs) {
+                        const uint8_t lhs_identity = uint8_t(lhs.projection)*3 + uint8_t(lhs.sidecar);
+                        const uint8_t rhs_identity = uint8_t(rhs.projection)*3 + uint8_t(rhs.sidecar);
+                        return lhs_identity < rhs_identity;
+                    });
+                completion.digest = 1469598103934665603ULL;
+                for (size_t segment_index = 0; segment_index < completed_segment_count; ++segment_index) {
+                    const auto & segment = completed_segments[segment_index];
+                    const auto * bytes = static_cast<const uint8_t *>(segment.data);
+                    for (uint64_t byte_index = 0; byte_index < segment.byte_count; ++byte_index) {
+                        completion.digest ^= bytes[byte_index];
+                        completion.digest *= 1099511628211ULL;
+                    }
+                }
+            }
+            lock.lock();
+            current = find_read(handle);
+            if (current != nullptr) {
+                if (current->cancel_requested) completion.result = llm_expert_async_result::closed;
                 current->completion = completion;
                 current->completion.complete_us = uint64_t(ggml_time_us());
                 current->completion.request = handle;
@@ -1419,6 +1431,8 @@ struct llm_expert_async_transport::impl {
 llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config config) : pimpl(std::make_unique<impl>()) {
     if (config.effective_hot_capacity == 0 || config.request_capacity == 0 || config.trace_capacity == 0 ||
         config.cold_cache_bytes == 0 ||
+        config.positional_worker_count == 0 || config.positional_worker_count > 4 ||
+        (config.positional_worker_count > 1 && (!config.force_positional_reads || config.direct_io_requested)) ||
         (config.requested_queue_depth != 0 &&
          (config.requested_queue_depth < 8 || config.requested_queue_depth > 4096))) {
         throw std::invalid_argument("invalid expert async transport configuration");
@@ -1448,6 +1462,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     pimpl->group_handles.resize(config.request_capacity);
     pimpl->registered_files.resize(config.source_file_capacity == 0 ? 256 : config.source_file_capacity);
     pimpl->direct_disabled_handles.resize(pimpl->registered_files.size());
+    pimpl->workers.reserve(config.positional_worker_count);
     for (auto & operation : pimpl->operations) {
         operation.generation = config.initial_operation_generation_for_testing;
     }
@@ -1467,7 +1482,8 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
         pimpl->batch_slots.capacity()*sizeof(uint32_t) +
         pimpl->group_handles.capacity()*sizeof(llm_expert_request_handle) +
         pimpl->registered_files.capacity()*sizeof(int) +
-        pimpl->direct_disabled_handles.capacity()*sizeof(intptr_t);
+        pimpl->direct_disabled_handles.capacity()*sizeof(intptr_t) +
+        pimpl->workers.capacity()*sizeof(std::thread);
 #if defined(__linux__)
     if (config.direct_io_requested && staging_ceiling != 0 && config.maximum_direct_alignment != 0) {
         const uint64_t allocation_alignment = std::max<uint64_t>(config.maximum_direct_alignment, sizeof(void *));
@@ -1556,8 +1572,23 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
             ring_error, "ring-setup");
     }
 #endif
-    pimpl->worker = std::thread([this] { pimpl->worker_main(); });
-    pimpl->counters.worker_started = true;
+    try {
+        for (uint32_t index = 0; index < config.positional_worker_count; ++index) {
+            pimpl->workers.emplace_back([this] { pimpl->worker_main(); });
+        }
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(pimpl->mutex);
+            pimpl->worker_stop = true;
+            pimpl->condition.notify_all();
+        }
+        for (auto & worker : pimpl->workers) {
+            if (worker.joinable()) worker.join();
+        }
+        throw;
+    }
+    pimpl->counters.worker_count = uint32_t(pimpl->workers.size());
+    pimpl->counters.worker_started = !pimpl->workers.empty();
 }
 
 llm_expert_async_transport::~llm_expert_async_transport() {
@@ -1819,14 +1850,14 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
         "layout_class_id", identity.layout_class_id, "operation_count", read_count);
     LLM_EXPERT_TRACE_COUNTER("k3.resource", "storage_active_requests", 3, pimpl->counters.active_read_requests);
     pimpl->deferred_batch_open = defer_worker;
-    if (!defer_worker) pimpl->condition.notify_one();
+    if (!defer_worker) pimpl->condition.notify_all();
     return llm_expert_async_result::ready;
 }
 
 void llm_expert_async_transport::start_deferred_reads() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     pimpl->deferred_batch_open = false;
-    pimpl->condition.notify_one();
+    pimpl->condition.notify_all();
 }
 
 llm_expert_async_result llm_expert_async_transport::register_files(
@@ -2008,12 +2039,13 @@ bool llm_expert_async_transport::shutdown() noexcept {
         pimpl->deferred_batch_open = false;
         pimpl->condition.notify_all();
     }
-    if (pimpl->worker.joinable() && pimpl->worker.get_id() != std::this_thread::get_id()) {
-        pimpl->worker.join();
+    for (auto & worker : pimpl->workers) {
+        if (worker.joinable() && worker.get_id() != std::this_thread::get_id()) {
+            worker.join();
+        }
     }
 #if defined(__linux__)
-    // The worker is the only ring submitter. Tear the ring down only after it
-    // has observed cancellation and drained every in-flight completion.
+    // The ring path has one worker; close it only after that worker drains every completion.
     pimpl->ring.close_ring();
 #endif
     std::lock_guard<std::mutex> lock(pimpl->mutex);

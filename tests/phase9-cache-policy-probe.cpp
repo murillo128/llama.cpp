@@ -75,6 +75,7 @@ struct arguments {
     uint64_t ring_bytes = 16U*1024U*1024U;
     uint32_t queue_depth = 0;
     uint32_t trace_capacity = 0;
+    uint32_t positional_workers = 1;
     uint32_t ratio = 7500;
     uint32_t window = 1024;
     uint32_t aging = 1024;
@@ -136,6 +137,10 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--ring-bytes") { if (!parse_u64(value, result.ring_bytes)) return false; }
         else if (option == "--queue-depth") { if (!parse_u32(value, result.queue_depth)) return false; }
         else if (option == "--trace-capacity") { if (!parse_u32(value, result.trace_capacity)) return false; }
+        else if (option == "--positional-workers") {
+            if (!parse_u32(value, result.positional_workers) || result.positional_workers == 0 ||
+                result.positional_workers > 4) return false;
+        }
         else if (option == "--ratio") { if (!parse_u32(value, result.ratio)) return false; }
         else if (option == "--window") { if (!parse_u32(value, result.window)) return false; }
         else if (option == "--aging") { if (!parse_u32(value, result.aging)) return false; }
@@ -389,7 +394,8 @@ json async_diagnostics_json(const llm_expert_async_diagnostics & value) {
         {"io_uring_setup_error", value.io_uring_setup_error}, {"io_uring_probe_error", value.io_uring_probe_error},
         {"io_uring_runtime_error", value.io_uring_runtime_error}, {"opcode_read", value.opcode_read},
         {"opcode_readv", value.opcode_readv}, {"opcode_async_cancel", value.opcode_async_cancel},
-        {"opcode_read_fixed", value.opcode_read_fixed}, {"worker_started", value.worker_started},
+        {"opcode_read_fixed", value.opcode_read_fixed}, {"worker_count", value.worker_count},
+        {"worker_started", value.worker_started},
         {"admission_closed", value.admission_closed},
     };
 }
@@ -457,6 +463,7 @@ int main(int argc, char ** argv) {
         model_params.expert_io_queue_depth = args.queue_depth;
         model_params.expert_io_trace_capacity = args.trace_capacity;
         model_params.expert_io_force_positional_reads = args.transport == "POSITIONAL";
+        model_params.expert_io_positional_workers = args.positional_workers;
         model_params.n_gpu_layers = -1;
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_weights_mode = args.mode == "disabled" ? LLAMA_EXPERT_WEIGHTS_MODE_DISABLED :
@@ -736,6 +743,7 @@ int main(int argc, char ** argv) {
                 {"ring_pinned_or_registered_bytes", diagnostics.ring_pinned_or_registered_bytes},
                 {"io_queue_depth_requested", args.queue_depth},
                 {"io_trace_capacity_requested", args.trace_capacity},
+                {"io_positional_workers_requested", args.positional_workers},
             }},
             {"async_io", {
                 {"diagnostics", async_diagnostics_json(async_diagnostics)},
