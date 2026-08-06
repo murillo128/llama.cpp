@@ -26,6 +26,7 @@ namespace {
 
 constexpr uint64_t k_cupti_retained_bytes_max = UINT64_C(256)*1024U*1024U;
 constexpr size_t k_cupti_buffer_bytes = 1024U*1024U;
+constexpr uint64_t k_cupti_activity_buffer_reserve_bytes = UINT64_C(32)*1024U*1024U;
 std::atomic<bool> g_trace_active { false };
 std::atomic<uint64_t> g_next_trace_id { 1 };
 std::atomic<uint64_t> g_cupti_active_buffer_bytes { 0 };
@@ -513,7 +514,9 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
 
     state.cupti_records.clear();
     try {
-        const uint64_t retained_budget = state.config.cupti_retained_bytes/2;
+        const uint64_t buffer_reserve = std::min<uint64_t>(
+            k_cupti_activity_buffer_reserve_bytes, state.config.cupti_retained_bytes/2);
+        const uint64_t retained_budget = state.config.cupti_retained_bytes - buffer_reserve;
         state.cupti_records.reserve(size_t(retained_budget/sizeof(retained_cupti_record)));
     } catch (...) {
         record_callback_failure(state, "CUPTI retained-record reserve failed");
