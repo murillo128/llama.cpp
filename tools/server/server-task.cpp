@@ -1095,6 +1095,10 @@ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
     if (!prob_output.probs.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs);
     }
+    if (prob_output.has_logits_identity) {
+        res["logits_fnv64"] = prob_output.logits_fnv64;
+        res["nonfinite_logits"] = prob_output.nonfinite_logits;
+    }
     return res;
 }
 

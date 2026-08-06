@@ -6,10 +6,12 @@
 #include "cli-server.h"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <fstream>
+#include <vector>
 
 struct cli_timings {
     double prompt_per_second    = 0.0;
@@ -55,6 +57,9 @@ private:
     struct generated_content {
         std::string reasoning;
         std::string content;
+        std::vector<llama_token> generated_ids;
+        std::vector<uint64_t> logits_fnv64;
+        uint64_t nonfinite_logits = 0;
     };
     bool generate_completion(generated_content & content_out, cli_timings & timings);
     void fetch_server_props();

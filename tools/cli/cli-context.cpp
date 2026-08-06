@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -349,12 +351,17 @@ void cli_context::write_output_file(const std::string & content) {
 }
 
 bool cli_context::generate_completion(generated_content & content_out, cli_timings & timings) {
+    const char * evidence_value = std::getenv("LLAMA_PERFETTO_EVIDENCE_IDENTITY");
+    const bool evidence_identity = evidence_value != nullptr && std::strcmp(evidence_value, "1") == 0;
     json body = {
         {"messages",          impl->messages},
         {"stream",            true},
         // in order to get timings even when we cancel mid-way
         {"timings_per_token", true},
     };
+    if (evidence_identity) {
+        body["verbose"] = true;
+    }
     if (!client.model.empty()) {
         body["model"] = client.model;
     }
@@ -377,6 +384,16 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
             const auto & t = chunk.at("timings");
             timings.prompt_per_second    = t.value("prompt_per_second",    0.0);
             timings.predicted_per_second = t.value("predicted_per_second", 0.0);
+        }
+        if (evidence_identity && chunk.contains("__verbose")) {
+            const auto & verbose = chunk.at("__verbose");
+            if (verbose.contains("tokens") && verbose.at("tokens").is_array() &&
+                    verbose.at("tokens").size() == 1 && verbose.contains("logits_fnv64") &&
+                    verbose.contains("nonfinite_logits")) {
+                content_out.generated_ids.push_back(verbose.at("tokens").at(0).get<llama_token>());
+                content_out.logits_fnv64.push_back(verbose.at("logits_fnv64").get<uint64_t>());
+                content_out.nonfinite_logits += verbose.at("nonfinite_logits").get<uint32_t>();
+            }
         }
         if (!chunk.contains("choices") || !chunk.at("choices").is_array() || chunk.at("choices").empty()) {
             return;
@@ -623,6 +640,17 @@ int cli_context::run() {
         cli_timings timings;
         generated_content content;
         generate_completion(content, timings);
+
+        const char * evidence_value = std::getenv("LLAMA_PERFETTO_EVIDENCE_IDENTITY");
+        if (evidence_value != nullptr && std::strcmp(evidence_value, "1") == 0) {
+            json evidence = {
+                {"generated_ids", content.generated_ids},
+                {"logits_fnv64", content.logits_fnv64},
+                {"nonfinite_logits", content.nonfinite_logits},
+            };
+            std::fprintf(stderr, "LLAMA_PERFETTO_EVIDENCE_IDENTITY %s\n", evidence.dump().c_str());
+            std::fflush(stderr);
+        }
 
         impl->messages.push_back({
             {"role",    "assistant"},

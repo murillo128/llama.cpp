@@ -18,8 +18,11 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -38,6 +41,42 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+struct evidence_logits_identity {
+    bool enabled = false;
+    uint64_t fnv64 = 0;
+    uint32_t nonfinite = 0;
+};
+
+static evidence_logits_identity capture_evidence_logits_identity(
+        llama_context * ctx, const llama_vocab * vocab, int32_t output_index) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_PERFETTO_EVIDENCE_IDENTITY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+
+    evidence_logits_identity result;
+    result.enabled = enabled;
+    if (!enabled) {
+        return result;
+    }
+
+    const float * logits = llama_get_logits_ith(ctx, output_index);
+    GGML_ASSERT(logits != nullptr);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    result.fnv64 = 1469598103934665603ULL;
+    const auto * bytes = reinterpret_cast<const uint8_t *>(logits);
+    for (size_t i = 0; i < size_t(n_vocab) * sizeof(float); ++i) {
+        result.fnv64 ^= bytes[i];
+        result.fnv64 *= 1099511628211ULL;
+    }
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        if (!std::isfinite(logits[i])) {
+            ++result.nonfinite;
+        }
+    }
+    return result;
+}
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -2059,7 +2098,7 @@ private:
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
 
         // populate res.probs_output
-        if (slot.task->params.sampling.n_probs > 0) {
+        if (slot.task->params.sampling.n_probs > 0 || tkn.has_logits_identity) {
             res->prob_output = tkn; // copy the token probs
         }
 
@@ -3749,6 +3788,7 @@ private:
             const int tok_idx = slot.i_batch - off;
 
             llama_token id;
+            const auto evidence_identity = capture_evidence_logits_identity(slot.ctx_tgt, vocab, tok_idx);
             {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
@@ -3777,6 +3817,9 @@ private:
             result.tok          = id;
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+            result.has_logits_identity = evidence_identity.enabled;
+            result.logits_fnv64         = evidence_identity.fnv64;
+            result.nonfinite_logits     = evidence_identity.nonfinite;
 
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);

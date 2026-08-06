@@ -320,6 +320,12 @@ struct completion_token_output {
     llama_token tok;
     float prob;
     std::string text_to_send;
+    // Bounded, opt-in Phase 12.5 evidence. These fields are populated only
+    // when LLAMA_PERFETTO_EVIDENCE_IDENTITY=1 and are exposed through the
+    // existing verbose response envelope rather than the stable API.
+    bool has_logits_identity = false;
+    uint64_t logits_fnv64 = 0;
+    uint32_t nonfinite_logits = 0;
     struct prob_info {
         llama_token tok;
         std::string txt;
