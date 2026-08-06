@@ -1190,6 +1190,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
         if (is_progress) {
             last_json.push_back({"prompt_progress", progress.to_json()});
         }
+        if (verbose) {
+            deltas.front()["__verbose"] = to_json_non_oaicompat();
+        }
     }
 
     return deltas;
