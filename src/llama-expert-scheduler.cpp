@@ -274,15 +274,38 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
         uint64_t(config.layer_count)*config.experts_per_layer > uint64_t(std::numeric_limits<uint32_t>::max())) {
         throw std::invalid_argument("invalid expert scheduler configuration");
     }
-    if (config.per_device_request_capacity == 0) {
-        config.per_device_request_capacity = config.request_capacity;
+    const bool exact_device_capacities = std::any_of(
+        config.device_request_capacities.begin(), config.device_request_capacities.end(),
+        [](uint32_t capacity) { return capacity != 0; });
+    uint64_t total_device_capacity = 0;
+    if (exact_device_capacities) {
+        for (uint32_t device = 0; device < config.device_count; ++device) {
+            const uint32_t request = config.device_request_capacities[device];
+            uint32_t & inflight = config.device_inflight_capacities[device];
+            if (inflight == 0) inflight = request;
+            if (request == 0 || inflight > request) {
+                throw std::invalid_argument("invalid exact expert scheduler device capacity");
+            }
+            total_device_capacity += request;
+        }
+        for (uint32_t device = config.device_count; device < LLM_EXPERT_MAX_DEVICES; ++device) {
+            if (config.device_request_capacities[device] != 0 ||
+                config.device_inflight_capacities[device] != 0) {
+                throw std::invalid_argument("out-of-range expert scheduler device capacity");
+            }
+        }
+    } else {
+        if (config.per_device_request_capacity == 0) {
+            config.per_device_request_capacity = config.request_capacity;
+        }
+        if (config.per_device_inflight_capacity == 0) {
+            config.per_device_inflight_capacity = config.per_device_request_capacity;
+        }
+        total_device_capacity = uint64_t(config.per_device_request_capacity)*config.device_count;
     }
-    if (config.per_device_inflight_capacity == 0) {
-        config.per_device_inflight_capacity = config.per_device_request_capacity;
-    }
-    if (config.per_device_request_capacity > config.request_capacity ||
-        config.per_device_inflight_capacity > config.per_device_request_capacity ||
-        uint64_t(config.per_device_request_capacity)*config.device_count > config.request_capacity) {
+    if ((!exact_device_capacities &&
+         config.per_device_inflight_capacity > config.per_device_request_capacity) ||
+        total_device_capacity > config.request_capacity) {
         throw std::invalid_argument("invalid expert scheduler device capacity");
     }
     pimpl->config = config;
@@ -296,8 +319,10 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
     pimpl->counters.devices.resize(config.device_count);
     for (uint32_t device = 0; device < config.device_count; ++device) {
         pimpl->counters.devices[device].device_id = llm_expert_device_id(device);
-        pimpl->counters.devices[device].request_capacity = config.per_device_request_capacity;
-        pimpl->counters.devices[device].inflight_capacity = config.per_device_inflight_capacity;
+        pimpl->counters.devices[device].request_capacity = exact_device_capacities ?
+            config.device_request_capacities[device] : config.per_device_request_capacity;
+        pimpl->counters.devices[device].inflight_capacity = exact_device_capacities ?
+            config.device_inflight_capacities[device] : config.per_device_inflight_capacity;
     }
     pimpl->counters.administration_bytes = sizeof(*pimpl) + pimpl->requests.capacity()*sizeof(impl::request_record);
 }
@@ -376,7 +401,10 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     }
 
     const bool device_at_capacity =
-        pimpl->active_on_device(metadata.target_device) >= pimpl->config.per_device_request_capacity;
+        pimpl->active_on_device(metadata.target_device) >=
+            (pimpl->config.device_request_capacities[metadata.target_device] != 0 ?
+                pimpl->config.device_request_capacities[metadata.target_device] :
+                pimpl->config.per_device_request_capacity);
     if (device_at_capacity) {
         if (priority >= llm_expert_priority::prefetch_next) {
             pimpl->counters.drops++;
@@ -470,8 +498,11 @@ llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_sn
         if (request.state != llm_expert_request_state::queued) {
             continue;
         }
-        if (pimpl->inflight_on_device(request.metadata.target_device) >=
-            pimpl->config.per_device_inflight_capacity) {
+        const uint32_t inflight_capacity =
+            pimpl->config.device_inflight_capacities[request.metadata.target_device] != 0 ?
+                pimpl->config.device_inflight_capacities[request.metadata.target_device] :
+                pimpl->config.per_device_inflight_capacity;
+        if (pimpl->inflight_on_device(request.metadata.target_device) >= inflight_capacity) {
             continue;
         }
         if (selected == UINT32_MAX || request.priority < pimpl->requests[selected].priority ||

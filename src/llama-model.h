@@ -54,6 +54,7 @@ struct llm_expert_role_plan {
 };
 
 void llm_expert_role_canonicalize(std::vector<llm_expert_role_device_plan> & experts);
+bool llm_expert_transport_edge_required(uint32_t source, uint32_t destination, uint32_t device_count) noexcept;
 
 struct llm_deferred_expert_diagnostics {
     uint64_t tensor_count = 0;
@@ -717,8 +718,10 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     uint32_t expert_device_count() const;
+    uint32_t expert_transport_device_count() const noexcept;
     uint32_t expert_hot_cache_capacity() const;
     const llm_expert_role_plan & expert_role_plan() const;
+    ggml_backend_dev_t expert_resident_device() const noexcept;
     bool has_explicit_expert_role_config() const;
     void resolve_legacy_expert_role_plan();
     llama_expert_peer_transport expert_peer_transport() const;

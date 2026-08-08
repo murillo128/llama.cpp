@@ -3129,9 +3129,73 @@ void test_cuda_directory_copy() {
     plan.reset();
 }
 
+void test_cuda_unequal_device_capacities_are_atomic() {
+    ggml_backend_load_all();
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        auto * device = ggml_backend_dev_get(index);
+        auto * reg = ggml_backend_dev_backend_reg(device);
+        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU && reg != nullptr &&
+            std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            devices.push_back(device);
+        }
+    }
+    if (devices.size() < 2) return;
+
+    tensor_fixture tensors(7, 16, 8, 1, 2);
+    auto config = test_config(8, 1, 8, 2);
+    config.target_device = devices[0];
+    config.target_buffer_type = ggml_backend_dev_buffer_type(devices[0]);
+    config.allow_non_cuda_target_for_testing = true;
+    config.cold_mode = true;
+    config.cold_cache_bytes = 1U << 20;
+    config.transfer_ring_bytes = 1U << 20;
+    config.force_pageable_transfer_for_testing = true;
+    config.peer_staging_bytes = 64;
+    config.devices = {
+        { 0, devices[0], ggml_backend_dev_buffer_type(devices[0]), 2,
+            0, "00000000:00:08.0", "GPU-test-0" },
+        { 1, devices[1], ggml_backend_dev_buffer_type(devices[1]), 6,
+            1, "00000000:00:0a.0", "GPU-test-1" },
+    };
+
+    auto provider = llm_create_cold_cache_expert_weight_provider(config);
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(provider->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    GGML_ASSERT(binding.bootstrap);
+    const auto initialized = provider->initialize_after_reserve();
+    if (!initialized.is_ready()) {
+        std::fprintf(stderr, "unequal-device initialization failed: status=%u error=%u\n",
+            unsigned(initialized.status), unsigned(initialized.error));
+    }
+    GGML_ASSERT(initialized.is_ready());
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.effective_capacity == 8);
+    GGML_ASSERT(diagnostics.devices.size() == 2);
+    GGML_ASSERT(diagnostics.devices[0].requested_capacity == 2);
+    GGML_ASSERT(diagnostics.devices[0].effective_capacity == 2);
+    GGML_ASSERT(diagnostics.devices[1].requested_capacity == 6);
+    GGML_ASSERT(diagnostics.devices[1].effective_capacity == 6);
+    GGML_ASSERT(diagnostics.devices[0].pool_bytes > 0);
+    GGML_ASSERT(diagnostics.devices[1].pool_bytes > diagnostics.devices[0].pool_bytes);
+    GGML_ASSERT(provider->surrender().is_ready());
+
+    llm_expert_provider_faults faults;
+    faults.fail_pool_allocation_device_for_testing = 1;
+    auto failing = llm_create_cold_cache_expert_weight_provider(config, faults);
+    GGML_ASSERT(failing->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    const auto failed = failing->initialize_after_reserve();
+    GGML_ASSERT(failed.status == llm_expert_provider_status::allocation_failed);
+    const auto failed_diagnostics = failing->hot_cache_diagnostics();
+    GGML_ASSERT(failed_diagnostics.effective_capacity == 0);
+    GGML_ASSERT(failed_diagnostics.pool_bytes == 0);
+    GGML_ASSERT(failed_diagnostics.devices.empty());
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
+    test_cuda_unequal_device_capacities_are_atomic();
     test_runtime_policy_adapters_and_bounded_metadata();
     test_predictor_runtime_has_no_heap_allocations();
     test_initialization_stage_and_descriptor_only_scale();

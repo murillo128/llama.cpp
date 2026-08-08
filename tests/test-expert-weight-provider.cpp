@@ -238,6 +238,7 @@ void test_expert_role_resolution_and_ownership() {
     GGML_ASSERT(local_plan.experts[0].uuid.rfind("GPU-", 0) == 0);
     GGML_ASSERT(local_plan.total_hot_slots == 7);
     GGML_ASSERT(local_model->expert_device_count() == 1);
+    GGML_ASSERT(local_model->expert_transport_device_count() == 1);
     GGML_ASSERT(local_model->expert_hot_cache_capacity() == 7);
     local_devices[0].hot_slots = 99;
     local.expert_device_count = 0;
@@ -317,6 +318,8 @@ void test_expert_role_resolution_and_ownership() {
     GGML_ASSERT(first_plan.experts[0].hot_slots == 7);
     GGML_ASSERT(first_plan.experts[1].device == devices[1]);
     GGML_ASSERT(first_plan.experts[1].hot_slots == 11);
+    GGML_ASSERT(first->expert_device_count() == 2);
+    GGML_ASSERT(first->expert_transport_device_count() == 2);
 
     llama_expert_role_device remote_device = {devices[1], 13};
     llama_expert_role_config remote = {
@@ -327,6 +330,8 @@ void test_expert_role_resolution_and_ownership() {
     GGML_ASSERT(remote_model != nullptr);
     GGML_ASSERT(remote_model->expert_role_plan().shape == llm_expert_role_shape::remote_single);
     GGML_ASSERT(remote_model->expert_role_plan().experts[0].hot_slots == 13);
+    GGML_ASSERT(remote_model->expert_device_count() == 1);
+    GGML_ASSERT(remote_model->expert_transport_device_count() == 2);
 
     std::reverse(requested.begin(), requested.end());
     striped.expert_devices = requested.data();
@@ -360,6 +365,24 @@ void test_expert_role_resolution_and_ownership() {
     overflow.expert_devices = overflow_devices;
     invalid_params = role_test_params(&overflow, &policy);
     expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+}
+
+void test_expert_transport_star_topology() {
+    GGML_ASSERT(!llm_expert_transport_edge_required(0, 0, 4));
+    GGML_ASSERT(llm_expert_transport_edge_required(0, 1, 4));
+    GGML_ASSERT(llm_expert_transport_edge_required(1, 0, 4));
+    GGML_ASSERT(llm_expert_transport_edge_required(0, 3, 4));
+    GGML_ASSERT(llm_expert_transport_edge_required(3, 0, 4));
+    GGML_ASSERT(!llm_expert_transport_edge_required(1, 2, 4));
+    GGML_ASSERT(!llm_expert_transport_edge_required(2, 3, 4));
+    GGML_ASSERT(!llm_expert_transport_edge_required(0, 4, 4));
+    uint32_t edge_count = 0;
+    for (uint32_t source = 0; source < 4; ++source) {
+        for (uint32_t destination = 0; destination < 4; ++destination) {
+            edge_count += llm_expert_transport_edge_required(source, destination, 4);
+        }
+    }
+    GGML_ASSERT(edge_count == 6);
 }
 
 void test_keys_and_descriptors() {
@@ -845,6 +868,7 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     test_default_and_model_ownership();
     test_expert_role_resolution_and_ownership();
+    test_expert_transport_star_topology();
     test_keys_and_descriptors();
     test_selection_binding_and_handles();
     test_failed_graph_binding_is_never_reusable();

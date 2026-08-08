@@ -1396,6 +1396,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     expert_weight_provider(params.expert_weight_provider),
+    expert_resident_device(params.expert_resident_device),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2038,6 +2039,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     llm_expert_projection_descriptor cpu_down;
     ggml_tensor * cpu_execution_ids = nullptr;
     bool hybrid_execution = false;
+    bool remote_single_execution = false;
+    llm_expert_graph_binding::device_binding remote_execution_binding;
     bool multi_device_execution = false;
     std::vector<llm_expert_graph_binding::device_binding> device_execution_bindings;
 
@@ -2073,6 +2076,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             execution_down_exps_s = binding.down.scale;
             execution_ids = binding.execution_ids;
             hybrid_execution = binding.hybrid;
+            remote_single_execution = binding.remote_single;
+            if (remote_single_execution) {
+                remote_execution_binding = binding.remote_device;
+            }
             multi_device_execution = binding.multi_device;
             if (multi_device_execution) {
                 device_execution_bindings = binding.devices;
@@ -2155,6 +2162,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ASSERT(device_execution_backends[device] != nullptr &&
                 device_execution_backends[device] != backend_cpu);
         }
+    }
+    ggml_backend_t remote_execution_backend = nullptr;
+    if (remote_single_execution) {
+        for (int backend_index = 0; backend_index < ggml_backend_sched_get_n_backends(sched); ++backend_index) {
+            ggml_backend_t candidate = ggml_backend_sched_get_backend(sched, backend_index);
+            if (ggml_backend_get_device(candidate) == remote_execution_binding.target_device) {
+                remote_execution_backend = candidate;
+                break;
+            }
+        }
+        GGML_ASSERT(remote_execution_backend != nullptr && remote_execution_backend != backend_cpu);
+    }
+    ggml_backend_t resident_execution_backend = nullptr;
+    if (remote_single_execution || multi_device_execution) {
+        for (int backend_index = 0; backend_index < ggml_backend_sched_get_n_backends(sched); ++backend_index) {
+            ggml_backend_t candidate = ggml_backend_sched_get_backend(sched, backend_index);
+            if (ggml_backend_get_device(candidate) == expert_resident_device) {
+                resident_execution_backend = candidate;
+                break;
+            }
+        }
+        GGML_ASSERT(resident_execution_backend != nullptr && resident_execution_backend != backend_cpu);
     }
 
     auto build_expert_branch = [&](ggml_tensor * branch_up_exps,
@@ -2355,7 +2384,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = nullptr;
-    if (multi_device_execution) {
+    if (remote_single_execution) {
+        const auto & branch = remote_execution_binding;
+        experts = build_expert_branch(
+            branch.up.weight, branch.up.bias, branch.gate.weight, branch.gate.bias,
+            branch.gate_up.weight, branch.gate_up.bias, branch.down.weight, branch.down.bias,
+            branch.gate_up.weight ? branch.gate_up.scale : branch.up.scale,
+            branch.gate.scale, branch.down.scale, branch.execution_ids,
+            false, "remote", remote_execution_backend);
+    } else if (multi_device_execution) {
         for (size_t device = 0; device < device_execution_bindings.size(); ++device) {
             const auto & branch = device_execution_bindings[device];
             char branch_name[32];
@@ -2370,7 +2407,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 experts = device_experts;
             } else {
                 experts = ggml_add(ctx0, experts, device_experts);
-                ggml_backend_sched_set_tensor_backend(sched, experts, device_execution_backends.front());
+                ggml_backend_sched_set_tensor_backend(sched, experts, resident_execution_backend);
                 cb(experts, "ffn_moe_device_branch_merge", il);
             }
         }
@@ -2394,6 +2431,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
+        if (remote_single_execution || multi_device_execution) {
+            ggml_backend_sched_set_tensor_backend(sched, experts, resident_execution_backend);
+        }
         cb(experts, "ffn_moe_weighted", il);
     }
 
@@ -2418,6 +2458,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        if (remote_single_execution || multi_device_execution) {
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, resident_execution_backend);
+        }
 
         ggml_build_forward_expand(gf, moe_out);
     }
