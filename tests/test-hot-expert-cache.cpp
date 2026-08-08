@@ -2257,6 +2257,40 @@ void test_cold_provider_uses_bounded_transfer_waves() {
     plan.reset();
 }
 
+void test_cold_provider_reserves_one_demand_width_beyond_hot_capacity() {
+    tensor_fixture tensors;
+    auto sizing_config = cold_test_config(2);
+    auto sizing = llm_create_cold_cache_expert_weight_provider(sizing_config);
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(sizing->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    const auto sizing_initialized = sizing->initialize_after_reserve();
+    if (!sizing_initialized.is_ready()) {
+        std::fprintf(stderr, "cold demand-width sizing failed: status=%u error=%u\n",
+            unsigned(sizing_initialized.status), unsigned(sizing_initialized.error));
+    }
+    GGML_ASSERT(sizing_initialized.is_ready());
+    const auto sizing_diagnostics = sizing->hot_cache_diagnostics();
+    GGML_ASSERT(sizing_diagnostics.cold_effective_slots == 4);
+    GGML_ASSERT(sizing_diagnostics.cold_slot_footprint > 0);
+
+    auto insufficient_config = sizing_config;
+    insufficient_config.cold_cache_bytes = sizing_diagnostics.cold_slot_footprint*3;
+    auto insufficient = llm_create_cold_cache_expert_weight_provider(insufficient_config);
+    binding = {};
+    GGML_ASSERT(insufficient->bind(
+        tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    GGML_ASSERT(insufficient->initialize_after_reserve().error ==
+        llm_expert_provider_error::unsupported_configuration);
+
+    auto exact_config = sizing_config;
+    exact_config.cold_cache_bytes = sizing_diagnostics.cold_slot_footprint*4;
+    auto exact = llm_create_cold_cache_expert_weight_provider(exact_config);
+    binding = {};
+    GGML_ASSERT(exact->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    GGML_ASSERT(exact->initialize_after_reserve().is_ready());
+    GGML_ASSERT(exact->hot_cache_diagnostics().cold_effective_slots == 4);
+}
+
 void test_context_extent_matrix_and_prepare_revalidation() {
     auto exact_top_k = llm_create_hot_cache_expert_weight_provider(test_config(2));
     GGML_ASSERT(exact_top_k->validate_context_extent(64, 1).is_ready());
@@ -3201,6 +3235,7 @@ int main(int argc, char ** argv) {
     test_initialization_stage_and_descriptor_only_scale();
     test_configuration_matrix();
     test_cold_provider_uses_bounded_transfer_waves();
+    test_cold_provider_reserves_one_demand_width_beyond_hot_capacity();
     test_context_extent_matrix_and_prepare_revalidation();
     test_cold_provider_rejects_cuda_host_source();
     test_pool_lifetime_trim_surrender_and_epoch();

@@ -5451,7 +5451,15 @@ public:
             if (config.cold_mode) {
                 llm_cold_cache_config cold_config;
                 cold_config.byte_budget = config.cold_cache_bytes;
-                cold_config.minimum_slots = config.capacity;
+                // Hot slots retain cold backing references. When the hot tier
+                // cannot hold every logical key, reserve one full decode
+                // demand width so a miss can be admitted before its victim's
+                // cold reference is released. Otherwise an exactly full cold
+                // tier can initialize successfully and later fail remap with
+                // busy despite an otherwise valid bounded configuration.
+                cold_config.minimum_slots = uint32_t(std::min<uint64_t>(
+                    config.total_expert_keys,
+                    uint64_t(config.capacity) + config.n_expert_used));
                 cold_config.routed_layer_count = config.routed_layer_count;
                 cold_config.total_expert_keys = config.total_expert_keys;
                 cold_config.minimum_domain_slots = config.n_expert_used;
