@@ -8427,48 +8427,59 @@ private:
             const uint32_t * selected_candidates,
             size_t selected_candidate_count,
             int32_t & selected_slot) noexcept {
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "multi_device_hot_slot_select",
+            "target_device", target_device, "selected_candidate_count", selected_candidate_count);
         auto capacity = cache_policy_result(hot_policy.validate_event_capacity(5));
         if (!capacity.is_ready()) return capacity;
         size_t candidate_count = 0;
-        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
-            const auto & entry = directory_slots[slot];
-            const bool policy_free = hot_policy.validate_free(slot);
-            const bool policy_loading = hot_policy.validate_loading(
-                slot, entry.generation, policy_key_for(entry.key));
-            const bool policy_ready = hot_policy.validate_resident(
-                slot, entry.generation, policy_key_for(entry.key));
-            const bool mechanism_loading = entry.state == hot_slot_state::loading;
-            const bool mechanism_ready = entry.state == hot_slot_state::ready ||
-                entry.state == hot_slot_state::pinned;
-            if ((entry.state == hot_slot_state::free) != policy_free ||
-                mechanism_loading != policy_loading || mechanism_ready != policy_ready) {
-                metadata_mismatches++;
-                return llm_expert_provider_result::failure(
-                    llm_expert_provider_error::metadata_mismatch);
+        {
+            LLM_EXPERT_TRACE_SCOPE("k3.provider", "multi_device_hot_slot_candidate_build",
+                "target_device", target_device);
+            for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+                const auto & entry = directory_slots[slot];
+                const bool policy_free = hot_policy.validate_free(slot);
+                const bool policy_loading = hot_policy.validate_loading(
+                    slot, entry.generation, policy_key_for(entry.key));
+                const bool policy_ready = hot_policy.validate_resident(
+                    slot, entry.generation, policy_key_for(entry.key));
+                const bool mechanism_loading = entry.state == hot_slot_state::loading;
+                const bool mechanism_ready = entry.state == hot_slot_state::ready ||
+                    entry.state == hot_slot_state::pinned;
+                if ((entry.state == hot_slot_state::free) != policy_free ||
+                    mechanism_loading != policy_loading || mechanism_ready != policy_ready) {
+                    metadata_mismatches++;
+                    return llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch);
+                }
+                if (entry.device_id != target_device) continue;
+                bool already_candidate = false;
+                for (size_t index = 0; index < selected_candidate_count; ++index) {
+                    already_candidate = already_candidate || selected_candidates[index] == slot;
+                }
+                const bool excluded = slot_selected[slot] || already_candidate;
+                policy_candidate_slots[candidate_count++] = {
+                    slot,
+                    entry.generation,
+                    policy_key_for(entry.key),
+                    entry.state == hot_slot_state::free ? payload_for_key(key) : payload_for_key(entry.key),
+                    hot_physical_slot_footprint_bytes,
+                    !excluded && entry.state == hot_slot_state::free,
+                    !excluded && entry.state == hot_slot_state::ready && entry.refcount == 0,
+                };
             }
-            if (entry.device_id != target_device) continue;
-            bool already_candidate = false;
-            for (size_t index = 0; index < selected_candidate_count; ++index) {
-                already_candidate = already_candidate || selected_candidates[index] == slot;
-            }
-            const bool excluded = slot_selected[slot] || already_candidate;
-            policy_candidate_slots[candidate_count++] = {
-                slot,
-                entry.generation,
-                policy_key_for(entry.key),
-                entry.state == hot_slot_state::free ? payload_for_key(key) : payload_for_key(entry.key),
-                hot_physical_slot_footprint_bytes,
-                !excluded && entry.state == hot_slot_state::free,
-                !excluded && entry.state == hot_slot_state::ready && entry.refcount == 0,
-            };
         }
         if (candidate_count == 0) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
         }
         llm_expert_cache_policy_decision decision;
-        auto result = cache_policy_result(hot_policy.optional_admission(
-            policy_key_for(key), llm_expert_cache_policy_admission::mandatory_current_output,
-            policy_candidate_slots.data(), candidate_count, decision));
+        llm_expert_provider_result result;
+        {
+            LLM_EXPERT_TRACE_SCOPE("k3.provider", "multi_device_hot_slot_policy_admission",
+                "target_device", target_device, "candidate_count", candidate_count);
+            result = cache_policy_result(hot_policy.optional_admission(
+                policy_key_for(key), llm_expert_cache_policy_admission::mandatory_current_output,
+                policy_candidate_slots.data(), candidate_count, decision));
+        }
         if (!result.is_ready()) return result;
         if (decision.slot >= directory_slots.size() ||
             directory_slots[decision.slot].device_id != target_device) {
@@ -8486,6 +8497,8 @@ private:
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
         if (!decision.free) {
+            LLM_EXPERT_TRACE_SCOPE("k3.provider", "multi_device_hot_slot_feasibility_accounting",
+                "target_device", target_device);
             const auto scan_started = std::chrono::steady_clock::now();
             for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
                 const auto & skipped = directory_slots[slot];
