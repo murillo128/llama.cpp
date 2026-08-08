@@ -14,7 +14,6 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <future>
@@ -1884,81 +1883,6 @@ bool copy_expert_projection(
     return true;
 }
 
-class llm_expert_stage_task {
-public:
-    virtual ~llm_expert_stage_task() = default;
-    virtual llm_expert_provider_result run() noexcept = 0;
-};
-
-class llm_expert_stage_worker {
-public:
-    ~llm_expert_stage_worker() {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            stopping = true;
-            condition.notify_one();
-        }
-        if (worker.joinable()) worker.join();
-    }
-
-    bool start() noexcept {
-        try {
-            worker = std::thread([this] { worker_main(); });
-        } catch (...) {
-            return false;
-        }
-        return true;
-    }
-
-    bool started() const noexcept {
-        return worker.joinable();
-    }
-
-    bool submit(llm_expert_stage_task & next) noexcept {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!worker.joinable() || stopping || task != nullptr || completed) return false;
-        task = &next;
-        condition.notify_one();
-        return true;
-    }
-
-    llm_expert_provider_result wait() noexcept {
-        std::unique_lock<std::mutex> lock(mutex);
-        condition.wait(lock, [&] { return completed; });
-        completed = false;
-        return result;
-    }
-
-private:
-    void worker_main() noexcept {
-        std::unique_lock<std::mutex> lock(mutex);
-        while (true) {
-            condition.wait(lock, [&] { return stopping || task != nullptr; });
-            if (task == nullptr) {
-                if (stopping) return;
-                continue;
-            }
-            auto * current = task;
-            lock.unlock();
-            const auto current_result = current->run();
-            lock.lock();
-            task = nullptr;
-            result = current_result;
-            completed = true;
-            condition.notify_one();
-            if (stopping) return;
-        }
-    }
-
-    mutable std::mutex mutex;
-    std::condition_variable condition;
-    std::thread worker;
-    llm_expert_stage_task * task = nullptr;
-    llm_expert_provider_result result;
-    bool completed = false;
-    bool stopping = false;
-};
-
 class llm_hot_cache_expert_weight_provider final : public llm_expert_weight_provider {
 public:
     llm_hot_cache_expert_weight_provider(llm_hot_cache_config config, llm_expert_provider_faults faults) :
@@ -2123,9 +2047,6 @@ public:
             }
         } else if (config.auto_cost_model.version != 0 || config.auto_cost_model_digest != 0) {
             throw std::invalid_argument("expert AUTO cost model supplied for a non-AUTO policy");
-        }
-        if (multi_device && config.devices.size() == 2 && !stage_worker.start()) {
-            throw std::runtime_error("multi-device expert stage worker initialization failed");
         }
     }
 
@@ -3028,7 +2949,7 @@ public:
             return wave_result;
         };
 
-        const auto reserve_miss_stage = [&](size_t index) noexcept {
+        const auto stage_miss = [&](size_t index) noexcept {
             const uint32_t unique_index = miss_unique_indices[index];
             const auto & key = unique_keys[unique_index];
             const auto owner = llm_expert_owner_device(key.expert, uint32_t(device_pools.size()));
@@ -3052,26 +2973,9 @@ public:
                     scheduler_handles[index].slot, scheduler_handles[index].generation, key,
                     binding.layout_class_id, owner,
                 });
-            return staged;
-        };
-
-        const auto copy_miss_stage = [&](size_t index) noexcept {
-            const uint32_t global_slot = candidate_slots[index];
-            auto * ring = ring_for_slot(global_slot);
-            if (ring == nullptr) {
-                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
-            }
-            return ring->stage(
+            if (staged.is_ready()) staged = ring->stage(
                 transfer_lanes[index], cold_cache->bundle(cold_references[index].layout_class_id));
-        };
-
-        const auto finish_miss_stage = [&](size_t index) noexcept {
-            auto staged = llm_expert_provider_result::success();
-            const uint32_t unique_index = miss_unique_indices[index];
-            const auto & key = unique_keys[unique_index];
-            const auto owner = llm_expert_owner_device(key.expert, uint32_t(device_pools.size()));
-            const uint32_t global_slot = candidate_slots[index];
-            auto & entry = directory_slots[global_slot];
+            if (!staged.is_ready()) return staged;
             device_transfers[owner].push_back({
                 transfer_lanes[index],
                 device_pools[owner]->bundles[cold_references[index].layout_class_id],
@@ -3090,72 +2994,6 @@ public:
                 staged = flush_device_transfers();
             }
             return staged;
-        };
-
-        const auto stage_miss = [&](size_t index) noexcept {
-            auto staged = reserve_miss_stage(index);
-            if (staged.is_ready()) staged = copy_miss_stage(index);
-            if (staged.is_ready()) staged = finish_miss_stage(index);
-            return staged;
-        };
-
-        const auto stage_misses = [&](size_t count) noexcept {
-            if (device_pools.size() != 2 || !stage_worker.started() || count < 2) {
-                for (size_t index = 0; index < count; ++index) {
-                    const auto staged = stage_miss(index);
-                    if (!staged.is_ready()) return staged;
-                }
-                return llm_expert_provider_result::success();
-            }
-            std::array<size_t, 2> counts{};
-            for (size_t index = 0; index < count; ++index) {
-                const auto & key = unique_keys[miss_unique_indices[index]];
-                counts[llm_expert_owner_device(key.expert, uint32_t(device_pools.size()))]++;
-            }
-            if (counts[0] == 0 || counts[1] == 0 ||
-                    counts[0] > device_lane_capacities[0] ||
-                    counts[1] > device_lane_capacities[1]) {
-                for (size_t index = 0; index < count; ++index) {
-                    const auto staged = stage_miss(index);
-                    if (!staged.is_ready()) return staged;
-                }
-                return llm_expert_provider_result::success();
-            }
-            for (size_t index = 0; index < count; ++index) {
-                const auto staged = reserve_miss_stage(index);
-                if (!staged.is_ready()) return staged;
-            }
-            const auto stage_device = [&](size_t device) noexcept {
-                for (size_t index = 0; index < count; ++index) {
-                    const auto & key = unique_keys[miss_unique_indices[index]];
-                    if (llm_expert_owner_device(key.expert, uint32_t(device_pools.size())) != device) {
-                        continue;
-                    }
-                    const auto staged = copy_miss_stage(index);
-                    if (!staged.is_ready()) return staged;
-                }
-                return llm_expert_provider_result::success();
-            };
-            class stage_device_task final : public llm_expert_stage_task {
-            public:
-                explicit stage_device_task(const decltype(stage_device) & function) : function(function) {}
-                llm_expert_provider_result run() noexcept override { return function(1); }
-            private:
-                const decltype(stage_device) & function;
-            } auxiliary(stage_device);
-            if (!stage_worker.submit(auxiliary)) {
-                return llm_expert_provider_result::failure(
-                    llm_expert_provider_error::initialization_failed);
-            }
-            const auto primary_result = stage_device(0);
-            const auto auxiliary_result = stage_worker.wait();
-            if (!primary_result.is_ready()) return primary_result;
-            if (!auxiliary_result.is_ready()) return auxiliary_result;
-            for (size_t index = 0; index < count; ++index) {
-                const auto staged = finish_miss_stage(index);
-                if (!staged.is_ready()) return staged;
-            }
-            return llm_expert_provider_result::success();
         };
 
         const bool issue_ahead_storage = config.storage != nullptr && config.async_transport != nullptr;
@@ -3360,8 +3198,10 @@ public:
                 completed_count++;
             }
 
-            result = stage_misses(miss_count);
-            if (!result.is_ready()) return fail_multi(result);
+            for (size_t index = 0; index < miss_count; ++index) {
+                result = stage_miss(index);
+                if (!result.is_ready()) return fail_multi(result);
+            }
         } else {
             for (size_t index = 0; index < miss_count; ++index) {
                 if (abort_requested()) {
@@ -9261,7 +9101,6 @@ private:
     std::vector<uint8_t> device_transfer_event_capabilities;
     llm_expert_transfer_ring * transfer_ring = nullptr;
     bool multi_device = false;
-    llm_expert_stage_worker stage_worker;
     struct device_runtime_counters {
         uint64_t hits = 0;
         uint64_t misses = 0;
