@@ -2558,6 +2558,13 @@ public:
             bool (*abort_callback)(void *),
             void * abort_callback_data,
             std::unique_lock<std::mutex> * provider_lock) noexcept {
+        (void) llm_perfetto_trace_maybe_start_decode_window(active_request_id, binding.layer);
+        LLM_EXPERT_TRACE_SCOPE("k3.provider", "acquire_and_remap", "request_id", active_request_id,
+            "layer", binding.layer, "layout_class_id", binding.layout_class_id,
+            "selected_key_count", logical_id_count);
+        LLM_EXPERT_TRACE_SCOPE("k3.graph", "expert_layer_execution", "request_id", active_request_id,
+            "layer", binding.layer, "selected_key_count", logical_id_count);
+        LLM_EXPERT_TRACE_CUDA_SCOPE(llm_perfetto_trace_id(llm_perfetto_trace_domain::request, active_request_id));
         if (!multi_device || !active_request || !pool || logical_ids == nullptr ||
             binding.provider_identity != this || binding.bootstrap ||
             binding.graph_epoch != epoch || binding.generation_lease.get() != pool.get() ||
@@ -3106,6 +3113,7 @@ public:
             bool (*abort_callback)(void *),
             void * abort_callback_data,
             std::unique_lock<std::mutex> * provider_lock) noexcept {
+        (void) llm_perfetto_trace_maybe_start_decode_window(active_request_id, binding.layer);
         LLM_EXPERT_TRACE_SCOPE("k3.provider", "acquire_and_remap", "request_id", active_request_id,
             "layer", binding.layer, "layout_class_id", binding.layout_class_id,
             "selected_key_count", logical_id_count);

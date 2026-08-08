@@ -34,30 +34,89 @@ public:
         const char * requested = std::getenv("LLAMA_PERFETTO_CAPTURE");
         enabled = requested != nullptr && std::strcmp(requested, "1") == 0;
         if (!enabled) return;
-        llm_perfetto_trace_config config;
+        llm_perfetto_decode_window_config config;
+        if (!read_env("LLAMA_PERFETTO_WINDOW_REQUEST", config.request_ordinal) ||
+            !read_env("LLAMA_PERFETTO_WINDOW_LAYER", config.routed_layer) ||
+            !read_env("LLAMA_PERFETTO_WINDOW_MS", config.duration_ms) ||
+            !read_env("LLAMA_PERFETTO_WINDOW_SEED", config.selection_seed)) {
+            throw std::runtime_error("Perfetto decode-window environment is incomplete or invalid");
+        }
+        config.trace.cupti_retained_bytes = UINT64_C(128)*1024U*1024U;
         char error[256] = {};
-        if (!llm_perfetto_trace_initialize_system(config, error, sizeof(error)) ||
-            !llm_perfetto_trace_wait_until_active(30000, error, sizeof(error))) {
-            throw std::runtime_error(std::string("Perfetto/CUPTI activation failed: ") + error);
+        if (!llm_perfetto_trace_arm_decode_window(config, error, sizeof(error))) {
+            throw std::runtime_error(std::string("Perfetto/CUPTI decode-window arm failed: ") + error);
         }
     }
 
     ~perfetto_evidence_owner() {
-        if (!enabled) return;
+        if (!enabled || close_attempted) return;
         char error[256] = {};
-        const bool stopped = llm_perfetto_trace_request_stop(error, sizeof(error)) &&
-            llm_perfetto_trace_wait_until_inactive(30000, error, sizeof(error)) &&
-            llm_perfetto_trace_shutdown(error, sizeof(error));
-        if (!stopped) {
+        if (!close(error, sizeof(error))) {
             std::fprintf(stderr, "phase9-cache-policy-probe: Perfetto/CUPTI closeout failed: %s\n", error);
             std::fflush(stderr);
             std::_Exit(90);
         }
     }
 
+    bool close(char * error, size_t error_capacity) noexcept {
+        if (!enabled) return true;
+        if (close_attempted) return closed;
+        close_attempted = true;
+        closed = llm_perfetto_trace_wait_for_decode_window(120000, error, error_capacity) &&
+            llm_perfetto_trace_shutdown(error, error_capacity);
+        return closed;
+    }
+
 private:
+    template<typename T>
+    static bool read_env(const char * name, T & destination) noexcept {
+        const char * text = std::getenv(name);
+        if (text == nullptr || *text == '\0') return false;
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(text, &end, 10);
+        if (errno != 0 || end == text || *end != '\0' || parsed > uint64_t(std::numeric_limits<T>::max())) {
+            return false;
+        }
+        destination = T(parsed);
+        return true;
+    }
+
     bool enabled = false;
+    bool close_attempted = false;
+    bool closed = false;
 };
+
+json perfetto_diagnostics_json(const llm_perfetto_trace_diagnostics & value) {
+    return {
+        {"compiled", value.compiled}, {"initialized", value.initialized},
+        {"track_event_active", value.track_event_active}, {"cupti_capable", value.cupti_capable},
+        {"cupti_active", value.cupti_active}, {"shutdown", value.shutdown},
+        {"perfetto_sessions_started", value.perfetto_sessions_started},
+        {"perfetto_sessions_stopped", value.perfetto_sessions_stopped},
+        {"cupti_version", value.cupti_version}, {"clock_start_ns", value.clock_start_ns},
+        {"clock_stop_ns", value.clock_stop_ns}, {"cupti_errors", value.cupti_errors},
+        {"cupti_records", value.cupti_records}, {"cupti_dropped_records", value.cupti_dropped_records},
+        {"cupti_retained_bytes", value.cupti_retained_bytes},
+        {"cupti_retained_capacity_bytes", value.cupti_retained_capacity_bytes},
+        {"cupti_peak_buffer_bytes", value.cupti_peak_buffer_bytes},
+        {"cupti_peak_total_bytes", value.cupti_peak_total_bytes},
+        {"cupti_unknown_timestamps", value.cupti_unknown_timestamps},
+        {"cupti_unmatched_correlations", value.cupti_unmatched_correlations},
+        {"cupti_kernel_records", value.cupti_kernel_records},
+        {"cupti_memcpy_records", value.cupti_memcpy_records},
+        {"cupti_synchronization_records", value.cupti_synchronization_records},
+        {"cupti_unsupported_records", value.cupti_unsupported_records},
+        {"cupti_enabled_kind_count", value.cupti_enabled_kind_count},
+        {"decode_window_armed", value.decode_window_armed},
+        {"decode_window_triggered", value.decode_window_triggered},
+        {"decode_window_complete", value.decode_window_complete},
+        {"decode_window_request_ordinal", value.decode_window_request_ordinal},
+        {"decode_window_routed_layer", value.decode_window_routed_layer},
+        {"decode_window_requested_ms", value.decode_window_requested_ms},
+        {"decode_window_selection_seed", value.decode_window_selection_seed},
+    };
+}
 #endif
 
 struct arguments {
@@ -727,6 +786,16 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "phase9-cache-policy-probe: expected device failure was not observed\n");
             return 9;
         }
+#if defined(LLAMA_PERFETTO)
+        char perfetto_error[256] = {};
+        if (!trace_owner.close(perfetto_error, sizeof(perfetto_error))) {
+            std::fprintf(stderr, "phase9-cache-policy-probe: Perfetto/CUPTI closeout failed: %s\n", perfetto_error);
+            return 13;
+        }
+        const json perfetto_diagnostics = perfetto_diagnostics_json(llm_perfetto_trace_get_diagnostics());
+#else
+        const json perfetto_diagnostics = nullptr;
+#endif
         const auto peer_transport_diagnostics = context->expert_peer_transport_diagnostics();
         // Releasing the context closes the provider request, drains or cancels
         // every background flight, and emits all reserved policy terminals.
@@ -753,6 +822,7 @@ int main(int argc, char ** argv) {
                 {"logits_fnv64", logits_digests}, {"latency_us", latency_us},
                 {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},
                 {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
+                {"perfetto", perfetto_diagnostics},
             };
             std::ofstream destination(args.output, std::ios::binary | std::ios::trunc);
             if (!destination) return 12;
@@ -906,6 +976,7 @@ int main(int argc, char ** argv) {
             {"logits_fnv64", logits_digests}, {"latency_us", latency_us},
             {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},
             {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
+            {"perfetto", perfetto_diagnostics},
             {"topology", {
                 {"routed_layers", routed_layers}, {"experts_per_layer", diagnostics.n_expert},
                 {"hot_physical_slot_footprint_bytes", hot_footprint},
