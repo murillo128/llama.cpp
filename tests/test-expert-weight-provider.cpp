@@ -113,6 +113,9 @@ void test_default_and_model_ownership() {
     GGML_ASSERT(params.expert_hot_cache_capacity == 0);
     GGML_ASSERT(params.expert_cold_cache_bytes == 0);
     GGML_ASSERT(params.expert_transfer_ring_bytes == 0);
+    GGML_ASSERT(params.expert_device_count == 1);
+    GGML_ASSERT(params.expert_peer_transport == LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED);
+    GGML_ASSERT(params.expert_peer_staging_bytes == 0);
 
     llama_model * model = llama_model_create(LLM_ARCH_KIMI_K3, params);
     GGML_ASSERT(model != nullptr);

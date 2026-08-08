@@ -652,6 +652,51 @@ void test_reset_surrender_and_reinitialize() {
         "reinitialize starts a fresh bounded transcript");
 }
 
+void test_compliance_and_performance_modes() {
+    const int32_t layers[] = { 0 };
+    auto run = [&](bool state_attestation) {
+        llm_expert_cache_policy policy;
+        auto config = make_config(LLAMA_EXPERT_CACHE_POLICY_LRU);
+        config.state_attestation = state_attestation;
+        require(policy.initialize(config, llm_expert_cache_policy_tier::hot,
+            layers, 1, 4, 1, 1, 128, 32).is_ready(), "initialize runtime-mode fixture");
+        begin(policy);
+        demand(policy, 0, 0);
+        const llm_expert_cache_policy_candidate free_candidates[] = {
+            candidate(0, 0, -1, -1, true, false),
+        };
+        llm_expert_cache_policy_decision decision;
+        require(policy.select({ 0, 0 }, free_candidates, 1, decision).is_ready() &&
+            decision.slot == 0 && decision.free, "runtime modes preserve selection");
+        load(policy, 0, 1, 0, 0);
+        demand(policy, 0, 0);
+        require(policy.hit(0, 1).is_ready(), "runtime modes preserve hit semantics");
+        require(policy.request_end(true, false).is_ready(), "runtime modes preserve request closeout");
+        return policy;
+    };
+    const auto compliance = run(true);
+    const auto performance = run(false);
+    const auto & c = compliance.diagnostics();
+    const auto & p = performance.diagnostics();
+    require(c.events == p.events && c.demands == p.demands && c.hits == p.hits &&
+        c.misses == p.misses && c.free_selections == p.free_selections &&
+        c.victim_selections == p.victim_selections,
+        "compliance and performance modes preserve policy decisions and counters");
+    require(c.config.state_attestation && c.state_digest != 0 &&
+        compliance.transcript_size() == c.events && c.transcript_records == c.events,
+        "compliance mode preserves full state and transcript attestation");
+    require(!p.config.state_attestation && p.state_digest == 0 &&
+        performance.transcript_size() == 0 && p.transcript_records == 0 && p.transcript_dropped == 0,
+        "performance mode disables state and transcript attestation");
+    auto performance_config = make_config(LLAMA_EXPERT_CACHE_POLICY_LRU);
+    performance_config.state_attestation = false;
+    llm_expert_cache_policy seam_guard;
+    require(seam_guard.initialize(performance_config, llm_expert_cache_policy_tier::hot,
+        layers, 1, 4, 1, 1, 128, 1).is_ready() &&
+        !seam_guard.set_ordinals_for_testing(1, 1, 1),
+        "performance mode disables evidence-only policy test seams");
+}
+
 } // namespace
 
 int main() {
@@ -670,6 +715,7 @@ int main() {
     test_slru_pinned_blocked_demotion();
     test_lfu_aging_and_per_layer();
     test_reset_surrender_and_reinitialize();
+    test_compliance_and_performance_modes();
     std::puts("expert cache policy tests passed");
     return 0;
 }

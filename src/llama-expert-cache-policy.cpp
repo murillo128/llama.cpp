@@ -134,6 +134,7 @@ llm_expert_cache_policy_result llm_expert_cache_policy_copy_config(
         value.admission,
         value.admission_window_events,
         value.lfu_aging_interval_events,
+        true,
         source != nullptr,
         source != nullptr ? *source : llama_expert_cache_policy_config {},
         value,
@@ -231,7 +232,12 @@ llm_expert_cache_policy_result llm_expert_cache_policy::initialize(
         } else {
             frequency_window.clear();
         }
-        events.assign(transcript_capacity, {});
+        if (config.state_attestation) {
+            events.assign(transcript_capacity, {});
+        } else {
+            events.clear();
+            events.shrink_to_fit();
+        }
         frequency_window_write = 0;
         frequency_window_size = 0;
         event_write = 0;
@@ -272,7 +278,7 @@ llm_expert_cache_policy_result llm_expert_cache_policy::initialize(
         counters.administration_actual_bytes = actual_admin;
         counters.administration_bytes = actual_admin;
         counters.peak_administration_bytes = counters.administration_bytes;
-        counters.state_digest = hash_state();
+        refresh_state_digest();
         initialized = true;
         return llm_expert_cache_policy_result::success();
     } catch (const std::bad_alloc &) {
@@ -319,7 +325,11 @@ llm_expert_cache_policy_result llm_expert_cache_policy::append_event(
     }
     counters.event_sequence++;
     counters.events++;
-    counters.state_digest = hash_state();
+    refresh_state_digest();
+    if (!config.state_attestation) {
+        counters.transcript_records = 0;
+        return llm_expert_cache_policy_result::success();
+    }
     if (event_write >= events.size()) {
         counters.transcript_dropped++;
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::transcript_full);
@@ -336,10 +346,12 @@ llm_expert_cache_policy_result llm_expert_cache_policy::append_event(
 }
 
 llm_expert_cache_policy_result llm_expert_cache_policy::preflight_events(size_t count) const noexcept {
-    const size_t used = std::min(event_write, events.size());
-    if (reserved_terminal_events > events.size() - used ||
-        count > events.size() - used - reserved_terminal_events) {
-        return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::transcript_full);
+    if (config.state_attestation) {
+        const size_t used = std::min(event_write, events.size());
+        if (reserved_terminal_events > events.size() - used ||
+            count > events.size() - used - reserved_terminal_events) {
+            return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::transcript_full);
+        }
     }
     if (reserved_terminal_events > UINT64_MAX - counters.event_sequence ||
         count > UINT64_MAX - counters.event_sequence - reserved_terminal_events) {
@@ -372,7 +384,7 @@ llm_expert_cache_policy_result llm_expert_cache_policy::set_ubatch_ordinal(uint6
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::invalid_event);
     }
     counters.ubatch_ordinal = ordinal;
-    counters.state_digest = hash_state();
+    refresh_state_digest();
     return llm_expert_cache_policy_result::success();
 }
 
@@ -399,9 +411,9 @@ bool llm_expert_cache_policy::normalize_aging(
     return true;
 }
 
-bool llm_expert_cache_policy::candidate_precedes(uint32_t lhs_slot, uint32_t rhs_slot) noexcept {
-    auto & lhs = slots[lhs_slot];
-    auto & rhs = slots[rhs_slot];
+bool llm_expert_cache_policy::candidate_precedes(uint32_t lhs_slot, uint32_t rhs_slot) const noexcept {
+    const auto & lhs = slots[lhs_slot];
+    const auto & rhs = slots[rhs_slot];
     bool precedes = false;
     bool equivalent = false;
     if (config.policy == LLAMA_EXPERT_CACHE_POLICY_LRU) {
@@ -943,11 +955,13 @@ llm_expert_cache_policy_result llm_expert_cache_policy::flush_terminal_events() 
         }
         auto & pending = slots[uint32_t(selected)];
         if (!pending.terminal_pending) return llm_expert_cache_policy_result::success();
-        if (reserved_terminal_events == 0 || event_write >= events.size() ||
+        if (reserved_terminal_events == 0 ||
+            (config.state_attestation && event_write >= events.size()) ||
             counters.event_sequence == UINT64_MAX) {
             return llm_expert_cache_policy_result::failure(
                 reserved_terminal_events == 0 ? llm_expert_cache_policy_error::metadata_mismatch :
-                event_write >= events.size() ? llm_expert_cache_policy_error::transcript_full :
+                config.state_attestation && event_write >= events.size() ?
+                    llm_expert_cache_policy_error::transcript_full :
                 llm_expert_cache_policy_error::sequence_exhausted);
         }
         const auto state = pending;
@@ -1088,6 +1102,14 @@ bool llm_expert_cache_policy::validate_loading(
         slots[slot].generation == generation && key_matches(slots[slot].key, key);
 }
 
+bool llm_expert_cache_policy::resident_precedes(uint32_t lhs_slot, uint32_t rhs_slot) const noexcept {
+    if (lhs_slot >= slots.size() || rhs_slot >= slots.size() ||
+        !slots[lhs_slot].resident || !slots[rhs_slot].resident) {
+        return false;
+    }
+    return candidate_precedes(lhs_slot, rhs_slot);
+}
+
 bool llm_expert_cache_policy::validate_free(uint32_t slot) const noexcept {
     return slot < slots.size() && !slots[slot].loading && !slots[slot].resident;
 }
@@ -1105,21 +1127,25 @@ bool llm_expert_cache_policy::set_ordinals_for_testing(
         uint64_t event_sequence,
         uint64_t demand_ordinal,
         uint64_t operation_ordinal) noexcept {
-    if (!initialized || request_active || event_write != 0) return false;
+    if (!config.state_attestation || !initialized || request_active || event_write != 0) return false;
     counters.event_sequence = event_sequence;
     counters.demand_ordinal = demand_ordinal;
     counters.operation_ordinal = operation_ordinal;
-    counters.state_digest = hash_state();
+    refresh_state_digest();
     return true;
 }
 
 bool llm_expert_cache_policy::set_resident_frequency_for_testing(
         uint32_t slot, uint64_t frequency, uint64_t aging_epoch) noexcept {
-    if (!initialized || slot >= slots.size() || !slots[slot].resident) return false;
+    if (!config.state_attestation || !initialized || slot >= slots.size() || !slots[slot].resident) return false;
     slots[slot].resident_frequency = frequency;
     slots[slot].aging_epoch = aging_epoch;
-    counters.state_digest = hash_state();
+    refresh_state_digest();
     return true;
+}
+
+void llm_expert_cache_policy::refresh_state_digest() noexcept {
+    counters.state_digest = config.state_attestation ? hash_state() : 0;
 }
 
 uint64_t llm_expert_cache_policy::hash_state() const noexcept {

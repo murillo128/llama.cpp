@@ -75,6 +75,7 @@
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
@@ -87,6 +88,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -702,9 +704,47 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+    ggml_cuda_set_device(device);
+
+    // A focused-test gate may deliberately hold either half of a staged copy.
+    // Closeout is a fail-closed drain boundary, so release such gates before
+    // waiting on the generation-qualified H2D completion events.
+    for (auto & gate : expert_peer_test_gates) {
+        if (gate == nullptr) {
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> gate_lock(gate->mutex);
+            gate->release = true;
+        }
+        gate->cv.notify_all();
+    }
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    for (auto & edge : expert_host_staging_edges) {
+        if (!edge.configured) {
+            continue;
+        }
+        edge.accepting = false;
+        for (auto & slot : edge.slots) {
+            if (slot.h2d_recorded) {
+                ggml_cuda_set_device(edge.dst_device);
+                CUDA_CHECK(cudaEventSynchronize(slot.h2d_complete));
+            }
+            if (slot.d2h_complete != nullptr) {
+                ggml_cuda_set_device(edge.src_device);
+                CUDA_CHECK(cudaEventDestroy(slot.d2h_complete));
+            }
+            if (slot.h2d_complete != nullptr) {
+                ggml_cuda_set_device(edge.dst_device);
+                CUDA_CHECK(cudaEventDestroy(slot.h2d_complete));
+            }
+        }
+    }
+    if (expert_host_staging != nullptr) {
+        CUDA_CHECK(cudaFreeHost(expert_host_staging));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -1876,36 +1916,36 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
 
-    const auto try_fast_path = [&]() {
+    const auto try_fast_path = [&](const ggml_tensor * fast_ids) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, fast_ids, dst);
                     return true;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, fast_ids, dst);
                     return true;
                 }
             }
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            ggml_cuda_mul_mat_q(ctx, src0, src1, fast_ids, dst);
             return true;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            ggml_cuda_mul_mat_f(ctx, src0, src1, fast_ids, dst);
             return true;
         }
         return false;
     };
-    if (!allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && try_fast_path()) {
+    if (!allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && try_fast_path(ids)) {
         return;
     }
 
@@ -1949,10 +1989,59 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             inactive[lane] = expert == -1;
         }
     }
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        std::none_of(inactive.begin(), inactive.end(), [](uint8_t value) { return value != 0; }) &&
-        try_fast_path()) {
-        return;
+    if (allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        ne02 >= n_expert_used) {
+        // The fast MUL_MAT_ID helpers require one valid, unique expert id for
+        // every lane.  Give inactive branch lanes temporary unused ids, execute
+        // the ordinary kernel, then zero those lanes on the same stream.  Active
+        // lanes therefore retain the accepted one-device kernel arithmetic.
+        std::vector<char> fast_ids_host = ids_host;
+        std::vector<uint8_t> used(static_cast<size_t>(ne02), uint8_t(0));
+        bool fast_ids_valid = true;
+        for (int64_t i12 = 0; i12 < ne12 && fast_ids_valid; ++i12) {
+            std::fill(used.begin(), used.end(), uint8_t(0));
+            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                const int32_t expert = *(const int32_t *)(
+                    ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (expert >= 0) {
+                    if (used[size_t(expert)] != 0) {
+                        fast_ids_valid = false;
+                        break;
+                    }
+                    used[size_t(expert)] = 1;
+                }
+            }
+            int32_t replacement = 0;
+            for (int64_t iex = 0; iex < n_expert_used && fast_ids_valid; ++iex) {
+                int32_t * expert = (int32_t *)(
+                    fast_ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (*expert != -1) continue;
+                while (replacement < ne02 && used[size_t(replacement)] != 0) replacement++;
+                if (replacement >= ne02) {
+                    fast_ids_valid = false;
+                    break;
+                }
+                *expert = replacement;
+                used[size_t(replacement++)] = 1;
+            }
+        }
+        if (fast_ids_valid) {
+            ggml_cuda_pool_alloc<char> fast_ids_data(ctx.pool(), ggml_nbytes(ids));
+            CUDA_CHECK(cudaMemcpyAsync(fast_ids_data.ptr, fast_ids_host.data(),
+                ggml_nbytes(ids), cudaMemcpyHostToDevice, stream));
+            ggml_tensor fast_ids = *ids;
+            fast_ids.data = fast_ids_data.ptr;
+            if (try_fast_path(&fast_ids)) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                        if (!inactive[size_t(i12*n_expert_used + iex)]) continue;
+                        CUDA_CHECK(cudaMemsetAsync((char *) dst->data + i12*nb2 + iex*nb1,
+                            0, ne0*nb0, stream));
+                    }
+                }
+                return;
+            }
+        }
     }
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
@@ -2463,6 +2552,565 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// Configures one backend instance for the explicit routed-expert peer
+// transport. Return values are stable for the llama layer: 0 success, -1
+// invalid input, -2 conflicting reconfiguration, -3 allocation/runtime error.
+enum ggml_cuda_expert_peer_test_phase : uint32_t {
+    GGML_CUDA_EXPERT_PEER_TEST_PHASE_NONE = 0,
+    GGML_CUDA_EXPERT_PEER_TEST_PHASE_D2H = 1,
+    GGML_CUDA_EXPERT_PEER_TEST_PHASE_H2D = 2,
+};
+
+struct ggml_cuda_expert_peer_test_gate_payload {
+    ggml_backend_cuda_context::expert_peer_test_gate * gate = nullptr;
+    uint32_t phase = GGML_CUDA_EXPERT_PEER_TEST_PHASE_NONE;
+};
+
+static void CUDART_CB ggml_cuda_expert_peer_test_gate_callback(void * data) {
+    std::unique_ptr<ggml_cuda_expert_peer_test_gate_payload> payload(
+        static_cast<ggml_cuda_expert_peer_test_gate_payload *>(data));
+    auto * gate = payload->gate;
+    std::unique_lock<std::mutex> lock(gate->mutex);
+    if (gate->armed_phase != payload->phase) {
+        return;
+    }
+    gate->entered_phase = payload->phase;
+    gate->cv.notify_all();
+    gate->cv.wait(lock, [&] { return gate->release; });
+    gate->armed_phase = GGML_CUDA_EXPERT_PEER_TEST_PHASE_NONE;
+}
+
+static cudaError_t ggml_cuda_expert_enqueue_peer_test_gate(
+        ggml_backend_cuda_context * destination, uint32_t source_expert_device,
+        uint32_t phase, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(destination, source_expert_device, phase, stream);
+    return cudaSuccess;
+#else
+    auto * gate = destination->expert_peer_test_gates[source_expert_device].get();
+    if (gate == nullptr) {
+        return cudaSuccess;
+    }
+    {
+        std::lock_guard<std::mutex> lock(gate->mutex);
+        if (gate->armed_phase != phase || gate->release) {
+            return cudaSuccess;
+        }
+    }
+    auto * payload = new (std::nothrow) ggml_cuda_expert_peer_test_gate_payload { gate, phase };
+    if (payload == nullptr) {
+        return cudaErrorMemoryAllocation;
+    }
+    const cudaError_t status = cudaLaunchHostFunc(
+        stream, ggml_cuda_expert_peer_test_gate_callback, payload);
+    if (status != cudaSuccess) {
+        delete payload;
+    }
+    return status;
+#endif
+}
+
+static bool ggml_cuda_expert_complete_peer_slot_locked(
+        ggml_backend_cuda_context::expert_host_staging_edge & edge,
+        ggml_backend_cuda_context::expert_host_staging_slot & slot,
+        uint64_t expected_generation, bool release_live_slot,
+        ggml_backend_cuda_context::expert_host_staging_slot_state terminal_state) {
+    if (expected_generation == 0 || slot.generation != expected_generation ||
+        slot.h2d_generation != expected_generation) {
+        edge.stale_completions++;
+        return false;
+    }
+    edge.completions++;
+    if (release_live_slot) {
+        GGML_ASSERT(edge.live_slots > 0);
+        edge.live_slots--;
+    }
+    slot.state = terminal_state;
+    return true;
+}
+
+struct ggml_cuda_expert_peer_cancel_token {
+    uint32_t slot = 0;
+    uint64_t generation = 0;
+};
+
+static void ggml_cuda_expert_release_peer_test_gate(
+        ggml_backend_cuda_context * context, uint32_t source_expert_device) {
+    auto * gate = context->expert_peer_test_gates[source_expert_device].get();
+    if (gate == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(gate->mutex);
+        gate->release = true;
+    }
+    gate->cv.notify_all();
+}
+
+// Fail-closed recovery closes admission for one directed edge, identifies
+// which copy half is active, releases any focused-test gate, and drains every
+// generation-qualified H2D completion before returning. The CUDA host wait is
+// intentionally confined to cancellation/closeout, never steady state.
+static int ggml_backend_cuda_expert_cancel_peer_edge(
+        ggml_backend_t backend, uint32_t source_expert_device) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (source_expert_device >= context->expert_device_count ||
+        source_expert_device == context->expert_device_id) {
+        return -1;
+    }
+    std::vector<ggml_cuda_expert_peer_cancel_token> tokens;
+    {
+        std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+        auto & edge = context->expert_host_staging_edges[source_expert_device];
+        if (!edge.configured || context->expert_peer_transport != 0) {
+            return -2;
+        }
+        for (const auto & slot : edge.slots) {
+            if (slot.state == ggml_backend_cuda_context::expert_host_staging_slot_state::reserved) {
+                return -3;
+            }
+        }
+        edge.accepting = false;
+        edge.cancellation_requests++;
+        for (uint32_t index = 0; index < edge.slots.size(); ++index) {
+            auto & slot = edge.slots[index];
+            if (slot.state != ggml_backend_cuda_context::expert_host_staging_slot_state::in_flight) {
+                continue;
+            }
+            slot.state = ggml_backend_cuda_context::expert_host_staging_slot_state::cancelling;
+            tokens.push_back({ index, slot.generation });
+        }
+    }
+
+    auto & edge = context->expert_host_staging_edges[source_expert_device];
+    for (const auto & token : tokens) {
+        auto & slot = edge.slots[token.slot];
+        ggml_cuda_set_device(edge.src_device);
+        const cudaError_t d2h_status = cudaEventQuery(slot.d2h_complete);
+        ggml_cuda_set_device(edge.dst_device);
+        const cudaError_t h2d_status = cudaEventQuery(slot.h2d_complete);
+        if ((d2h_status != cudaSuccess && d2h_status != cudaErrorNotReady) ||
+            (h2d_status != cudaSuccess && h2d_status != cudaErrorNotReady)) {
+            ggml_cuda_expert_release_peer_test_gate(context, source_expert_device);
+            std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+            slot.state = ggml_backend_cuda_context::expert_host_staging_slot_state::failed;
+            return -4;
+        }
+        std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+        if (d2h_status == cudaErrorNotReady) {
+            edge.cancellations_during_d2h++;
+        } else if (h2d_status == cudaErrorNotReady) {
+            edge.cancellations_during_h2d++;
+        }
+    }
+
+    ggml_cuda_expert_release_peer_test_gate(context, source_expert_device);
+    for (const auto & token : tokens) {
+        auto & slot = edge.slots[token.slot];
+        ggml_cuda_set_device(edge.dst_device);
+        const cudaError_t status = cudaEventSynchronize(slot.h2d_complete);
+        std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+        if (status != cudaSuccess) {
+            slot.state = ggml_backend_cuda_context::expert_host_staging_slot_state::failed;
+            return -4;
+        }
+        if (!ggml_cuda_expert_complete_peer_slot_locked(edge, slot, token.generation, true,
+                ggml_backend_cuda_context::expert_host_staging_slot_state::cancelled)) {
+            return -5;
+        }
+        edge.cancellation_drains++;
+    }
+    return 0;
+}
+
+static int ggml_backend_cuda_expert_set_peer_test_gate(
+        ggml_backend_t backend, uint32_t source_expert_device, uint32_t phase) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(backend, source_expert_device, phase);
+    return -2;
+#else
+    if (!ggml_backend_is_cuda(backend) ||
+        (phase != GGML_CUDA_EXPERT_PEER_TEST_PHASE_D2H &&
+         phase != GGML_CUDA_EXPERT_PEER_TEST_PHASE_H2D)) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (source_expert_device >= context->expert_device_count ||
+        source_expert_device == context->expert_device_id) {
+        return -1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+        const auto & edge = context->expert_host_staging_edges[source_expert_device];
+        if (!edge.configured || !edge.accepting || edge.live_slots != 0) {
+            return -2;
+        }
+    }
+    auto * gate = context->expert_peer_test_gates[source_expert_device].get();
+    if (gate == nullptr) {
+        return -2;
+    }
+    std::lock_guard<std::mutex> lock(gate->mutex);
+    gate->armed_phase = phase;
+    gate->entered_phase = GGML_CUDA_EXPERT_PEER_TEST_PHASE_NONE;
+    gate->release = false;
+    return 0;
+#endif
+}
+
+static int ggml_backend_cuda_expert_wait_peer_test_gate(
+        ggml_backend_t backend, uint32_t source_expert_device, uint32_t phase) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(backend, source_expert_device, phase);
+    return -2;
+#else
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (source_expert_device >= context->expert_device_count) {
+        return -1;
+    }
+    auto * gate = context->expert_peer_test_gates[source_expert_device].get();
+    if (gate == nullptr) {
+        return -2;
+    }
+    std::unique_lock<std::mutex> lock(gate->mutex);
+    return gate->cv.wait_for(lock, std::chrono::seconds(10), [&] {
+        return gate->entered_phase == phase;
+    }) ? 0 : -3;
+#endif
+}
+
+static int ggml_backend_cuda_expert_peer_slot_generation_for_testing(
+        ggml_backend_t backend, uint32_t source_expert_device, uint32_t slot_index,
+        uint64_t * generation) {
+    if (!ggml_backend_is_cuda(backend) || generation == nullptr) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (source_expert_device >= context->expert_device_count ||
+        slot_index >= ggml_backend_cuda_context::expert_host_staging_slot_count) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+    const auto & edge = context->expert_host_staging_edges[source_expert_device];
+    if (!edge.configured) {
+        return -2;
+    }
+    *generation = edge.slots[slot_index].generation;
+    return 0;
+}
+
+static int ggml_backend_cuda_expert_complete_peer_slot_for_testing(
+        ggml_backend_t backend, uint32_t source_expert_device, uint32_t slot_index,
+        uint64_t expected_generation) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (source_expert_device >= context->expert_device_count ||
+        slot_index >= ggml_backend_cuda_context::expert_host_staging_slot_count) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+    auto & edge = context->expert_host_staging_edges[source_expert_device];
+    auto & slot = edge.slots[slot_index];
+    if (!edge.configured || slot.state !=
+            ggml_backend_cuda_context::expert_host_staging_slot_state::in_flight ||
+        expected_generation == slot.generation) {
+        return -2;
+    }
+    return ggml_cuda_expert_complete_peer_slot_locked(edge, slot, expected_generation, false,
+        slot.state) ? 0 : 1;
+}
+
+static int ggml_backend_cuda_expert_configure_peer_transport(
+        ggml_backend_t backend, int transport, size_t host_staging_capacity,
+        uint32_t expert_device_id, uint32_t expert_device_count) {
+    if (!ggml_backend_is_cuda(backend) || transport < 0 || transport > 1 ||
+        (transport == 0) != (host_staging_capacity != 0) ||
+        expert_device_count < 2 || expert_device_count > GGML_CUDA_MAX_DEVICES ||
+        expert_device_id >= expert_device_count ||
+        (transport == 0 && host_staging_capacity/
+            ((expert_device_count - 1)*ggml_backend_cuda_context::expert_host_staging_slot_count) == 0)) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+    if (context->expert_peer_transport >= 0) {
+        return context->expert_peer_transport == transport &&
+            context->expert_host_staging_capacity == host_staging_capacity &&
+            context->expert_device_id == expert_device_id &&
+            context->expert_device_count == expert_device_count ? 0 : -2;
+    }
+    void * staging = nullptr;
+    if (transport == 0) {
+        const cudaError_t alloc_status = cudaHostAlloc(&staging, host_staging_capacity, cudaHostAllocPortable);
+        if (alloc_status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: failed to allocate %zu bytes of bounded pinned staging: %s\n",
+                __func__, host_staging_capacity, cudaGetErrorString(alloc_status));
+            return -3;
+        }
+    }
+    context->expert_peer_transport = transport;
+    context->expert_host_staging = staging;
+    context->expert_host_staging_capacity = host_staging_capacity;
+    context->expert_device_id = expert_device_id;
+    context->expert_device_count = expert_device_count;
+    return 0;
+}
+
+// Seals one directed edge after every backend has its fixed transport arena.
+// HOST_STAGED assigns two equal pinned slots per directed edge and creates the
+// D2H event on the source device and the H2D event on the destination device.
+static int ggml_backend_cuda_expert_configure_peer_edge(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst) {
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst) ||
+        backend_src == backend_dst) {
+        return -1;
+    }
+    auto * src = static_cast<ggml_backend_cuda_context *>(backend_src->context);
+    auto * dst = static_cast<ggml_backend_cuda_context *>(backend_dst->context);
+    std::scoped_lock lock(src->expert_peer_mutex, dst->expert_peer_mutex);
+    if (src->expert_peer_transport < 0 ||
+        src->expert_peer_transport != dst->expert_peer_transport ||
+        src->expert_device_count != dst->expert_device_count ||
+        src->expert_device_id >= src->expert_device_count ||
+        dst->expert_device_id >= dst->expert_device_count ||
+        src->expert_device_id == dst->expert_device_id) {
+        return -1;
+    }
+    auto & edge = dst->expert_host_staging_edges[src->expert_device_id];
+    if (edge.configured) {
+        return edge.src_device == src->device && edge.dst_device == dst->device &&
+            edge.src_expert_device == src->expert_device_id &&
+            edge.dst_expert_device == dst->expert_device_id ? 0 : -2;
+    }
+
+    edge.src_device = src->device;
+    edge.dst_device = dst->device;
+    edge.src_expert_device = src->expert_device_id;
+    edge.dst_expert_device = dst->expert_device_id;
+    if (src->expert_peer_transport == 0) {
+        dst->expert_peer_test_gates[src->expert_device_id].reset(
+            new (std::nothrow) ggml_backend_cuda_context::expert_peer_test_gate());
+        if (dst->expert_peer_test_gates[src->expert_device_id] == nullptr) {
+            edge = {};
+            return -3;
+        }
+        const uint32_t edge_index = src->expert_device_id < dst->expert_device_id ?
+            src->expert_device_id : src->expert_device_id - 1;
+        const size_t slot_capacity = dst->expert_host_staging_capacity/
+            ((dst->expert_device_count - 1)*ggml_backend_cuda_context::expert_host_staging_slot_count);
+        for (uint32_t index = 0;
+                index < ggml_backend_cuda_context::expert_host_staging_slot_count; ++index) {
+            auto & slot = edge.slots[index];
+            slot.data = static_cast<uint8_t *>(dst->expert_host_staging) +
+                (size_t(edge_index)*ggml_backend_cuda_context::expert_host_staging_slot_count + index)*slot_capacity;
+            slot.capacity = slot_capacity;
+            ggml_cuda_set_device(src->device);
+            cudaError_t status = cudaEventCreateWithFlags(&slot.d2h_complete, cudaEventDisableTiming);
+            if (status == cudaSuccess) {
+                ggml_cuda_set_device(dst->device);
+                status = cudaEventCreateWithFlags(&slot.h2d_complete, cudaEventDisableTiming);
+            }
+            if (status != cudaSuccess) {
+                GGML_LOG_ERROR("%s: failed to create directed staging events: %s\n",
+                    __func__, cudaGetErrorString(status));
+                for (auto & cleanup : edge.slots) {
+                    if (cleanup.d2h_complete != nullptr) {
+                        ggml_cuda_set_device(src->device);
+                        (void) cudaEventDestroy(cleanup.d2h_complete);
+                        cleanup.d2h_complete = nullptr;
+                    }
+                    if (cleanup.h2d_complete != nullptr) {
+                        ggml_cuda_set_device(dst->device);
+                        (void) cudaEventDestroy(cleanup.h2d_complete);
+                        cleanup.h2d_complete = nullptr;
+                    }
+                    cleanup.data = nullptr;
+                    cleanup.capacity = 0;
+                }
+                dst->expert_peer_test_gates[src->expert_device_id].reset();
+                edge = {};
+                return -3;
+            }
+        }
+    }
+    edge.configured = true;
+    return 0;
+}
+
+// Returns 1 when src can access dst, 0 when it cannot, and a negative value
+// for invalid/runtime failures. Enabling is explicit and idempotent.
+static int ggml_backend_cuda_expert_peer_capability(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst, int enable) {
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+        return -1;
+    }
+    auto * src = static_cast<ggml_backend_cuda_context *>(backend_src->context);
+    auto * dst = static_cast<ggml_backend_cuda_context *>(backend_dst->context);
+    const int src_physical = ggml_cuda_get_physical_device(src->device);
+    const int dst_physical = ggml_cuda_get_physical_device(dst->device);
+    if (src_physical == dst_physical) {
+        return 1;
+    }
+    int capable = 0;
+    const cudaError_t query_status = cudaDeviceCanAccessPeer(&capable, src_physical, dst_physical);
+    if (query_status != cudaSuccess) {
+        GGML_LOG_ERROR("%s: CUDA peer capability query failed: %s\n",
+            __func__, cudaGetErrorString(query_status));
+        return -2;
+    }
+    if (capable == 0 || enable == 0) {
+        return capable;
+    }
+    ggml_cuda_set_device(src->device);
+    const cudaError_t enable_status = cudaDeviceEnablePeerAccess(dst_physical, 0);
+    if (enable_status != cudaSuccess && enable_status != cudaErrorPeerAccessAlreadyEnabled) {
+        GGML_LOG_ERROR("%s: CUDA peer enable failed: %s\n",
+            __func__, cudaGetErrorString(enable_status));
+        return -3;
+    }
+    if (enable_status == cudaErrorPeerAccessAlreadyEnabled) {
+        (void) cudaGetLastError();
+    }
+    return 1;
+}
+
+static int ggml_backend_cuda_expert_device_identity(
+        int ordinal, char * uuid, size_t uuid_capacity, int * physical_ordinal) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(ordinal, uuid, uuid_capacity, physical_ordinal);
+    return -2;
+#else
+    if (ordinal < 0 || ordinal >= ggml_cuda_info().device_count || uuid == nullptr ||
+        uuid_capacity < 41 || physical_ordinal == nullptr) {
+        return -1;
+    }
+    const int physical = ggml_cuda_get_physical_device(ordinal);
+    cudaDeviceProp properties;
+    const cudaError_t status = cudaGetDeviceProperties(&properties, physical);
+    if (status != cudaSuccess) {
+        return -2;
+    }
+    const unsigned char * b = reinterpret_cast<const unsigned char *>(properties.uuid.bytes);
+    snprintf(uuid, uuid_capacity,
+        "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    *physical_ordinal = physical;
+    return 0;
+#endif
+}
+
+static int ggml_backend_cuda_expert_peer_diagnostics(
+        ggml_backend_t backend, uint32_t source_expert_device,
+        uint64_t * values, size_t value_count) {
+    if (!ggml_backend_is_cuda(backend) || values == nullptr || value_count < 17) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (source_expert_device >= context->expert_device_count ||
+        source_expert_device == context->expert_device_id) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+    auto & edge = context->expert_host_staging_edges[source_expert_device];
+    if (!edge.configured) {
+        return -2;
+    }
+    if (context->expert_peer_transport == 0) {
+        ggml_cuda_set_device(edge.dst_device);
+        for (auto & slot : edge.slots) {
+            if (!slot.h2d_recorded ||
+                slot.state != ggml_backend_cuda_context::expert_host_staging_slot_state::in_flight) {
+                continue;
+            }
+            const cudaError_t status = cudaEventQuery(slot.h2d_complete);
+            if (status == cudaSuccess) {
+                if (!ggml_cuda_expert_complete_peer_slot_locked(
+                        edge, slot, slot.h2d_generation, true,
+                        ggml_backend_cuda_context::expert_host_staging_slot_state::free)) {
+                    return -4;
+                }
+            } else if (status != cudaErrorNotReady) {
+                slot.state = ggml_backend_cuda_context::expert_host_staging_slot_state::failed;
+                return -3;
+            }
+        }
+    }
+    values[0] = edge.src_expert_device;
+    values[1] = edge.dst_expert_device;
+    values[2] = edge.host_staged_bytes;
+    values[3] = edge.host_staged_copies;
+    values[4] = context->expert_peer_transport == 0 ? edge.slots.size() : 0;
+    values[5] = edge.peak_in_flight;
+    values[6] = edge.reuse_waits;
+    values[7] = edge.cross_device_event_waits;
+    values[8] = edge.cpu_blocking_us;
+    values[9] = edge.enqueues;
+    values[10] = edge.completions;
+    values[11] = edge.unexpected_host_synchronizations;
+    values[12] = edge.peer_bytes;
+    values[13] = edge.peer_copies;
+    values[14] = context->expert_test_delay_enqueues.load(std::memory_order_acquire);
+    values[15] = context->expert_test_delay_completions.load(std::memory_order_acquire);
+    values[16] = context->expert_test_delay_requested_us.load(std::memory_order_acquire);
+    if (value_count >= 24) {
+        values[17] = edge.stale_completions;
+        values[18] = edge.cancellation_requests;
+        values[19] = edge.cancellations_during_d2h;
+        values[20] = edge.cancellations_during_h2d;
+        values[21] = edge.cancellation_drains;
+        values[22] = edge.rejected_enqueues;
+        values[23] = edge.live_slots;
+    }
+    return 0;
+}
+
+// Evidence-only device-completion perturbation. The callback blocks only the
+// selected CUDA stream; the host thread enqueuing graph work never sleeps.
+static int ggml_backend_cuda_expert_enqueue_stream_delay(
+        ggml_backend_t backend, uint64_t delay_us) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(backend, delay_us);
+    return -2;
+#else
+    if (!ggml_backend_is_cuda(backend) || delay_us == 0 || delay_us > 1000000) {
+        return -1;
+    }
+    struct delay_payload {
+        uint64_t delay_us;
+        std::atomic<uint64_t> * completions;
+    };
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto * payload = new (std::nothrow) delay_payload {
+        delay_us, &context->expert_test_delay_completions,
+    };
+    if (payload == nullptr) {
+        return -3;
+    }
+    ggml_cuda_set_device(context->device);
+    const cudaError_t status = cudaLaunchHostFunc(context->stream(), [](void * data) {
+        std::unique_ptr<delay_payload> owned(static_cast<delay_payload *>(data));
+        std::this_thread::sleep_for(std::chrono::microseconds(owned->delay_us));
+        owned->completions->fetch_add(1, std::memory_order_release);
+    }, payload);
+    if (status != cudaSuccess) {
+        delete payload;
+        return -3;
+    }
+    context->expert_test_delay_enqueues.fetch_add(1, std::memory_order_release);
+    context->expert_test_delay_requested_us.fetch_add(delay_us, std::memory_order_release);
+    return 0;
+#endif
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2498,10 +3146,151 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
+            const bool explicit_expert_transport =
+                cuda_ctx_src->expert_peer_transport >= 0 || cuda_ctx_dst->expert_peer_transport >= 0;
+            if (explicit_expert_transport &&
+                cuda_ctx_src->expert_peer_transport != cuda_ctx_dst->expert_peer_transport) {
+                GGML_ABORT("routed-expert peer transport is not configured consistently");
+            }
+            if (explicit_expert_transport && cuda_ctx_src->expert_peer_transport == 0) {
+                const size_t bytes = ggml_nbytes(dst);
+                using slot_state = ggml_backend_cuda_context::expert_host_staging_slot_state;
+                const uint32_t src_expert_device = cuda_ctx_src->expert_device_id;
+                ggml_backend_cuda_context::expert_host_staging_edge * edge = nullptr;
+                ggml_backend_cuda_context::expert_host_staging_slot * slot = nullptr;
+                bool prior_h2d_in_flight = false;
+                bool prior_h2d_completed = false;
+                uint64_t prior_generation = 0;
+                uint64_t next_generation = 0;
+                {
+                    std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                    if (src_expert_device >= cuda_ctx_dst->expert_device_count) {
+                        GGML_ABORT("routed-expert HOST_STAGED source is outside the sealed topology");
+                    }
+                    edge = &cuda_ctx_dst->expert_host_staging_edges[src_expert_device];
+                    if (!edge->configured || edge->src_device != cuda_ctx_src->device ||
+                        edge->dst_device != cuda_ctx_dst->device) {
+                        GGML_ABORT("routed-expert HOST_STAGED directed edge is not configured");
+                    }
+                    if (!edge->accepting) {
+                        edge->rejected_enqueues++;
+                        GGML_ABORT("routed-expert HOST_STAGED directed edge is closed");
+                    }
+                    slot = &edge->slots[edge->next_slot];
+                    edge->next_slot = (edge->next_slot + 1)%edge->slots.size();
+                    if (slot->state == slot_state::failed ||
+                        slot->state == slot_state::reserved ||
+                        bytes > slot->capacity || slot->generation == UINT64_MAX) {
+                        GGML_ABORT("routed-expert HOST_STAGED slot invariant failed");
+                    }
+                    prior_generation = slot->generation;
+                    next_generation = prior_generation + 1;
+                    prior_h2d_in_flight = slot->h2d_recorded && slot->state == slot_state::in_flight;
+                    slot->state = slot_state::reserved;
+                }
+
+                if (prior_h2d_in_flight) {
+                    ggml_cuda_set_device(cuda_ctx_dst->device);
+                    const cudaError_t query_status = cudaEventQuery(slot->h2d_complete);
+                    if (query_status == cudaSuccess) {
+                        std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                        if (!ggml_cuda_expert_complete_peer_slot_locked(
+                                *edge, *slot, prior_generation, true, slot_state::reserved)) {
+                            slot->state = slot_state::failed;
+                            GGML_ABORT("routed-expert HOST_STAGED stale completion generation");
+                        }
+                        prior_h2d_completed = true;
+                    } else if (query_status == cudaErrorNotReady) {
+                        ggml_cuda_set_device(cuda_ctx_src->device);
+                        const cudaError_t wait_status = cudaStreamWaitEvent(
+                            cuda_ctx_src->stream(), slot->h2d_complete, 0);
+                        if (wait_status != cudaSuccess) {
+                            std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                            slot->state = slot_state::failed;
+                            GGML_ABORT("routed-expert HOST_STAGED slot-reuse dependency failed");
+                        }
+                        std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                        edge->reuse_waits++;
+                        edge->cross_device_event_waits++;
+                        // The prior generation is now terminally ordered ahead
+                        // of the new D2H on this source stream. Count that
+                        // completion once; the slot remains live for the new
+                        // generation and is observed again only after its H2D.
+                        if (!ggml_cuda_expert_complete_peer_slot_locked(
+                                *edge, *slot, prior_generation, false, slot_state::reserved)) {
+                            slot->state = slot_state::failed;
+                            GGML_ABORT("routed-expert HOST_STAGED stale reuse generation");
+                        }
+                    } else {
+                        std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                        slot->state = slot_state::failed;
+                        GGML_ABORT("routed-expert HOST_STAGED completion query failed");
+                    }
+                }
+
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                cudaError_t status = ggml_cuda_expert_enqueue_peer_test_gate(
+                    cuda_ctx_dst, src_expert_device, GGML_CUDA_EXPERT_PEER_TEST_PHASE_D2H,
+                    cuda_ctx_src->stream());
+                if (status == cudaSuccess) {
+                    status = cudaMemcpyAsync(slot->data, src->data, bytes,
+                        cudaMemcpyDeviceToHost, cuda_ctx_src->stream());
+                }
+                if (status == cudaSuccess) {
+                    status = cudaEventRecord(slot->d2h_complete, cuda_ctx_src->stream());
+                }
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                if (status == cudaSuccess) {
+                    status = cudaStreamWaitEvent(cuda_ctx_dst->stream(), slot->d2h_complete, 0);
+                }
+                if (status == cudaSuccess) {
+                    status = ggml_cuda_expert_enqueue_peer_test_gate(
+                        cuda_ctx_dst, src_expert_device, GGML_CUDA_EXPERT_PEER_TEST_PHASE_H2D,
+                        cuda_ctx_dst->stream());
+                }
+                if (status == cudaSuccess) {
+                    status = cudaMemcpyAsync(dst->data, slot->data, bytes,
+                        cudaMemcpyHostToDevice, cuda_ctx_dst->stream());
+                }
+                if (status == cudaSuccess) {
+                    status = cudaEventRecord(slot->h2d_complete, cuda_ctx_dst->stream());
+                }
+                {
+                    std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                    if (status != cudaSuccess) {
+                        slot->state = slot_state::failed;
+                        GGML_ABORT("routed-expert HOST_STAGED asynchronous enqueue failed");
+                    }
+                    slot->generation = next_generation;
+                    slot->d2h_generation = next_generation;
+                    slot->h2d_generation = next_generation;
+                    slot->state = slot_state::in_flight;
+                    slot->d2h_recorded = true;
+                    slot->h2d_recorded = true;
+                    if (!prior_h2d_in_flight || prior_h2d_completed) {
+                        edge->live_slots++;
+                    }
+                    edge->peak_in_flight = std::max<uint64_t>(edge->peak_in_flight, edge->live_slots);
+                    edge->host_staged_bytes += bytes;
+                    edge->host_staged_copies++;
+                    edge->cross_device_event_waits++;
+                    edge->enqueues++;
+                }
+                return true;
+            }
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            if (explicit_expert_transport && cuda_ctx_src->expert_peer_transport == 1) {
+                std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                auto & edge = cuda_ctx_dst->expert_host_staging_edges[cuda_ctx_src->expert_device_id];
+                if (!edge.configured) {
+                    GGML_ABORT("routed-expert P2P directed edge is not configured");
+                }
+                edge.peer_bytes += ggml_nbytes(dst);
+                edge.peer_copies++;
+            }
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -4229,6 +5018,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
 
 #ifdef USE_CUDA_GRAPH
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -5254,14 +6044,16 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 }
 
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+    ggml_cuda_set_device(dev_ctx->device);
 
     CUDA_CHECK(cudaEventDestroy((cudaEvent_t)event->context));
     delete event;
 }
 
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+    ggml_cuda_set_device(dev_ctx->device);
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
@@ -5393,6 +6185,39 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_uma_checksum") == 0) {
         return (void *)ggml_backend_cuda_uma_checksum;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_configure_peer_transport") == 0) {
+        return (void *)ggml_backend_cuda_expert_configure_peer_transport;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_configure_peer_edge") == 0) {
+        return (void *)ggml_backend_cuda_expert_configure_peer_edge;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_peer_capability") == 0) {
+        return (void *)ggml_backend_cuda_expert_peer_capability;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_device_identity") == 0) {
+        return (void *)ggml_backend_cuda_expert_device_identity;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_peer_diagnostics") == 0) {
+        return (void *)ggml_backend_cuda_expert_peer_diagnostics;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_cancel_peer_edge") == 0) {
+        return (void *)ggml_backend_cuda_expert_cancel_peer_edge;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_set_peer_test_gate") == 0) {
+        return (void *)ggml_backend_cuda_expert_set_peer_test_gate;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_wait_peer_test_gate") == 0) {
+        return (void *)ggml_backend_cuda_expert_wait_peer_test_gate;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_peer_slot_generation_for_testing") == 0) {
+        return (void *)ggml_backend_cuda_expert_peer_slot_generation_for_testing;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_complete_peer_slot_for_testing") == 0) {
+        return (void *)ggml_backend_cuda_expert_complete_peer_slot_for_testing;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_enqueue_stream_delay") == 0) {
+        return (void *)ggml_backend_cuda_expert_enqueue_stream_delay;
     }
     return nullptr;
 }

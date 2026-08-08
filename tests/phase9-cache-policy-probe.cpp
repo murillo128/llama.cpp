@@ -34,36 +34,97 @@ public:
         const char * requested = std::getenv("LLAMA_PERFETTO_CAPTURE");
         enabled = requested != nullptr && std::strcmp(requested, "1") == 0;
         if (!enabled) return;
-        llm_perfetto_trace_config config;
+        llm_perfetto_decode_window_config config;
+        if (!read_env("LLAMA_PERFETTO_WINDOW_REQUEST", config.request_ordinal) ||
+            !read_env("LLAMA_PERFETTO_WINDOW_LAYER", config.routed_layer) ||
+            !read_env("LLAMA_PERFETTO_WINDOW_MS", config.duration_ms) ||
+            !read_env("LLAMA_PERFETTO_WINDOW_SEED", config.selection_seed)) {
+            throw std::runtime_error("Perfetto decode-window environment is incomplete or invalid");
+        }
+        config.trace.cupti_retained_bytes = UINT64_C(128)*1024U*1024U;
         char error[256] = {};
-        if (!llm_perfetto_trace_initialize_system(config, error, sizeof(error)) ||
-            !llm_perfetto_trace_wait_until_active(30000, error, sizeof(error))) {
-            throw std::runtime_error(std::string("Perfetto/CUPTI activation failed: ") + error);
+        if (!llm_perfetto_trace_arm_decode_window(config, error, sizeof(error))) {
+            throw std::runtime_error(std::string("Perfetto/CUPTI decode-window arm failed: ") + error);
         }
     }
 
     ~perfetto_evidence_owner() {
-        if (!enabled) return;
+        if (!enabled || close_attempted) return;
         char error[256] = {};
-        const bool stopped = llm_perfetto_trace_request_stop(error, sizeof(error)) &&
-            llm_perfetto_trace_wait_until_inactive(30000, error, sizeof(error)) &&
-            llm_perfetto_trace_shutdown(error, sizeof(error));
-        if (!stopped) {
+        if (!close(error, sizeof(error))) {
             std::fprintf(stderr, "phase9-cache-policy-probe: Perfetto/CUPTI closeout failed: %s\n", error);
             std::fflush(stderr);
             std::_Exit(90);
         }
     }
 
+    bool close(char * error, size_t error_capacity) noexcept {
+        if (!enabled) return true;
+        if (close_attempted) return closed;
+        close_attempted = true;
+        closed = llm_perfetto_trace_wait_for_decode_window(120000, error, error_capacity) &&
+            llm_perfetto_trace_shutdown(error, error_capacity);
+        return closed;
+    }
+
 private:
+    template<typename T>
+    static bool read_env(const char * name, T & destination) noexcept {
+        const char * text = std::getenv(name);
+        if (text == nullptr || *text == '\0') return false;
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(text, &end, 10);
+        if (errno != 0 || end == text || *end != '\0' || parsed > uint64_t(std::numeric_limits<T>::max())) {
+            return false;
+        }
+        destination = T(parsed);
+        return true;
+    }
+
     bool enabled = false;
+    bool close_attempted = false;
+    bool closed = false;
 };
+
+json perfetto_diagnostics_json(const llm_perfetto_trace_diagnostics & value) {
+    return {
+        {"compiled", value.compiled}, {"initialized", value.initialized},
+        {"track_event_active", value.track_event_active}, {"cupti_capable", value.cupti_capable},
+        {"cupti_active", value.cupti_active}, {"shutdown", value.shutdown},
+        {"perfetto_sessions_started", value.perfetto_sessions_started},
+        {"perfetto_sessions_stopped", value.perfetto_sessions_stopped},
+        {"cupti_version", value.cupti_version}, {"clock_start_ns", value.clock_start_ns},
+        {"clock_stop_ns", value.clock_stop_ns}, {"cupti_errors", value.cupti_errors},
+        {"cupti_records", value.cupti_records}, {"cupti_dropped_records", value.cupti_dropped_records},
+        {"cupti_retained_bytes", value.cupti_retained_bytes},
+        {"cupti_retained_capacity_bytes", value.cupti_retained_capacity_bytes},
+        {"cupti_peak_buffer_bytes", value.cupti_peak_buffer_bytes},
+        {"cupti_active_buffer_bytes_at_close", value.cupti_active_buffer_bytes_at_close},
+        {"cupti_peak_total_bytes", value.cupti_peak_total_bytes},
+        {"cupti_unknown_timestamps", value.cupti_unknown_timestamps},
+        {"cupti_unmatched_correlations", value.cupti_unmatched_correlations},
+        {"cupti_kernel_records", value.cupti_kernel_records},
+        {"cupti_memcpy_records", value.cupti_memcpy_records},
+        {"cupti_synchronization_records", value.cupti_synchronization_records},
+        {"cupti_unsupported_records", value.cupti_unsupported_records},
+        {"cupti_enabled_kind_count", value.cupti_enabled_kind_count},
+        {"decode_window_armed", value.decode_window_armed},
+        {"decode_window_triggered", value.decode_window_triggered},
+        {"decode_window_complete", value.decode_window_complete},
+        {"decode_window_request_ordinal", value.decode_window_request_ordinal},
+        {"decode_window_routed_layer", value.decode_window_routed_layer},
+        {"decode_window_requested_ms", value.decode_window_requested_ms},
+        {"decode_window_selection_seed", value.decode_window_selection_seed},
+    };
+}
 #endif
 
 struct arguments {
     std::string model;
     std::string output;
     std::string mode = "cold";
+    std::string expert_runtime_mode = "COMPLIANCE";
     std::string prompt = "According to all known laws";
     std::string hot_policy = "LRU";
     std::string cold_policy = "LRU";
@@ -73,6 +134,14 @@ struct arguments {
     uint32_t hot_slots = 16;
     uint64_t cold_bytes = 64U*1024U*1024U;
     uint64_t ring_bytes = 16U*1024U*1024U;
+    uint32_t expert_devices = 1;
+    std::string peer_transport = "HOST_STAGED";
+    uint64_t peer_staging_bytes = 0;
+    uint32_t delayed_device = UINT32_MAX;
+    uint64_t device_delay_us = 0;
+    uint32_t failed_device = UINT32_MAX;
+    bool expect_device_failure = false;
+    bool fail_device_decode_only = false;
     uint32_t queue_depth = 0;
     uint32_t trace_capacity = 0;
     uint32_t ratio = 7500;
@@ -126,6 +195,11 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         if (option == "--model") result.model = value;
         else if (option == "--output") result.output = value;
         else if (option == "--mode") result.mode = value;
+        else if (option == "--expert-runtime-mode") {
+            result.expert_runtime_mode = value;
+            if (result.expert_runtime_mode != "COMPLIANCE" &&
+                result.expert_runtime_mode != "PRODUCTION_PERFORMANCE") return false;
+        }
         else if (option == "--prompt") result.prompt = value;
         else if (option == "--hot-policy") result.hot_policy = value;
         else if (option == "--cold-policy") result.cold_policy = value;
@@ -135,6 +209,27 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--hot-slots") { if (!parse_u32(value, result.hot_slots)) return false; }
         else if (option == "--cold-bytes") { if (!parse_u64(value, result.cold_bytes)) return false; }
         else if (option == "--ring-bytes") { if (!parse_u64(value, result.ring_bytes)) return false; }
+        else if (option == "--expert-devices") {
+            if (!parse_u32(value, result.expert_devices) || result.expert_devices == 0 ||
+                result.expert_devices > LLM_EXPERT_MAX_DEVICES) return false;
+        } else if (option == "--peer-transport") {
+            result.peer_transport = value;
+            if (result.peer_transport != "HOST_STAGED" && result.peer_transport != "P2P") return false;
+        } else if (option == "--peer-staging-bytes") {
+            if (!parse_u64(value, result.peer_staging_bytes)) return false;
+        } else if (option == "--delay-device") {
+            if (!parse_u32(value, result.delayed_device)) return false;
+        } else if (option == "--device-delay-us") {
+            if (!parse_u64(value, result.device_delay_us) || result.device_delay_us > 1000000) return false;
+        } else if (option == "--fail-device") {
+            if (!parse_u32(value, result.failed_device)) return false;
+        } else if (option == "--expect-device-failure") {
+            if (std::string(value) != "0" && std::string(value) != "1") return false;
+            result.expect_device_failure = std::string(value) == "1";
+        } else if (option == "--fail-device-decode-only") {
+            if (std::string(value) != "0" && std::string(value) != "1") return false;
+            result.fail_device_decode_only = std::string(value) == "1";
+        }
         else if (option == "--queue-depth") { if (!parse_u32(value, result.queue_depth)) return false; }
         else if (option == "--trace-capacity") { if (!parse_u32(value, result.trace_capacity)) return false; }
         else if (option == "--ratio") { if (!parse_u32(value, result.ratio)) return false; }
@@ -166,6 +261,14 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
     }
     return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ctx > 0 &&
         result.n_batch > 0 && result.n_ubatch > 0 && result.n_ubatch <= result.n_batch &&
+        (result.expert_devices == 1 ? result.peer_staging_bytes == 0 :
+            (result.peer_transport == "HOST_STAGED" ? result.peer_staging_bytes != 0 :
+                result.peer_staging_bytes == 0)) &&
+        ((result.delayed_device == UINT32_MAX && result.device_delay_us == 0) ||
+            (result.delayed_device < result.expert_devices && result.device_delay_us != 0)) &&
+        ((result.failed_device == UINT32_MAX && !result.expect_device_failure) ||
+            (result.failed_device < result.expert_devices && result.expect_device_failure)) &&
+        (!result.fail_device_decode_only || result.failed_device < result.expert_devices) &&
         (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold");
 }
 
@@ -241,7 +344,8 @@ json config_json(const llm_expert_cache_policy_diagnostics & diagnostics) {
         {"schema_version", "cache-policy-config-v1"}, {"policy", policy_name(value.policy)},
         {"scope", scope_name(value.scope)}, {"slru_protected_ratio_bps", value.slru_protected_ratio_bps},
         {"admission", admission_name(value.admission)}, {"admission_window_events", value.admission_window_events},
-        {"lfu_aging_interval_events", value.lfu_aging_interval_events}, {"digest", value.digest},
+        {"lfu_aging_interval_events", value.lfu_aging_interval_events},
+        {"state_attestation_enabled", value.state_attestation}, {"digest", value.digest},
     };
 }
 
@@ -410,6 +514,7 @@ json async_diagnostics_json(const llm_expert_async_diagnostics & value) {
         {"io_uring_runtime_error", value.io_uring_runtime_error}, {"opcode_read", value.opcode_read},
         {"opcode_readv", value.opcode_readv}, {"opcode_async_cancel", value.opcode_async_cancel},
         {"opcode_read_fixed", value.opcode_read_fixed}, {"worker_started", value.worker_started},
+        {"worker_count", value.worker_count},
         {"admission_closed", value.admission_closed},
     };
 }
@@ -465,6 +570,31 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "phase9-cache-policy-probe: CUDA/GPU backend required\n");
             return 2;
         }
+        std::vector<ggml_backend_dev_t> selected_devices;
+        for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+            ggml_backend_dev_t device = ggml_backend_dev_get(index);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(device, &props);
+            if (props.type == GGML_BACKEND_DEVICE_TYPE_GPU && props.device_id != nullptr &&
+                reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+                selected_devices.push_back(device);
+            }
+        }
+        std::sort(selected_devices.begin(), selected_devices.end(), [](ggml_backend_dev_t lhs, ggml_backend_dev_t rhs) {
+            ggml_backend_dev_props lhs_props;
+            ggml_backend_dev_props rhs_props;
+            ggml_backend_dev_get_props(lhs, &lhs_props);
+            ggml_backend_dev_get_props(rhs, &rhs_props);
+            return std::strcmp(lhs_props.device_id, rhs_props.device_id) < 0;
+        });
+        if (selected_devices.size() < args.expert_devices) {
+            std::fprintf(stderr, "phase9-cache-policy-probe: requested %u CUDA devices, found %zu\n",
+                args.expert_devices, selected_devices.size());
+            return 2;
+        }
+        selected_devices.resize(args.expert_devices);
+        selected_devices.push_back(nullptr);
         const auto hot_config = make_config(args.hot_policy, args, true);
         const auto cold_config = make_config(args.cold_policy, args, false);
         const llama_expert_auto_cost_model auto_cost = {
@@ -479,6 +609,9 @@ int main(int argc, char ** argv) {
             { nullptr, nullptr },
         };
         auto model_params = llama_model_default_params();
+        model_params.devices = selected_devices.data();
+        model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+        model_params.main_gpu = 0;
         model_params.load_mode = args.transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         model_params.expert_io_queue_depth = args.queue_depth;
         model_params.expert_io_trace_capacity = args.trace_capacity;
@@ -487,6 +620,12 @@ int main(int argc, char ** argv) {
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_weights_mode = args.mode == "disabled" ? LLAMA_EXPERT_WEIGHTS_MODE_DISABLED :
             args.mode == "cold" ? LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
+        model_params.expert_runtime_mode = args.expert_runtime_mode == "COMPLIANCE" ?
+            LLAMA_EXPERT_RUNTIME_MODE_COMPLIANCE : LLAMA_EXPERT_RUNTIME_MODE_PERFORMANCE;
+        model_params.expert_device_count = args.expert_devices;
+        model_params.expert_peer_transport = args.peer_transport == "P2P" ?
+            LLAMA_EXPERT_PEER_TRANSPORT_P2P : LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED;
+        model_params.expert_peer_staging_bytes = args.peer_staging_bytes;
         if (args.mode != "disabled") {
             model_params.expert_hot_cache_capacity = args.hot_slots;
             model_params.expert_hot_cache_policy = args.config_source == "NULL" ? nullptr : &hot_config;
@@ -516,6 +655,13 @@ int main(int argc, char ** argv) {
         context_params.n_batch = args.n_batch;
         context_params.n_ubatch = args.n_ubatch;
         context_params.no_perf = false;
+        if (provider != nullptr && args.delayed_device != UINT32_MAX &&
+            !provider->debug_set_device_delay_for_testing(
+                llm_expert_device_id(args.delayed_device), args.device_delay_us).is_ready()) return 4;
+        if (provider != nullptr && args.failed_device != UINT32_MAX &&
+            !provider->debug_set_device_failure_for_testing(
+                llm_expert_device_id(args.failed_device), true,
+                args.fail_device_decode_only).is_ready()) return 4;
         llama_context_ptr context(llama_init_from_model(model.get(), context_params));
         if (!context) return 6;
         route_capture routes;
@@ -527,6 +673,7 @@ int main(int argc, char ** argv) {
         std::vector<uint64_t> latency_us;
         llama_batch batch = llama_batch_get_one(prompt.data(), prompt.size());
         const int n_vocab = llama_vocab_n_tokens(vocab);
+        bool expected_device_failure_observed = false;
         for (int step = 0; step < args.max_generate; ++step) {
             const auto phase = step == 0 ? LLAMA_ROUTE_PHASE_PREFILL : LLAMA_ROUTE_PHASE_DECODE;
             if (args.observe_routes &&
@@ -554,6 +701,11 @@ int main(int argc, char ** argv) {
                     failed.effective_capacity, failed.cold_effective_slots, failed.last_logical_ids.size(),
                     (unsigned long long) failed.cpu_execution_lanes,
                     (unsigned long long) failed.gpu_execution_lanes);
+                if (args.expect_device_failure &&
+                    failed.last_remap_error == llm_expert_provider_error::copy_failed) {
+                    expected_device_failure_observed = true;
+                    break;
+                }
                 return 9;
             }
             llama_synchronize(context.get());
@@ -641,6 +793,21 @@ int main(int argc, char ** argv) {
             if (llama_vocab_is_eog(vocab, next)) break;
             batch = llama_batch_get_one(&generated.back(), 1);
         }
+        if (args.expect_device_failure && !expected_device_failure_observed) {
+            std::fprintf(stderr, "phase9-cache-policy-probe: expected device failure was not observed\n");
+            return 9;
+        }
+#if defined(LLAMA_PERFETTO)
+        char perfetto_error[256] = {};
+        if (!trace_owner.close(perfetto_error, sizeof(perfetto_error))) {
+            std::fprintf(stderr, "phase9-cache-policy-probe: Perfetto/CUPTI closeout failed: %s\n", perfetto_error);
+            return 13;
+        }
+        const json perfetto_diagnostics = perfetto_diagnostics_json(llm_perfetto_trace_get_diagnostics());
+#else
+        const json perfetto_diagnostics = nullptr;
+#endif
+        const auto peer_transport_diagnostics = context->expert_peer_transport_diagnostics();
         // Releasing the context closes the provider request, drains or cancels
         // every background flight, and emits all reserved policy terminals.
         // Evidence must never accept a live provisional transcript prefix.
@@ -655,6 +822,7 @@ int main(int argc, char ** argv) {
             json output = {
                 {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
                 {"command", command}, {"model_path", args.model}, {"mode", args.mode},
+                {"expert_runtime_mode", args.expert_runtime_mode},
                 {"provider_enabled", false}, {"prompt", prompt_text},
                 {"runtime", {
                     {"n_ctx", args.n_ctx},
@@ -666,6 +834,7 @@ int main(int argc, char ** argv) {
                 {"logits_fnv64", logits_digests}, {"latency_us", latency_us},
                 {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},
                 {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
+                {"perfetto", perfetto_diagnostics},
             };
             std::ofstream destination(args.output, std::ios::binary | std::ios::trunc);
             if (!destination) return 12;
@@ -703,23 +872,131 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
+        json device_diagnostics = json::array();
+        for (const auto & device : diagnostics.devices) {
+            device_diagnostics.push_back({
+                {"device_id", device.device_id}, {"cuda_ordinal", device.cuda_ordinal},
+                {"pci_bdf", device.pci_bdf}, {"uuid", device.uuid},
+                {"hot_requested_slots", device.requested_capacity},
+                {"hot_effective_slots", device.effective_capacity}, {"hot_occupancy", device.occupancy},
+                {"hot_pool_bytes", device.pool_bytes}, {"pool_generation", device.pool_generation},
+                {"hot_hits", device.hits}, {"hot_misses", device.misses},
+                {"hot_admissions", device.admissions}, {"hot_evictions", device.evictions},
+                {"h2d_bytes", device.h2d_bytes}, {"ring_requested_bytes", device.ring_requested_bytes},
+                {"ring_actual_bytes", device.ring_actual_bytes},
+                {"ring_pinned_or_registered_bytes", device.ring_pinned_or_registered_bytes},
+                {"ring_lane_reservations", device.ring_lane_reservations},
+                {"ring_stage_bytes", device.ring_stage_bytes},
+                {"ring_h2d_bytes", device.ring_h2d_bytes},
+                {"ring_h2d_time_us", device.ring_h2d_time_us},
+                {"ring_waves", device.ring_waves},
+                {"ring_async_enqueues", device.ring_async_enqueues},
+                {"ring_h2d_event_records", device.ring_h2d_event_records},
+                {"ring_h2d_event_waits", device.ring_h2d_event_waits},
+                {"ring_h2d_event_synchronizations", device.ring_h2d_event_synchronizations},
+                {"ring_live_events", device.ring_live_events},
+                {"ring_peak_in_flight_lanes", device.ring_peak_in_flight_lanes},
+                {"ring_first_h2d_enqueue_us", device.ring_first_h2d_enqueue_us},
+                {"ring_last_h2d_complete_us", device.ring_last_h2d_complete_us},
+                {"scheduler", {
+                    {"request_capacity", device.scheduler_request_capacity},
+                    {"inflight_capacity", device.scheduler_inflight_capacity},
+                    {"active_requests", device.scheduler_active_requests},
+                    {"peak_active_requests", device.scheduler_peak_active_requests},
+                    {"queued_requests", device.scheduler_queued_requests},
+                    {"inflight_requests", device.scheduler_inflight_requests},
+                    {"peak_inflight_requests", device.scheduler_peak_inflight_requests},
+                    {"reserved_storage_bytes", device.scheduler_reserved_storage_bytes},
+                    {"peak_reserved_storage_bytes", device.scheduler_peak_reserved_storage_bytes},
+                    {"reserved_h2d_bytes", device.scheduler_reserved_h2d_bytes},
+                    {"peak_reserved_h2d_bytes", device.scheduler_peak_reserved_h2d_bytes},
+                    {"terminal_complete", device.scheduler_terminal_complete},
+                    {"terminal_failed", device.scheduler_terminal_failed},
+                    {"terminal_cancelled", device.scheduler_terminal_cancelled},
+                    {"terminal_releases", device.scheduler_terminal_releases},
+                    {"stale_completions", device.scheduler_stale_completions},
+                }},
+            });
+        }
+        json peer_diagnostics = json::array();
+        for (const auto & device : peer_transport_diagnostics) {
+            peer_diagnostics.push_back({
+                {"source_device_id", device.source_device_id}, {"device_id", device.device_id},
+                {"host_staged_bytes", device.host_staged_bytes},
+                {"host_staged_copies", device.host_staged_copies},
+                {"host_staging_slots", device.host_staging_slots},
+                {"host_staging_peak_in_flight", device.host_staging_peak_in_flight},
+                {"host_staging_reuse_waits", device.host_staging_reuse_waits},
+                {"cross_device_event_waits", device.cross_device_event_waits},
+                {"host_staged_blocking_us", device.host_staged_blocking_us},
+                {"host_staging_enqueues", device.host_staging_enqueues},
+                {"host_staging_completions", device.host_staging_completions},
+                {"unexpected_host_synchronizations", device.unexpected_host_synchronizations},
+                {"stale_staging_completions", device.stale_staging_completions},
+                {"staging_cancellation_requests", device.staging_cancellation_requests},
+                {"staging_cancellations_during_d2h", device.staging_cancellations_during_d2h},
+                {"staging_cancellations_during_h2d", device.staging_cancellations_during_h2d},
+                {"staging_cancellation_drains", device.staging_cancellation_drains},
+                {"staging_rejected_enqueues", device.staging_rejected_enqueues},
+                {"host_staging_live_slots", device.host_staging_live_slots},
+                {"peer_bytes", device.peer_bytes}, {"peer_copies", device.peer_copies},
+                {"branch_delay_enqueues_for_testing", device.branch_delay_enqueues_for_testing},
+                {"branch_delay_completions_for_testing", device.branch_delay_completions_for_testing},
+                {"branch_delay_requested_us_for_testing", device.branch_delay_requested_us_for_testing},
+            });
+        }
         json output = {
             {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
             {"command", command}, {"model_path", args.model}, {"mode", args.mode},
+            {"expert_runtime_mode", args.expert_runtime_mode},
             {"prompt", prompt_text},
             {"transport_requested", args.transport},
             {"config_source", args.config_source},
             {"miss_policy", args.miss_policy}, {"background", args.background},
+            {"multi_gpu", {
+                {"device_count", args.expert_devices}, {"devices", device_diagnostics},
+                {"peer_transport", args.peer_transport},
+                {"peer_staging_bytes", args.peer_staging_bytes},
+                {"delayed_device", args.delayed_device == UINT32_MAX ? -1 : int64_t(args.delayed_device)},
+                {"device_delay_us", args.device_delay_us},
+                {"failed_device", args.failed_device == UINT32_MAX ? -1 : int64_t(args.failed_device)},
+                {"failed_device_decode_only", args.fail_device_decode_only},
+                {"expected_device_failure", args.expect_device_failure},
+                {"expected_device_failure_observed", expected_device_failure_observed},
+                {"physical_feasibility_skips", diagnostics.physical_feasibility_skips},
+                {"physical_feasibility_scan_calls", diagnostics.physical_feasibility_scan_calls},
+                {"physical_feasibility_scan_time_ns", diagnostics.physical_feasibility_scan_time_ns},
+                {"physical_feasibility_scan_max_ns", diagnostics.physical_feasibility_scan_max_ns},
+                {"physical_feasibility_scan_decode_calls", diagnostics.physical_feasibility_scan_decode_calls},
+                {"physical_feasibility_scan_decode_time_ns", diagnostics.physical_feasibility_scan_decode_time_ns},
+                {"physical_feasibility_scan_decode_max_ns", diagnostics.physical_feasibility_scan_decode_max_ns},
+                {"provider_h2d_join_waves", diagnostics.provider_h2d_join_waves},
+                {"provider_h2d_join_time_ns", diagnostics.provider_h2d_join_time_ns},
+                {"provider_h2d_join_max_ns", diagnostics.provider_h2d_join_max_ns},
+                {"provider_h2d_join_decode_waves", diagnostics.provider_h2d_join_decode_waves},
+                {"provider_h2d_join_decode_time_ns", diagnostics.provider_h2d_join_decode_time_ns},
+                {"provider_h2d_join_decode_max_ns", diagnostics.provider_h2d_join_decode_max_ns},
+                {"provider_h2d_async_decode_waves", diagnostics.provider_h2d_async_decode_waves},
+                {"provider_h2d_async_branch_waits", diagnostics.provider_h2d_async_branch_waits},
+                {"injected_device_failure_waves", diagnostics.injected_device_failure_waves},
+                {"injected_device_failure_participants", diagnostics.injected_device_failure_participants},
+                {"injected_device_failure_drained_waves", diagnostics.injected_device_failure_drained_waves},
+                {"directory_device_cells", diagnostics.directory_device_cells},
+                {"directory_owner_only_violations", diagnostics.directory_owner_only_violations},
+                {"peer_diagnostics", peer_diagnostics},
+            }},
             {"runtime", {
                 {"n_ctx", args.n_ctx},
                 {"n_batch", args.n_batch},
                 {"n_ubatch", args.n_ubatch},
                 {"max_generate", args.max_generate},
             }},
+            {"sampling", {{"seed", 1}, {"temperature", 0.0}, {"selection", "argmax"}}},
             {"prompt_ids", prompt}, {"generated_ids", generated}, {"generated_text", generated_text},
             {"logits_fnv64", logits_digests}, {"latency_us", latency_us},
             {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},
             {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
+            {"perfetto", perfetto_diagnostics},
             {"topology", {
                 {"routed_layers", routed_layers}, {"experts_per_layer", diagnostics.n_expert},
                 {"hot_physical_slot_footprint_bytes", hot_footprint},

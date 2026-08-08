@@ -148,6 +148,9 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    const bool expert_multi_device =
+        params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
+        params.expert_device_count > 1;
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -274,7 +277,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     }
 
     // if using single GPU mode, remove all except the main GPU
-    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty()) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty() && !expert_multi_device) {
         if (params.main_gpu < 0) {
             model->devices.clear();
         } else {
@@ -286,6 +289,40 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             model->devices.clear();
             model->devices.push_back(main_gpu);
         }
+    }
+
+    if (expert_multi_device) {
+        if (params.split_mode != LLAMA_SPLIT_MODE_NONE || params.main_gpu < 0 ||
+            model->devices.size() < params.expert_device_count) {
+            LLAMA_LOG_ERROR("%s: multi-device expert mode requires SPLIT_MODE_NONE and all selected CUDA devices\n", __func__);
+            return false;
+        }
+        for (const auto & device : model->devices) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(device.dev, &props);
+            if (device.is_meta || props.type != GGML_BACKEND_DEVICE_TYPE_GPU || props.device_id == nullptr) {
+                LLAMA_LOG_ERROR("%s: multi-device expert mode requires topology-visible discrete CUDA devices\n", __func__);
+                return false;
+            }
+        }
+        std::sort(model->devices.begin(), model->devices.end(), [](const llama_device & lhs, const llama_device & rhs) {
+            ggml_backend_dev_props lhs_props;
+            ggml_backend_dev_props rhs_props;
+            ggml_backend_dev_get_props(lhs.dev, &lhs_props);
+            ggml_backend_dev_get_props(rhs.dev, &rhs_props);
+            return std::strcmp(lhs_props.device_id, rhs_props.device_id) < 0;
+        });
+        for (size_t index = 1; index < model->devices.size(); ++index) {
+            ggml_backend_dev_props prior;
+            ggml_backend_dev_props current;
+            ggml_backend_dev_get_props(model->devices[index - 1].dev, &prior);
+            ggml_backend_dev_get_props(model->devices[index].dev, &current);
+            if (std::strcmp(prior.device_id, current.device_id) == 0) {
+                LLAMA_LOG_ERROR("%s: duplicate multi-device expert PCI identity %s\n", __func__, current.device_id);
+                return false;
+            }
+        }
+        model->devices.resize(params.expert_device_count);
     }
 
     for (const auto & dev : model->devices) {

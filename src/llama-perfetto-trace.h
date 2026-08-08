@@ -102,9 +102,30 @@ struct llm_perfetto_trace_diagnostics {
     uint64_t cupti_retained_bytes = 0;
     uint64_t cupti_retained_capacity_bytes = 0;
     uint64_t cupti_peak_buffer_bytes = 0;
+    uint64_t cupti_active_buffer_bytes_at_close = 0;
     uint64_t cupti_peak_total_bytes = 0;
     uint64_t cupti_unknown_timestamps = 0;
     uint64_t cupti_unmatched_correlations = 0;
+    uint64_t cupti_kernel_records = 0;
+    uint64_t cupti_memcpy_records = 0;
+    uint64_t cupti_synchronization_records = 0;
+    uint64_t cupti_unsupported_records = 0;
+    uint32_t cupti_enabled_kind_count = 0;
+    bool decode_window_armed = false;
+    bool decode_window_triggered = false;
+    bool decode_window_complete = false;
+    uint64_t decode_window_request_ordinal = 0;
+    int32_t decode_window_routed_layer = -1;
+    uint32_t decode_window_requested_ms = 0;
+    uint64_t decode_window_selection_seed = 0;
+};
+
+struct llm_perfetto_decode_window_config {
+    llm_perfetto_trace_config trace;
+    uint64_t request_ordinal = 0;
+    int32_t routed_layer = -1;
+    uint32_t duration_ms = 1000;
+    uint64_t selection_seed = 0;
 };
 
 #if defined(LLAMA_PERFETTO)
@@ -119,6 +140,11 @@ bool llm_perfetto_trace_is_active() noexcept;
 uint64_t llm_perfetto_trace_next_id(llm_perfetto_trace_domain domain) noexcept;
 bool llm_perfetto_trace_cuda_smoke() noexcept;
 llm_perfetto_trace_diagnostics llm_perfetto_trace_get_diagnostics() noexcept;
+bool llm_perfetto_trace_arm_decode_window(
+    const llm_perfetto_decode_window_config & config, char * error, size_t error_capacity) noexcept;
+bool llm_perfetto_trace_maybe_start_decode_window(uint64_t request_ordinal, int32_t routed_layer) noexcept;
+bool llm_perfetto_trace_wait_for_decode_window(
+    uint32_t timeout_ms, char * error, size_t error_capacity) noexcept;
 
 class llm_perfetto_correlation_scope {
 public:
@@ -145,6 +171,10 @@ inline uint64_t llm_perfetto_trace_next_id(llm_perfetto_trace_domain) noexcept {
 
 inline llm_perfetto_trace_diagnostics llm_perfetto_trace_get_diagnostics() noexcept {
     return {};
+}
+
+inline bool llm_perfetto_trace_maybe_start_decode_window(uint64_t, int32_t) noexcept {
+    return true;
 }
 
 #endif

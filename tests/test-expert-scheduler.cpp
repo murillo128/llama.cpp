@@ -205,6 +205,75 @@ void test_layout_class_identity_is_part_of_join_state() {
         llm_expert_schedule_disposition::admitted);
 }
 
+void test_device_qualified_single_flight_and_backpressure() {
+    for (int32_t expert = 0; expert < 16; ++expert) {
+        GGML_ASSERT(llm_expert_owner_device(expert, 2) == llm_expert_device_id(expert & 1));
+    }
+    GGML_ASSERT(llm_expert_owner_device(-1, 2) == LLM_EXPERT_DEVICE_ID_INVALID);
+    GGML_ASSERT(llm_expert_owner_device(0, 0) == LLM_EXPERT_DEVICE_ID_INVALID);
+
+    auto scheduler_config = config(4);
+    scheduler_config.device_count = 2;
+    scheduler_config.per_device_request_capacity = 2;
+    scheduler_config.per_device_inflight_capacity = 1;
+    llm_expert_scheduler scheduler(scheduler_config);
+
+    llm_expert_request_metadata gpu0;
+    gpu0.target_device = 0;
+    gpu0.reserved_storage_bytes = 10;
+    gpu0.reserved_h2d_bytes = 20;
+    llm_expert_request_metadata gpu1 = gpu0;
+    gpu1.target_device = 1;
+
+    const auto first0 = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, gpu0);
+    const auto first1 = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, gpu1);
+    GGML_ASSERT(first0.disposition == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(first1.disposition == llm_expert_schedule_disposition::admitted);
+    GGML_ASSERT(first0.handle.target_device == 0 && first1.handle.target_device == 1);
+    GGML_ASSERT(first0.handle.slot != first1.handle.slot);
+
+    const auto joined0 = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, gpu0);
+    GGML_ASSERT(joined0.disposition == llm_expert_schedule_disposition::joined);
+    GGML_ASSERT(joined0.handle.slot == first0.handle.slot);
+
+    GGML_ASSERT(scheduler.enqueue(
+        { 0, 1 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, gpu0).accepted());
+    GGML_ASSERT(scheduler.enqueue(
+        { 0, 2 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, gpu0).disposition ==
+        llm_expert_schedule_disposition::busy);
+
+    llm_expert_request_snapshot selected0;
+    GGML_ASSERT(scheduler.take_next(selected0).accepted());
+    GGML_ASSERT(selected0.metadata.target_device == 0);
+    llm_expert_request_snapshot selected1;
+    GGML_ASSERT(scheduler.take_next(selected1).accepted());
+    GGML_ASSERT(selected1.metadata.target_device == 1);
+
+    const auto wrong_device = llm_expert_request_handle {
+        selected0.handle.slot, selected0.handle.generation, 1 };
+    GGML_ASSERT(scheduler.transition(wrong_device,
+        llm_expert_request_state::submitting,
+        llm_expert_request_state::host_ready) ==
+        llm_expert_schedule_disposition::stale_generation);
+
+    const auto diagnostics = scheduler.diagnostics();
+    GGML_ASSERT(diagnostics.devices.size() == 2);
+    GGML_ASSERT(diagnostics.devices[0].active_requests == 2);
+    GGML_ASSERT(diagnostics.devices[1].active_requests == 1);
+    GGML_ASSERT(diagnostics.devices[0].inflight_requests == 1);
+    GGML_ASSERT(diagnostics.devices[1].inflight_requests == 1);
+    GGML_ASSERT(diagnostics.devices[0].reserved_storage_bytes == 20);
+    GGML_ASSERT(diagnostics.devices[1].reserved_h2d_bytes == 20);
+}
+
 void test_quiescent_shutdown() {
     llm_expert_scheduler scheduler(config());
     GGML_ASSERT(scheduler.enqueue(
@@ -597,6 +666,7 @@ int main() {
     test_saturation_and_preemption();
     test_stale_completion_and_generation_exhaustion();
     test_layout_class_identity_is_part_of_join_state();
+    test_device_qualified_single_flight_and_backpressure();
     test_quiescent_shutdown();
     test_post_h2d_cancellation_path();
     test_cold_hit_reaches_host_ready_without_io();

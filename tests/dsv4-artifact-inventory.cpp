@@ -312,6 +312,9 @@ int main(int argc, char ** argv) {
                 { "any_bundle_crosses_source_files", any_bundle_crosses_source_files },
                 { "layout_class_count", layout_layers.size() },
                 { "single_fixed_slot_layout_representable", layout_layers.size() == 1 },
+                { "bounded_layout_registry_sealed",
+                    all_expert_axes_contiguous && !layout_layers.empty() &&
+                    layout_layers.size() <= LLM_EXPERT_LAYOUT_CLASS_MAX },
                 { "layout_classes", std::move(layouts) },
             } },
         };
@@ -332,7 +335,8 @@ int main(int argc, char ** argv) {
                   << "\tpayload_backed_tensors=" << result["load"]["payload_backed_tensor_count"]
                   << '\n';
         llama_model_free(model);
-        return layout_layers.size() == 1 ? 0 : 10;
+        return all_expert_axes_contiguous && !layout_layers.empty() &&
+            layout_layers.size() <= LLM_EXPERT_LAYOUT_CLASS_MAX ? 0 : 10;
     } catch (const std::exception & error) {
         std::cerr << "dsv4-artifact-inventory: " << error.what() << '\n';
         llama_model_free(model);

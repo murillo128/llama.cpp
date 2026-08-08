@@ -49,14 +49,6 @@ bool round_up(uint64_t value, uint64_t alignment, uint64_t & result) {
     return remainder == 0 ? (result = value, true) : checked_add(value, alignment - remainder, result);
 }
 
-bool checked_lcm_size(size_t lhs, size_t rhs, size_t & result) {
-    if (lhs == 0 || rhs == 0) return false;
-    const size_t reduced = lhs/std::gcd(lhs, rhs);
-    if (reduced > SIZE_MAX/rhs) return false;
-    result = reduced*rhs;
-    return true;
-}
-
 bool device_is_cuda(ggml_backend_dev_t device) {
     if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) return false;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
@@ -66,7 +58,8 @@ bool device_is_cuda(ggml_backend_dev_t device) {
 bool same_flight(const llm_expert_flight_id & lhs, const llm_expert_flight_id & rhs) {
     return lhs.transport_epoch == rhs.transport_epoch && lhs.request_slot == rhs.request_slot &&
         lhs.request_generation == rhs.request_generation && lhs.key.layer == rhs.key.layer &&
-        lhs.key.expert == rhs.key.expert && lhs.layout_class_id == rhs.layout_class_id;
+        lhs.key.expert == rhs.key.expert && lhs.layout_class_id == rhs.layout_class_id &&
+        lhs.target_device == rhs.target_device;
 }
 
 uint64_t interval_union_intersection_us(
@@ -175,7 +168,6 @@ bool derive_registry_layout(
                 if (axis < 0 || tensor->nb[axis] > SIZE_MAX ||
                     !checked_add(payloads[class_index], tensor->nb[axis], payloads[class_index])) return false;
                 maximum_bytes[role] = std::max<uint64_t>(maximum_bytes[role], tensor->nb[axis]);
-                if (!checked_lcm_size(lane_alignment, ggml_type_size(tensor->type), lane_alignment)) return false;
             }
         }
         if (payloads[class_index] == 0 || payloads[class_index] != layout_class.payload_bytes) return false;
@@ -239,7 +231,7 @@ struct llm_expert_transfer_ring::impl {
     };
 
     impl(llm_transfer_ring_config config, llm_transfer_ring_faults faults) : config(config), faults(faults) {
-        if (config.byte_budget == 0 || config.minimum_lanes == 0 || config.trace_capacity == 0 ||
+        if (config.byte_budget == 0 || config.minimum_lanes == 0 ||
             config.target_device == nullptr ||
             (!config.allow_non_cuda_target_for_testing && !device_is_cuda(config.target_device))) {
             throw std::invalid_argument("invalid transfer-ring budget or target");
@@ -797,7 +789,8 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
         llm_expert_flight_id flight) noexcept {
     LLM_EXPERT_TRACE_SCOPE("k3.transfer", "lane_reserve", "cold_slot", cold.slot,
         "cold_generation", cold.generation, "hot_slot", hot_slot, "hot_generation", hot_generation,
-        "flight_slot", flight.request_slot, "flight_generation", flight.request_generation);
+        "flight_slot", flight.request_slot, "flight_generation", flight.request_generation,
+        "device_id", flight.target_device);
     std::unique_lock<std::mutex> lock(pimpl->mutex);
     if (!pimpl->arena) return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
     uint32_t index = 0;
@@ -845,7 +838,8 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
     reference = { index, lane.generation, lane.layout_class_id };
     pimpl->counters.lane_reservations++;
     LLM_EXPERT_TRACE_INSTANT("k3.transfer", "lane_reserved", "lane", index,
-        "event_generation", lane.generation, "layout_class_id", lane.layout_class_id);
+        "event_generation", lane.generation, "layout_class_id", lane.layout_class_id,
+        "device_id", flight.target_device);
     LLM_EXPERT_TRACE_COUNTER("k3.resource", "transfer_lane_occupancy", 6, pimpl->occupied_lanes());
     return llm_expert_provider_result::success();
 }
@@ -982,7 +976,8 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
             binding.lane.lane, uint32_t(binding.lane.generation), 0);
         LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.transfer", "h2d", trace_id, "lane", binding.lane.lane,
             "event_generation", binding.lane.generation, "hot_slot", binding.hot_slot,
-            "hot_generation", lane.hot_generation, "h2d_bytes", pimpl->payload_for(binding.lane.layout_class_id));
+            "hot_generation", lane.hot_generation, "h2d_bytes", pimpl->payload_for(binding.lane.layout_class_id),
+            "device_id", lane.flight.target_device);
         LLM_EXPERT_TRACE_CUDA_SCOPE(llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight,
             lane.flight.request_slot, uint32_t(lane.flight.request_generation)));
         if (async) lane.state = llm_transfer_lane_state::in_flight;

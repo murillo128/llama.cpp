@@ -2038,6 +2038,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     llm_expert_projection_descriptor cpu_down;
     ggml_tensor * cpu_execution_ids = nullptr;
     bool hybrid_execution = false;
+    bool multi_device_execution = false;
+    std::vector<llm_expert_graph_binding::device_binding> device_execution_bindings;
 
     if (expert_weight_provider && res->get_expert_provider_result().is_ready()) {
         const llm_expert_bundle_descriptor bundle = {
@@ -2071,6 +2073,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             execution_down_exps_s = binding.down.scale;
             execution_ids = binding.execution_ids;
             hybrid_execution = binding.hybrid;
+            multi_device_execution = binding.multi_device;
+            if (multi_device_execution) {
+                device_execution_bindings = binding.devices;
+                // Unlike the hybrid graph, the per-device execution-id inputs do
+                // not depend on the logical-id checkpoint.  Retain the checkpoint
+                // explicitly so the scheduler callback can remap those inputs
+                // before either device branch executes.
+                GGML_ASSERT(binding.checkpoint_ids != nullptr);
+                ggml_build_forward_expand(gf, binding.checkpoint_ids);
+            }
             if (hybrid_execution) {
                 cpu_up = binding.cpu_up;
                 cpu_gate = binding.cpu_gate;
@@ -2088,9 +2100,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // that checkpoint on the CPU scheduler backend so observing it never
                 // host-synchronizes the CUDA compute backend.
                 ggml_backend_sched_set_tensor_backend(
-                    sched, hybrid_execution ? binding.checkpoint_ids : execution_ids, backend_cpu);
+                    sched, (hybrid_execution || multi_device_execution) ?
+                        binding.checkpoint_ids : execution_ids, backend_cpu);
                 if (cpu_execution_ids != nullptr) {
                     ggml_backend_sched_set_tensor_backend(sched, cpu_execution_ids, backend_cpu);
+                }
+                for (const auto & device : binding.devices) {
+                    ggml_backend_sched_set_tensor_backend(sched, device.execution_ids, backend_cpu);
                 }
             }
             res->add_expert_binding(std::move(binding));
@@ -2125,6 +2141,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         GGML_ASSERT(hybrid_gpu_backend != nullptr && hybrid_gpu_backend != backend_cpu);
     }
+    std::vector<ggml_backend_t> device_execution_backends;
+    if (multi_device_execution) {
+        device_execution_backends.resize(device_execution_bindings.size());
+        for (size_t device = 0; device < device_execution_bindings.size(); ++device) {
+            for (int backend_index = 0; backend_index < ggml_backend_sched_get_n_backends(sched); ++backend_index) {
+                ggml_backend_t candidate = ggml_backend_sched_get_backend(sched, backend_index);
+                if (ggml_backend_get_device(candidate) == device_execution_bindings[device].target_device) {
+                    device_execution_backends[device] = candidate;
+                    break;
+                }
+            }
+            GGML_ASSERT(device_execution_backends[device] != nullptr &&
+                device_execution_backends[device] != backend_cpu);
+        }
+    }
 
     auto build_expert_branch = [&](ggml_tensor * branch_up_exps,
                                    ggml_tensor * branch_up_exps_b,
@@ -2139,7 +2170,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                                    ggml_tensor * branch_down_exps_s,
                                    ggml_tensor * branch_ids,
                                    bool inactive_capable,
-                                   const char * branch_name) -> ggml_tensor * {
+                                   const char * branch_name,
+                                   ggml_backend_t branch_backend) -> ggml_tensor * {
         ggml_tensor * branch_input = cur;
         ggml_tensor * branch_cur = branch_input;
         ggml_tensor * branch_up = nullptr;
@@ -2150,11 +2182,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 char tagged[96];
                 snprintf(tagged, sizeof(tagged), "%s_%s", name, branch_name);
                 cb(tensor, tagged, il);
-                if (strcmp(branch_name, "cpu") == 0) {
-                    ggml_backend_sched_set_tensor_backend(sched, tensor, backend_cpu);
-                } else if (strcmp(branch_name, "gpu") == 0) {
-                    ggml_backend_sched_set_tensor_backend(sched, tensor, hybrid_gpu_backend);
-                }
+                GGML_ASSERT(branch_backend != nullptr);
+                ggml_backend_sched_set_tensor_backend(sched, tensor, branch_backend);
             }
         };
 
@@ -2325,17 +2354,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return branch_experts;
     };
 
-    ggml_tensor * experts = build_expert_branch(
-        execution_up_exps, execution_up_exps_b, execution_gate_exps, execution_gate_exps_b,
-        execution_gate_up_exps, execution_gate_up_exps_b, execution_down_exps, execution_down_exps_b,
-        execution_up_exps_s, execution_gate_exps_s, execution_down_exps_s, execution_ids,
-        hybrid_execution, hybrid_execution ? "gpu" : nullptr);
+    ggml_tensor * experts = nullptr;
+    if (multi_device_execution) {
+        for (size_t device = 0; device < device_execution_bindings.size(); ++device) {
+            const auto & branch = device_execution_bindings[device];
+            char branch_name[32];
+            snprintf(branch_name, sizeof(branch_name), "device_%zu", device);
+            ggml_tensor * device_experts = build_expert_branch(
+                branch.up.weight, branch.up.bias, branch.gate.weight, branch.gate.bias,
+                branch.gate_up.weight, branch.gate_up.bias, branch.down.weight, branch.down.bias,
+                branch.gate_up.weight ? branch.gate_up.scale : branch.up.scale,
+                branch.gate.scale, branch.down.scale, branch.execution_ids,
+                true, branch_name, device_execution_backends[device]);
+            if (experts == nullptr) {
+                experts = device_experts;
+            } else {
+                experts = ggml_add(ctx0, experts, device_experts);
+                ggml_backend_sched_set_tensor_backend(sched, experts, device_execution_backends.front());
+                cb(experts, "ffn_moe_device_branch_merge", il);
+            }
+        }
+    } else {
+        experts = build_expert_branch(
+            execution_up_exps, execution_up_exps_b, execution_gate_exps, execution_gate_exps_b,
+            execution_gate_up_exps, execution_gate_up_exps_b, execution_down_exps, execution_down_exps_b,
+            execution_up_exps_s, execution_gate_exps_s, execution_down_exps_s, execution_ids,
+            hybrid_execution, hybrid_execution ? "gpu" : nullptr,
+            hybrid_execution ? hybrid_gpu_backend : nullptr);
+    }
     if (hybrid_execution) {
         ggml_tensor * cpu_experts = build_expert_branch(
             cpu_up.weight, cpu_up.bias, cpu_gate.weight, cpu_gate.bias,
             cpu_gate_up.weight, cpu_gate_up.bias, cpu_down.weight, cpu_down.bias,
             cpu_gate_up.weight ? cpu_gate_up.scale : cpu_up.scale, cpu_gate.scale, cpu_down.scale,
-            cpu_execution_ids, true, "cpu");
+            cpu_execution_ids, true, "cpu", backend_cpu);
         experts = ggml_add(ctx0, experts, cpu_experts);
         cb(experts, "ffn_moe_branch_merge", il);
     }

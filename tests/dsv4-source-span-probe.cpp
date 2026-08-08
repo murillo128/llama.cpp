@@ -256,6 +256,12 @@ int main(int argc, char ** argv) {
         { nullptr, nullptr },
     };
     llama_model_params params = llama_model_default_params();
+    ggml_backend_dev_t selected_devices[] = {
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU), nullptr };
+    if (selected_devices[0] == nullptr) return 3;
+    params.devices = selected_devices;
+    params.split_mode = LLAMA_SPLIT_MODE_NONE;
+    params.main_gpu = 0;
     params.n_gpu_layers = -1;
     params.load_mode = LLAMA_LOAD_MODE_MMAP;
     params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
@@ -511,6 +517,9 @@ int main(int argc, char ** argv) {
             { "summary", {
                 { "sample_count", samples.size() },
                 { "cross_split_sample_present", cross_split_sample_added },
+                { "cross_split_requirement", cross_split_sample_added ?
+                    "covered" : "not_applicable_no_bundle_crosses_source_files" },
+                { "source_file_count", file_count },
                 { "all_source_sync_async_equal", all_equal },
                 { "sample_bytes_per_path", total_sample_bytes },
                 { "storage_read_requests", final_storage.read_requests },
@@ -547,7 +556,7 @@ int main(int argc, char ** argv) {
                   << "\tkernel_comparisons=" << representative_layers.size()*3
                   << "\tkernel_pass=" << all_kernel_comparisons_pass
                   << '\n';
-        result_code = all_equal && cross_split_sample_added && shutdown && all_kernel_comparisons_pass ? 0 : 5;
+        result_code = all_equal && shutdown && all_kernel_comparisons_pass ? 0 : 5;
     } catch (const std::exception & error) {
         std::cerr << "dsv4-source-span-probe: " << error.what() << '\n';
     }

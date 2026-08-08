@@ -234,14 +234,6 @@ size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1)/alignment*alignment;
 }
 
-bool checked_lcm_size(size_t lhs, size_t rhs, size_t & result) {
-    if (lhs == 0 || rhs == 0) return false;
-    const size_t reduced = lhs/std::gcd(lhs, rhs);
-    if (reduced > SIZE_MAX/rhs) return false;
-    result = reduced*rhs;
-    return true;
-}
-
 size_t universal_slot_stride(
         const llm_expert_layout_registry & registry,
         ggml_backend_buffer_type_t buffer_type,
@@ -257,7 +249,7 @@ size_t universal_slot_stride(
     for (size_t projection = 0; projection < 4; ++projection) {
         for (size_t member_index = 0; member_index < 3; ++member_index) {
             const size_t role = projection*3 + member_index;
-            size_t role_alignment = std::max<size_t>(64, buffer_alignment);
+            const size_t role_alignment = std::max<size_t>(4096, buffer_alignment);
             for (const auto & layout_class : registry.classes) {
                 auto source = layout_class.prototype;
                 const auto * tensor = bundle_member(source, projection, member_index);
@@ -265,8 +257,6 @@ size_t universal_slot_stride(
                 const int axis = expert_axis(tensor, source.n_expert, member_index == 0);
                 if (axis < 0) return SIZE_MAX;
                 role_extents[role] = std::max(role_extents[role], tensor->nb[axis]);
-                role_alignment = std::max(role_alignment, ggml_type_size(tensor->type));
-                if (!checked_lcm_size(slot_alignment, ggml_type_size(tensor->type), slot_alignment)) return SIZE_MAX;
             }
             if (role_extents[role] == 0) continue;
             role_offsets[role] = align_up(within_slot, role_alignment);

@@ -33,24 +33,20 @@ std::atomic<uint64_t> g_next_trace_id { 1 };
 std::atomic<uint64_t> g_cupti_active_buffer_bytes { 0 };
 std::atomic<uint64_t> g_cupti_buffer_limit { k_cupti_retained_bytes_max };
 std::atomic<uint64_t> g_cupti_retained_capacity_bytes { 0 };
+std::atomic<bool> g_accept_cupti_records { false };
 
 enum class cupti_record_kind : uint8_t {
-    runtime,
-    driver,
     kernel,
     memcpy,
-    memset,
     synchronization,
-    external_correlation,
 };
 
 struct retained_cupti_record {
-    cupti_record_kind kind = cupti_record_kind::runtime;
+    cupti_record_kind kind = cupti_record_kind::kernel;
     uint64_t start = 0;
     uint64_t end = 0;
     uint64_t queued = 0;
     uint64_t submitted = 0;
-    uint64_t external_id = 0;
     uint64_t grid_id = 0;
     uint64_t bytes = 0;
     uint32_t correlation_id = 0;
@@ -58,9 +54,7 @@ struct retained_cupti_record {
     uint32_t device_id = 0;
     uint32_t context_id = 0;
     uint32_t stream_id = 0;
-    uint32_t thread_id = 0;
     uint32_t subtype = 0;
-    uint32_t return_value = 0;
     int32_t grid_x = 0;
     int32_t grid_y = 0;
     int32_t grid_z = 0;
@@ -107,9 +101,16 @@ struct trace_state {
     bool callback_failed = false;
     char callback_error[192] = {};
     std::vector<retained_cupti_record> cupti_records;
-    std::array<CUpti_ActivityKind, 7> enabled_kinds {};
+    std::array<CUpti_ActivityKind, 3> enabled_kinds {};
     size_t enabled_kind_count = 0;
     bool stop_in_progress = false;
+    bool decode_window_armed = false;
+    bool decode_window_triggered = false;
+    bool decode_window_complete = false;
+    bool decode_window_failed = false;
+    char decode_window_error[192] = {};
+    llm_perfetto_decode_window_config decode_window_config;
+    std::thread decode_window_thread;
 };
 
 trace_state & state() {
@@ -153,6 +154,11 @@ void retain_cupti_record(trace_state & value, const retained_cupti_record & reco
     try {
         value.cupti_records.push_back(record);
         value.diagnostics.cupti_records++;
+        switch (record.kind) {
+            case cupti_record_kind::kernel:          value.diagnostics.cupti_kernel_records++; break;
+            case cupti_record_kind::memcpy:          value.diagnostics.cupti_memcpy_records++; break;
+            case cupti_record_kind::synchronization: value.diagnostics.cupti_synchronization_records++; break;
+        }
         value.diagnostics.cupti_retained_bytes = next_bytes;
     } catch (...) {
         record_callback_failure(value, "CUPTI retained-record allocation failed");
@@ -199,8 +205,9 @@ void CUPTIAPI cupti_buffer_requested(uint8_t ** buffer, size_t * size, size_t * 
 void CUPTIAPI cupti_buffer_completed(
         CUcontext context, uint32_t stream_id, uint8_t * buffer, size_t, size_t valid_size) {
     auto & value = state();
-    if (valid_size != 0) {
+    {
         std::lock_guard<std::mutex> lock(value.mutex);
+        if (valid_size != 0 && g_accept_cupti_records.load(std::memory_order_acquire)) {
         CUpti_Activity * activity = nullptr;
         while (true) {
             const CUptiResult next = cuptiActivityGetNextRecord(buffer, valid_size, &activity);
@@ -211,19 +218,6 @@ void CUPTIAPI cupti_buffer_completed(
             }
             retained_cupti_record record;
             switch (activity->kind) {
-                case CUPTI_ACTIVITY_KIND_RUNTIME:
-                case CUPTI_ACTIVITY_KIND_DRIVER: {
-                    const auto * source = reinterpret_cast<const CUpti_ActivityAPI *>(activity);
-                    record.kind = activity->kind == CUPTI_ACTIVITY_KIND_RUNTIME ?
-                        cupti_record_kind::runtime : cupti_record_kind::driver;
-                    record.start = source->start;
-                    record.end = source->end;
-                    record.correlation_id = source->correlationId;
-                    record.thread_id = source->threadId;
-                    record.subtype = uint32_t(source->cbid);
-                    record.return_value = source->returnValue;
-                    break;
-                }
                 case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL: {
                     const auto * source = reinterpret_cast<const CUpti_ActivityKernel9 *>(activity);
                     record.kind = cupti_record_kind::kernel;
@@ -260,19 +254,6 @@ void CUPTIAPI cupti_buffer_completed(
                     record.bytes = source->bytes;
                     break;
                 }
-                case CUPTI_ACTIVITY_KIND_MEMSET: {
-                    const auto * source = reinterpret_cast<const CUpti_ActivityMemset4 *>(activity);
-                    record.kind = cupti_record_kind::memset;
-                    record.start = source->start;
-                    record.end = source->end;
-                    record.correlation_id = source->correlationId;
-                    record.device_id = source->deviceId;
-                    record.context_id = source->contextId;
-                    record.stream_id = source->streamId;
-                    record.bytes = source->bytes;
-                    record.subtype = source->value;
-                    break;
-                }
                 case CUPTI_ACTIVITY_KIND_SYNCHRONIZATION: {
                     const auto * source = reinterpret_cast<const CUpti_ActivitySynchronization2 *>(activity);
                     record.kind = cupti_record_kind::synchronization;
@@ -282,22 +263,13 @@ void CUPTIAPI cupti_buffer_completed(
                     record.context_id = source->contextId;
                     record.stream_id = source->streamId;
                     record.subtype = uint32_t(source->type);
-                    record.return_value = source->returnValue;
-                    break;
-                }
-                case CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION: {
-                    const auto * source = reinterpret_cast<const CUpti_ActivityExternalCorrelation *>(activity);
-                    if (source->externalKind != CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0) continue;
-                    record.kind = cupti_record_kind::external_correlation;
-                    record.correlation_id = source->correlationId;
-                    record.external_id = source->externalId;
                     break;
                 }
                 default:
+                    value.diagnostics.cupti_unsupported_records++;
                     continue;
             }
-            if (record.kind != cupti_record_kind::external_correlation &&
-                !valid_interval(record.start, record.end)) {
+            if (!valid_interval(record.start, record.end)) {
                 value.diagnostics.cupti_unknown_timestamps++;
             }
             retain_cupti_record(value, record);
@@ -309,105 +281,42 @@ void CUPTIAPI cupti_buffer_completed(
         } else {
             value.diagnostics.cupti_dropped_records += dropped;
         }
+        }
     }
     std::free(buffer);
     g_cupti_active_buffer_bytes.fetch_sub(k_cupti_buffer_bytes, std::memory_order_acq_rel);
 }
 
-uint64_t external_id_for(
-        const std::vector<std::pair<uint32_t, uint64_t>> & mappings, uint32_t correlation_id) noexcept {
-    const auto found = std::lower_bound(mappings.begin(), mappings.end(), correlation_id,
-        [](const auto & item, uint32_t value) { return item.first < value; });
-    return found != mappings.end() && found->first == correlation_id ? found->second : 0;
-}
-
 void emit_retained_cupti_records(trace_state & value) {
-    std::vector<std::pair<uint32_t, uint64_t>> mappings;
-    mappings.reserve(value.cupti_records.size());
-    for (const auto & record : value.cupti_records) {
-        if (record.kind == cupti_record_kind::external_correlation) {
-            mappings.emplace_back(record.correlation_id, record.external_id);
-        }
-    }
-    std::sort(mappings.begin(), mappings.end());
-    mappings.erase(std::unique(mappings.begin(), mappings.end(), [](const auto & lhs, const auto & rhs) {
-        return lhs.first == rhs.first;
-    }), mappings.end());
     std::stable_sort(value.cupti_records.begin(), value.cupti_records.end(), [](const auto & lhs, const auto & rhs) {
-        const uint64_t lhs_time = lhs.kind == cupti_record_kind::external_correlation ? UINT64_MAX : lhs.start;
-        const uint64_t rhs_time = rhs.kind == cupti_record_kind::external_correlation ? UINT64_MAX : rhs.start;
-        if (lhs_time != rhs_time) return lhs_time < rhs_time;
+        if (lhs.start != rhs.start) return lhs.start < rhs.start;
         if (lhs.context_id != rhs.context_id) return lhs.context_id < rhs.context_id;
         if (lhs.stream_id != rhs.stream_id) return lhs.stream_id < rhs.stream_id;
         return uint8_t(lhs.kind) < uint8_t(rhs.kind);
     });
 
     for (const auto & record : value.cupti_records) {
-        if (record.kind == cupti_record_kind::external_correlation || !valid_interval(record.start, record.end)) continue;
-        const uint64_t external_id = external_id_for(mappings, record.correlation_id);
-        if (record.correlation_id != 0 && external_id == 0) value.diagnostics.cupti_unmatched_correlations++;
+        if (!valid_interval(record.start, record.end)) continue;
         const uint64_t track_id = llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::cuda,
-            record.kind == cupti_record_kind::runtime || record.kind == cupti_record_kind::driver ?
-                record.thread_id : record.context_id,
-            record.stream_id, uint32_t(record.kind) + 1);
+            record.context_id, record.stream_id, uint32_t(record.kind) + 1);
         switch (record.kind) {
-            case cupti_record_kind::runtime: {
-                const perfetto::NamedTrack track(perfetto::StaticString("CUDA runtime API"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "runtime_api", track, monotonic_raw_timestamp(record.start),
-                    "correlation_id", record.correlation_id, "application_correlation_id", external_id,
-                    "cbid", record.subtype, "thread_id", record.thread_id);
-                TRACE_EVENT_END(
-                    "k3.cuda", track, monotonic_raw_timestamp(record.end), "return_value", record.return_value);
-                break;
-            }
-            case cupti_record_kind::driver: {
-                const perfetto::NamedTrack track(perfetto::StaticString("CUDA driver API"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "driver_api", track, monotonic_raw_timestamp(record.start),
-                    "correlation_id", record.correlation_id, "application_correlation_id", external_id,
-                    "cbid", record.subtype, "thread_id", record.thread_id);
-                TRACE_EVENT_END(
-                    "k3.cuda", track, monotonic_raw_timestamp(record.end), "return_value", record.return_value);
-                break;
-            }
             case cupti_record_kind::kernel: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA kernels"), track_id);
                 TRACE_EVENT_BEGIN("k3.cuda", "kernel", track, monotonic_raw_timestamp(record.start),
-                    "correlation_id", record.correlation_id, "application_correlation_id", external_id, "kernel_name",
+                    "correlation_id", record.correlation_id, "kernel_name",
                     record.name.data(), "device_id", record.device_id, "context_id", record.context_id,
                     "stream_id", record.stream_id, "grid_id", record.grid_id, "grid_x", record.grid_x,
                     "grid_y", record.grid_y, "grid_z", record.grid_z, "block_x", record.block_x,
-                    "block_y", record.block_y, "block_z", record.block_z, "queued_ns", record.queued,
-                    "submitted_ns", record.submitted);
+                    "block_y", record.block_y, "block_z", record.block_z);
                 TRACE_EVENT_END("k3.cuda", track, monotonic_raw_timestamp(record.end));
-                if (record.queued != CUPTI_TIMESTAMP_UNKNOWN && record.submitted != CUPTI_TIMESTAMP_UNKNOWN &&
-                    record.queued != 0 && record.submitted >= record.queued) {
-                    const uint64_t latency_track_id = llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::cuda,
-                        record.context_id, record.correlation_id, 0xfe);
-                    const perfetto::NamedTrack latency_track(
-                        perfetto::StaticString("CUDA kernel launch latency"), latency_track_id);
-                    TRACE_EVENT_BEGIN("k3.cuda", "kernel_queued", latency_track,
-                        monotonic_raw_timestamp(record.queued), "correlation_id", record.correlation_id,
-                        "application_correlation_id", external_id);
-                    TRACE_EVENT_END("k3.cuda", latency_track, monotonic_raw_timestamp(record.submitted));
-                }
                 break;
             }
             case cupti_record_kind::memcpy: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA memcpy"), track_id);
                 TRACE_EVENT_BEGIN("k3.cuda", "memcpy", track, monotonic_raw_timestamp(record.start),
                     "correlation_id", record.correlation_id, "runtime_correlation_id", record.runtime_correlation_id,
-                    "application_correlation_id", external_id, "copy_kind", record.subtype,
-                    "bytes", record.bytes, "device_id", record.device_id, "context_id", record.context_id,
-                    "stream_id", record.stream_id);
-                TRACE_EVENT_END("k3.cuda", track, monotonic_raw_timestamp(record.end));
-                break;
-            }
-            case cupti_record_kind::memset: {
-                const perfetto::NamedTrack track(perfetto::StaticString("CUDA memset"), track_id);
-                TRACE_EVENT_BEGIN("k3.cuda", "memset", track, monotonic_raw_timestamp(record.start),
-                    "correlation_id", record.correlation_id, "application_correlation_id", external_id,
-                    "value", record.subtype,
-                    "bytes", record.bytes, "device_id", record.device_id, "context_id", record.context_id,
+                    "copy_kind", record.subtype, "bytes", record.bytes,
+                    "device_id", record.device_id, "context_id", record.context_id,
                     "stream_id", record.stream_id);
                 TRACE_EVENT_END("k3.cuda", track, monotonic_raw_timestamp(record.end));
                 break;
@@ -415,21 +324,18 @@ void emit_retained_cupti_records(trace_state & value) {
             case cupti_record_kind::synchronization: {
                 const perfetto::NamedTrack track(perfetto::StaticString("CUDA synchronization"), track_id);
                 TRACE_EVENT_BEGIN("k3.cuda", "synchronization", track, monotonic_raw_timestamp(record.start),
-                    "correlation_id", record.correlation_id, "application_correlation_id", external_id,
-                    "sync_type", record.subtype,
+                    "correlation_id", record.correlation_id, "sync_type", record.subtype,
                     "context_id", record.context_id, "stream_id", record.stream_id);
-                TRACE_EVENT_END(
-                    "k3.cuda", track, monotonic_raw_timestamp(record.end), "return_value", record.return_value);
+                TRACE_EVENT_END("k3.cuda", track, monotonic_raw_timestamp(record.end));
                 break;
             }
-            case cupti_record_kind::external_correlation:
-                break;
         }
     }
 }
 
 bool finalize_cupti_activity(trace_state & value) {
     g_trace_active.store(false, std::memory_order_release);
+    const uint64_t capture_stop_ns = monotonic_raw_ns();
     CUptiResult first_error = cuptiActivityFlushAll(0);
     for (size_t index = 0; index < value.enabled_kind_count; ++index) {
         const CUptiResult result = cuptiActivityDisable(value.enabled_kinds[index]);
@@ -439,7 +345,11 @@ bool finalize_cupti_activity(trace_state & value) {
     if (first_error == CUPTI_SUCCESS && final_flush != CUPTI_SUCCESS) first_error = final_flush;
     const CUptiResult sync_disable = cuptiActivityEnableAllSyncRecords(0);
     if (first_error == CUPTI_SUCCESS && sync_disable != CUPTI_SUCCESS) first_error = sync_disable;
-    (void) cuptiActivityEnableLatencyTimestamps(0);
+
+    // CUPTI may retain empty callback buffers after all enabled kinds have
+    // been disabled and flushed.  A later callback only releases its bounded
+    // allocation and must not append records after trace finalization.
+    g_accept_cupti_records.store(false, std::memory_order_release);
 
     std::lock_guard<std::mutex> lock(value.mutex);
     if (!value.diagnostics.track_event_active || !value.diagnostics.cupti_active) {
@@ -448,15 +358,14 @@ bool finalize_cupti_activity(trace_state & value) {
     }
     value.enabled_kind_count = 0;
     if (first_error != CUPTI_SUCCESS) record_cupti_error(value, "CUPTI activity shutdown", first_error);
-    if (g_cupti_active_buffer_bytes.load(std::memory_order_acquire) != 0) {
-        record_callback_failure(value, "CUPTI activity buffers remained active after flush");
-    }
+    value.diagnostics.cupti_active_buffer_bytes_at_close =
+        g_cupti_active_buffer_bytes.load(std::memory_order_acquire);
     try {
         emit_retained_cupti_records(value);
     } catch (...) {
         record_callback_failure(value, "CUPTI TrackEvent emission failed");
     }
-    value.diagnostics.clock_stop_ns = monotonic_raw_ns();
+    value.diagnostics.clock_stop_ns = capture_stop_ns;
     LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "trace_session_stop", "clock_monotonic_raw_ns",
         value.diagnostics.clock_stop_ns, "cupti_errors", value.diagnostics.cupti_errors,
         "cupti_records", value.diagnostics.cupti_records,
@@ -464,8 +373,13 @@ bool finalize_cupti_activity(trace_state & value) {
         "cupti_dropped_records", value.diagnostics.cupti_dropped_records,
         "cupti_retained_capacity_bytes", value.diagnostics.cupti_retained_capacity_bytes,
         "cupti_peak_total_bytes", value.diagnostics.cupti_peak_total_bytes,
+        "cupti_active_buffer_bytes_at_close", value.diagnostics.cupti_active_buffer_bytes_at_close,
         "cupti_unknown_timestamps", value.diagnostics.cupti_unknown_timestamps,
-        "cupti_unmatched_correlations", value.diagnostics.cupti_unmatched_correlations);
+        "cupti_unmatched_correlations", value.diagnostics.cupti_unmatched_correlations,
+        "cupti_kernel_records", value.diagnostics.cupti_kernel_records,
+        "cupti_memcpy_records", value.diagnostics.cupti_memcpy_records,
+        "cupti_synchronization_records", value.diagnostics.cupti_synchronization_records,
+        "cupti_unsupported_records", value.diagnostics.cupti_unsupported_records);
     value.diagnostics.cupti_active = false;
     return !value.callback_failed;
 }
@@ -500,13 +414,6 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
         state.changed.notify_all();
         return;
     }
-    result = cuptiActivityEnableLatencyTimestamps(1);
-    if (result != CUPTI_SUCCESS) {
-        record_cupti_error(state, "cuptiActivityEnableLatencyTimestamps", result);
-        state.changed.notify_all();
-        return;
-    }
-
     result = cuptiActivityRegisterCallbacks(cupti_buffer_requested, cupti_buffer_completed);
     if (result != CUPTI_SUCCESS) {
         record_cupti_error(state, "cuptiActivityRegisterCallbacks", result);
@@ -548,13 +455,9 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
         state.config.cupti_retained_bytes - retained_capacity_bytes, std::memory_order_release);
 
     state.enabled_kinds = {
-        CUPTI_ACTIVITY_KIND_RUNTIME,
-        CUPTI_ACTIVITY_KIND_DRIVER,
         CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL,
         CUPTI_ACTIVITY_KIND_MEMCPY,
-        CUPTI_ACTIVITY_KIND_MEMSET,
         CUPTI_ACTIVITY_KIND_SYNCHRONIZATION,
-        CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION,
     };
     state.enabled_kind_count = 0;
     for (const auto kind : state.enabled_kinds) {
@@ -571,6 +474,8 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
         }
         state.enabled_kind_count++;
     }
+    state.diagnostics.cupti_enabled_kind_count = uint32_t(state.enabled_kind_count);
+    g_accept_cupti_records.store(true, std::memory_order_release);
     state.diagnostics.track_event_active = true;
     state.diagnostics.cupti_active = true;
     g_trace_active.store(true, std::memory_order_release);
@@ -778,6 +683,134 @@ bool llm_perfetto_trace_shutdown(char * error, size_t error_capacity) noexcept {
     return true;
 }
 
+bool llm_perfetto_trace_arm_decode_window(
+        const llm_perfetto_decode_window_config & config, char * error, size_t error_capacity) noexcept {
+    auto & value = state();
+    std::lock_guard<std::mutex> lock(value.mutex);
+    if (value.diagnostics.initialized || value.decode_window_armed || value.decode_window_thread.joinable()) {
+        set_error(error, error_capacity, "Perfetto decode window may be armed only once per process");
+        return false;
+    }
+    if (config.request_ordinal < 2 || config.routed_layer < 0 || config.selection_seed == 0 ||
+        (config.duration_ms != 1000 && config.duration_ms != 500 && config.duration_ms != 250)) {
+        set_error(error, error_capacity, "invalid seeded Perfetto decode window");
+        return false;
+    }
+    value.decode_window_config = config;
+    value.decode_window_armed = true;
+    value.decode_window_triggered = false;
+    value.decode_window_complete = false;
+    value.decode_window_failed = false;
+    value.decode_window_error[0] = '\0';
+    value.diagnostics.compiled = true;
+    value.diagnostics.decode_window_armed = true;
+    value.diagnostics.decode_window_request_ordinal = config.request_ordinal;
+    value.diagnostics.decode_window_routed_layer = config.routed_layer;
+    value.diagnostics.decode_window_requested_ms = config.duration_ms;
+    value.diagnostics.decode_window_selection_seed = config.selection_seed;
+    return true;
+}
+
+bool llm_perfetto_trace_maybe_start_decode_window(
+        uint64_t request_ordinal, int32_t routed_layer) noexcept {
+    auto & value = state();
+    llm_perfetto_decode_window_config window;
+    {
+        std::lock_guard<std::mutex> lock(value.mutex);
+        if (!value.decode_window_armed || value.decode_window_triggered ||
+            request_ordinal != value.decode_window_config.request_ordinal ||
+            routed_layer != value.decode_window_config.routed_layer) {
+            return true;
+        }
+        value.decode_window_triggered = true;
+        window = value.decode_window_config;
+    }
+
+    char error[256] = {};
+    if (!llm_perfetto_trace_initialize_system(window.trace, error, sizeof(error)) ||
+        !llm_perfetto_trace_wait_until_active(30000, error, sizeof(error))) {
+        std::lock_guard<std::mutex> lock(value.mutex);
+        value.decode_window_failed = true;
+        value.decode_window_complete = true;
+        std::snprintf(value.decode_window_error, sizeof(value.decode_window_error), "%s", error);
+        value.changed.notify_all();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(value.mutex);
+        value.diagnostics.decode_window_armed = true;
+        value.diagnostics.decode_window_triggered = true;
+        value.diagnostics.decode_window_request_ordinal = window.request_ordinal;
+        value.diagnostics.decode_window_routed_layer = window.routed_layer;
+        value.diagnostics.decode_window_requested_ms = window.duration_ms;
+        value.diagnostics.decode_window_selection_seed = window.selection_seed;
+    }
+    LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "decode_window_start",
+        "request_id", window.request_ordinal, "layer", window.routed_layer,
+        "duration_ms", window.duration_ms, "selection_seed", window.selection_seed);
+    try {
+        value.decode_window_thread = std::thread([window] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(window.duration_ms));
+            LLM_EXPERT_TRACE_INSTANT("k3.lifecycle", "decode_window_end",
+                "request_id", window.request_ordinal, "layer", window.routed_layer,
+                "duration_ms", window.duration_ms, "selection_seed", window.selection_seed);
+            char thread_error[256] = {};
+            const bool stopped = llm_perfetto_trace_request_stop(thread_error, sizeof(thread_error)) &&
+                llm_perfetto_trace_wait_until_inactive(30000, thread_error, sizeof(thread_error));
+            auto & thread_state = state();
+            std::lock_guard<std::mutex> lock(thread_state.mutex);
+            thread_state.decode_window_failed = !stopped;
+            thread_state.decode_window_complete = true;
+            thread_state.diagnostics.decode_window_complete = stopped;
+            if (!stopped) {
+                std::snprintf(thread_state.decode_window_error,
+                    sizeof(thread_state.decode_window_error), "%s", thread_error);
+            }
+            thread_state.changed.notify_all();
+        });
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(value.mutex);
+        value.decode_window_failed = true;
+        value.decode_window_complete = true;
+        std::snprintf(value.decode_window_error, sizeof(value.decode_window_error), "%s",
+            "Perfetto decode-window timer creation failed");
+        value.changed.notify_all();
+        return false;
+    }
+    return true;
+}
+
+bool llm_perfetto_trace_wait_for_decode_window(
+        uint32_t timeout_ms, char * error, size_t error_capacity) noexcept {
+    auto & value = state();
+    std::thread completed_thread;
+    {
+        std::unique_lock<std::mutex> lock(value.mutex);
+        if (!value.decode_window_armed) {
+            set_error(error, error_capacity, "Perfetto decode window was not armed");
+            return false;
+        }
+        const bool complete = value.changed.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+            return value.decode_window_complete;
+        });
+        if (!complete) {
+            set_error(error, error_capacity, value.decode_window_triggered ?
+                "timed out waiting for Perfetto decode window" :
+                "seeded Perfetto decode window was not reached");
+            return false;
+        }
+        if (value.decode_window_thread.joinable()) {
+            completed_thread = std::move(value.decode_window_thread);
+        }
+        if (value.decode_window_failed) {
+            set_error(error, error_capacity, value.decode_window_error);
+        }
+    }
+    if (completed_thread.joinable()) completed_thread.join();
+    std::lock_guard<std::mutex> lock(value.mutex);
+    return !value.decode_window_failed;
+}
+
 llm_perfetto_trace_diagnostics llm_perfetto_trace_get_diagnostics() noexcept {
     auto & value = state();
     std::lock_guard<std::mutex> lock(value.mutex);
@@ -811,29 +844,10 @@ bool llm_perfetto_trace_cuda_smoke() noexcept {
 }
 
 llm_perfetto_correlation_scope::llm_perfetto_correlation_scope(uint64_t id) noexcept : id(id) {
-    if (id == 0) return;
-    const CUptiResult result = cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, id);
-    if (result == CUPTI_SUCCESS) {
-        pushed = true;
-        return;
-    }
-    auto & value = state();
-    std::lock_guard<std::mutex> lock(value.mutex);
-    record_cupti_error(value, "cuptiActivityPushExternalCorrelationId", result);
+    // Phase 13 uses filtered CUPTI activity without external-correlation records.
+    // Keep the application instrumentation call sites source-compatible and inert.
+    (void) this->id;
 }
 
 llm_perfetto_correlation_scope::~llm_perfetto_correlation_scope() {
-    if (!pushed) return;
-    uint64_t popped = 0;
-    const CUptiResult result = cuptiActivityPopExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, &popped);
-    if (result == CUPTI_SUCCESS && popped == id) return;
-    auto & value = state();
-    std::lock_guard<std::mutex> lock(value.mutex);
-    if (result != CUPTI_SUCCESS) {
-        record_cupti_error(value, "cuptiActivityPopExternalCorrelationId", result);
-    } else {
-        value.diagnostics.cupti_errors++;
-        value.callback_failed = true;
-        std::snprintf(value.callback_error, sizeof(value.callback_error), "%s", "CUPTI external correlation stack mismatch");
-    }
 }
