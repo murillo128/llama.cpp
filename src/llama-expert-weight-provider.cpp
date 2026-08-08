@@ -2749,6 +2749,7 @@ public:
             miss_count, llm_expert_request_state::free);
         std::vector<std::vector<llm_transfer_binding>> device_transfers(device_pools.size());
         std::vector<std::vector<uint64_t>> device_transfer_hot_generations(device_pools.size());
+        for (size_t index = 0; index < miss_count; ++index) async_flights[index] = {};
         auto fail_multi = [&](llm_expert_provider_result failure) {
             for (size_t device = 0; device < binding.devices.size(); ++device) {
                 for (const auto & dependency : binding.devices[device].h2d_dependencies) {
@@ -2759,6 +2760,27 @@ public:
             }
             for (auto & ring : transfer_rings) (void) ring->cleanup_failed_lanes();
             (void) release_request_pins_locked();
+            for (size_t index = 0; index < miss_count; ++index) {
+                auto & flight = async_flights[index];
+                if (flight.read_active) {
+                    (void) config.async_transport->cancel_read(flight.handle);
+                    llm_expert_async_read_completion discarded;
+                    if (provider_lock != nullptr) provider_lock->unlock();
+                    const auto drained = config.async_transport->wait_read(flight.handle, discarded);
+                    if (provider_lock != nullptr) provider_lock->lock();
+                    (void) config.async_transport->release_read(flight.handle);
+                    config.storage->record_async_read(
+                        flight.destination_count, discarded.bytes_completed,
+                        drained == llm_expert_async_result::closed ?
+                            llm_expert_storage_error::cancelled : llm_expert_storage_error::io_error,
+                        discarded.native_error);
+                    flight.read_active = false;
+                }
+                if (flight.reserved) {
+                    (void) cold_cache->fail_reservation(flight.key, flight.cold);
+                    flight.reserved = false;
+                }
+            }
             for (size_t index = 0; index < miss_count; ++index) {
                 const uint32_t slot = candidate_slots[index];
                 if (slot >= directory_slots.size()) continue;
@@ -2918,97 +2940,303 @@ public:
             return wave_result;
         };
 
-        for (size_t index = 0; index < miss_count; ++index) {
-            if (abort_requested()) {
-                return fail_multi(llm_expert_provider_result::failure(
-                    llm_expert_provider_error::cancelled));
-            }
+        const auto stage_miss = [&](size_t index) noexcept {
             const uint32_t unique_index = miss_unique_indices[index];
             const auto & key = unique_keys[unique_index];
             const auto owner = llm_expert_owner_device(key.expert, uint32_t(device_pools.size()));
-            llm_expert_request_metadata metadata;
-            metadata.layout_class_id = binding.layout_class_id;
-            metadata.target_device = owner;
-            metadata.reserved_storage_bytes = payload_for_key(key);
-            metadata.reserved_h2d_bytes = payload_for_key(key);
-            const auto scheduled = config.scheduler->enqueue(
-                key, llm_expert_priority::demand_current_layer,
-                llm_expert_readiness::device_ready, metadata);
-            if (!scheduled.accepted()) {
-                return fail_multi(llm_expert_provider_result::failure(
-                    scheduled.disposition == llm_expert_schedule_disposition::generation_exhausted ?
-                        llm_expert_provider_error::generation_exhausted : llm_expert_provider_error::busy));
-            }
-            scheduler_handles[index] = scheduled.handle;
-            scheduler_states[index] = llm_expert_request_state::queued;
-            llm_expert_request_snapshot snapshot;
-            const auto selected = config.scheduler->take_next(snapshot);
-            if (!selected.accepted() || selected.handle.slot != scheduled.handle.slot ||
-                selected.handle.generation != scheduled.handle.generation ||
-                selected.handle.target_device != scheduled.handle.target_device) {
-                return fail_multi(llm_expert_provider_result::failure(
-                    llm_expert_provider_error::metadata_mismatch));
-            }
-            scheduler_states[index] = llm_expert_request_state::submitting;
-
-            storage_load_context storage_context = {
-                config.storage, nullptr, nullptr, config.integrity_mode, provider_lock, {}, false,
-                abort_callback, abort_callback_data,
-            };
-            storage_context.layer_ids = &layout_registry.layer_ids;
-            storage_context.layout_registry = &layout_registry;
-            storage_context.target_device = owner;
-            result = cold_cache->find_or_admit_with_loader(
-                key, cold_references[index], load_storage_bundle, &storage_context);
-            if (!result.is_ready()) return fail_multi(result);
-            if (config.scheduler->transition(scheduled.handle,
-                    llm_expert_request_state::submitting,
-                    llm_expert_request_state::host_ready) !=
-                llm_expert_schedule_disposition::admitted) {
-                return fail_multi(llm_expert_provider_result::failure(
-                    llm_expert_provider_error::metadata_mismatch));
-            }
-            scheduler_states[index] = llm_expert_request_state::host_ready;
-
             const uint32_t global_slot = candidate_slots[index];
-            result = prepare_hot_slot_locked(global_slot, key, cold_references[index]);
-            if (!result.is_ready()) return fail_multi(result);
+            auto staged = prepare_hot_slot_locked(global_slot, key, cold_references[index]);
+            if (!staged.is_ready()) return staged;
             auto & entry = directory_slots[global_slot];
             auto * ring = ring_for_slot(global_slot);
             if (ring == nullptr || entry.device_id != owner) {
-                return fail_multi(llm_expert_provider_result::failure(
-                    llm_expert_provider_error::metadata_mismatch));
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
             }
-            result = ring->reserve(*cold_cache, cold_references[index], entry.device_slot,
+            staged = ring->reserve(*cold_cache, cold_references[index], entry.device_slot,
                 entry.generation, transfer_lanes[index], {
                     config.async_transport->diagnostics().transport_epoch,
-                    scheduled.handle.slot, scheduled.handle.generation, key,
+                    scheduler_handles[index].slot, scheduler_handles[index].generation, key,
                     binding.layout_class_id, owner,
                 });
-            if (result.is_ready()) result = ring->stage(
+            if (staged.is_ready()) staged = ring->stage(
                 transfer_lanes[index], cold_cache->bundle(cold_references[index].layout_class_id));
-            if (!result.is_ready()) return fail_multi(result);
+            if (!staged.is_ready()) return staged;
             device_transfers[owner].push_back({
                 transfer_lanes[index],
                 device_pools[owner]->bundles[cold_references[index].layout_class_id],
                 entry.device_slot,
             });
             device_transfer_hot_generations[owner].push_back(entry.generation);
-            if (config.scheduler->transition(scheduled.handle,
+            if (config.scheduler->transition(scheduler_handles[index],
                     llm_expert_request_state::host_ready,
                     llm_expert_request_state::h2d_in_flight) !=
                 llm_expert_schedule_disposition::admitted) {
-                return fail_multi(llm_expert_provider_result::failure(
-                    llm_expert_provider_error::metadata_mismatch));
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
             }
             scheduler_states[index] = llm_expert_request_state::h2d_in_flight;
             const uint32_t lane_capacity = ring->diagnostics().effective_lanes;
             if (lane_capacity == 0) {
-                return fail_multi(llm_expert_provider_result::failure(
-                    llm_expert_provider_error::initialization_failed));
+                return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
             }
             if (device_transfers[owner].size() >= lane_capacity) {
-                result = flush_device_transfers();
+                staged = flush_device_transfers();
+            }
+            return staged;
+        };
+
+        const bool issue_ahead_storage = config.storage != nullptr && config.async_transport != nullptr;
+        if (issue_ahead_storage) {
+            size_t submitted_count = 0;
+            for (size_t index = 0; index < miss_count; ++index) {
+                if (abort_requested()) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::cancelled));
+                }
+                const uint32_t unique_index = miss_unique_indices[index];
+                const auto & key = unique_keys[unique_index];
+                const auto owner = llm_expert_owner_device(key.expert, uint32_t(device_pools.size()));
+                auto & flight = async_flights[index];
+                flight.key = key;
+                llm_expert_request_metadata metadata;
+                metadata.layout_class_id = binding.layout_class_id;
+                metadata.target_device = owner;
+                metadata.reserved_storage_bytes = payload_for_key(key);
+                metadata.reserved_h2d_bytes = payload_for_key(key);
+                const auto scheduled = config.scheduler->enqueue(
+                    key, llm_expert_priority::demand_current_layer,
+                    llm_expert_readiness::device_ready, metadata);
+                if (scheduled.disposition != llm_expert_schedule_disposition::admitted) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        scheduled.disposition == llm_expert_schedule_disposition::generation_exhausted ?
+                            llm_expert_provider_error::generation_exhausted :
+                            llm_expert_provider_error::busy));
+                }
+                scheduler_handles[index] = scheduled.handle;
+                scheduler_states[index] = llm_expert_request_state::queued;
+                flight.handle = scheduled.handle;
+            }
+
+            for (size_t index = 0; index < miss_count; ++index) {
+                auto & flight = async_flights[index];
+                llm_cold_demand_lookup lookup = llm_cold_demand_lookup::reserved;
+                result = cold_cache->reserve_or_join_demand(flight.key, flight.cold, lookup);
+                if (!result.is_ready()) return fail_multi(result);
+                if (lookup == llm_cold_demand_lookup::joined_loading) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                flight.cold_hit = lookup == llm_cold_demand_lookup::ready;
+                flight.reserved = lookup == llm_cold_demand_lookup::reserved;
+                cold_references[index] = flight.cold;
+                if (flight.cold_hit) continue;
+                if (flight.cold.layout_class_id >= layout_registry.classes.size() ||
+                    !build_storage_destinations(flight,
+                        cold_cache->bundle(flight.cold.layout_class_id),
+                        layout_registry.classes[flight.cold.layout_class_id].prototype,
+                        flight.cold.slot)) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                const auto planned = config.storage->make_read_plan(
+                    flight.key, flight.destinations.data(), flight.destination_count,
+                    flight.operations.data(), flight.operations.size(), flight.operation_count);
+                if (!planned.is_ready()) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+            }
+
+            for (size_t taken_count = 0; taken_count < miss_count; ++taken_count) {
+                llm_expert_request_snapshot snapshot;
+                const auto selected = config.scheduler->take_next(snapshot);
+                size_t index = miss_count;
+                if (selected.disposition == llm_expert_schedule_disposition::admitted) {
+                    for (size_t candidate = 0; candidate < miss_count; ++candidate) {
+                        if (scheduler_states[candidate] != llm_expert_request_state::queued) continue;
+                        const auto & expected = scheduler_handles[candidate];
+                        if (selected.handle.slot == expected.slot &&
+                            selected.handle.generation == expected.generation &&
+                            selected.handle.target_device == expected.target_device) {
+                            index = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (index == miss_count) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                auto & flight = async_flights[index];
+                scheduler_states[index] = llm_expert_request_state::submitting;
+                if (flight.cold_hit) {
+                    if (config.scheduler->transition(flight.handle,
+                            llm_expert_request_state::submitting,
+                            llm_expert_request_state::host_ready) !=
+                        llm_expert_schedule_disposition::admitted) {
+                        return fail_multi(llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch));
+                    }
+                    scheduler_states[index] = llm_expert_request_state::host_ready;
+                    flight.processed = true;
+                    continue;
+                }
+                const llm_expert_async_operation_identity identity = {
+                    config.async_transport->diagnostics().transport_epoch,
+                    flight.handle, 0, flight.key, llm_expert_readiness::device_ready,
+                    llm_expert_priority::demand_current_layer, flight.cold.layout_class_id,
+                };
+                const auto submitted = config.async_transport->submit_read_plan(
+                    identity, flight.operations.data(), flight.operation_count, true);
+                if (submitted != llm_expert_async_result::ready) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::copy_failed));
+                }
+                flight.submitted = true;
+                flight.read_active = true;
+                submitted_count++;
+                if (config.scheduler->transition(flight.handle,
+                        llm_expert_request_state::submitting,
+                        llm_expert_request_state::io_in_flight) !=
+                    llm_expert_schedule_disposition::admitted) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::copy_failed));
+                }
+                scheduler_states[index] = llm_expert_request_state::io_in_flight;
+            }
+            if (submitted_count != 0) config.async_transport->start_deferred_reads();
+            LLM_EXPERT_TRACE_INSTANT("k3.storage", "multi_device_issue_ahead",
+                "layer", binding.layer, "demand_count", miss_count,
+                "submitted_count", submitted_count);
+
+            size_t completed_count = miss_count - submitted_count;
+            while (completed_count < miss_count) {
+                size_t pending_count = 0;
+                for (size_t index = 0; index < miss_count; ++index) {
+                    if (async_flights[index].read_active) {
+                        async_handles[pending_count++] = async_flights[index].handle;
+                    }
+                }
+                if (pending_count == 0) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                llm_expert_async_read_completion completion;
+                llm_expert_request_handle completed_handle;
+                if (provider_lock != nullptr) provider_lock->unlock();
+                const auto waited = config.async_transport->wait_any_read(
+                    async_handles.data(), pending_count, completed_handle, completion,
+                    abort_callback, abort_callback_data);
+                if (provider_lock != nullptr) provider_lock->lock();
+                size_t index = miss_count;
+                for (size_t candidate = 0; candidate < miss_count; ++candidate) {
+                    const auto & flight = async_flights[candidate];
+                    if (flight.read_active && flight.handle.slot == completed_handle.slot &&
+                        flight.handle.generation == completed_handle.generation &&
+                        flight.handle.target_device == completed_handle.target_device) {
+                        index = candidate;
+                        break;
+                    }
+                }
+                if (index == miss_count) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        waited == llm_expert_async_result::closed ?
+                            llm_expert_provider_error::cancelled :
+                            llm_expert_provider_error::stale_generation));
+                }
+                auto & flight = async_flights[index];
+                const auto released = config.async_transport->release_read(flight.handle);
+                if (released == llm_expert_async_result::ready) flight.read_active = false;
+                const auto storage_error = waited == llm_expert_async_result::ready ?
+                    llm_expert_storage_error::none :
+                    (waited == llm_expert_async_result::closed ? llm_expert_storage_error::cancelled :
+                     (completion.native_error == 0 ? llm_expert_storage_error::short_read :
+                      llm_expert_storage_error::io_error));
+                config.storage->record_async_read(
+                    flight.destination_count, completion.bytes_completed,
+                    storage_error, completion.native_error);
+                const bool integrity_matches = waited == llm_expert_async_result::ready &&
+                    released == llm_expert_async_result::ready &&
+                    finalize_payload_integrity(config.integrity_mode, *config.storage,
+                        flight.destinations.data(), flight.destination_count,
+                        completion.integrity_status, completion.digest);
+                if (!integrity_matches) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        waited == llm_expert_async_result::closed ?
+                            llm_expert_provider_error::cancelled : llm_expert_provider_error::copy_failed));
+                }
+                result = cold_cache->publish_ready(flight.key, flight.cold);
+                if (!result.is_ready()) return fail_multi(result);
+                flight.reserved = false;
+                flight.read_completed = true;
+                flight.processed = true;
+                if (config.scheduler->transition(flight.handle,
+                        llm_expert_request_state::io_in_flight,
+                        llm_expert_request_state::host_ready) !=
+                    llm_expert_schedule_disposition::admitted) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                scheduler_states[index] = llm_expert_request_state::host_ready;
+                completed_count++;
+            }
+
+            for (size_t index = 0; index < miss_count; ++index) {
+                result = stage_miss(index);
+                if (!result.is_ready()) return fail_multi(result);
+            }
+        } else {
+            for (size_t index = 0; index < miss_count; ++index) {
+                if (abort_requested()) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::cancelled));
+                }
+                const uint32_t unique_index = miss_unique_indices[index];
+                const auto & key = unique_keys[unique_index];
+                const auto owner = llm_expert_owner_device(key.expert, uint32_t(device_pools.size()));
+                llm_expert_request_metadata metadata;
+                metadata.layout_class_id = binding.layout_class_id;
+                metadata.target_device = owner;
+                metadata.reserved_storage_bytes = payload_for_key(key);
+                metadata.reserved_h2d_bytes = payload_for_key(key);
+                const auto scheduled = config.scheduler->enqueue(
+                    key, llm_expert_priority::demand_current_layer,
+                    llm_expert_readiness::device_ready, metadata);
+                if (!scheduled.accepted()) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        scheduled.disposition == llm_expert_schedule_disposition::generation_exhausted ?
+                            llm_expert_provider_error::generation_exhausted :
+                            llm_expert_provider_error::busy));
+                }
+                scheduler_handles[index] = scheduled.handle;
+                scheduler_states[index] = llm_expert_request_state::queued;
+                llm_expert_request_snapshot snapshot;
+                const auto selected = config.scheduler->take_next(snapshot);
+                if (!selected.accepted() || selected.handle.slot != scheduled.handle.slot ||
+                    selected.handle.generation != scheduled.handle.generation ||
+                    selected.handle.target_device != scheduled.handle.target_device) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                scheduler_states[index] = llm_expert_request_state::submitting;
+                storage_load_context storage_context = {
+                    config.storage, nullptr, nullptr, config.integrity_mode, provider_lock, {}, false,
+                    abort_callback, abort_callback_data,
+                };
+                storage_context.layer_ids = &layout_registry.layer_ids;
+                storage_context.layout_registry = &layout_registry;
+                storage_context.target_device = owner;
+                result = cold_cache->find_or_admit_with_loader(
+                    key, cold_references[index], load_storage_bundle, &storage_context);
+                if (!result.is_ready()) return fail_multi(result);
+                if (config.scheduler->transition(scheduled.handle,
+                        llm_expert_request_state::submitting,
+                        llm_expert_request_state::host_ready) !=
+                    llm_expert_schedule_disposition::admitted) {
+                    return fail_multi(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                scheduler_states[index] = llm_expert_request_state::host_ready;
+                result = stage_miss(index);
                 if (!result.is_ready()) return fail_multi(result);
             }
         }
