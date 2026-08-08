@@ -2716,6 +2716,10 @@ public:
         result = release_request_pins_locked();
         if (!result.is_ready()) return fail(result);
 
+        if (miss_count != 0) {
+            result = validate_hot_directory_policy_locked();
+            if (!result.is_ready()) return fail(result);
+        }
         for (size_t index = 0; index < miss_count; ++index) {
             const uint32_t unique_index = miss_unique_indices[index];
             const auto owner = llm_expert_owner_device(
@@ -8429,24 +8433,27 @@ private:
             int32_t & selected_slot) noexcept {
         auto capacity = cache_policy_result(hot_policy.validate_event_capacity(5));
         if (!capacity.is_ready()) return capacity;
+        if (target_device >= config.devices.size()) {
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::metadata_mismatch);
+        }
+        uint32_t first_slot = 0;
+        for (size_t device = 0; device < target_device; ++device) {
+            first_slot += config.devices[device].capacity;
+        }
+        const uint32_t last_slot = first_slot + config.devices[target_device].capacity;
+        if (last_slot > directory_slots.size()) {
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::metadata_mismatch);
+        }
         size_t candidate_count = 0;
-        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+        for (uint32_t slot = first_slot; slot < last_slot; ++slot) {
             const auto & entry = directory_slots[slot];
-            const bool policy_free = hot_policy.validate_free(slot);
-            const bool policy_loading = hot_policy.validate_loading(
-                slot, entry.generation, policy_key_for(entry.key));
-            const bool policy_ready = hot_policy.validate_resident(
-                slot, entry.generation, policy_key_for(entry.key));
-            const bool mechanism_loading = entry.state == hot_slot_state::loading;
-            const bool mechanism_ready = entry.state == hot_slot_state::ready ||
-                entry.state == hot_slot_state::pinned;
-            if ((entry.state == hot_slot_state::free) != policy_free ||
-                mechanism_loading != policy_loading || mechanism_ready != policy_ready) {
+            if (entry.device_id != target_device) {
                 metadata_mismatches++;
                 return llm_expert_provider_result::failure(
                     llm_expert_provider_error::metadata_mismatch);
             }
-            if (entry.device_id != target_device) continue;
             bool already_candidate = false;
             for (size_t index = 0; index < selected_candidate_count; ++index) {
                 already_candidate = already_candidate || selected_candidates[index] == slot;
@@ -8508,6 +8515,27 @@ private:
             }
         }
         selected_slot = int32_t(decision.slot);
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result validate_hot_directory_policy_locked() noexcept {
+        for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
+            const auto & entry = directory_slots[slot];
+            const bool policy_free = hot_policy.validate_free(slot);
+            const bool policy_loading = hot_policy.validate_loading(
+                slot, entry.generation, policy_key_for(entry.key));
+            const bool policy_ready = hot_policy.validate_resident(
+                slot, entry.generation, policy_key_for(entry.key));
+            const bool mechanism_loading = entry.state == hot_slot_state::loading;
+            const bool mechanism_ready = entry.state == hot_slot_state::ready ||
+                entry.state == hot_slot_state::pinned;
+            if ((entry.state == hot_slot_state::free) != policy_free ||
+                mechanism_loading != policy_loading || mechanism_ready != policy_ready) {
+                metadata_mismatches++;
+                return llm_expert_provider_result::failure(
+                    llm_expert_provider_error::metadata_mismatch);
+            }
+        }
         return llm_expert_provider_result::success();
     }
 
