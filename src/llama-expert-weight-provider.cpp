@@ -2949,7 +2949,7 @@ public:
             return wave_result;
         };
 
-        const auto stage_miss = [&](size_t index) noexcept {
+        const auto reserve_miss_stage = [&](size_t index) noexcept {
             const uint32_t unique_index = miss_unique_indices[index];
             const auto & key = unique_keys[unique_index];
             const auto owner = llm_expert_owner_device(key.expert, uint32_t(device_pools.size()));
@@ -2973,9 +2973,26 @@ public:
                     scheduler_handles[index].slot, scheduler_handles[index].generation, key,
                     binding.layout_class_id, owner,
                 });
-            if (staged.is_ready()) staged = ring->stage(
+            return staged;
+        };
+
+        const auto copy_miss_stage = [&](size_t index) noexcept {
+            const uint32_t global_slot = candidate_slots[index];
+            auto * ring = ring_for_slot(global_slot);
+            if (ring == nullptr) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+            return ring->stage(
                 transfer_lanes[index], cold_cache->bundle(cold_references[index].layout_class_id));
-            if (!staged.is_ready()) return staged;
+        };
+
+        const auto finish_miss_stage = [&](size_t index) noexcept {
+            auto staged = llm_expert_provider_result::success();
+            const uint32_t unique_index = miss_unique_indices[index];
+            const auto & key = unique_keys[unique_index];
+            const auto owner = llm_expert_owner_device(key.expert, uint32_t(device_pools.size()));
+            const uint32_t global_slot = candidate_slots[index];
+            auto & entry = directory_slots[global_slot];
             device_transfers[owner].push_back({
                 transfer_lanes[index],
                 device_pools[owner]->bundles[cold_references[index].layout_class_id],
@@ -2994,6 +3011,72 @@ public:
                 staged = flush_device_transfers();
             }
             return staged;
+        };
+
+        const auto stage_miss = [&](size_t index) noexcept {
+            auto staged = reserve_miss_stage(index);
+            if (staged.is_ready()) staged = copy_miss_stage(index);
+            if (staged.is_ready()) staged = finish_miss_stage(index);
+            return staged;
+        };
+
+        const auto stage_misses = [&](size_t count) noexcept {
+            if (device_pools.size() < 2 || count < 2) {
+                for (size_t index = 0; index < count; ++index) {
+                    const auto staged = stage_miss(index);
+                    if (!staged.is_ready()) return staged;
+                }
+                return llm_expert_provider_result::success();
+            }
+            std::array<size_t, LLM_EXPERT_MAX_DEVICES> counts{};
+            for (size_t index = 0; index < count; ++index) {
+                const auto & key = unique_keys[miss_unique_indices[index]];
+                counts[llm_expert_owner_device(key.expert, uint32_t(device_pools.size()))]++;
+            }
+            for (size_t device = 0; device < device_pools.size(); ++device) {
+                if (counts[device] > device_lane_capacities[device]) {
+                    for (size_t index = 0; index < count; ++index) {
+                        const auto staged = stage_miss(index);
+                        if (!staged.is_ready()) return staged;
+                    }
+                    return llm_expert_provider_result::success();
+                }
+            }
+            for (size_t index = 0; index < count; ++index) {
+                const auto staged = reserve_miss_stage(index);
+                if (!staged.is_ready()) return staged;
+            }
+            try {
+                std::vector<std::future<llm_expert_provider_result>> stages;
+                stages.reserve(device_pools.size());
+                for (size_t device = 0; device < device_pools.size(); ++device) {
+                    if (counts[device] == 0) continue;
+                    stages.emplace_back(std::async(std::launch::async, [&, device] {
+                        for (size_t index = 0; index < count; ++index) {
+                            const auto & key = unique_keys[miss_unique_indices[index]];
+                            if (llm_expert_owner_device(key.expert, uint32_t(device_pools.size())) != device) {
+                                continue;
+                            }
+                            const auto staged = copy_miss_stage(index);
+                            if (!staged.is_ready()) return staged;
+                        }
+                        return llm_expert_provider_result::success();
+                    }));
+                }
+                llm_expert_provider_result staged = llm_expert_provider_result::success();
+                for (auto & stage : stages) {
+                    const auto device_result = stage.get();
+                    if (staged.is_ready() && !device_result.is_ready()) staged = device_result;
+                }
+                if (!staged.is_ready()) return staged;
+            } catch (...) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+            }
+            for (size_t index = 0; index < count; ++index) {
+                const auto staged = finish_miss_stage(index);
+                if (!staged.is_ready()) return staged;
+            }
+            return llm_expert_provider_result::success();
         };
 
         const bool issue_ahead_storage = config.storage != nullptr && config.async_transport != nullptr;
@@ -3198,10 +3281,8 @@ public:
                 completed_count++;
             }
 
-            for (size_t index = 0; index < miss_count; ++index) {
-                result = stage_miss(index);
-                if (!result.is_ready()) return fail_multi(result);
-            }
+            result = stage_misses(miss_count);
+            if (!result.is_ready()) return fail_multi(result);
         } else {
             for (size_t index = 0; index < miss_count; ++index) {
                 if (abort_requested()) {
