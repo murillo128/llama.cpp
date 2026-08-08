@@ -100,6 +100,7 @@ json perfetto_diagnostics_json(const llm_perfetto_trace_diagnostics & value) {
         {"cupti_retained_bytes", value.cupti_retained_bytes},
         {"cupti_retained_capacity_bytes", value.cupti_retained_capacity_bytes},
         {"cupti_peak_buffer_bytes", value.cupti_peak_buffer_bytes},
+        {"cupti_active_buffer_bytes_at_close", value.cupti_active_buffer_bytes_at_close},
         {"cupti_peak_total_bytes", value.cupti_peak_total_bytes},
         {"cupti_unknown_timestamps", value.cupti_unknown_timestamps},
         {"cupti_unmatched_correlations", value.cupti_unmatched_correlations},

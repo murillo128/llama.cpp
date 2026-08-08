@@ -102,6 +102,7 @@ struct llm_perfetto_trace_diagnostics {
     uint64_t cupti_retained_bytes = 0;
     uint64_t cupti_retained_capacity_bytes = 0;
     uint64_t cupti_peak_buffer_bytes = 0;
+    uint64_t cupti_active_buffer_bytes_at_close = 0;
     uint64_t cupti_peak_total_bytes = 0;
     uint64_t cupti_unknown_timestamps = 0;
     uint64_t cupti_unmatched_correlations = 0;

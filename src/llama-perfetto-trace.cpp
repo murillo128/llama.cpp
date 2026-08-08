@@ -33,6 +33,7 @@ std::atomic<uint64_t> g_next_trace_id { 1 };
 std::atomic<uint64_t> g_cupti_active_buffer_bytes { 0 };
 std::atomic<uint64_t> g_cupti_buffer_limit { k_cupti_retained_bytes_max };
 std::atomic<uint64_t> g_cupti_retained_capacity_bytes { 0 };
+std::atomic<bool> g_accept_cupti_records { false };
 
 enum class cupti_record_kind : uint8_t {
     kernel,
@@ -204,8 +205,9 @@ void CUPTIAPI cupti_buffer_requested(uint8_t ** buffer, size_t * size, size_t * 
 void CUPTIAPI cupti_buffer_completed(
         CUcontext context, uint32_t stream_id, uint8_t * buffer, size_t, size_t valid_size) {
     auto & value = state();
-    if (valid_size != 0) {
+    {
         std::lock_guard<std::mutex> lock(value.mutex);
+        if (valid_size != 0 && g_accept_cupti_records.load(std::memory_order_acquire)) {
         CUpti_Activity * activity = nullptr;
         while (true) {
             const CUptiResult next = cuptiActivityGetNextRecord(buffer, valid_size, &activity);
@@ -279,6 +281,7 @@ void CUPTIAPI cupti_buffer_completed(
         } else {
             value.diagnostics.cupti_dropped_records += dropped;
         }
+        }
     }
     std::free(buffer);
     g_cupti_active_buffer_bytes.fetch_sub(k_cupti_buffer_bytes, std::memory_order_acq_rel);
@@ -343,14 +346,10 @@ bool finalize_cupti_activity(trace_state & value) {
     const CUptiResult sync_disable = cuptiActivityEnableAllSyncRecords(0);
     if (first_error == CUPTI_SUCCESS && sync_disable != CUPTI_SUCCESS) first_error = sync_disable;
 
-    // Flush completion can precede the final activity-buffer callback.  This
-    // bounded closeout wait is outside inference and preserves fail-closed
-    // accounting without introducing a CUDA stream/device synchronization.
-    const auto buffer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (g_cupti_active_buffer_bytes.load(std::memory_order_acquire) != 0 &&
-           std::chrono::steady_clock::now() < buffer_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    // CUPTI may retain empty callback buffers after all enabled kinds have
+    // been disabled and flushed.  A later callback only releases its bounded
+    // allocation and must not append records after trace finalization.
+    g_accept_cupti_records.store(false, std::memory_order_release);
 
     std::lock_guard<std::mutex> lock(value.mutex);
     if (!value.diagnostics.track_event_active || !value.diagnostics.cupti_active) {
@@ -359,9 +358,8 @@ bool finalize_cupti_activity(trace_state & value) {
     }
     value.enabled_kind_count = 0;
     if (first_error != CUPTI_SUCCESS) record_cupti_error(value, "CUPTI activity shutdown", first_error);
-    if (g_cupti_active_buffer_bytes.load(std::memory_order_acquire) != 0) {
-        record_callback_failure(value, "CUPTI activity buffers remained active after flush");
-    }
+    value.diagnostics.cupti_active_buffer_bytes_at_close =
+        g_cupti_active_buffer_bytes.load(std::memory_order_acquire);
     try {
         emit_retained_cupti_records(value);
     } catch (...) {
@@ -375,6 +373,7 @@ bool finalize_cupti_activity(trace_state & value) {
         "cupti_dropped_records", value.diagnostics.cupti_dropped_records,
         "cupti_retained_capacity_bytes", value.diagnostics.cupti_retained_capacity_bytes,
         "cupti_peak_total_bytes", value.diagnostics.cupti_peak_total_bytes,
+        "cupti_active_buffer_bytes_at_close", value.diagnostics.cupti_active_buffer_bytes_at_close,
         "cupti_unknown_timestamps", value.diagnostics.cupti_unknown_timestamps,
         "cupti_unmatched_correlations", value.diagnostics.cupti_unmatched_correlations,
         "cupti_kernel_records", value.diagnostics.cupti_kernel_records,
@@ -476,6 +475,7 @@ void trace_observer::OnStart(const perfetto::DataSourceBase::StartArgs &) {
         state.enabled_kind_count++;
     }
     state.diagnostics.cupti_enabled_kind_count = uint32_t(state.enabled_kind_count);
+    g_accept_cupti_records.store(true, std::memory_order_release);
     state.diagnostics.track_event_active = true;
     state.diagnostics.cupti_active = true;
     g_trace_active.store(true, std::memory_order_release);
