@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -116,6 +118,7 @@ void test_default_and_model_ownership() {
     GGML_ASSERT(params.expert_device_count == 1);
     GGML_ASSERT(params.expert_peer_transport == LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED);
     GGML_ASSERT(params.expert_peer_staging_bytes == 0);
+    GGML_ASSERT(params.expert_role_config == nullptr);
 
     llama_model * model = llama_model_create(LLM_ARCH_KIMI_K3, params);
     GGML_ASSERT(model != nullptr);
@@ -157,6 +160,206 @@ void test_default_and_model_ownership() {
         invalid = true;
     }
     GGML_ASSERT(invalid);
+}
+
+std::vector<ggml_backend_dev_t> cuda_devices() {
+    std::vector<ggml_backend_dev_t> result;
+    for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        auto * device = ggml_backend_dev_get(index);
+        auto * reg = ggml_backend_dev_backend_reg(device);
+        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU && reg != nullptr &&
+            std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            result.push_back(device);
+        }
+    }
+    return result;
+}
+
+llama_expert_cache_policy_config role_test_policy() {
+    return {
+        LLAMA_EXPERT_CACHE_POLICY_VERSION_1,
+        sizeof(llama_expert_cache_policy_config),
+        LLAMA_EXPERT_CACHE_POLICY_LRU,
+        LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL,
+        0,
+        LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS,
+        0,
+        0,
+        {},
+    };
+}
+
+llama_model_params role_test_params(
+        const llama_expert_role_config * role,
+        const llama_expert_cache_policy_config * policy) {
+    auto params = llama_model_default_params();
+    params.split_mode = LLAMA_SPLIT_MODE_NONE;
+    params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+    params.expert_cold_cache_bytes = 1U << 20;
+    params.expert_transfer_ring_bytes = 1U << 20;
+    const bool local_single = role->expert_device_count == 1 && role->expert_devices != nullptr &&
+        role->resident_device == role->expert_devices[0].device;
+    params.expert_peer_staging_bytes = local_single ? 0 : 64;
+    params.expert_hot_cache_policy = policy;
+    params.expert_role_config = role;
+    return params;
+}
+
+template<class F> void expect_invalid_role(F && fn) {
+    bool rejected = false;
+    try {
+        fn();
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    GGML_ASSERT(rejected);
+}
+
+void test_expert_role_resolution_and_ownership() {
+    const auto devices = cuda_devices();
+    if (devices.empty()) return;
+    const auto policy = role_test_policy();
+
+    std::vector<llama_expert_role_device> local_devices = {{devices[0], 7}};
+    llama_expert_role_config local = {
+        LLAMA_EXPERT_ROLE_CONFIG_VERSION_1, devices[0], local_devices.data(), uint32_t(local_devices.size()),
+    };
+    auto local_params = role_test_params(&local, &policy);
+    std::unique_ptr<llama_model> local_model(llama_model_create(LLM_ARCH_KIMI_K3, local_params));
+    GGML_ASSERT(local_model != nullptr);
+    const auto & local_plan = local_model->expert_role_plan();
+    GGML_ASSERT(local_plan.explicit_config);
+    GGML_ASSERT(local_plan.shape == llm_expert_role_shape::local_single);
+    GGML_ASSERT(local_plan.experts.size() == 1);
+    GGML_ASSERT(local_plan.experts[0].hot_slots == 7);
+    GGML_ASSERT(local_plan.experts[0].pci_bdf.size() == 16);
+    GGML_ASSERT(local_plan.experts[0].pci_bdf[8] == ':' && local_plan.experts[0].pci_bdf[11] == ':' &&
+        local_plan.experts[0].pci_bdf[14] == '.');
+    GGML_ASSERT(local_plan.experts[0].uuid.rfind("GPU-", 0) == 0);
+    GGML_ASSERT(local_plan.total_hot_slots == 7);
+    GGML_ASSERT(local_model->expert_device_count() == 1);
+    GGML_ASSERT(local_model->expert_hot_cache_capacity() == 7);
+    local_devices[0].hot_slots = 99;
+    local.expert_device_count = 0;
+    GGML_ASSERT(local_model->expert_role_plan().experts[0].hot_slots == 7);
+
+    auto mixed = local_params;
+    mixed.expert_hot_cache_capacity = 1;
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, mixed)); });
+    ggml_backend_dev_t selected_devices[] = {devices[0], nullptr};
+    mixed = local_params;
+    mixed.devices = selected_devices;
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, mixed)); });
+    float tensor_split[] = {1.0f};
+    mixed = local_params;
+    mixed.tensor_split = tensor_split;
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, mixed)); });
+    mixed = local_params;
+    mixed.split_mode = LLAMA_SPLIT_MODE_ROW;
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, mixed)); });
+    mixed = local_params;
+    mixed.main_gpu = 1;
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, mixed)); });
+    mixed = local_params;
+    mixed.expert_device_count = 2;
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, mixed)); });
+    auto invalid_version = local;
+    invalid_version.version = 2;
+    auto invalid_params = role_test_params(&invalid_version, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+    llama_expert_role_device zero_slot = {devices[0], 0};
+    auto invalid_slots = local;
+    invalid_slots.version = LLAMA_EXPERT_ROLE_CONFIG_VERSION_1;
+    invalid_slots.expert_devices = &zero_slot;
+    invalid_slots.expert_device_count = 1;
+    invalid_params = role_test_params(&invalid_slots, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+    auto invalid_array = local;
+    invalid_array.expert_devices = nullptr;
+    invalid_params = role_test_params(&invalid_array, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+    auto invalid_count = local;
+    invalid_count.expert_device_count = 0;
+    invalid_params = role_test_params(&invalid_count, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+    invalid_count.expert_device_count = LLM_EXPERT_MAX_DEVICES + 1;
+    invalid_params = role_test_params(&invalid_count, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+    auto invalid_resident = local;
+    invalid_resident.resident_device = nullptr;
+    invalid_params = role_test_params(&invalid_resident, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+    llama_expert_role_device cpu_role = {ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), 1};
+    auto invalid_cuda = local;
+    invalid_cuda.version = LLAMA_EXPERT_ROLE_CONFIG_VERSION_1;
+    invalid_cuda.resident_device = cpu_role.device;
+    invalid_cuda.expert_devices = &cpu_role;
+    invalid_cuda.expert_device_count = 1;
+    invalid_params = role_test_params(&invalid_cuda, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+
+    if (devices.size() < 2) return;
+    std::vector<llama_expert_role_device> requested = {{devices[1], 11}, {devices[0], 7}};
+    llama_expert_role_config striped = {
+        LLAMA_EXPERT_ROLE_CONFIG_VERSION_1, devices[0], requested.data(), uint32_t(requested.size()),
+    };
+    auto striped_params = role_test_params(&striped, &policy);
+    std::unique_ptr<llama_model> first(llama_model_create(LLM_ARCH_KIMI_K3, striped_params));
+    GGML_ASSERT(first != nullptr);
+    const auto first_plan = first->expert_role_plan();
+    GGML_ASSERT(first_plan.shape == llm_expert_role_shape::striped_multi);
+    GGML_ASSERT(first_plan.total_hot_slots == 18);
+    GGML_ASSERT(first_plan.experts.size() == 2);
+    GGML_ASSERT(first_plan.experts[0].pci_bdf < first_plan.experts[1].pci_bdf ||
+        (first_plan.experts[0].pci_bdf == first_plan.experts[1].pci_bdf &&
+         first_plan.experts[0].uuid < first_plan.experts[1].uuid));
+    GGML_ASSERT(first_plan.experts[0].device == devices[0]);
+    GGML_ASSERT(first_plan.experts[0].hot_slots == 7);
+    GGML_ASSERT(first_plan.experts[1].device == devices[1]);
+    GGML_ASSERT(first_plan.experts[1].hot_slots == 11);
+
+    llama_expert_role_device remote_device = {devices[1], 13};
+    llama_expert_role_config remote = {
+        LLAMA_EXPERT_ROLE_CONFIG_VERSION_1, devices[0], &remote_device, 1,
+    };
+    std::unique_ptr<llama_model> remote_model(
+        llama_model_create(LLM_ARCH_KIMI_K3, role_test_params(&remote, &policy)));
+    GGML_ASSERT(remote_model != nullptr);
+    GGML_ASSERT(remote_model->expert_role_plan().shape == llm_expert_role_shape::remote_single);
+    GGML_ASSERT(remote_model->expert_role_plan().experts[0].hot_slots == 13);
+
+    std::reverse(requested.begin(), requested.end());
+    striped.expert_devices = requested.data();
+    std::unique_ptr<llama_model> second(llama_model_create(LLM_ARCH_KIMI_K3, role_test_params(&striped, &policy)));
+    const auto & second_plan = second->expert_role_plan();
+    for (size_t index = 0; index < first_plan.experts.size(); ++index) {
+        GGML_ASSERT(first_plan.experts[index].pci_bdf == second_plan.experts[index].pci_bdf);
+        GGML_ASSERT(first_plan.experts[index].uuid == second_plan.experts[index].uuid);
+        GGML_ASSERT(first_plan.experts[index].hot_slots == second_plan.experts[index].hot_slots);
+    }
+    auto ordinal_permutation = first_plan.experts;
+    std::swap(ordinal_permutation[0].cuda_ordinal, ordinal_permutation[1].cuda_ordinal);
+    std::reverse(ordinal_permutation.begin(), ordinal_permutation.end());
+    llm_expert_role_canonicalize(ordinal_permutation);
+    for (size_t index = 0; index < first_plan.experts.size(); ++index) {
+        GGML_ASSERT(first_plan.experts[index].pci_bdf == ordinal_permutation[index].pci_bdf);
+        GGML_ASSERT(first_plan.experts[index].uuid == ordinal_permutation[index].uuid);
+        GGML_ASSERT(llm_expert_owner_device(int32_t(index), 2) == llm_expert_device_id(index));
+    }
+
+    llama_expert_role_device duplicate_devices[] = {{devices[0], 1}, {devices[0], 1}};
+    auto duplicate = striped;
+    duplicate.expert_devices = duplicate_devices;
+    duplicate.expert_device_count = 2;
+    invalid_params = role_test_params(&duplicate, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
+    llama_expert_role_device overflow_devices[] = {
+        {devices[0], std::numeric_limits<uint32_t>::max()}, {devices[1], 1},
+    };
+    auto overflow = striped;
+    overflow.expert_devices = overflow_devices;
+    invalid_params = role_test_params(&overflow, &policy);
+    expect_invalid_role([&] { std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_KIMI_K3, invalid_params)); });
 }
 
 void test_keys_and_descriptors() {
@@ -639,7 +842,9 @@ void test_model_integration(const char * model_path, int n_gpu_layers) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    ggml_backend_load_all();
     test_default_and_model_ownership();
+    test_expert_role_resolution_and_ownership();
     test_keys_and_descriptors();
     test_selection_binding_and_handles();
     test_failed_graph_binding_is_never_reusable();
@@ -647,15 +852,14 @@ int main(int argc, char ** argv) {
     test_resident_provider_and_plan_retention();
     test_resident_provider_failures_cleanup_partially_acquired_handles();
     if (argc == 3 || argc == 4) {
-        ggml_backend_load_all();
         test_model_integration(argv[1], std::stoi(argv[2]));
         if (argc == 4) {
             test_two_models(argv[1], argv[3], std::stoi(argv[2]));
         }
-        llama_backend_free();
     } else if (argc != 1) {
         std::cerr << "usage: test-expert-weight-provider [MODEL GPU_LAYERS [SECOND_MODEL]]\n";
         return 2;
     }
+    llama_backend_free();
     return 0;
 }

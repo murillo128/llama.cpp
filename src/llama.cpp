@@ -148,9 +148,11 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    const bool explicit_roles = model->has_explicit_expert_role_config();
     const bool expert_multi_device =
         params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
-        params.expert_device_count > 1;
+        (explicit_roles ? model->expert_role_plan().shape != llm_expert_role_shape::local_single :
+            params.expert_device_count > 1);
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -276,6 +278,18 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         }
     }
 
+    if (explicit_roles) {
+        const auto & plan = model->expert_role_plan();
+        model->devices.clear();
+        model->devices.push_back({false, plan.resident.device});
+        for (const auto & expert : plan.experts) {
+            const bool present = std::any_of(model->devices.begin(), model->devices.end(), [&](const auto & value) {
+                return value.dev == expert.device;
+            });
+            if (!present) model->devices.push_back({false, expert.device});
+        }
+    }
+
     // if using single GPU mode, remove all except the main GPU
     if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty() && !expert_multi_device) {
         if (params.main_gpu < 0) {
@@ -291,7 +305,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         }
     }
 
-    if (expert_multi_device) {
+    if (expert_multi_device && !explicit_roles) {
         if (params.split_mode != LLAMA_SPLIT_MODE_NONE || params.main_gpu < 0 ||
             model->devices.size() < params.expert_device_count) {
             LLAMA_LOG_ERROR("%s: multi-device expert mode requires SPLIT_MODE_NONE and all selected CUDA devices\n", __func__);
@@ -323,6 +337,18 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
         }
         model->devices.resize(params.expert_device_count);
+    }
+
+    const bool cached_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE ||
+        params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE ||
+        params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
+    if (cached_mode && !explicit_roles) {
+        try {
+            model->resolve_legacy_expert_role_plan();
+        } catch (const std::exception & error) {
+            LLAMA_LOG_ERROR("%s: unable to resolve legacy expert roles: %s\n", __func__, error.what());
+            return false;
+        }
     }
 
     for (const auto & dev : model->devices) {

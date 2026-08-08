@@ -121,6 +121,10 @@ json perfetto_diagnostics_json(const llm_perfetto_trace_diagnostics & value) {
 #endif
 
 struct arguments {
+    struct role_device {
+        uint32_t device = 0;
+        uint32_t hot_slots = 0;
+    };
     std::string model;
     std::string output;
     std::string mode = "cold";
@@ -135,6 +139,9 @@ struct arguments {
     uint64_t cold_bytes = 64U*1024U*1024U;
     uint64_t ring_bytes = 16U*1024U*1024U;
     uint32_t expert_devices = 1;
+    std::string role_config = "LEGACY";
+    uint32_t resident_device = 0;
+    std::vector<role_device> role_devices;
     std::string peer_transport = "HOST_STAGED";
     uint64_t peer_staging_bytes = 0;
     uint32_t delayed_device = UINT32_MAX;
@@ -171,6 +178,28 @@ bool parse_u32(const char * text, uint32_t & value) {
     if (!parse_u64(text, parsed) || parsed > UINT32_MAX) return false;
     value = uint32_t(parsed);
     return true;
+}
+
+bool parse_role_devices(const char * text, std::vector<arguments::role_device> & result) {
+    result.clear();
+    std::string input = text;
+    size_t begin = 0;
+    while (begin < input.size()) {
+        const size_t end = input.find(',', begin);
+        const std::string entry = input.substr(begin, end == std::string::npos ? end : end - begin);
+        const size_t separator = entry.find(':');
+        arguments::role_device parsed;
+        if (separator == std::string::npos ||
+            !parse_u32(entry.substr(0, separator).c_str(), parsed.device) ||
+            !parse_u32(entry.substr(separator + 1).c_str(), parsed.hot_slots) || parsed.hot_slots == 0) {
+            return false;
+        }
+        result.push_back(parsed);
+        if (result.size() > LLM_EXPERT_MAX_DEVICES) return false;
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return !result.empty();
 }
 
 std::string token_piece(const llama_vocab * vocab, llama_token token) {
@@ -212,6 +241,13 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--expert-devices") {
             if (!parse_u32(value, result.expert_devices) || result.expert_devices == 0 ||
                 result.expert_devices > LLM_EXPERT_MAX_DEVICES) return false;
+        } else if (option == "--role-config") {
+            result.role_config = value;
+            if (result.role_config != "LEGACY" && result.role_config != "EXPLICIT") return false;
+        } else if (option == "--resident-device") {
+            if (!parse_u32(value, result.resident_device)) return false;
+        } else if (option == "--expert-role-devices") {
+            if (!parse_role_devices(value, result.role_devices)) return false;
         } else if (option == "--peer-transport") {
             result.peer_transport = value;
             if (result.peer_transport != "HOST_STAGED" && result.peer_transport != "P2P") return false;
@@ -259,9 +295,18 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
             if (result.integrity != "NONE" && result.integrity != "FNV64_END_TO_END") return false;
         } else return false;
     }
+    if (result.role_config == "EXPLICIT") {
+        if (result.role_devices.empty()) return false;
+        result.expert_devices = uint32_t(result.role_devices.size());
+    } else if (!result.role_devices.empty() || result.resident_device != 0) {
+        return false;
+    }
+    const bool remote_roles = result.role_config == "EXPLICIT" ?
+        result.role_devices.size() > 1 || result.role_devices[0].device != result.resident_device :
+        result.expert_devices > 1;
     return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ctx > 0 &&
         result.n_batch > 0 && result.n_ubatch > 0 && result.n_ubatch <= result.n_batch &&
-        (result.expert_devices == 1 ? result.peer_staging_bytes == 0 :
+        (!remote_roles ? result.peer_staging_bytes == 0 :
             (result.peer_transport == "HOST_STAGED" ? result.peer_staging_bytes != 0 :
                 result.peer_staging_bytes == 0)) &&
         ((result.delayed_device == UINT32_MAX && result.device_delay_us == 0) ||
@@ -588,13 +633,36 @@ int main(int argc, char ** argv) {
             ggml_backend_dev_get_props(rhs, &rhs_props);
             return std::strcmp(lhs_props.device_id, rhs_props.device_id) < 0;
         });
-        if (selected_devices.size() < args.expert_devices) {
+        uint32_t required_devices = args.expert_devices;
+        if (args.role_config == "EXPLICIT") {
+            required_devices = args.resident_device + 1;
+            for (const auto & role : args.role_devices) {
+                required_devices = std::max(required_devices, role.device + 1);
+            }
+        }
+        if (selected_devices.size() < required_devices) {
             std::fprintf(stderr, "phase9-cache-policy-probe: requested %u CUDA devices, found %zu\n",
-                args.expert_devices, selected_devices.size());
+                required_devices, selected_devices.size());
             return 2;
         }
-        selected_devices.resize(args.expert_devices);
-        selected_devices.push_back(nullptr);
+        std::vector<ggml_backend_dev_t> legacy_devices;
+        std::vector<llama_expert_role_device> role_devices;
+        llama_expert_role_config role_config = {};
+        if (args.role_config == "LEGACY") {
+            legacy_devices.assign(selected_devices.begin(), selected_devices.begin() + args.expert_devices);
+            legacy_devices.push_back(nullptr);
+        } else {
+            role_devices.reserve(args.role_devices.size());
+            for (const auto & role : args.role_devices) {
+                role_devices.push_back({selected_devices[role.device], role.hot_slots});
+            }
+            role_config = {
+                LLAMA_EXPERT_ROLE_CONFIG_VERSION_1,
+                selected_devices[args.resident_device],
+                role_devices.data(),
+                uint32_t(role_devices.size()),
+            };
+        }
         const auto hot_config = make_config(args.hot_policy, args, true);
         const auto cold_config = make_config(args.cold_policy, args, false);
         const llama_expert_auto_cost_model auto_cost = {
@@ -609,7 +677,7 @@ int main(int argc, char ** argv) {
             { nullptr, nullptr },
         };
         auto model_params = llama_model_default_params();
-        model_params.devices = selected_devices.data();
+        model_params.devices = args.role_config == "LEGACY" ? legacy_devices.data() : nullptr;
         model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
         model_params.main_gpu = 0;
         model_params.load_mode = args.transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
@@ -622,14 +690,15 @@ int main(int argc, char ** argv) {
             args.mode == "cold" ? LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
         model_params.expert_runtime_mode = args.expert_runtime_mode == "COMPLIANCE" ?
             LLAMA_EXPERT_RUNTIME_MODE_COMPLIANCE : LLAMA_EXPERT_RUNTIME_MODE_PERFORMANCE;
-        model_params.expert_device_count = args.expert_devices;
+        model_params.expert_device_count = args.role_config == "LEGACY" ? args.expert_devices : 1;
         model_params.expert_peer_transport = args.peer_transport == "P2P" ?
             LLAMA_EXPERT_PEER_TRANSPORT_P2P : LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED;
         model_params.expert_peer_staging_bytes = args.peer_staging_bytes;
         if (args.mode != "disabled") {
-            model_params.expert_hot_cache_capacity = args.hot_slots;
+            model_params.expert_hot_cache_capacity = args.role_config == "LEGACY" ? args.hot_slots : 0;
             model_params.expert_hot_cache_policy = args.config_source == "NULL" ? nullptr : &hot_config;
         }
+        model_params.expert_role_config = args.role_config == "EXPLICIT" ? &role_config : nullptr;
         if (args.mode == "cold") {
             model_params.expert_cold_cache_bytes = args.cold_bytes;
             model_params.expert_transfer_ring_bytes = args.ring_bytes;
@@ -808,6 +877,7 @@ int main(int argc, char ** argv) {
         const json perfetto_diagnostics = nullptr;
 #endif
         const auto peer_transport_diagnostics = context->expert_peer_transport_diagnostics();
+        const auto graph_diagnostics = context->expert_graph_diagnostics();
         // Releasing the context closes the provider request, drains or cancels
         // every background flight, and emits all reserved policy terminals.
         // Evidence must never accept a live provisional transcript prefix.
@@ -845,6 +915,8 @@ int main(int argc, char ** argv) {
             return 0;
         }
         const auto diagnostics = provider->hot_cache_diagnostics();
+        const auto & resolved_roles = model->expert_role_plan();
+        const auto provider_stats = model->expert_weight_provider_stats();
         const auto storage_diagnostics = model->expert_storage()->diagnostics();
         const auto async_diagnostics = model->expert_async_diagnostics();
         const auto async_read_intervals = model->expert_async_read_intervals();
@@ -945,6 +1017,15 @@ int main(int argc, char ** argv) {
                 {"branch_delay_requested_us_for_testing", device.branch_delay_requested_us_for_testing},
             });
         }
+        json role_device_diagnostics = json::array();
+        for (size_t index = 0; index < resolved_roles.experts.size(); ++index) {
+            const auto & expert = resolved_roles.experts[index];
+            role_device_diagnostics.push_back({
+                {"device_id", index}, {"cuda_ordinal", expert.cuda_ordinal},
+                {"pci_bdf", expert.pci_bdf}, {"uuid", expert.uuid},
+                {"hot_slots", expert.hot_slots},
+            });
+        }
         json output = {
             {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
             {"command", command}, {"model_path", args.model}, {"mode", args.mode},
@@ -952,6 +1033,7 @@ int main(int argc, char ** argv) {
             {"prompt", prompt_text},
             {"transport_requested", args.transport},
             {"config_source", args.config_source},
+            {"role_config_source", args.role_config},
             {"miss_policy", args.miss_policy}, {"background", args.background},
             {"multi_gpu", {
                 {"device_count", args.expert_devices}, {"devices", device_diagnostics},
@@ -984,6 +1066,31 @@ int main(int argc, char ** argv) {
                 {"directory_device_cells", diagnostics.directory_device_cells},
                 {"directory_owner_only_violations", diagnostics.directory_owner_only_violations},
                 {"peer_diagnostics", peer_diagnostics},
+            }},
+            {"expert_roles", {
+                {"shape", resolved_roles.shape == llm_expert_role_shape::local_single ? "LOCAL_SINGLE" :
+                    resolved_roles.shape == llm_expert_role_shape::remote_single ? "REMOTE_SINGLE" : "STRIPED_MULTI"},
+                {"explicit", resolved_roles.explicit_config},
+                {"resident", {
+                    {"cuda_ordinal", resolved_roles.resident.cuda_ordinal},
+                    {"pci_bdf", resolved_roles.resident.pci_bdf},
+                    {"uuid", resolved_roles.resident.uuid},
+                }},
+                {"expert_device_count", resolved_roles.experts.size()},
+                {"total_hot_slots", resolved_roles.total_hot_slots},
+                {"experts", role_device_diagnostics},
+            }},
+            {"role_path_structure", {
+                {"graph_operation_hash", graph_diagnostics.operation_hash},
+                {"graph_node_count", graph_diagnostics.node_count},
+                {"graph_binding_count", graph_diagnostics.binding_count},
+                {"graphs_reused", graph_diagnostics.graphs_reused},
+                {"provider_bind_calls", provider_stats.bind_calls},
+                {"remap_dynamic_allocations", diagnostics.remap_dynamic_allocations},
+                {"synchronization_checkpoints", diagnostics.synchronization_checkpoints},
+                {"execution_id_read_bytes", diagnostics.execution_id_read_bytes},
+                {"execution_id_write_bytes", diagnostics.execution_id_write_bytes},
+                {"peer_edge_count", peer_diagnostics.size()},
             }},
             {"runtime", {
                 {"n_ctx", args.n_ctx},
@@ -1026,7 +1133,8 @@ int main(int argc, char ** argv) {
                 {"universal_hot_slot_stride", diagnostics.hot_slot_stride},
             }},
             {"capacities", {
-                {"hot_requested_slots", args.hot_slots}, {"hot_effective_slots", diagnostics.effective_capacity},
+                {"hot_requested_slots", resolved_roles.total_hot_slots},
+                {"hot_effective_slots", diagnostics.effective_capacity},
                 {"hot_pool_bytes", diagnostics.pool_bytes}, {"cold_requested_bytes", diagnostics.cold_requested_bytes},
                 {"cold_actual_bytes", diagnostics.cold_actual_bytes}, {"cold_effective_slots", diagnostics.cold_effective_slots},
                 {"cold_unused_budget_bytes", diagnostics.cold_unused_budget_bytes},
