@@ -1,4 +1,5 @@
 #include "llama-expert-cache-policy.h"
+#include "llama-perfetto-trace.h"
 
 #include <algorithm>
 #include <limits>
@@ -1131,6 +1132,9 @@ bool llm_expert_cache_policy::set_resident_frequency_for_testing(
 }
 
 uint64_t llm_expert_cache_policy::hash_state() const noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.policy", "hash_state",
+        "key_count", uint64_t(keys.size()), "slot_count", uint64_t(slots.size()),
+        "domain_count", uint64_t(domains.size()));
     uint64_t hash = fnv_offset;
     hash_append(hash, config.digest);
     hash_append(hash, counters.request_ordinal);

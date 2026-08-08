@@ -11,6 +11,7 @@ PERFETTO_DEFINE_CATEGORIES(
     perfetto::Category("k3.request").SetDescription("Model, context, request, token, and teardown lifetimes"),
     perfetto::Category("k3.route").SetDescription("Router selection and publication"),
     perfetto::Category("k3.provider").SetDescription("Expert provider planning, binding, readiness, and release"),
+    perfetto::Category("k3.policy").SetDescription("Expert cache-policy state and decision accounting"),
     perfetto::Category("k3.scheduler").SetDescription("Expert single-flight scheduling and cancellation"),
     perfetto::Category("k3.cache.hot").SetDescription("Hot expert cache state transitions"),
     perfetto::Category("k3.cache.cold").SetDescription("Cold expert cache state transitions"),
