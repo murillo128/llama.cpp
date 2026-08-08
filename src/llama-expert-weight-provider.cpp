@@ -2634,6 +2634,11 @@ public:
             return fail(llm_expert_provider_result::failure(
                 llm_expert_provider_error::invalid_binding));
         }
+        if (runtime_device_backends &&
+            device_transfer_event_capabilities.size() != binding.devices.size()) {
+            return fail(llm_expert_provider_result::failure(
+                llm_expert_provider_error::initialization_failed));
+        }
         bool async_decode_transfers = runtime_device_backends &&
             requested_phase == llm_expert_cache_policy_phase::decode;
         for (size_t device = 0; device < binding.devices.size(); ++device) {
@@ -2647,7 +2652,7 @@ public:
                 return fail(llm_expert_provider_result::failure(
                     llm_expert_provider_error::invalid_binding));
             }
-            if (async_decode_transfers && !transfer_rings[device]->diagnostics().event_capable) {
+            if (async_decode_transfers && !device_transfer_event_capabilities[device]) {
                 return fail(llm_expert_provider_result::failure(
                     llm_expert_provider_error::unsupported_configuration));
             }
@@ -5347,6 +5352,7 @@ public:
             std::unique_ptr<llm_expert_transfer_ring> ring_candidate;
             std::vector<std::unique_ptr<llm_expert_transfer_ring>> ring_candidates;
             std::vector<uint32_t> device_transfer_lane_capacities_candidate;
+            std::vector<uint8_t> device_transfer_event_capabilities_candidate;
             uint64_t cold_bundle_payload_candidate = 0;
             uint32_t transfer_lane_capacity_candidate = 0;
             if (config.cold_mode) {
@@ -5366,6 +5372,7 @@ public:
                 }
                 ring_candidates.reserve(pool_devices.size());
                 device_transfer_lane_capacities_candidate.reserve(pool_devices.size());
+                device_transfer_event_capabilities_candidate.reserve(pool_devices.size());
                 for (const auto & device : pool_devices) {
                     auto device_ring = std::make_unique<llm_expert_transfer_ring>(llm_transfer_ring_config {
                         config.transfer_ring_bytes,
@@ -5386,13 +5393,16 @@ public:
                             config.phase8_test_control);
                         if (!initialized.is_ready()) return fail(initialized);
                     }
-                    const uint32_t device_lane_capacity = device_ring->diagnostics().effective_lanes;
+                    const auto device_ring_diagnostics = device_ring->diagnostics();
+                    const uint32_t device_lane_capacity = device_ring_diagnostics.effective_lanes;
                     if (device_lane_capacity < 2) {
                         return fail_initialization("device transfer ring capacity",
                             llm_expert_provider_result::failure(
                                 llm_expert_provider_error::unsupported_configuration));
                     }
                     device_transfer_lane_capacities_candidate.push_back(device_lane_capacity);
+                    device_transfer_event_capabilities_candidate.push_back(
+                        device_ring_diagnostics.event_capable ? 1 : 0);
                     ring_candidates.push_back(std::move(device_ring));
                 }
                 ring_candidate = std::move(ring_candidates.front());
@@ -5710,6 +5720,8 @@ public:
             cold_bundle_payload = cold_bundle_payload_candidate;
             transfer_lane_capacity = transfer_lane_capacity_candidate;
             device_transfer_lane_capacities = std::move(device_transfer_lane_capacities_candidate);
+            device_transfer_event_capabilities = std::move(
+                device_transfer_event_capabilities_candidate);
             use_clock = seed_use_clock;
 
             for (auto & device_pool : pool_candidates) device_pool->id = ++generation;
@@ -5875,6 +5887,7 @@ public:
         transfer_ring = nullptr;
         transfer_rings.clear();
         device_transfer_lane_capacities.clear();
+        device_transfer_event_capabilities.clear();
         directory_forward.clear();
         directory_slots.clear();
         LLM_EXPERT_TRACE_COUNTER("k3.resource", "hot_cache_occupancy", 4, 0);
@@ -9073,6 +9086,7 @@ private:
     std::unique_ptr<llm_cold_expert_cache> cold_cache;
     std::vector<std::unique_ptr<llm_expert_transfer_ring>> transfer_rings;
     std::vector<uint32_t> device_transfer_lane_capacities;
+    std::vector<uint8_t> device_transfer_event_capabilities;
     llm_expert_transfer_ring * transfer_ring = nullptr;
     bool multi_device = false;
     struct device_runtime_counters {
