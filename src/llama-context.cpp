@@ -346,6 +346,46 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        if (model.expert_device_count() > 1) {
+            const uint32_t device_count = model.expert_device_count();
+            if (backends.size() != device_count) {
+                throw std::runtime_error("routed-expert backend count does not match the sealed device topology");
+            }
+            using configure_peer_fn = int (*)(ggml_backend_t, int, size_t);
+            using peer_capability_fn = int (*)(ggml_backend_t, ggml_backend_t, int);
+            std::vector<peer_capability_fn> peer_capabilities(device_count, nullptr);
+            const uint64_t total_staging = model.expert_peer_staging_bytes();
+            const size_t per_device_staging = model.expert_peer_transport() ==
+                    LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED ?
+                size_t(total_staging/device_count) : 0;
+            for (uint32_t device = 0; device < device_count; ++device) {
+                ggml_backend_t backend = backends[device].get();
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto configure = reg ? reinterpret_cast<configure_peer_fn>(ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_expert_configure_peer_transport")) : nullptr;
+                auto capability = reg ? reinterpret_cast<peer_capability_fn>(ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_expert_peer_capability")) : nullptr;
+                if (configure == nullptr || capability == nullptr ||
+                    configure(backend, int(model.expert_peer_transport()), per_device_staging) != 0) {
+                    throw std::runtime_error("failed to configure the explicit routed-expert CUDA peer transport");
+                }
+                peer_capabilities[device] = capability;
+            }
+            if (model.expert_peer_transport() == LLAMA_EXPERT_PEER_TRANSPORT_P2P) {
+                for (uint32_t src = 0; src < device_count; ++src) {
+                    for (uint32_t dst = 0; dst < device_count; ++dst) {
+                        if (src != dst && peer_capabilities[src](backends[src].get(), backends[dst].get(), 1) != 1) {
+                            throw std::runtime_error("requested routed-expert P2P transport is not capable in both directions");
+                        }
+                    }
+                }
+            }
+            LLAMA_LOG_INFO("%s: routed-expert peer transport = %s, bounded pinned staging = %" PRIu64 " bytes\n",
+                __func__, model.expert_peer_transport() == LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED ?
+                    "HOST_STAGED" : "P2P", total_staging);
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -738,9 +778,11 @@ void llama_context::sched_reserve() {
         }
         const auto initialized = expert_weight_provider->initialize_after_reserve();
         if (!initialized.is_ready()) {
-            throw std::runtime_error(initialized.status == llm_expert_provider_status::allocation_failed
+            const char * message = initialized.status == llm_expert_provider_status::allocation_failed
                 ? "failed to allocate bounded cold-cache hierarchy"
-                : "failed to initialize bounded cold-cache hierarchy");
+                : "failed to initialize bounded cold-cache hierarchy";
+            throw std::runtime_error(std::string(message) +
+                " (provider error " + std::to_string(int(initialized.error)) + ")");
         }
         hierarchy_initialized = true;
         backend_bytes_after_hierarchy = scheduler_backend_bytes();
@@ -1004,6 +1046,33 @@ llm_expert_graph_diagnostics llama_context::expert_graph_diagnostics() const {
         hash = (hash ^ 0xffU)*prime;
     }
     result.operation_hash = hash;
+    return result;
+}
+
+std::vector<llm_expert_peer_transport_diagnostics>
+llama_context::expert_peer_transport_diagnostics() const {
+    std::vector<llm_expert_peer_transport_diagnostics> result;
+    const uint32_t device_count = model.expert_device_count();
+    result.reserve(device_count);
+    using diagnostics_fn = int (*)(ggml_backend_t, uint64_t *, size_t);
+    for (uint32_t device = 0; device < device_count && device < backends.size(); ++device) {
+        llm_expert_peer_transport_diagnostics diagnostics;
+        diagnostics.device_id = llm_expert_device_id(device);
+        ggml_backend_t backend = backends[device].get();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto query = reg ? reinterpret_cast<diagnostics_fn>(ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_cuda_expert_peer_diagnostics")) : nullptr;
+        uint64_t values[5] = {};
+        if (query != nullptr && query(backend, values, 5) == 0) {
+            diagnostics.host_staged_bytes = values[0];
+            diagnostics.host_staged_copies = values[1];
+            diagnostics.host_staged_blocking_us = values[2];
+            diagnostics.peer_bytes = values[3];
+            diagnostics.peer_copies = values[4];
+        }
+        result.push_back(diagnostics);
+    }
     return result;
 }
 
@@ -1817,7 +1886,8 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
         for (const auto & binding : *ctx->expert_eval_bindings) {
             if (!binding.bootstrap && binding.logical_ids != nullptr &&
                 binding.execution_ids != binding.logical_ids &&
-                (binding.hybrid ? binding.checkpoint_ids : binding.execution_ids) == tensor) {
+                ((binding.hybrid || binding.multi_device) ?
+                    binding.checkpoint_ids : binding.execution_ids) == tensor) {
                 checkpoint = &binding;
                 break;
             }

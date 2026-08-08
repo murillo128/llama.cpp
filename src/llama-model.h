@@ -689,6 +689,9 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    uint32_t expert_device_count() const;
+    llama_expert_peer_transport expert_peer_transport() const;
+    uint64_t expert_peer_staging_bytes() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

@@ -36,6 +36,13 @@ bool checked_add(uint64_t lhs, uint64_t rhs, uint64_t & result) {
     return true;
 }
 
+bool same_request(
+        llm_expert_request_handle lhs,
+        llm_expert_request_handle rhs) {
+    return lhs.slot == rhs.slot && lhs.generation == rhs.generation &&
+        lhs.target_device == rhs.target_device;
+}
+
 bool checked_multiply(uint64_t lhs, uint64_t rhs, uint64_t & result) {
     if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max()/lhs) {
         return false;
@@ -366,7 +373,7 @@ struct llm_expert_async_transport::impl {
     read_request_record * find_read(llm_expert_request_handle handle) {
         if (!handle.valid() || handle.slot >= read_requests.size()) return nullptr;
         auto & request = read_requests[handle.slot];
-        return request.state != read_state::free && request.handle.generation == handle.generation ? &request : nullptr;
+        return request.state != read_state::free && same_request(request.handle, handle) ? &request : nullptr;
     }
 
     void mark_request_running_locked(read_request_record & request) {
@@ -464,8 +471,7 @@ struct llm_expert_async_transport::impl {
     void record_request_traces_locked(const read_request_record & request) {
         for (const auto & operation : operations) {
             if (!operation.active || !operation.read_operation ||
-                operation.identity.request.slot != request.handle.slot ||
-                operation.identity.request.generation != request.handle.generation) continue;
+                !same_request(operation.identity.request, request.handle)) continue;
             if (operation.submit_us == 0 || operation.complete_us < operation.submit_us) continue;
             if (counters.trace_records < traces.size()) {
                 auto & trace = traces[counters.trace_records++];
@@ -503,8 +509,7 @@ struct llm_expert_async_transport::impl {
             size_t completed_segment_count = 0;
             for (const auto & operation : operations) {
                 if (!operation.active || !operation.read_operation ||
-                    operation.identity.request.slot != request.handle.slot ||
-                    operation.identity.request.generation != request.handle.generation) continue;
+                    !same_request(operation.identity.request, request.handle)) continue;
                 for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
                     if (completed_segment_count < completed_segments.size()) {
                         completed_segments[completed_segment_count++] = &operation.read.segments[index];
@@ -544,8 +549,7 @@ struct llm_expert_async_transport::impl {
         if (request.completion.result == llm_expert_async_result::closed) counters.read_requests_cancelled++;
         for (auto & operation : operations) {
             if (operation.active && operation.read_operation &&
-                operation.identity.request.slot == request.handle.slot &&
-                operation.identity.request.generation == request.handle.generation) {
+                same_request(operation.identity.request, request.handle)) {
                 operation.active = false;
                 operation.read_operation = false;
                 operation.ring_completed = false;
@@ -567,8 +571,7 @@ struct llm_expert_async_transport::impl {
             const auto handle = group_handles[handle_index];
             for (auto & operation : operations) {
                 if (!operation.active || !operation.read_operation ||
-                    operation.identity.request.slot != handle.slot ||
-                    operation.identity.request.generation != handle.generation) continue;
+                    !same_request(operation.identity.request, handle)) continue;
                 operation.submit_us = uint64_t(ggml_time_us());
                 operation.completed_bytes = 0;
                 LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation",
@@ -802,8 +805,7 @@ struct llm_expert_async_transport::impl {
             std::lock_guard<std::mutex> guard(mutex);
             for (const auto & operation : operations) {
                 if (operation.active && operation.read_operation &&
-                    operation.identity.request.slot == handle.slot &&
-                    operation.identity.request.generation == handle.generation) remaining++;
+                    same_request(operation.identity.request, handle)) remaining++;
             }
         }
         while (remaining > 0) {
@@ -812,8 +814,7 @@ struct llm_expert_async_transport::impl {
                 std::lock_guard<std::mutex> guard(mutex);
                 auto & operation = operations[next];
                 if (!operation.active || !operation.read_operation ||
-                    operation.identity.request.slot != handle.slot ||
-                    operation.identity.request.generation != handle.generation) continue;
+                    !same_request(operation.identity.request, handle)) continue;
                 if (read_requests[handle.slot].cancel_requested) {
                     completion.result = llm_expert_async_result::closed;
                     return false;
@@ -973,8 +974,7 @@ struct llm_expert_async_transport::impl {
                 }
                 auto & operation = operations[operation_slot];
                 if (!operation.active || operation.generation != operation_generation ||
-                    operation.identity.request.slot != handle.slot ||
-                    operation.identity.request.generation != handle.generation) {
+                    !same_request(operation.identity.request, handle)) {
                     counters.stale_completions++;
                     if (first_error == llm_expert_async_result::ready) first_error = llm_expert_async_result::stale_generation;
                     if (cancel_completion) cancel_completions_left--;
@@ -1194,8 +1194,7 @@ struct llm_expert_async_transport::impl {
                 lock.lock();
                 auto & stored = operations[operation_index];
                 if (!stored.active || !stored.read_operation ||
-                    stored.identity.request.slot != handle.slot ||
-                    stored.identity.request.generation != handle.generation) {
+                    !same_request(stored.identity.request, handle)) {
                     lock.unlock();
                     continue;
                 }
@@ -1365,8 +1364,7 @@ struct llm_expert_async_transport::impl {
                     size_t completed_segment_count = 0;
                     for (const auto & operation : operations) {
                         if (!operation.active || !operation.read_operation ||
-                            operation.identity.request.slot != handle.slot ||
-                            operation.identity.request.generation != handle.generation) continue;
+                            !same_request(operation.identity.request, handle)) continue;
                         for (uint8_t index = 0; index < operation.read.segment_count; ++index) {
                             if (completed_segment_count < completed_segments.size()) {
                                 completed_segments[completed_segment_count++] = &operation.read.segments[index];
@@ -1407,8 +1405,7 @@ struct llm_expert_async_transport::impl {
                 if (completion.result == llm_expert_async_result::closed) counters.read_requests_cancelled++;
                 for (auto & operation : operations) {
                     if (operation.active && operation.read_operation &&
-                        operation.identity.request.slot == handle.slot &&
-                        operation.identity.request.generation == handle.generation) {
+                        same_request(operation.identity.request, handle)) {
                         operation.active = false;
                         operation.read_operation = false;
                         operation.ring_completed = false;
@@ -1766,7 +1763,7 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
         llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight, identity.request.slot,
             uint32_t(identity.request.generation)), "layer", identity.key.layer,
         "original_expert_id", identity.key.expert, "layout_class_id", identity.layout_class_id,
-        "operation_count", read_count);
+        "operation_count", read_count, "device_id", identity.request.target_device);
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->counters.admission_closed) return llm_expert_async_result::closed;
     if (!identity.request.valid() || identity.request.slot >= pimpl->read_requests.size() ||
@@ -1831,7 +1828,8 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
     LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_request", trace_id, "request_generation",
         identity.request.generation, "request_slot", identity.request.slot, "request_ordinal", request.ordinal,
         "layer", identity.key.layer, "original_expert_id", identity.key.expert,
-        "layout_class_id", identity.layout_class_id, "operation_count", read_count);
+        "layout_class_id", identity.layout_class_id, "operation_count", read_count,
+        "device_id", identity.request.target_device);
     LLM_EXPERT_TRACE_COUNTER("k3.resource", "storage_active_requests", 3, pimpl->counters.active_read_requests);
     pimpl->deferred_batch_open = defer_worker;
     if (!defer_worker) pimpl->condition.notify_one();

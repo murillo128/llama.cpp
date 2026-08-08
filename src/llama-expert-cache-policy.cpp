@@ -399,9 +399,9 @@ bool llm_expert_cache_policy::normalize_aging(
     return true;
 }
 
-bool llm_expert_cache_policy::candidate_precedes(uint32_t lhs_slot, uint32_t rhs_slot) noexcept {
-    auto & lhs = slots[lhs_slot];
-    auto & rhs = slots[rhs_slot];
+bool llm_expert_cache_policy::candidate_precedes(uint32_t lhs_slot, uint32_t rhs_slot) const noexcept {
+    const auto & lhs = slots[lhs_slot];
+    const auto & rhs = slots[rhs_slot];
     bool precedes = false;
     bool equivalent = false;
     if (config.policy == LLAMA_EXPERT_CACHE_POLICY_LRU) {
@@ -1086,6 +1086,14 @@ bool llm_expert_cache_policy::validate_loading(
         llm_expert_cache_policy_key key) const noexcept {
     return slot < slots.size() && slots[slot].loading && !slots[slot].resident &&
         slots[slot].generation == generation && key_matches(slots[slot].key, key);
+}
+
+bool llm_expert_cache_policy::resident_precedes(uint32_t lhs_slot, uint32_t rhs_slot) const noexcept {
+    if (lhs_slot >= slots.size() || rhs_slot >= slots.size() ||
+        !slots[lhs_slot].resident || !slots[rhs_slot].resident) {
+        return false;
+    }
+    return candidate_precedes(lhs_slot, rhs_slot);
 }
 
 bool llm_expert_cache_policy::validate_free(uint32_t slot) const noexcept {

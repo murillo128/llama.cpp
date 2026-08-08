@@ -28,13 +28,13 @@ struct fixture {
 
     explicit fixture(int32_t n_expert, bool fill = true,
             ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type(),
-            ggml_type type = GGML_TYPE_F32) : n_expert(n_expert) {
+            ggml_type type = GGML_TYPE_F32, int64_t width = 8) : n_expert(n_expert) {
         ggml_init_params params = { ggml_tensor_overhead()*8, nullptr, true };
         ctx.reset(ggml_init(params));
         GGML_ASSERT(ctx);
-        up = ggml_new_tensor_3d(ctx.get(), type, 8, 16, n_expert);
-        gate = ggml_new_tensor_3d(ctx.get(), type, 8, 16, n_expert);
-        down = ggml_new_tensor_3d(ctx.get(), type, 16, 8, n_expert);
+        up = ggml_new_tensor_3d(ctx.get(), type, width, 16, n_expert);
+        gate = ggml_new_tensor_3d(ctx.get(), type, width, 16, n_expert);
+        down = ggml_new_tensor_3d(ctx.get(), type, width, 16, n_expert);
         buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
         GGML_ASSERT(buffer);
         if (fill) {
@@ -140,10 +140,10 @@ void test_budget_fallback_and_wave() {
 }
 
 void test_three_layout_classes_reuse_universal_lanes() {
-    fixture f32(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_F32);
-    fixture f16(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_F16);
-    fixture bf16(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_BF16);
-    const std::array<const fixture *, 3> sources = { &f32, &f16, &bf16 };
+    fixture iq2(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_IQ2_XS, 256);
+    fixture iq3(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_IQ3_XXS, 256);
+    fixture mxfp4(4, true, ggml_backend_cpu_buffer_type(), GGML_TYPE_MXFP4, 256);
+    const std::array<const fixture *, 3> sources = { &iq2, &iq3, &mxfp4 };
 
     llm_expert_layout_registry registry;
     registry.layer_ids.assign(LLAMA_MAX_LAYERS, LLM_EXPERT_LAYOUT_CLASS_INVALID);
@@ -177,7 +177,7 @@ void test_three_layout_classes_reuse_universal_lanes() {
     uint64_t expected_useful_bytes = 0;
     for (int32_t layer = 0; layer < 3; ++layer) {
         fixture hot(2, false, ggml_backend_cpu_buffer_type(),
-            sources[size_t(layer)]->up->type);
+            sources[size_t(layer)]->up->type, 256);
         llm_cold_reference cold_reference;
         GGML_ASSERT(cold.find_or_admit(
             { layer, 0 }, sources[size_t(layer)]->bundle(layer), cold_reference).is_ready());

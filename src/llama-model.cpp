@@ -1113,6 +1113,26 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     const bool cold_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
     const bool uma_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
     const bool cached_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE || cold_mode || uma_mode;
+    const bool multi_device = params.expert_device_count > 1;
+    if (params.expert_device_count == 0 || params.expert_device_count > LLM_EXPERT_MAX_DEVICES ||
+        params.expert_peer_transport < LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED ||
+        params.expert_peer_transport >= LLAMA_EXPERT_PEER_TRANSPORT_COUNT ||
+        (!multi_device && params.expert_peer_staging_bytes != 0) ||
+        (multi_device && params.expert_hot_cache_capacity > UINT32_MAX/params.expert_device_count) ||
+        (multi_device && (!cold_mode || params.split_mode != LLAMA_SPLIT_MODE_NONE ||
+            params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU ||
+            params.expert_background_promotion || params.expert_auto_cost_model != nullptr ||
+            params.expert_hot_cache_policy == nullptr ||
+            params.expert_hot_cache_policy->policy != LLAMA_EXPERT_CACHE_POLICY_LRU ||
+            params.expert_hot_cache_policy->scope != LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL ||
+            params.expert_hot_cache_policy->admission != LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS ||
+            (params.expert_peer_transport == LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED &&
+             (params.expert_peer_staging_bytes == 0 ||
+              params.expert_peer_staging_bytes % params.expert_device_count != 0)) ||
+            (params.expert_peer_transport == LLAMA_EXPERT_PEER_TRANSPORT_P2P &&
+             params.expert_peer_staging_bytes != 0)))) {
+        throw std::invalid_argument("invalid multi-device expert configuration");
+    }
     if (!cached_mode && params.expert_hot_cache_policy != nullptr) {
         throw std::invalid_argument("expert hot-cache policy requires hot-cache or cold-cache mode");
     }
@@ -1143,13 +1163,15 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         pimpl->expert_uma_config_owned = *params.expert_uma_config;
         this->params.expert_uma_config = &*pimpl->expert_uma_config_owned;
     }
-    const uint64_t scheduler_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
+    const uint64_t scheduler_capacity_64 = std::max<uint64_t>(16,
+        uint64_t(params.expert_hot_cache_capacity)*4*params.expert_device_count);
     if (scheduler_capacity_64 > UINT32_MAX) {
         throw std::invalid_argument("expert prefetch scheduler capacity overflow");
     }
     const auto prefetch_result = llm_expert_prefetch_copy_config(
         params.expert_prefetch_config, params.expert_prefetch_profile_path, params.expert_weights_mode,
-        0, params.expert_hot_cache_capacity, params.expert_cold_cache_bytes, uint32_t(scheduler_capacity_64),
+        0, uint64_t(params.expert_hot_cache_capacity)*params.expert_device_count,
+        params.expert_cold_cache_bytes, uint32_t(scheduler_capacity_64),
         params.expert_cold_cache_bytes, params.expert_transfer_ring_bytes, pimpl->expert_prefetch_config);
     if (!prefetch_result.is_ready()) {
         throw std::invalid_argument("invalid expert prefetch configuration");
@@ -1368,7 +1390,7 @@ void llama_model::init_expert_weight_provider() {
                 throw std::overflow_error("hot-cache expert directory exceeds uint32_t capacity");
             }
             llm_hot_cache_config config;
-            config.capacity = params.expert_hot_cache_capacity;
+            config.capacity = params.expert_hot_cache_capacity*params.expert_device_count;
             config.n_expert_used = uint32_t(hparams.n_expert_used);
             config.routed_layer_count = routed_layer_count;
             config.total_expert_keys = uint32_t(directory_entries);
@@ -1432,6 +1454,46 @@ void llama_model::init_expert_weight_provider() {
                 config.trace_capacity = pimpl->expert_async_transport->diagnostics().trace_capacity;
                 config.miss_policy = params.expert_miss_policy;
                 config.background_promotion = params.expert_background_promotion;
+                config.peer_transport = params.expert_peer_transport;
+                config.peer_staging_bytes = params.expert_peer_staging_bytes;
+                if (params.expert_device_count > 1) {
+                    if (devices.size() != params.expert_device_count || devices.front().dev != target) {
+                        throw std::invalid_argument("multi-device expert topology does not preserve primary DeviceId 0");
+                    }
+                    config.devices.reserve(devices.size());
+                    for (size_t index = 0; index < devices.size(); ++index) {
+                        ggml_backend_dev_props props;
+                        ggml_backend_dev_get_props(devices[index].dev, &props);
+                        if (props.type != GGML_BACKEND_DEVICE_TYPE_GPU || props.device_id == nullptr) {
+                            throw std::invalid_argument("multi-device expert topology lacks stable CUDA PCI identity");
+                        }
+                        int32_t ordinal = -1;
+                        auto * reg = ggml_backend_dev_backend_reg(devices[index].dev);
+                        for (size_t candidate = 0; candidate < ggml_backend_reg_dev_count(reg); ++candidate) {
+                            if (ggml_backend_reg_dev_get(reg, candidate) == devices[index].dev) {
+                                ordinal = int32_t(candidate);
+                                break;
+                            }
+                        }
+                        if (ordinal < 0) {
+                            throw std::invalid_argument("multi-device expert CUDA ordinal is unavailable");
+                        }
+                        using identity_fn = int (*)(int, char *, size_t, int *);
+                        auto identity = reinterpret_cast<identity_fn>(ggml_backend_reg_get_proc_address(
+                            reg, "ggml_backend_cuda_expert_device_identity"));
+                        char uuid[64] = {};
+                        int physical_ordinal = -1;
+                        if (identity == nullptr || identity(ordinal, uuid, sizeof(uuid), &physical_ordinal) != 0 ||
+                            physical_ordinal < 0 || uuid[0] == '\0') {
+                            throw std::invalid_argument("multi-device expert CUDA UUID/ordinal identity is unavailable");
+                        }
+                        config.devices.push_back({
+                            llm_expert_device_id(index), devices[index].dev,
+                            ggml_backend_dev_buffer_type(devices[index].dev),
+                            params.expert_hot_cache_capacity, physical_ordinal, props.device_id, uuid,
+                        });
+                    }
+                }
                 if (params.expert_auto_cost_model != nullptr) {
                     config.auto_cost_model = *params.expert_auto_cost_model;
                     config.auto_cost_model_digest = pimpl->expert_auto_cost_model_digest;
@@ -1571,7 +1633,8 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
             storage_diagnostics.maximum_direct_alignment, maximum_aligned_read_bytes)) {
         throw std::overflow_error("expert async maximum aligned read size overflow");
     }
-    const uint64_t request_capacity_64 = std::max<uint64_t>(16, uint64_t(params.expert_hot_cache_capacity)*4);
+    const uint64_t request_capacity_64 = std::max<uint64_t>(16,
+        uint64_t(params.expert_hot_cache_capacity)*4*params.expert_device_count);
     if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
     const uint32_t request_capacity = uint32_t(request_capacity_64);
     if (params.expert_io_trace_capacity != 0 &&
@@ -1594,6 +1657,9 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         predictive_prefetch ? prefetch.max_speculative_cold_slots : 0,
         predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
         uint32_t(std::min<int64_t>(hparams.n_expert, params.expert_hot_cache_capacity)),
+        params.expert_device_count,
+        uint32_t(request_capacity_64/params.expert_device_count),
+        uint32_t(request_capacity_64/params.expert_device_count),
     });
     const uint64_t transport_accounting_bytes = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE &&
         params.expert_cold_cache_bytes == 0 ? storage_diagnostics.maximum_bundle_bytes : params.expert_cold_cache_bytes;
@@ -2195,6 +2261,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
+        if (params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
+            params.expert_device_count > 1) {
+            auto * dev = devices.front().dev;
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to primary expert device %s, is_swa = %d\n",
+                il, ggml_backend_dev_name(dev), is_swa);
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
+        }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
@@ -2603,6 +2676,18 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+uint32_t llama_model::expert_device_count() const {
+    return params.expert_device_count;
+}
+
+llama_expert_peer_transport llama_model::expert_peer_transport() const {
+    return params.expert_peer_transport;
+}
+
+uint64_t llama_model::expert_peer_staging_bytes() const {
+    return params.expert_peer_staging_bytes;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -3227,6 +3312,9 @@ llama_model_params llama_model_default_params() {
         /*.expert_hot_cache_capacity   =*/ 0,
         /*.expert_cold_cache_bytes     =*/ 0,
         /*.expert_transfer_ring_bytes  =*/ 0,
+        /*.expert_device_count         =*/ 1,
+        /*.expert_peer_transport       =*/ LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED,
+        /*.expert_peer_staging_bytes   =*/ 0,
         /*.expert_io_queue_depth       =*/ 0,
         /*.expert_io_trace_capacity    =*/ 0,
         /*.expert_io_staging_bytes     =*/ 0,

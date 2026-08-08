@@ -702,9 +702,17 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+    ggml_cuda_set_device(device);
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    if (expert_host_staging_event != nullptr) {
+        CUDA_CHECK(cudaEventSynchronize(expert_host_staging_event));
+        CUDA_CHECK(cudaEventDestroy(expert_host_staging_event));
+    }
+    if (expert_host_staging != nullptr) {
+        CUDA_CHECK(cudaFreeHost(expert_host_staging));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -1876,36 +1884,36 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool allow_inactive = dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != 0;
 
-    const auto try_fast_path = [&]() {
+    const auto try_fast_path = [&](const ggml_tensor * fast_ids) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, fast_ids, dst);
                     return true;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, fast_ids, dst);
                     return true;
                 }
             }
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            ggml_cuda_mul_mat_q(ctx, src0, src1, fast_ids, dst);
             return true;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            ggml_cuda_mul_mat_f(ctx, src0, src1, fast_ids, dst);
             return true;
         }
         return false;
     };
-    if (!allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && try_fast_path()) {
+    if (!allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && try_fast_path(ids)) {
         return;
     }
 
@@ -1949,10 +1957,59 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             inactive[lane] = expert == -1;
         }
     }
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        std::none_of(inactive.begin(), inactive.end(), [](uint8_t value) { return value != 0; }) &&
-        try_fast_path()) {
-        return;
+    if (allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        ne02 >= n_expert_used) {
+        // The fast MUL_MAT_ID helpers require one valid, unique expert id for
+        // every lane.  Give inactive branch lanes temporary unused ids, execute
+        // the ordinary kernel, then zero those lanes on the same stream.  Active
+        // lanes therefore retain the accepted one-device kernel arithmetic.
+        std::vector<char> fast_ids_host = ids_host;
+        std::vector<uint8_t> used(static_cast<size_t>(ne02), uint8_t(0));
+        bool fast_ids_valid = true;
+        for (int64_t i12 = 0; i12 < ne12 && fast_ids_valid; ++i12) {
+            std::fill(used.begin(), used.end(), uint8_t(0));
+            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                const int32_t expert = *(const int32_t *)(
+                    ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (expert >= 0) {
+                    if (used[size_t(expert)] != 0) {
+                        fast_ids_valid = false;
+                        break;
+                    }
+                    used[size_t(expert)] = 1;
+                }
+            }
+            int32_t replacement = 0;
+            for (int64_t iex = 0; iex < n_expert_used && fast_ids_valid; ++iex) {
+                int32_t * expert = (int32_t *)(
+                    fast_ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (*expert != -1) continue;
+                while (replacement < ne02 && used[size_t(replacement)] != 0) replacement++;
+                if (replacement >= ne02) {
+                    fast_ids_valid = false;
+                    break;
+                }
+                *expert = replacement;
+                used[size_t(replacement++)] = 1;
+            }
+        }
+        if (fast_ids_valid) {
+            ggml_cuda_pool_alloc<char> fast_ids_data(ctx.pool(), ggml_nbytes(ids));
+            CUDA_CHECK(cudaMemcpyAsync(fast_ids_data.ptr, fast_ids_host.data(),
+                ggml_nbytes(ids), cudaMemcpyHostToDevice, stream));
+            ggml_tensor fast_ids = *ids;
+            fast_ids.data = fast_ids_data.ptr;
+            if (try_fast_path(&fast_ids)) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                        if (!inactive[size_t(i12*n_expert_used + iex)]) continue;
+                        CUDA_CHECK(cudaMemsetAsync((char *) dst->data + i12*nb2 + iex*nb1,
+                            0, ne0*nb0, stream));
+                    }
+                }
+                return;
+            }
+        }
     }
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
@@ -2463,6 +2520,124 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// Configures one backend instance for the explicit routed-expert peer
+// transport. Return values are stable for the llama layer: 0 success, -1
+// invalid input, -2 conflicting reconfiguration, -3 allocation/runtime error.
+static int ggml_backend_cuda_expert_configure_peer_transport(
+        ggml_backend_t backend, int transport, size_t host_staging_capacity) {
+    if (!ggml_backend_is_cuda(backend) || transport < 0 || transport > 1 ||
+        (transport == 0) != (host_staging_capacity != 0)) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+    if (context->expert_peer_transport >= 0) {
+        return context->expert_peer_transport == transport &&
+            context->expert_host_staging_capacity == host_staging_capacity ? 0 : -2;
+    }
+    void * staging = nullptr;
+    cudaEvent_t event = nullptr;
+    if (transport == 0) {
+        const cudaError_t alloc_status = cudaHostAlloc(&staging, host_staging_capacity, cudaHostAllocPortable);
+        if (alloc_status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: failed to allocate %zu bytes of bounded pinned staging: %s\n",
+                __func__, host_staging_capacity, cudaGetErrorString(alloc_status));
+            return -3;
+        }
+        ggml_cuda_set_device(context->device);
+        const cudaError_t event_status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (event_status != cudaSuccess) {
+            cudaFreeHost(staging);
+            GGML_LOG_ERROR("%s: failed to create staging completion event: %s\n",
+                __func__, cudaGetErrorString(event_status));
+            return -3;
+        }
+    }
+    context->expert_peer_transport = transport;
+    context->expert_host_staging = staging;
+    context->expert_host_staging_capacity = host_staging_capacity;
+    context->expert_host_staging_event = event;
+    return 0;
+}
+
+// Returns 1 when src can access dst, 0 when it cannot, and a negative value
+// for invalid/runtime failures. Enabling is explicit and idempotent.
+static int ggml_backend_cuda_expert_peer_capability(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst, int enable) {
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+        return -1;
+    }
+    auto * src = static_cast<ggml_backend_cuda_context *>(backend_src->context);
+    auto * dst = static_cast<ggml_backend_cuda_context *>(backend_dst->context);
+    const int src_physical = ggml_cuda_get_physical_device(src->device);
+    const int dst_physical = ggml_cuda_get_physical_device(dst->device);
+    if (src_physical == dst_physical) {
+        return 1;
+    }
+    int capable = 0;
+    const cudaError_t query_status = cudaDeviceCanAccessPeer(&capable, src_physical, dst_physical);
+    if (query_status != cudaSuccess) {
+        GGML_LOG_ERROR("%s: CUDA peer capability query failed: %s\n",
+            __func__, cudaGetErrorString(query_status));
+        return -2;
+    }
+    if (capable == 0 || enable == 0) {
+        return capable;
+    }
+    ggml_cuda_set_device(src->device);
+    const cudaError_t enable_status = cudaDeviceEnablePeerAccess(dst_physical, 0);
+    if (enable_status != cudaSuccess && enable_status != cudaErrorPeerAccessAlreadyEnabled) {
+        GGML_LOG_ERROR("%s: CUDA peer enable failed: %s\n",
+            __func__, cudaGetErrorString(enable_status));
+        return -3;
+    }
+    if (enable_status == cudaErrorPeerAccessAlreadyEnabled) {
+        (void) cudaGetLastError();
+    }
+    return 1;
+}
+
+static int ggml_backend_cuda_expert_device_identity(
+        int ordinal, char * uuid, size_t uuid_capacity, int * physical_ordinal) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(ordinal, uuid, uuid_capacity, physical_ordinal);
+    return -2;
+#else
+    if (ordinal < 0 || ordinal >= ggml_cuda_info().device_count || uuid == nullptr ||
+        uuid_capacity < 41 || physical_ordinal == nullptr) {
+        return -1;
+    }
+    const int physical = ggml_cuda_get_physical_device(ordinal);
+    cudaDeviceProp properties;
+    const cudaError_t status = cudaGetDeviceProperties(&properties, physical);
+    if (status != cudaSuccess) {
+        return -2;
+    }
+    const unsigned char * b = reinterpret_cast<const unsigned char *>(properties.uuid.bytes);
+    snprintf(uuid, uuid_capacity,
+        "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    *physical_ordinal = physical;
+    return 0;
+#endif
+}
+
+static int ggml_backend_cuda_expert_peer_diagnostics(
+        ggml_backend_t backend, uint64_t * values, size_t value_count) {
+    if (!ggml_backend_is_cuda(backend) || values == nullptr || value_count < 5) {
+        return -1;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(context->expert_peer_mutex);
+    values[0] = context->expert_host_staged_bytes;
+    values[1] = context->expert_host_staged_copies;
+    values[2] = context->expert_host_staged_blocking_us;
+    values[3] = context->expert_peer_bytes;
+    values[4] = context->expert_peer_copies;
+    return 0;
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2498,10 +2673,43 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
+            const bool explicit_expert_transport =
+                cuda_ctx_src->expert_peer_transport >= 0 || cuda_ctx_dst->expert_peer_transport >= 0;
+            if (explicit_expert_transport &&
+                cuda_ctx_src->expert_peer_transport != cuda_ctx_dst->expert_peer_transport) {
+                GGML_ABORT("routed-expert peer transport is not configured consistently");
+            }
+            if (explicit_expert_transport && cuda_ctx_src->expert_peer_transport == 0) {
+                const size_t bytes = ggml_nbytes(dst);
+                std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                const int64_t begin_us = ggml_time_us();
+                if (cuda_ctx_dst->expert_host_staging == nullptr ||
+                    bytes > cuda_ctx_dst->expert_host_staging_capacity) {
+                    GGML_ABORT("routed-expert HOST_STAGED transfer exceeds its fixed pinned budget");
+                }
+                CUDA_CHECK(cudaEventSynchronize(cuda_ctx_dst->expert_host_staging_event));
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaMemcpyAsync(cuda_ctx_dst->expert_host_staging, src->data, bytes,
+                    cudaMemcpyDeviceToHost, cuda_ctx_src->stream()));
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx_src->stream()));
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                CUDA_CHECK(cudaMemcpyAsync(dst->data, cuda_ctx_dst->expert_host_staging, bytes,
+                    cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+                CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->expert_host_staging_event, cuda_ctx_dst->stream()));
+                cuda_ctx_dst->expert_host_staged_bytes += bytes;
+                cuda_ctx_dst->expert_host_staged_copies++;
+                cuda_ctx_dst->expert_host_staged_blocking_us += uint64_t(ggml_time_us() - begin_us);
+                return true;
+            }
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            if (explicit_expert_transport && cuda_ctx_src->expert_peer_transport == 1) {
+                std::lock_guard<std::mutex> lock(cuda_ctx_dst->expert_peer_mutex);
+                cuda_ctx_dst->expert_peer_bytes += ggml_nbytes(dst);
+                cuda_ctx_dst->expert_peer_copies++;
+            }
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -4229,6 +4437,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
 
 #ifdef USE_CUDA_GRAPH
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -5254,14 +5463,16 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 }
 
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+    ggml_cuda_set_device(dev_ctx->device);
 
     CUDA_CHECK(cudaEventDestroy((cudaEvent_t)event->context));
     delete event;
 }
 
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+    ggml_cuda_set_device(dev_ctx->device);
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
@@ -5393,6 +5604,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_uma_checksum") == 0) {
         return (void *)ggml_backend_cuda_uma_checksum;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_configure_peer_transport") == 0) {
+        return (void *)ggml_backend_cuda_expert_configure_peer_transport;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_peer_capability") == 0) {
+        return (void *)ggml_backend_cuda_expert_peer_capability;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_device_identity") == 0) {
+        return (void *)ggml_backend_cuda_expert_device_identity;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_peer_diagnostics") == 0) {
+        return (void *)ggml_backend_cuda_expert_peer_diagnostics;
     }
     return nullptr;
 }

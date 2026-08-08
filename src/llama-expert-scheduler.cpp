@@ -165,23 +165,64 @@ struct llm_expert_scheduler::impl {
             return nullptr;
         }
         request_record & request = requests[handle.slot];
-        return request.state != llm_expert_request_state::free && request.generation == handle.generation ? &request : nullptr;
+        return request.state != llm_expert_request_state::free &&
+            request.generation == handle.generation &&
+            request.metadata.target_device == handle.target_device ? &request : nullptr;
     }
 
     void update_occupancy() {
         uint32_t active = 0;
         uint32_t queued = 0;
+        for (auto & device : counters.devices) {
+            device.active_requests = 0;
+            device.queued_requests = 0;
+            device.inflight_requests = 0;
+            device.reserved_storage_bytes = 0;
+            device.reserved_h2d_bytes = 0;
+        }
         for (const request_record & request : requests) {
             if (request.state != llm_expert_request_state::free) {
                 active++;
+                auto & device = counters.devices[request.metadata.target_device];
+                device.active_requests++;
+                device.reserved_storage_bytes += request.metadata.reserved_storage_bytes;
+                device.reserved_h2d_bytes += request.metadata.reserved_h2d_bytes;
             }
             if (request.state == llm_expert_request_state::queued) {
                 queued++;
+                counters.devices[request.metadata.target_device].queued_requests++;
+            } else if (is_submitted(request.state)) {
+                counters.devices[request.metadata.target_device].inflight_requests++;
             }
         }
         counters.active_requests = active;
         counters.queued_requests = queued;
         counters.peak_active_requests = std::max(counters.peak_active_requests, active);
+        for (auto & device : counters.devices) {
+            device.peak_active_requests = std::max(device.peak_active_requests, device.active_requests);
+            device.peak_inflight_requests = std::max(device.peak_inflight_requests, device.inflight_requests);
+            device.peak_reserved_storage_bytes = std::max(
+                device.peak_reserved_storage_bytes, device.reserved_storage_bytes);
+            device.peak_reserved_h2d_bytes = std::max(
+                device.peak_reserved_h2d_bytes, device.reserved_h2d_bytes);
+        }
+    }
+
+    uint32_t active_on_device(llm_expert_device_id device_id) const {
+        uint32_t count = 0;
+        for (const auto & request : requests) {
+            count += request.state != llm_expert_request_state::free &&
+                request.metadata.target_device == device_id;
+        }
+        return count;
+    }
+
+    uint32_t inflight_on_device(llm_expert_device_id device_id) const {
+        uint32_t count = 0;
+        for (const auto & request : requests) {
+            count += is_submitted(request.state) && request.metadata.target_device == device_id;
+        }
+        return count;
     }
 
     bool reset_for_reuse(request_record & request) {
@@ -219,6 +260,7 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
         config.max_speculative_cold_slots != 0 && config.max_speculative_hot_slots != 0;
     if (config.layer_count == 0 || config.experts_per_layer == 0 || config.request_capacity == 0 ||
         config.waiters_per_request == 0 ||
+        config.device_count == 0 || config.device_count > LLM_EXPERT_MAX_DEVICES ||
         any_speculative_budget != complete_speculative_budget ||
         (complete_speculative_budget &&
             (config.max_current_layer_demand_flights == 0 ||
@@ -232,6 +274,17 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
         uint64_t(config.layer_count)*config.experts_per_layer > uint64_t(std::numeric_limits<uint32_t>::max())) {
         throw std::invalid_argument("invalid expert scheduler configuration");
     }
+    if (config.per_device_request_capacity == 0) {
+        config.per_device_request_capacity = config.request_capacity;
+    }
+    if (config.per_device_inflight_capacity == 0) {
+        config.per_device_inflight_capacity = config.per_device_request_capacity;
+    }
+    if (config.per_device_request_capacity > config.request_capacity ||
+        config.per_device_inflight_capacity > config.per_device_request_capacity ||
+        uint64_t(config.per_device_request_capacity)*config.device_count > config.request_capacity) {
+        throw std::invalid_argument("invalid expert scheduler device capacity");
+    }
     pimpl->config = config;
     pimpl->requests.resize(config.request_capacity);
     for (auto & request : pimpl->requests) {
@@ -240,6 +293,12 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
     pimpl->counters.request_capacity = config.request_capacity;
     pimpl->counters.waiters_per_request = config.waiters_per_request;
     pimpl->counters.max_current_layer_demand_flights = config.max_current_layer_demand_flights;
+    pimpl->counters.devices.resize(config.device_count);
+    for (uint32_t device = 0; device < config.device_count; ++device) {
+        pimpl->counters.devices[device].device_id = llm_expert_device_id(device);
+        pimpl->counters.devices[device].request_capacity = config.per_device_request_capacity;
+        pimpl->counters.devices[device].inflight_capacity = config.per_device_inflight_capacity;
+    }
     pimpl->counters.administration_bytes = sizeof(*pimpl) + pimpl->requests.capacity()*sizeof(impl::request_record);
 }
 
@@ -251,12 +310,14 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
         llm_expert_readiness readiness,
         llm_expert_request_metadata metadata) noexcept {
     LLM_EXPERT_TRACE_SCOPE("k3.scheduler", "enqueue", "layer", key.layer, "original_expert_id", key.expert,
-        "layout_class_id", metadata.layout_class_id, "priority", uint32_t(priority));
+        "layout_class_id", metadata.layout_class_id, "target_device", metadata.target_device,
+        "priority", uint32_t(priority));
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (pimpl->counters.admission_closed) {
         return { llm_expert_schedule_disposition::closed, {} };
     }
     if (!key.is_valid(pimpl->config.layer_count, pimpl->config.experts_per_layer) ||
+        metadata.target_device >= pimpl->config.device_count ||
         metadata.layout_class_id >= LLM_EXPERT_LAYOUT_CLASS_MAX) {
         return { llm_expert_schedule_disposition::invalid, {} };
     }
@@ -272,7 +333,8 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     }
     for (uint32_t slot = 0; slot < pimpl->requests.size(); ++slot) {
         impl::request_record & request = pimpl->requests[slot];
-        if (request.state != llm_expert_request_state::free && !is_terminal(request.state) && same_key(request.key, key)) {
+        if (request.state != llm_expert_request_state::free && !is_terminal(request.state) &&
+            same_key(request.key, key) && request.metadata.target_device == metadata.target_device) {
             if (request.metadata.layout_class_id != metadata.layout_class_id) {
                 return { llm_expert_schedule_disposition::invalid, {} };
             }
@@ -282,7 +344,8 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
             // a generation which can still terminalize as speculative cancel.
             if (!speculative && (request.state == llm_expert_request_state::cancelling ||
                     request.state == llm_expert_request_state::draining)) {
-                return { llm_expert_schedule_disposition::busy, { slot, request.generation } };
+                return { llm_expert_schedule_disposition::busy,
+                    { slot, request.generation, request.metadata.target_device } };
             }
             if (request.waiters == pimpl->config.waiters_per_request) {
                 return { llm_expert_schedule_disposition::busy, {} };
@@ -307,15 +370,27 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
             LLM_EXPERT_TRACE_INSTANT("k3.scheduler", "single_flight_join", "flight_id",
                 llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight, slot, uint32_t(request.generation)),
                 "layer", key.layer, "original_expert_id", key.expert, "waiters", request.waiters);
-            return { llm_expert_schedule_disposition::joined, { slot, request.generation } };
+            return { llm_expert_schedule_disposition::joined,
+                { slot, request.generation, request.metadata.target_device } };
+        }
+    }
+
+    const bool device_at_capacity =
+        pimpl->active_on_device(metadata.target_device) >= pimpl->config.per_device_request_capacity;
+    if (device_at_capacity) {
+        if (priority >= llm_expert_priority::prefetch_next) {
+            pimpl->counters.drops++;
+            return { llm_expert_schedule_disposition::dropped, {} };
         }
     }
 
     uint32_t slot = UINT32_MAX;
-    for (uint32_t index = 0; index < pimpl->requests.size(); ++index) {
-        if (pimpl->requests[index].state == llm_expert_request_state::free) {
-            slot = index;
-            break;
+    if (!device_at_capacity) {
+        for (uint32_t index = 0; index < pimpl->requests.size(); ++index) {
+            if (pimpl->requests[index].state == llm_expert_request_state::free) {
+                slot = index;
+                break;
+            }
         }
     }
     if (slot == UINT32_MAX && priority < llm_expert_priority::prefetch_next) {
@@ -323,6 +398,7 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
         for (uint32_t index = 0; index < pimpl->requests.size(); ++index) {
             const impl::request_record & request = pimpl->requests[index];
             if (request.state == llm_expert_request_state::queued &&
+                request.metadata.target_device == metadata.target_device &&
                 request.priority > priority && request.enqueue_ordinal < oldest) {
                 slot = index;
                 oldest = request.enqueue_ordinal;
@@ -382,7 +458,8 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     LLM_EXPERT_TRACE_COUNTER("k3.resource", "scheduler_active_requests", 1, pimpl->counters.active_requests);
     LLM_EXPERT_TRACE_COUNTER("k3.resource", "scheduler_queue_depth", 2, pimpl->counters.queued_requests);
     pimpl->state_cv.notify_all();
-    return { llm_expert_schedule_disposition::admitted, { slot, request.generation } };
+    return { llm_expert_schedule_disposition::admitted,
+        { slot, request.generation, request.metadata.target_device } };
 }
 
 llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_snapshot & result) noexcept {
@@ -391,6 +468,10 @@ llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_sn
     for (uint32_t slot = 0; slot < pimpl->requests.size(); ++slot) {
         const impl::request_record & request = pimpl->requests[slot];
         if (request.state != llm_expert_request_state::queued) {
+            continue;
+        }
+        if (pimpl->inflight_on_device(request.metadata.target_device) >=
+            pimpl->config.per_device_inflight_capacity) {
             continue;
         }
         if (selected == UINT32_MAX || request.priority < pimpl->requests[selected].priority ||
@@ -407,7 +488,7 @@ llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_sn
     request.state = llm_expert_request_state::submitting;
     result = {
         request.key,
-        { selected, request.generation },
+        { selected, request.generation, request.metadata.target_device },
         request.priority,
         request.readiness,
         request.state,
@@ -421,6 +502,7 @@ llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_sn
         llm_perfetto_trace_domain::flight, selected, uint32_t(request.generation));
     LLM_EXPERT_TRACE_INSTANT("k3.scheduler", "dispatch", "flight_id", flight_id,
         "layer", request.key.layer, "original_expert_id", request.key.expert,
+        "target_device", request.metadata.target_device,
         "queue_depth", pimpl->counters.queued_requests);
     LLM_EXPERT_TRACE_FLOW_BEGIN("k3.scheduler", "flight_dispatch", flight_id, "flight_id", flight_id);
     return { llm_expert_schedule_disposition::admitted, result.handle };
@@ -434,6 +516,7 @@ llm_expert_schedule_disposition llm_expert_scheduler::transition(
     impl::request_record * request = pimpl->find(handle);
     if (request == nullptr) {
         pimpl->counters.stale_completions++;
+        if (handle.target_device < pimpl->counters.devices.size()) pimpl->counters.devices[handle.target_device].stale_completions++;
         return llm_expert_schedule_disposition::stale_generation;
     }
     if (request->state != expected || next == llm_expert_request_state::cancelling ||
@@ -457,6 +540,7 @@ llm_expert_schedule_disposition llm_expert_scheduler::begin_speculative_cancella
     impl::request_record * request = pimpl->find(handle);
     if (request == nullptr) {
         pimpl->counters.stale_completions++;
+        if (handle.target_device < pimpl->counters.devices.size()) pimpl->counters.devices[handle.target_device].stale_completions++;
         return llm_expert_schedule_disposition::stale_generation;
     }
     if (request->state != expected ||
@@ -482,6 +566,7 @@ llm_expert_schedule_disposition llm_expert_scheduler::begin_demand_cancellation(
     impl::request_record * request = pimpl->find(handle);
     if (request == nullptr) {
         pimpl->counters.stale_completions++;
+        if (handle.target_device < pimpl->counters.devices.size()) pimpl->counters.devices[handle.target_device].stale_completions++;
         return llm_expert_schedule_disposition::stale_generation;
     }
     if (request->state != expected ||
@@ -506,6 +591,7 @@ llm_expert_schedule_disposition llm_expert_scheduler::finish(
     impl::request_record * request = pimpl->find(handle);
     if (request == nullptr) {
         pimpl->counters.stale_completions++;
+        if (handle.target_device < pimpl->counters.devices.size()) pimpl->counters.devices[handle.target_device].stale_completions++;
         return llm_expert_schedule_disposition::stale_generation;
     }
     const bool complete_ready = terminal == llm_expert_request_state::complete &&
@@ -524,6 +610,10 @@ llm_expert_schedule_disposition llm_expert_scheduler::finish(
     if (terminal == llm_expert_request_state::complete) pimpl->counters.terminal_complete++;
     if (terminal == llm_expert_request_state::failed) pimpl->counters.terminal_failed++;
     if (terminal == llm_expert_request_state::cancelled) pimpl->counters.terminal_cancelled++;
+    auto & device = pimpl->counters.devices[request->metadata.target_device];
+    if (terminal == llm_expert_request_state::complete) device.terminal_complete++;
+    if (terminal == llm_expert_request_state::failed) device.terminal_failed++;
+    if (terminal == llm_expert_request_state::cancelled) device.terminal_cancelled++;
     pimpl->update_occupancy();
     [[maybe_unused]] const uint64_t flight_id = llm_perfetto_trace_pair_id(
         llm_perfetto_trace_domain::flight, handle.slot, uint32_t(handle.generation));
@@ -539,11 +629,13 @@ llm_expert_schedule_disposition llm_expert_scheduler::release_terminal(llm_exper
     impl::request_record * request = pimpl->find(handle);
     if (request == nullptr) {
         pimpl->counters.stale_completions++;
+        if (handle.target_device < pimpl->counters.devices.size()) pimpl->counters.devices[handle.target_device].stale_completions++;
         return llm_expert_schedule_disposition::stale_generation;
     }
     if (!is_terminal(request->state)) {
         return llm_expert_schedule_disposition::busy;
     }
+    pimpl->counters.devices[request->metadata.target_device].terminal_releases++;
     pimpl->release_charge(*request);
     request->key = { -1, -1 };
     request->enqueue_ordinal = 0;
@@ -601,6 +693,7 @@ llm_expert_schedule_disposition llm_expert_scheduler::cancel_queued_speculative(
     impl::request_record * request = pimpl->find(handle);
     if (request == nullptr) {
         pimpl->counters.stale_completions++;
+        if (handle.target_device < pimpl->counters.devices.size()) pimpl->counters.devices[handle.target_device].stale_completions++;
         return llm_expert_schedule_disposition::stale_generation;
     }
     if (request->state != llm_expert_request_state::queued ||

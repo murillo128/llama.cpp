@@ -372,6 +372,12 @@ extern "C" {
         LLAMA_EXPERT_MISS_POLICY_COUNT           = 3,
     };
 
+    enum llama_expert_peer_transport {
+        LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED = 0,
+        LLAMA_EXPERT_PEER_TRANSPORT_P2P         = 1,
+        LLAMA_EXPERT_PEER_TRANSPORT_COUNT       = 2,
+    };
+
     enum llama_expert_cache_policy {
         LLAMA_EXPERT_CACHE_POLICY_LRU       = 0,
         LLAMA_EXPERT_CACHE_POLICY_LFRU      = 1,
@@ -507,6 +513,9 @@ extern "C" {
         uint32_t expert_hot_cache_capacity; // global routed-expert slot capacity [EXPERIMENTAL]
         uint64_t expert_cold_cache_bytes; // pageable routed-expert cache budget [EXPERIMENTAL]
         uint64_t expert_transfer_ring_bytes; // bounded transfer staging budget [EXPERIMENTAL]
+        uint32_t expert_device_count; // bounded owner-only expert device set [EXPERIMENTAL]
+        enum llama_expert_peer_transport expert_peer_transport; // routed activation/result transport [EXPERIMENTAL]
+        uint64_t expert_peer_staging_bytes; // bounded pinned HOST_STAGED bounce budget [EXPERIMENTAL]
         uint32_t expert_io_queue_depth; // bounded asynchronous I/O queue depth [EXPERIMENTAL]
         uint32_t expert_io_trace_capacity; // bounded asynchronous I/O evidence records [EXPERIMENTAL, EVIDENCE ONLY]
         uint64_t expert_io_staging_bytes; // bounded direct-I/O staging budget [EXPERIMENTAL]

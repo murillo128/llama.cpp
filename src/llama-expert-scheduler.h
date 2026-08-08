@@ -35,6 +35,7 @@ struct llm_expert_request_metadata {
     uint32_t speculative_cold_slots = 0;
     uint32_t speculative_hot_slots = 0;
     llm_expert_layout_class_id layout_class_id = 0;
+    llm_expert_device_id target_device = 0;
 };
 
 enum class llm_expert_request_state : uint8_t {
@@ -56,8 +57,11 @@ enum class llm_expert_request_state : uint8_t {
 struct llm_expert_request_handle {
     uint32_t slot = UINT32_MAX;
     uint64_t generation = 0;
+    llm_expert_device_id target_device = 0;
 
-    bool valid() const { return slot != UINT32_MAX && generation != 0; }
+    bool valid() const {
+        return slot != UINT32_MAX && generation != 0 && target_device < LLM_EXPERT_MAX_DEVICES;
+    }
 };
 
 struct llm_expert_scheduler_config {
@@ -74,6 +78,9 @@ struct llm_expert_scheduler_config {
     uint32_t max_speculative_cold_slots = 0;
     uint32_t max_speculative_hot_slots = 0;
     uint32_t max_current_layer_demand_flights = 0;
+    uint32_t device_count = 1;
+    uint32_t per_device_request_capacity = 0;
+    uint32_t per_device_inflight_capacity = 0;
 };
 
 enum class llm_expert_schedule_disposition {
@@ -109,6 +116,26 @@ struct llm_expert_request_snapshot {
     bool promoted_from_speculative = false;
 };
 
+struct llm_expert_scheduler_device_diagnostics {
+    llm_expert_device_id device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    uint32_t request_capacity = 0;
+    uint32_t inflight_capacity = 0;
+    uint32_t active_requests = 0;
+    uint32_t peak_active_requests = 0;
+    uint32_t queued_requests = 0;
+    uint32_t inflight_requests = 0;
+    uint32_t peak_inflight_requests = 0;
+    uint64_t reserved_storage_bytes = 0;
+    uint64_t peak_reserved_storage_bytes = 0;
+    uint64_t reserved_h2d_bytes = 0;
+    uint64_t peak_reserved_h2d_bytes = 0;
+    uint64_t terminal_complete = 0;
+    uint64_t terminal_failed = 0;
+    uint64_t terminal_cancelled = 0;
+    uint64_t terminal_releases = 0;
+    uint64_t stale_completions = 0;
+};
+
 struct llm_expert_scheduler_diagnostics {
     uint32_t request_capacity = 0;
     uint32_t active_requests = 0;
@@ -142,6 +169,7 @@ struct llm_expert_scheduler_diagnostics {
     uint32_t speculative_hot_slots = 0;
     uint32_t peak_speculative_hot_slots = 0;
     bool admission_closed = false;
+    std::vector<llm_expert_scheduler_device_diagnostics> devices;
 };
 
 class llm_expert_scheduler {

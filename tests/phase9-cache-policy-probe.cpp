@@ -73,6 +73,11 @@ struct arguments {
     uint32_t hot_slots = 16;
     uint64_t cold_bytes = 64U*1024U*1024U;
     uint64_t ring_bytes = 16U*1024U*1024U;
+    uint32_t expert_devices = 1;
+    std::string peer_transport = "HOST_STAGED";
+    uint64_t peer_staging_bytes = 0;
+    uint32_t delayed_device = UINT32_MAX;
+    uint64_t device_delay_us = 0;
     uint32_t queue_depth = 0;
     uint32_t trace_capacity = 0;
     uint32_t ratio = 7500;
@@ -135,6 +140,19 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--hot-slots") { if (!parse_u32(value, result.hot_slots)) return false; }
         else if (option == "--cold-bytes") { if (!parse_u64(value, result.cold_bytes)) return false; }
         else if (option == "--ring-bytes") { if (!parse_u64(value, result.ring_bytes)) return false; }
+        else if (option == "--expert-devices") {
+            if (!parse_u32(value, result.expert_devices) || result.expert_devices == 0 ||
+                result.expert_devices > LLM_EXPERT_MAX_DEVICES) return false;
+        } else if (option == "--peer-transport") {
+            result.peer_transport = value;
+            if (result.peer_transport != "HOST_STAGED" && result.peer_transport != "P2P") return false;
+        } else if (option == "--peer-staging-bytes") {
+            if (!parse_u64(value, result.peer_staging_bytes)) return false;
+        } else if (option == "--delay-device") {
+            if (!parse_u32(value, result.delayed_device)) return false;
+        } else if (option == "--device-delay-us") {
+            if (!parse_u64(value, result.device_delay_us) || result.device_delay_us > 1000000) return false;
+        }
         else if (option == "--queue-depth") { if (!parse_u32(value, result.queue_depth)) return false; }
         else if (option == "--trace-capacity") { if (!parse_u32(value, result.trace_capacity)) return false; }
         else if (option == "--ratio") { if (!parse_u32(value, result.ratio)) return false; }
@@ -166,6 +184,11 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
     }
     return !result.model.empty() && !result.output.empty() && result.hot_slots > 0 && result.n_ctx > 0 &&
         result.n_batch > 0 && result.n_ubatch > 0 && result.n_ubatch <= result.n_batch &&
+        (result.expert_devices == 1 ? result.peer_staging_bytes == 0 :
+            (result.peer_transport == "HOST_STAGED" ? result.peer_staging_bytes != 0 :
+                result.peer_staging_bytes == 0)) &&
+        ((result.delayed_device == UINT32_MAX && result.device_delay_us == 0) ||
+            (result.delayed_device < result.expert_devices && result.device_delay_us != 0)) &&
         (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold");
 }
 
@@ -465,6 +488,31 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "phase9-cache-policy-probe: CUDA/GPU backend required\n");
             return 2;
         }
+        std::vector<ggml_backend_dev_t> selected_devices;
+        for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+            ggml_backend_dev_t device = ggml_backend_dev_get(index);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(device, &props);
+            if (props.type == GGML_BACKEND_DEVICE_TYPE_GPU && props.device_id != nullptr &&
+                reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+                selected_devices.push_back(device);
+            }
+        }
+        std::sort(selected_devices.begin(), selected_devices.end(), [](ggml_backend_dev_t lhs, ggml_backend_dev_t rhs) {
+            ggml_backend_dev_props lhs_props;
+            ggml_backend_dev_props rhs_props;
+            ggml_backend_dev_get_props(lhs, &lhs_props);
+            ggml_backend_dev_get_props(rhs, &rhs_props);
+            return std::strcmp(lhs_props.device_id, rhs_props.device_id) < 0;
+        });
+        if (selected_devices.size() < args.expert_devices) {
+            std::fprintf(stderr, "phase9-cache-policy-probe: requested %u CUDA devices, found %zu\n",
+                args.expert_devices, selected_devices.size());
+            return 2;
+        }
+        selected_devices.resize(args.expert_devices);
+        selected_devices.push_back(nullptr);
         const auto hot_config = make_config(args.hot_policy, args, true);
         const auto cold_config = make_config(args.cold_policy, args, false);
         const llama_expert_auto_cost_model auto_cost = {
@@ -479,6 +527,9 @@ int main(int argc, char ** argv) {
             { nullptr, nullptr },
         };
         auto model_params = llama_model_default_params();
+        model_params.devices = selected_devices.data();
+        model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+        model_params.main_gpu = 0;
         model_params.load_mode = args.transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         model_params.expert_io_queue_depth = args.queue_depth;
         model_params.expert_io_trace_capacity = args.trace_capacity;
@@ -487,6 +538,10 @@ int main(int argc, char ** argv) {
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_weights_mode = args.mode == "disabled" ? LLAMA_EXPERT_WEIGHTS_MODE_DISABLED :
             args.mode == "cold" ? LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
+        model_params.expert_device_count = args.expert_devices;
+        model_params.expert_peer_transport = args.peer_transport == "P2P" ?
+            LLAMA_EXPERT_PEER_TRANSPORT_P2P : LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED;
+        model_params.expert_peer_staging_bytes = args.peer_staging_bytes;
         if (args.mode != "disabled") {
             model_params.expert_hot_cache_capacity = args.hot_slots;
             model_params.expert_hot_cache_policy = args.config_source == "NULL" ? nullptr : &hot_config;
@@ -518,6 +573,9 @@ int main(int argc, char ** argv) {
         context_params.no_perf = false;
         llama_context_ptr context(llama_init_from_model(model.get(), context_params));
         if (!context) return 6;
+        if (provider != nullptr && args.delayed_device != UINT32_MAX &&
+            !provider->debug_set_device_delay_for_testing(
+                llm_expert_device_id(args.delayed_device), args.device_delay_us).is_ready()) return 4;
         route_capture routes;
         if (args.observe_routes &&
             llama_set_route_observer(context.get(), capture_route, &routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 7;
@@ -641,6 +699,7 @@ int main(int argc, char ** argv) {
             if (llama_vocab_is_eog(vocab, next)) break;
             batch = llama_batch_get_one(&generated.back(), 1);
         }
+        const auto peer_transport_diagnostics = context->expert_peer_transport_diagnostics();
         // Releasing the context closes the provider request, drains or cancels
         // every background flight, and emits all reserved policy terminals.
         // Evidence must never accept a live provisional transcript prefix.
@@ -703,6 +762,57 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
+        json device_diagnostics = json::array();
+        for (const auto & device : diagnostics.devices) {
+            device_diagnostics.push_back({
+                {"device_id", device.device_id}, {"cuda_ordinal", device.cuda_ordinal},
+                {"pci_bdf", device.pci_bdf}, {"uuid", device.uuid},
+                {"hot_requested_slots", device.requested_capacity},
+                {"hot_effective_slots", device.effective_capacity}, {"hot_occupancy", device.occupancy},
+                {"hot_pool_bytes", device.pool_bytes}, {"pool_generation", device.pool_generation},
+                {"hot_hits", device.hits}, {"hot_misses", device.misses},
+                {"hot_admissions", device.admissions}, {"hot_evictions", device.evictions},
+                {"h2d_bytes", device.h2d_bytes}, {"ring_requested_bytes", device.ring_requested_bytes},
+                {"ring_actual_bytes", device.ring_actual_bytes},
+                {"ring_pinned_or_registered_bytes", device.ring_pinned_or_registered_bytes},
+                {"ring_lane_reservations", device.ring_lane_reservations},
+                {"ring_stage_bytes", device.ring_stage_bytes},
+                {"ring_h2d_bytes", device.ring_h2d_bytes},
+                {"ring_h2d_time_us", device.ring_h2d_time_us},
+                {"ring_waves", device.ring_waves},
+                {"ring_live_events", device.ring_live_events},
+                {"ring_peak_in_flight_lanes", device.ring_peak_in_flight_lanes},
+                {"ring_first_h2d_enqueue_us", device.ring_first_h2d_enqueue_us},
+                {"ring_last_h2d_complete_us", device.ring_last_h2d_complete_us},
+                {"scheduler", {
+                    {"request_capacity", device.scheduler_request_capacity},
+                    {"inflight_capacity", device.scheduler_inflight_capacity},
+                    {"active_requests", device.scheduler_active_requests},
+                    {"peak_active_requests", device.scheduler_peak_active_requests},
+                    {"queued_requests", device.scheduler_queued_requests},
+                    {"inflight_requests", device.scheduler_inflight_requests},
+                    {"peak_inflight_requests", device.scheduler_peak_inflight_requests},
+                    {"reserved_storage_bytes", device.scheduler_reserved_storage_bytes},
+                    {"peak_reserved_storage_bytes", device.scheduler_peak_reserved_storage_bytes},
+                    {"reserved_h2d_bytes", device.scheduler_reserved_h2d_bytes},
+                    {"peak_reserved_h2d_bytes", device.scheduler_peak_reserved_h2d_bytes},
+                    {"terminal_complete", device.scheduler_terminal_complete},
+                    {"terminal_failed", device.scheduler_terminal_failed},
+                    {"terminal_cancelled", device.scheduler_terminal_cancelled},
+                    {"terminal_releases", device.scheduler_terminal_releases},
+                    {"stale_completions", device.scheduler_stale_completions},
+                }},
+            });
+        }
+        json peer_diagnostics = json::array();
+        for (const auto & device : peer_transport_diagnostics) {
+            peer_diagnostics.push_back({
+                {"device_id", device.device_id}, {"host_staged_bytes", device.host_staged_bytes},
+                {"host_staged_copies", device.host_staged_copies},
+                {"host_staged_blocking_us", device.host_staged_blocking_us},
+                {"peer_bytes", device.peer_bytes}, {"peer_copies", device.peer_copies},
+            });
+        }
         json output = {
             {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
             {"command", command}, {"model_path", args.model}, {"mode", args.mode},
@@ -710,12 +820,24 @@ int main(int argc, char ** argv) {
             {"transport_requested", args.transport},
             {"config_source", args.config_source},
             {"miss_policy", args.miss_policy}, {"background", args.background},
+            {"multi_gpu", {
+                {"device_count", args.expert_devices}, {"devices", device_diagnostics},
+                {"peer_transport", args.peer_transport},
+                {"peer_staging_bytes", args.peer_staging_bytes},
+                {"delayed_device", args.delayed_device == UINT32_MAX ? -1 : int64_t(args.delayed_device)},
+                {"device_delay_us", args.device_delay_us},
+                {"physical_feasibility_skips", diagnostics.physical_feasibility_skips},
+                {"directory_device_cells", diagnostics.directory_device_cells},
+                {"directory_owner_only_violations", diagnostics.directory_owner_only_violations},
+                {"peer_diagnostics", peer_diagnostics},
+            }},
             {"runtime", {
                 {"n_ctx", args.n_ctx},
                 {"n_batch", args.n_batch},
                 {"n_ubatch", args.n_ubatch},
                 {"max_generate", args.max_generate},
             }},
+            {"sampling", {{"seed", 1}, {"temperature", 0.0}, {"selection", "argmax"}}},
             {"prompt_ids", prompt}, {"generated_ids", generated}, {"generated_text", generated_text},
             {"logits_fnv64", logits_digests}, {"latency_us", latency_us},
             {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},

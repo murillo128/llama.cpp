@@ -1473,6 +1473,20 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    // Explicit routed-expert inter-device transport. Append-only backend
+    // instance state preserves the offsets of the existing CUDA context used
+    // across the separately compiled CUDA translation units.
+    int expert_peer_transport = -1;
+    void * expert_host_staging = nullptr;
+    size_t expert_host_staging_capacity = 0;
+    cudaEvent_t expert_host_staging_event = nullptr;
+    std::mutex expert_peer_mutex;
+    uint64_t expert_host_staged_bytes = 0;
+    uint64_t expert_host_staged_copies = 0;
+    uint64_t expert_host_staged_blocking_us = 0;
+    uint64_t expert_peer_bytes = 0;
+    uint64_t expert_peer_copies = 0;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
@@ -1658,4 +1672,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
