@@ -2728,6 +2728,14 @@ public:
             unique_slots[unique_index] = selected;
         }
 
+        std::vector<uint32_t> device_lane_capacities(device_pools.size(), 0);
+        for (size_t device = 0; device < device_lane_capacities.size(); ++device) {
+            device_lane_capacities[device] = transfer_rings[device]->diagnostics().effective_lanes;
+            if (device_lane_capacities[device] == 0) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::initialization_failed));
+            }
+        }
         if (async_decode_transfers) {
             std::vector<uint32_t> per_device_misses(device_pools.size(), 0);
             for (size_t index = 0; index < miss_count; ++index) {
@@ -2736,8 +2744,7 @@ public:
                 per_device_misses[owner]++;
             }
             for (size_t device = 0; device < per_device_misses.size(); ++device) {
-                if (per_device_misses[device] >
-                    transfer_rings[device]->diagnostics().effective_lanes) {
+                if (per_device_misses[device] > device_lane_capacities[device]) {
                     return fail(llm_expert_provider_result::failure(
                         llm_expert_provider_error::unsupported_configuration));
                 }
@@ -2974,10 +2981,7 @@ public:
                 return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
             }
             scheduler_states[index] = llm_expert_request_state::h2d_in_flight;
-            const uint32_t lane_capacity = ring->diagnostics().effective_lanes;
-            if (lane_capacity == 0) {
-                return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
-            }
+            const uint32_t lane_capacity = device_lane_capacities[owner];
             if (device_transfers[owner].size() >= lane_capacity) {
                 staged = flush_device_transfers();
             }
