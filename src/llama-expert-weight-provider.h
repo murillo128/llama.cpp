@@ -1017,6 +1017,13 @@ struct llm_expert_peer_transport_diagnostics {
     uint64_t host_staging_enqueues = 0;
     uint64_t host_staging_completions = 0;
     uint64_t unexpected_host_synchronizations = 0;
+    uint64_t stale_staging_completions = 0;
+    uint64_t staging_cancellation_requests = 0;
+    uint64_t staging_cancellations_during_d2h = 0;
+    uint64_t staging_cancellations_during_h2d = 0;
+    uint64_t staging_cancellation_drains = 0;
+    uint64_t staging_rejected_enqueues = 0;
+    uint64_t host_staging_live_slots = 0;
     uint64_t peer_bytes = 0;
     uint64_t peer_copies = 0;
     uint64_t branch_delay_enqueues_for_testing = 0;

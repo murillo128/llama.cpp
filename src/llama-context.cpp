@@ -1081,8 +1081,8 @@ llama_context::expert_peer_transport_diagnostics() const {
             llm_expert_peer_transport_diagnostics diagnostics;
             diagnostics.source_device_id = llm_expert_device_id(source);
             diagnostics.device_id = llm_expert_device_id(destination);
-            uint64_t values[17] = {};
-            if (query != nullptr && query(backend, source, values, 17) == 0) {
+            uint64_t values[24] = {};
+            if (query != nullptr && query(backend, source, values, 24) == 0) {
                 diagnostics.source_device_id = llm_expert_device_id(values[0]);
                 diagnostics.device_id = llm_expert_device_id(values[1]);
                 diagnostics.host_staged_bytes = values[2];
@@ -1100,6 +1100,13 @@ llama_context::expert_peer_transport_diagnostics() const {
                 diagnostics.branch_delay_enqueues_for_testing = values[14];
                 diagnostics.branch_delay_completions_for_testing = values[15];
                 diagnostics.branch_delay_requested_us_for_testing = values[16];
+                diagnostics.stale_staging_completions = values[17];
+                diagnostics.staging_cancellation_requests = values[18];
+                diagnostics.staging_cancellations_during_d2h = values[19];
+                diagnostics.staging_cancellations_during_h2d = values[20];
+                diagnostics.staging_cancellation_drains = values[21];
+                diagnostics.staging_rejected_enqueues = values[22];
+                diagnostics.host_staging_live_slots = values[23];
             }
             result.push_back(diagnostics);
         }

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 
@@ -1482,6 +1483,8 @@ struct ggml_backend_cuda_context {
         free,
         reserved,
         in_flight,
+        cancelling,
+        cancelled,
         failed,
     };
     struct expert_host_staging_slot {
@@ -1490,7 +1493,10 @@ struct ggml_backend_cuda_context {
         cudaEvent_t d2h_complete = nullptr;
         cudaEvent_t h2d_complete = nullptr;
         uint64_t generation = 0;
+        uint64_t d2h_generation = 0;
+        uint64_t h2d_generation = 0;
         expert_host_staging_slot_state state = expert_host_staging_slot_state::free;
+        bool d2h_recorded = false;
         bool h2d_recorded = false;
     };
     struct expert_host_staging_edge {
@@ -1499,6 +1505,7 @@ struct ggml_backend_cuda_context {
         uint32_t src_expert_device = UINT32_MAX;
         uint32_t dst_expert_device = UINT32_MAX;
         bool configured = false;
+        bool accepting = true;
         uint32_t next_slot = 0;
         uint32_t live_slots = 0;
         std::array<expert_host_staging_slot, expert_host_staging_slot_count> slots;
@@ -1511,8 +1518,21 @@ struct ggml_backend_cuda_context {
         uint64_t enqueues = 0;
         uint64_t completions = 0;
         uint64_t unexpected_host_synchronizations = 0;
+        uint64_t stale_completions = 0;
+        uint64_t cancellation_requests = 0;
+        uint64_t cancellations_during_d2h = 0;
+        uint64_t cancellations_during_h2d = 0;
+        uint64_t cancellation_drains = 0;
+        uint64_t rejected_enqueues = 0;
         uint64_t peer_bytes = 0;
         uint64_t peer_copies = 0;
+    };
+    struct expert_peer_test_gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        uint32_t armed_phase = 0;
+        uint32_t entered_phase = 0;
+        bool release = false;
     };
     int expert_peer_transport = -1;
     void * expert_host_staging = nullptr;
@@ -1520,6 +1540,7 @@ struct ggml_backend_cuda_context {
     uint32_t expert_device_id = UINT32_MAX;
     uint32_t expert_device_count = 0;
     std::array<expert_host_staging_edge, GGML_CUDA_MAX_DEVICES> expert_host_staging_edges;
+    std::array<std::unique_ptr<expert_peer_test_gate>, GGML_CUDA_MAX_DEVICES> expert_peer_test_gates;
     std::mutex expert_peer_mutex;
     std::atomic<uint64_t> expert_test_delay_enqueues { 0 };
     std::atomic<uint64_t> expert_test_delay_completions { 0 };
