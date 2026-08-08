@@ -28,6 +28,42 @@ struct llm_expert_async_diagnostics;
 struct llm_expert_async_read_interval;
 struct llm_expert_scheduler_diagnostics;
 
+enum class llm_expert_role_shape {
+    local_single,
+    remote_single,
+    striped_multi,
+};
+
+struct llm_expert_physical_device {
+    ggml_backend_dev_t device = nullptr;
+    int32_t cuda_ordinal = -1;
+    std::string pci_bdf;
+    std::string uuid;
+};
+
+struct llm_expert_role_device_plan : llm_expert_physical_device {
+    uint32_t hot_slots = 0;
+};
+
+struct llm_expert_role_plan {
+    llm_expert_role_shape shape = llm_expert_role_shape::local_single;
+    llm_expert_physical_device resident;
+    std::vector<llm_expert_role_device_plan> experts;
+    uint32_t total_hot_slots = 0;
+    bool explicit_config = false;
+};
+
+struct llm_expert_transport_endpoint_plan : llm_expert_physical_device {
+    llm_expert_transport_endpoint_id endpoint_id = LLM_EXPERT_TRANSPORT_ENDPOINT_ID_INVALID;
+    llm_expert_device_id expert_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    bool resident = false;
+};
+
+void llm_expert_role_canonicalize(std::vector<llm_expert_role_device_plan> & experts);
+std::vector<llm_expert_transport_endpoint_plan> llm_expert_transport_endpoints(
+    const llm_expert_role_plan & roles);
+bool llm_expert_transport_edge_required(uint32_t source, uint32_t destination, uint32_t device_count) noexcept;
+
 struct llm_deferred_expert_diagnostics {
     uint64_t tensor_count = 0;
     uint64_t payload_bytes = 0;
@@ -690,6 +726,12 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     uint32_t expert_device_count() const;
+    uint32_t expert_transport_device_count() const;
+    uint32_t expert_hot_cache_capacity() const;
+    const llm_expert_role_plan & expert_role_plan() const;
+    ggml_backend_dev_t expert_resident_device() const noexcept;
+    bool has_explicit_expert_role_config() const;
+    void resolve_legacy_expert_role_plan();
     llama_expert_peer_transport expert_peer_transport() const;
     uint64_t expert_peer_staging_bytes() const;
 

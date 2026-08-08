@@ -274,6 +274,46 @@ void test_device_qualified_single_flight_and_backpressure() {
     GGML_ASSERT(diagnostics.devices[1].reserved_h2d_bytes == 20);
 }
 
+void test_exact_unequal_device_capacities() {
+    auto exact = config(8);
+    exact.device_count = 2;
+    exact.device_request_capacities[0] = 2;
+    exact.device_request_capacities[1] = 6;
+    exact.device_inflight_capacities[0] = 1;
+    exact.device_inflight_capacities[1] = 3;
+    llm_expert_scheduler scheduler(exact);
+    auto diagnostics = scheduler.diagnostics();
+    GGML_ASSERT(diagnostics.devices.size() == 2);
+    GGML_ASSERT(diagnostics.devices[0].request_capacity == 2);
+    GGML_ASSERT(diagnostics.devices[1].request_capacity == 6);
+    GGML_ASSERT(diagnostics.devices[0].inflight_capacity == 1);
+    GGML_ASSERT(diagnostics.devices[1].inflight_capacity == 3);
+
+    llm_expert_request_metadata first;
+    first.target_device = 0;
+    GGML_ASSERT(scheduler.enqueue({ 0, 0 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, first).accepted());
+    GGML_ASSERT(scheduler.enqueue({ 0, 1 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, first).accepted());
+    GGML_ASSERT(scheduler.enqueue({ 0, 2 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::device_ready, first).disposition ==
+        llm_expert_schedule_disposition::busy);
+
+    llm_expert_request_metadata second;
+    second.target_device = 1;
+    for (int32_t expert = 2; expert < 6; ++expert) {
+        GGML_ASSERT(scheduler.enqueue({ 1, expert }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::device_ready, second).accepted());
+    }
+
+    auto invalid = exact;
+    invalid.device_request_capacities[1] = 7;
+    expect_invalid([&] { llm_expert_scheduler rejected(invalid); });
+    invalid = exact;
+    invalid.device_request_capacities[1] = 0;
+    expect_invalid([&] { llm_expert_scheduler rejected(invalid); });
+}
+
 void test_quiescent_shutdown() {
     llm_expert_scheduler scheduler(config());
     GGML_ASSERT(scheduler.enqueue(
@@ -667,6 +707,7 @@ int main() {
     test_stale_completion_and_generation_exhaustion();
     test_layout_class_identity_is_part_of_join_state();
     test_device_qualified_single_flight_and_backpressure();
+    test_exact_unequal_device_capacities();
     test_quiescent_shutdown();
     test_post_h2d_cancellation_path();
     test_cold_hit_reaches_host_ready_without_io();

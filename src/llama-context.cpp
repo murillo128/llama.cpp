@@ -346,8 +346,9 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
-        if (model.expert_device_count() > 1) {
-            const uint32_t device_count = model.expert_device_count();
+        const uint32_t expert_transport_device_count = model.expert_transport_device_count();
+        if (expert_transport_device_count > 1) {
+            const uint32_t device_count = expert_transport_device_count;
             if (backends.size() != device_count) {
                 throw std::runtime_error("routed-expert backend count does not match the sealed device topology");
             }
@@ -380,7 +381,7 @@ llama_context::llama_context(
             }
             for (uint32_t src = 0; src < device_count; ++src) {
                 for (uint32_t dst = 0; dst < device_count; ++dst) {
-                    if (src != dst && configure_peer_edges[src](
+                    if (llm_expert_transport_edge_required(src, dst, device_count) && configure_peer_edges[src](
                             backends[src].get(), backends[dst].get()) != 0) {
                         throw std::runtime_error("failed to seal a routed-expert directed CUDA edge");
                     }
@@ -389,7 +390,8 @@ llama_context::llama_context(
             if (model.expert_peer_transport() == LLAMA_EXPERT_PEER_TRANSPORT_P2P) {
                 for (uint32_t src = 0; src < device_count; ++src) {
                     for (uint32_t dst = 0; dst < device_count; ++dst) {
-                        if (src != dst && peer_capabilities[src](backends[src].get(), backends[dst].get(), 1) != 1) {
+                        if (llm_expert_transport_edge_required(src, dst, device_count) &&
+                            peer_capabilities[src](backends[src].get(), backends[dst].get(), 1) != 1) {
                             throw std::runtime_error("requested routed-expert P2P transport is not capable in both directions");
                         }
                     }
@@ -1066,8 +1068,9 @@ llm_expert_graph_diagnostics llama_context::expert_graph_diagnostics() const {
 std::vector<llm_expert_peer_transport_diagnostics>
 llama_context::expert_peer_transport_diagnostics() const {
     std::vector<llm_expert_peer_transport_diagnostics> result;
-    const uint32_t device_count = model.expert_device_count();
-    result.reserve(size_t(device_count)*(device_count > 0 ? device_count - 1 : 0));
+    const auto endpoints = llm_expert_transport_endpoints(model.expert_role_plan());
+    const uint32_t device_count = uint32_t(endpoints.size());
+    result.reserve(device_count > 1 ? 2*(device_count - 1) : 0);
     using diagnostics_fn = int (*)(ggml_backend_t, uint32_t, uint64_t *, size_t);
     for (uint32_t destination = 0;
             destination < device_count && destination < backends.size(); ++destination) {
@@ -1077,14 +1080,31 @@ llama_context::expert_peer_transport_diagnostics() const {
         auto query = reg ? reinterpret_cast<diagnostics_fn>(ggml_backend_reg_get_proc_address(
             reg, "ggml_backend_cuda_expert_peer_diagnostics")) : nullptr;
         for (uint32_t source = 0; source < device_count; ++source) {
-            if (source == destination) continue;
+            if (!llm_expert_transport_edge_required(source, destination, device_count)) continue;
+            const auto & source_endpoint = endpoints[source];
+            const auto & destination_endpoint = endpoints[destination];
             llm_expert_peer_transport_diagnostics diagnostics;
-            diagnostics.source_device_id = llm_expert_device_id(source);
-            diagnostics.device_id = llm_expert_device_id(destination);
+            diagnostics.source_endpoint_id = source_endpoint.endpoint_id;
+            diagnostics.endpoint_id = destination_endpoint.endpoint_id;
+            diagnostics.source_expert_device_id = source_endpoint.expert_device_id;
+            diagnostics.expert_device_id = destination_endpoint.expert_device_id;
+            diagnostics.source_cuda_ordinal = source_endpoint.cuda_ordinal;
+            diagnostics.cuda_ordinal = destination_endpoint.cuda_ordinal;
+            diagnostics.source_pci_bdf = source_endpoint.pci_bdf;
+            diagnostics.pci_bdf = destination_endpoint.pci_bdf;
+            diagnostics.source_uuid = source_endpoint.uuid;
+            diagnostics.uuid = destination_endpoint.uuid;
+            diagnostics.source_is_resident = source_endpoint.resident;
+            diagnostics.is_resident = destination_endpoint.resident;
+            const bool physical_mapping_valid =
+                source < backends.size() && destination < backends.size() &&
+                ggml_backend_get_device(backends[source].get()) == source_endpoint.device &&
+                ggml_backend_get_device(backends[destination].get()) == destination_endpoint.device;
             uint64_t values[24] = {};
             if (query != nullptr && query(backend, source, values, 24) == 0) {
-                diagnostics.source_device_id = llm_expert_device_id(values[0]);
-                diagnostics.device_id = llm_expert_device_id(values[1]);
+                diagnostics.endpoint_mapping_valid = physical_mapping_valid &&
+                    values[0] == source_endpoint.endpoint_id &&
+                    values[1] == destination_endpoint.endpoint_id;
                 diagnostics.host_staged_bytes = values[2];
                 diagnostics.host_staged_copies = values[3];
                 diagnostics.host_staging_slots = values[4];
@@ -1961,6 +1981,26 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
         void * expert_abort_callback_data = ctx->expert_abort_callback_for_testing != nullptr ?
             ctx->expert_abort_callback_data_for_testing : ctx->abort_callback_data;
         ggml_backend_t device_backends[LLM_EXPERT_MAX_DEVICES] = {};
+        if (checkpoint->remote_single && checkpoint->remote_device.completion_delay_us_for_testing != 0) {
+            using enqueue_delay_fn = int (*)(ggml_backend_t, uint64_t);
+            ggml_backend_t backend = nullptr;
+            for (const auto & candidate : ctx->backends) {
+                if (ggml_backend_get_device(candidate.get()) == checkpoint->remote_device.target_device) {
+                    backend = candidate.get();
+                    break;
+                }
+            }
+            ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto enqueue = reg ? reinterpret_cast<enqueue_delay_fn>(ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_expert_enqueue_stream_delay")) : nullptr;
+            if (enqueue == nullptr || enqueue(backend,
+                    checkpoint->remote_device.completion_delay_us_for_testing) != 0) {
+                ctx->expert_eval_result = llm_expert_provider_result::failure(
+                    llm_expert_provider_error::copy_failed);
+                return false;
+            }
+        }
         if (checkpoint->multi_device) {
             if (checkpoint->devices.size() > LLM_EXPERT_MAX_DEVICES) {
                 ctx->expert_eval_result = llm_expert_provider_result::failure(
@@ -3337,6 +3377,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.expert_weight_provider =*/ expert_weight_provider,
+        /*.expert_resident_device =*/ model.expert_resident_device(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.observe_routes =*/ route_observer_submission_active,

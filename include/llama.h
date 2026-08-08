@@ -433,6 +433,19 @@ extern "C" {
         LLAMA_EXPERT_CACHE_POLICY_LFU_AGING_DEFAULT_EVENTS = 1024,
         LLAMA_EXPERT_PREFETCH_VERSION_1 = 1,
         LLAMA_EXPERT_UMA_CONFIG_VERSION_1 = 1,
+        LLAMA_EXPERT_ROLE_CONFIG_VERSION_1 = 1,
+    };
+
+    struct llama_expert_role_device {
+        ggml_backend_dev_t device;
+        uint32_t hot_slots;
+    };
+
+    struct llama_expert_role_config {
+        uint32_t version;
+        ggml_backend_dev_t resident_device;
+        const struct llama_expert_role_device * expert_devices;
+        uint32_t expert_device_count;
     };
 
     struct llama_expert_uma_config_v1 {
@@ -535,6 +548,7 @@ extern "C" {
         const struct llama_expert_uma_config_v1 * expert_uma_config; // copied at model load [EXPERIMENTAL]
         const struct llama_expert_prefetch_config_v1 * expert_prefetch_config; // copied at model load [EXPERIMENTAL]
         const char * expert_prefetch_profile_path; // copied at model load [EXPERIMENTAL]
+        const struct llama_expert_role_config * expert_role_config; // copied at model load [EXPERIMENTAL]
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

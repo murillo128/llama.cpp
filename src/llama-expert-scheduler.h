@@ -2,6 +2,7 @@
 
 #include "llama-expert-weight-provider.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 
@@ -81,6 +82,8 @@ struct llm_expert_scheduler_config {
     uint32_t device_count = 1;
     uint32_t per_device_request_capacity = 0;
     uint32_t per_device_inflight_capacity = 0;
+    std::array<uint32_t, LLM_EXPERT_MAX_DEVICES> device_request_capacities = {};
+    std::array<uint32_t, LLM_EXPERT_MAX_DEVICES> device_inflight_capacities = {};
 };
 
 enum class llm_expert_schedule_disposition {

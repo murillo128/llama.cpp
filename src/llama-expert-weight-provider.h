@@ -318,10 +318,14 @@ struct llm_expert_graph_binding {
         // waits on this branch's compute backend.
         mutable std::vector<h2d_dependency> h2d_dependencies;
     };
+    device_binding remote_device;
     std::vector<device_binding> devices;
+    bool remote_single = false;
     bool multi_device = false;
 
     bool uses_merged_gate_up() const;
+    size_t execution_device_count() const noexcept;
+    const device_binding & execution_device(size_t index) const;
     llm_expert_provider_result validate(const llm_expert_selection & selection) const;
 };
 
@@ -586,6 +590,9 @@ struct llm_hot_cache_diagnostics {
     uint32_t auto_cost_model_version = 0;
     uint64_t auto_cost_model_digest = 0;
     uint64_t hybrid_bindings = 0;
+    uint64_t remote_single_bindings = 0;
+    uint64_t multi_device_bindings = 0;
+    uint64_t device_binding_vector_elements = 0;
     uint64_t gpu_execution_lanes = 0;
     uint64_t cpu_execution_lanes = 0;
     uint64_t mixed_execution_layers = 0;
@@ -1004,9 +1011,23 @@ struct llm_expert_graph_diagnostics {
     int32_t graphs_reused = 0;
 };
 
+using llm_expert_transport_endpoint_id = uint16_t;
+constexpr llm_expert_transport_endpoint_id LLM_EXPERT_TRANSPORT_ENDPOINT_ID_INVALID = UINT16_MAX;
+
 struct llm_expert_peer_transport_diagnostics {
-    llm_expert_device_id source_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
-    llm_expert_device_id device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    llm_expert_transport_endpoint_id source_endpoint_id = LLM_EXPERT_TRANSPORT_ENDPOINT_ID_INVALID;
+    llm_expert_transport_endpoint_id endpoint_id = LLM_EXPERT_TRANSPORT_ENDPOINT_ID_INVALID;
+    llm_expert_device_id source_expert_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    llm_expert_device_id expert_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    int32_t source_cuda_ordinal = -1;
+    int32_t cuda_ordinal = -1;
+    std::string source_pci_bdf;
+    std::string pci_bdf;
+    std::string source_uuid;
+    std::string uuid;
+    bool source_is_resident = false;
+    bool is_resident = false;
+    bool endpoint_mapping_valid = false;
     uint64_t host_staged_bytes = 0;
     uint64_t host_staged_copies = 0;
     uint64_t host_staging_slots = 0;
@@ -1313,6 +1334,7 @@ struct llm_expert_provider_faults {
     size_t fail_preparation_after_handles = SIZE_MAX;
     bool fail_pool_allocation = false;
     size_t fail_copy_after_tensors = SIZE_MAX;
+    uint32_t fail_pool_allocation_device_for_testing = UINT32_MAX;
 };
 
 struct llm_hot_cache_config {
@@ -1365,6 +1387,7 @@ struct llm_hot_cache_config {
     std::vector<device_config> devices;
     llama_expert_peer_transport peer_transport = LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED;
     uint64_t peer_staging_bytes = 0;
+    bool remote_single = false;
 };
 
 struct llm_uma_cache_config {
