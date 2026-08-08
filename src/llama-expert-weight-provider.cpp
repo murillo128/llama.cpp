@@ -2961,9 +2961,15 @@ public:
             if (ring == nullptr || entry.device_id != owner) {
                 return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
             }
+            uint64_t transport_epoch = 0;
+            {
+                LLM_EXPERT_TRACE_SCOPE("k3.provider", "multi_device_transport_epoch_snapshot",
+                    "phase", 2);
+                transport_epoch = config.async_transport->diagnostics().transport_epoch;
+            }
             staged = ring->reserve(*cold_cache, cold_references[index], entry.device_slot,
                 entry.generation, transfer_lanes[index], {
-                    config.async_transport->diagnostics().transport_epoch,
+                    transport_epoch,
                     scheduler_handles[index].slot, scheduler_handles[index].generation, key,
                     binding.layout_class_id, owner,
                 });
@@ -3086,8 +3092,14 @@ public:
                     flight.processed = true;
                     continue;
                 }
+                uint64_t transport_epoch = 0;
+                {
+                    LLM_EXPERT_TRACE_SCOPE("k3.provider", "multi_device_transport_epoch_snapshot",
+                        "phase", 1);
+                    transport_epoch = config.async_transport->diagnostics().transport_epoch;
+                }
                 const llm_expert_async_operation_identity identity = {
-                    config.async_transport->diagnostics().transport_epoch,
+                    transport_epoch,
                     flight.handle, 0, flight.key, llm_expert_readiness::device_ready,
                     llm_expert_priority::demand_current_layer, flight.cold.layout_class_id,
                 };
