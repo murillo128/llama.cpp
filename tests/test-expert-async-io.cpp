@@ -76,6 +76,29 @@ struct scripted_async_reader : llm_expert_async_read_override {
     }
 };
 
+struct concurrent_async_reader : llm_expert_async_read_override {
+    std::mutex mutex;
+    std::condition_variable condition;
+    uint32_t entered = 0;
+    bool released = false;
+
+    int64_t read_at(intptr_t, void * destination, size_t byte_count, uint64_t file_offset,
+            int & native_error) noexcept override {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            entered++;
+            condition.notify_all();
+            condition.wait(lock, [&] { return released; });
+        }
+        native_error = 0;
+        auto * bytes = static_cast<uint8_t *>(destination);
+        for (size_t index = 0; index < byte_count; ++index) {
+            bytes[index] = uint8_t(file_offset + index);
+        }
+        return int64_t(byte_count);
+    }
+};
+
 class provider_owned_destination final : public llm_expert_weight_provider {
 public:
     provider_owned_destination(llm_expert_async_transport * transport, bool & drained_before_destroy) :
@@ -165,11 +188,17 @@ void test_configuration() {
 
     auto positional = config(8);
     positional.force_positional_reads = true;
+    positional.worker_count = 2;
     llm_expert_async_transport positional_transport(positional);
     const auto positional_diagnostics = positional_transport.diagnostics();
     GGML_ASSERT(positional_diagnostics.positional_reads_forced);
+    GGML_ASSERT(positional_diagnostics.worker_count == 2);
     GGML_ASSERT(!positional_diagnostics.io_uring_enabled);
     GGML_ASSERT(positional_diagnostics.fallback_reason_mask == 0);
+
+    auto invalid_workers = config(8);
+    invalid_workers.worker_count = 2;
+    expect_invalid([&] { llm_expert_async_transport invalid(invalid_workers); });
 }
 
 void test_ring_layout_validation() {
@@ -427,6 +456,56 @@ void test_nonblocking_read_poll() {
     GGML_ASSERT(completion.bytes_completed == destination.size());
     GGML_ASSERT(std::memcmp(destination.data(), reader.bytes.data(), destination.size()) == 0);
     GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+}
+
+void test_bounded_positional_worker_parallelism() {
+    concurrent_async_reader reader;
+    auto cfg = config(8);
+    cfg.force_positional_reads = true;
+    cfg.worker_count = 2;
+    cfg.read_override_for_testing = &reader;
+    llm_expert_async_transport transport(cfg);
+    std::array<std::array<uint8_t, 8>, 2> destinations{};
+    std::array<llm_expert_storage_read_operation, 2> reads{};
+    std::array<llm_expert_async_operation_identity, 2> identities{};
+    for (uint32_t index = 0; index < 2; ++index) {
+        reads[index].native_handle = 17;
+        reads[index].source_size = 64;
+        reads[index].file_offset = index*16;
+        reads[index].byte_count = destinations[index].size();
+        reads[index].segment_count = 1;
+        reads[index].segments[0] = { destinations[index].data(), destinations[index].size(),
+            reads[index].file_offset, llm_expert_storage_projection::up,
+            llm_expert_storage_sidecar::weight };
+        identities[index] = {
+            1, { index, 1 }, index, { 0, int32_t(index) }, llm_expert_readiness::host_ready,
+            llm_expert_priority::demand_current_layer,
+        };
+        GGML_ASSERT(transport.submit_read_plan(identities[index], &reads[index], 1, true) ==
+            llm_expert_async_result::ready);
+    }
+    transport.start_deferred_reads();
+    bool parallel = false;
+    {
+        std::unique_lock<std::mutex> lock(reader.mutex);
+        parallel = reader.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+            return reader.entered == 2;
+        });
+        reader.released = true;
+        reader.condition.notify_all();
+    }
+    GGML_ASSERT(parallel);
+    for (uint32_t index = 0; index < 2; ++index) {
+        llm_expert_async_read_completion completion;
+        GGML_ASSERT(transport.wait_read(identities[index].request, completion) ==
+            llm_expert_async_result::ready);
+        GGML_ASSERT(completion.bytes_completed == destinations[index].size());
+        GGML_ASSERT(destinations[index][0] == reads[index].file_offset);
+        GGML_ASSERT(transport.release_read(identities[index].request) == llm_expert_async_result::ready);
+    }
+    const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(diagnostics.worker_count == 2 && diagnostics.active_read_requests == 0 &&
+        diagnostics.active_operations == 0);
 }
 
 void test_deferred_multi_request_ring_batch() {
@@ -1033,6 +1112,7 @@ int main() {
     test_generation_exhaustion();
     test_worker_read_and_drain();
     test_nonblocking_read_poll();
+    test_bounded_positional_worker_parallelism();
     test_deferred_multi_request_ring_batch();
     test_partial_ring_submission_falls_back_after_quiescence();
     test_file_registration_or_explicit_fallback();

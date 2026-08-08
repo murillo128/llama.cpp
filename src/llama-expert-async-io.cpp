@@ -338,7 +338,7 @@ struct llm_expert_async_transport::impl {
     std::vector<llm_expert_request_handle> group_handles;
     mutable std::mutex mutex;
     std::condition_variable condition;
-    std::thread worker;
+    std::vector<std::thread> workers;
     llm_expert_async_diagnostics counters;
     uint64_t next_read_ordinal = 1;
     bool worker_stop = false;
@@ -1429,7 +1429,9 @@ struct llm_expert_async_transport::impl {
 llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config config) : pimpl(std::make_unique<impl>()) {
     const bool integrity_mode_valid = config.integrity_mode == llm_expert_integrity_mode::none ||
         config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end;
-    if (config.effective_hot_capacity == 0 || config.request_capacity == 0 ||
+    if (config.effective_hot_capacity == 0 || config.request_capacity == 0 || config.worker_count == 0 ||
+        config.worker_count > 8 || (config.worker_count > 1 &&
+            (!config.force_positional_reads || config.direct_io_requested)) ||
         config.cold_cache_bytes == 0 || !integrity_mode_valid ||
         (config.requested_queue_depth != 0 &&
          (config.requested_queue_depth < 8 || config.requested_queue_depth > 4096))) {
@@ -1458,6 +1460,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     pimpl->traces.resize(config.trace_capacity);
     pimpl->batch_slots.resize(sq_entries);
     pimpl->group_handles.resize(config.request_capacity);
+    pimpl->workers.reserve(config.worker_count);
     pimpl->registered_files.resize(config.source_file_capacity == 0 ? 256 : config.source_file_capacity);
     pimpl->direct_disabled_handles.resize(pimpl->registered_files.size());
     for (auto & operation : pimpl->operations) {
@@ -1479,6 +1482,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
         pimpl->traces.capacity()*sizeof(impl::trace_record) +
         pimpl->batch_slots.capacity()*sizeof(uint32_t) +
         pimpl->group_handles.capacity()*sizeof(llm_expert_request_handle) +
+        pimpl->workers.capacity()*sizeof(std::thread) +
         pimpl->registered_files.capacity()*sizeof(int) +
         pimpl->direct_disabled_handles.capacity()*sizeof(intptr_t);
 #if defined(__linux__)
@@ -1569,8 +1573,11 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
             ring_error, "ring-setup");
     }
 #endif
-    pimpl->worker = std::thread([this] { pimpl->worker_main(); });
-    pimpl->counters.worker_started = true;
+    for (uint32_t worker = 0; worker < config.worker_count; ++worker) {
+        pimpl->workers.emplace_back([this] { pimpl->worker_main(); });
+    }
+    pimpl->counters.worker_started = !pimpl->workers.empty();
+    pimpl->counters.worker_count = uint32_t(pimpl->workers.size());
 }
 
 llm_expert_async_transport::~llm_expert_async_transport() {
@@ -1834,14 +1841,14 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
         "device_id", identity.request.target_device);
     LLM_EXPERT_TRACE_COUNTER("k3.resource", "storage_active_requests", 3, pimpl->counters.active_read_requests);
     pimpl->deferred_batch_open = defer_worker;
-    if (!defer_worker) pimpl->condition.notify_one();
+    if (!defer_worker) pimpl->condition.notify_all();
     return llm_expert_async_result::ready;
 }
 
 void llm_expert_async_transport::start_deferred_reads() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     pimpl->deferred_batch_open = false;
-    pimpl->condition.notify_one();
+    pimpl->condition.notify_all();
 }
 
 llm_expert_async_result llm_expert_async_transport::register_files(
@@ -2023,8 +2030,10 @@ bool llm_expert_async_transport::shutdown() noexcept {
         pimpl->deferred_batch_open = false;
         pimpl->condition.notify_all();
     }
-    if (pimpl->worker.joinable() && pimpl->worker.get_id() != std::this_thread::get_id()) {
-        pimpl->worker.join();
+    for (auto & worker : pimpl->workers) {
+        if (worker.joinable() && worker.get_id() != std::this_thread::get_id()) {
+            worker.join();
+        }
     }
 #if defined(__linux__)
     // The worker is the only ring submitter. Tear the ring down only after it

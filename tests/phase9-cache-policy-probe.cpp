@@ -514,6 +514,7 @@ json async_diagnostics_json(const llm_expert_async_diagnostics & value) {
         {"io_uring_runtime_error", value.io_uring_runtime_error}, {"opcode_read", value.opcode_read},
         {"opcode_readv", value.opcode_readv}, {"opcode_async_cancel", value.opcode_async_cancel},
         {"opcode_read_fixed", value.opcode_read_fixed}, {"worker_started", value.worker_started},
+        {"worker_count", value.worker_count},
         {"admission_closed", value.admission_closed},
     };
 }

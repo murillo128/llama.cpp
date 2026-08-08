@@ -1669,7 +1669,8 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         predictive_prefetch ? prefetch.max_speculative_cold_slots : 0,
         predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
         uint32_t(std::min<int64_t>(hparams.n_expert, params.expert_hot_cache_capacity)),
-        params.expert_device_count,
+        params.expert_io_force_positional_reads && params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO ?
+            params.expert_device_count : 1,
         uint32_t(request_capacity_64/params.expert_device_count),
         uint32_t(request_capacity_64/params.expert_device_count),
     });
@@ -1701,6 +1702,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         false,
         params.expert_io_force_positional_reads,
         pimpl->expert_integrity_mode,
+        params.expert_device_count,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;
