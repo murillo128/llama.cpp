@@ -469,6 +469,7 @@ struct llm_expert_async_transport::impl {
     }
 
     void record_request_traces_locked(const read_request_record & request) {
+        if (traces.empty()) return;
         for (const auto & operation : operations) {
             if (!operation.active || !operation.read_operation ||
                 !same_request(operation.identity.request, request.handle)) continue;
@@ -1428,7 +1429,7 @@ struct llm_expert_async_transport::impl {
 llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config config) : pimpl(std::make_unique<impl>()) {
     const bool integrity_mode_valid = config.integrity_mode == llm_expert_integrity_mode::none ||
         config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end;
-    if (config.effective_hot_capacity == 0 || config.request_capacity == 0 || config.trace_capacity == 0 ||
+    if (config.effective_hot_capacity == 0 || config.request_capacity == 0 ||
         config.cold_cache_bytes == 0 || !integrity_mode_valid ||
         (config.requested_queue_depth != 0 &&
          (config.requested_queue_depth < 8 || config.requested_queue_depth > 4096))) {
@@ -1746,6 +1747,7 @@ llm_expert_async_result llm_expert_async_transport::consume_completion_for_testi
 
 void llm_expert_async_transport::record_trace_for_testing() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (pimpl->traces.empty()) return;
     if (pimpl->counters.trace_records == pimpl->traces.size()) {
         pimpl->counters.trace_records_dropped++;
         return;

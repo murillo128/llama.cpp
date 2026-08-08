@@ -124,6 +124,7 @@ struct arguments {
     std::string model;
     std::string output;
     std::string mode = "cold";
+    std::string expert_runtime_mode = "COMPLIANCE";
     std::string prompt = "According to all known laws";
     std::string hot_policy = "LRU";
     std::string cold_policy = "LRU";
@@ -194,6 +195,11 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         if (option == "--model") result.model = value;
         else if (option == "--output") result.output = value;
         else if (option == "--mode") result.mode = value;
+        else if (option == "--expert-runtime-mode") {
+            result.expert_runtime_mode = value;
+            if (result.expert_runtime_mode != "COMPLIANCE" &&
+                result.expert_runtime_mode != "PRODUCTION_PERFORMANCE") return false;
+        }
         else if (option == "--prompt") result.prompt = value;
         else if (option == "--hot-policy") result.hot_policy = value;
         else if (option == "--cold-policy") result.cold_policy = value;
@@ -338,7 +344,8 @@ json config_json(const llm_expert_cache_policy_diagnostics & diagnostics) {
         {"schema_version", "cache-policy-config-v1"}, {"policy", policy_name(value.policy)},
         {"scope", scope_name(value.scope)}, {"slru_protected_ratio_bps", value.slru_protected_ratio_bps},
         {"admission", admission_name(value.admission)}, {"admission_window_events", value.admission_window_events},
-        {"lfu_aging_interval_events", value.lfu_aging_interval_events}, {"digest", value.digest},
+        {"lfu_aging_interval_events", value.lfu_aging_interval_events},
+        {"state_attestation_enabled", value.state_attestation}, {"digest", value.digest},
     };
 }
 
@@ -612,6 +619,8 @@ int main(int argc, char ** argv) {
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_weights_mode = args.mode == "disabled" ? LLAMA_EXPERT_WEIGHTS_MODE_DISABLED :
             args.mode == "cold" ? LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
+        model_params.expert_runtime_mode = args.expert_runtime_mode == "COMPLIANCE" ?
+            LLAMA_EXPERT_RUNTIME_MODE_COMPLIANCE : LLAMA_EXPERT_RUNTIME_MODE_PERFORMANCE;
         model_params.expert_device_count = args.expert_devices;
         model_params.expert_peer_transport = args.peer_transport == "P2P" ?
             LLAMA_EXPERT_PEER_TRANSPORT_P2P : LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED;
@@ -812,6 +821,7 @@ int main(int argc, char ** argv) {
             json output = {
                 {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
                 {"command", command}, {"model_path", args.model}, {"mode", args.mode},
+                {"expert_runtime_mode", args.expert_runtime_mode},
                 {"provider_enabled", false}, {"prompt", prompt_text},
                 {"runtime", {
                     {"n_ctx", args.n_ctx},
@@ -937,6 +947,7 @@ int main(int argc, char ** argv) {
         json output = {
             {"schema_version", "phase9-online-policy-capture-v1"}, {"status", "pass"},
             {"command", command}, {"model_path", args.model}, {"mode", args.mode},
+            {"expert_runtime_mode", args.expert_runtime_mode},
             {"prompt", prompt_text},
             {"transport_requested", args.transport},
             {"config_source", args.config_source},

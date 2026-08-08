@@ -73,6 +73,7 @@ struct llm_expert_cache_policy_config_internal {
     llama_expert_cache_admission admission = LLAMA_EXPERT_CACHE_ADMISSION_ALWAYS;
     uint32_t admission_window_events = 0;
     uint32_t lfu_aging_interval_events = 0;
+    bool state_attestation = true;
     bool supplied = false;
     llama_expert_cache_policy_config supplied_config = {};
     llama_expert_cache_policy_config resolved_config = {};
@@ -294,6 +295,7 @@ private:
     llm_expert_cache_policy_result flush_terminal_events() noexcept;
     void touch_slot(slot_state & slot) noexcept;
     void enforce_protected_capacity(uint32_t domain) noexcept;
+    void refresh_state_digest() noexcept;
     uint64_t hash_state() const noexcept;
 
     llm_expert_cache_policy_config_internal config;

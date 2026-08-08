@@ -358,6 +358,12 @@ extern "C" {
         LLAMA_EXPERT_WEIGHTS_MODE_COUNT = 5,
     };
 
+    enum llama_expert_runtime_mode {
+        LLAMA_EXPERT_RUNTIME_MODE_COMPLIANCE  = 0,
+        LLAMA_EXPERT_RUNTIME_MODE_PERFORMANCE = 1,
+        LLAMA_EXPERT_RUNTIME_MODE_COUNT       = 2,
+    };
+
     enum llama_expert_uma_readiness {
         LLAMA_EXPERT_UMA_READINESS_AUTO          = 0,
         LLAMA_EXPERT_UMA_READINESS_CUDA_PREFETCH = 1,
@@ -510,6 +516,7 @@ extern "C" {
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
         enum llama_expert_weights_mode expert_weights_mode; // routed-expert provider mode [EXPERIMENTAL]
+        enum llama_expert_runtime_mode expert_runtime_mode; // compliance attestation or production-performance mode [EXPERIMENTAL]
         uint32_t expert_hot_cache_capacity; // global routed-expert slot capacity [EXPERIMENTAL]
         uint64_t expert_cold_cache_bytes; // pageable routed-expert cache budget [EXPERIMENTAL]
         uint64_t expert_transfer_ring_bytes; // bounded transfer staging budget [EXPERIMENTAL]

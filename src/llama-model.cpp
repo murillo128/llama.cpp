@@ -1110,6 +1110,11 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) {
         throw std::invalid_argument("invalid expert weights mode");
     }
+    if (params.expert_runtime_mode != LLAMA_EXPERT_RUNTIME_MODE_COMPLIANCE &&
+        params.expert_runtime_mode != LLAMA_EXPERT_RUNTIME_MODE_PERFORMANCE) {
+        throw std::invalid_argument("invalid expert runtime mode");
+    }
+    const bool performance_mode = params.expert_runtime_mode == LLAMA_EXPERT_RUNTIME_MODE_PERFORMANCE;
     const bool cold_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
     const bool uma_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
     const bool cached_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE || cold_mode || uma_mode;
@@ -1148,6 +1153,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     if (!hot_policy_result.is_ready() || !cold_policy_result.is_ready()) {
         throw std::invalid_argument("invalid expert cache-policy configuration");
     }
+    pimpl->expert_hot_cache_policy_config.state_attestation = !performance_mode;
+    pimpl->expert_cold_cache_policy_config.state_attestation = !performance_mode;
     if (params.expert_hot_cache_policy != nullptr) {
         pimpl->expert_hot_cache_policy_owned = *params.expert_hot_cache_policy;
         this->params.expert_hot_cache_policy = &*pimpl->expert_hot_cache_policy_owned;
@@ -1549,6 +1556,7 @@ int routed_expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight
 
 void llama_model::init_expert_storage(llama_model_loader & ml) {
     LLM_EXPERT_TRACE_SCOPE("k3.storage", "storage_initialize", "expert_weights_mode", uint32_t(params.expert_weights_mode));
+    const bool performance_mode = params.expert_runtime_mode == LLAMA_EXPERT_RUNTIME_MODE_PERFORMANCE;
     if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
         params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) {
         return;
@@ -1637,12 +1645,16 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         uint64_t(params.expert_hot_cache_capacity)*4*params.expert_device_count);
     if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
     const uint32_t request_capacity = uint32_t(request_capacity_64);
+    if (performance_mode && params.expert_io_trace_capacity != 0) {
+        throw std::invalid_argument("performance expert runtime mode disables internal evidence traces");
+    }
     if (params.expert_io_trace_capacity != 0 &&
         (params.expert_io_trace_capacity < 1024 || params.expert_io_trace_capacity > 65536)) {
         throw std::invalid_argument("invalid expert async trace capacity");
     }
-    const uint64_t trace_capacity_64 = params.expert_io_trace_capacity != 0 ? params.expert_io_trace_capacity :
-        std::min<uint64_t>(65536, std::max<uint64_t>(1024, request_capacity_64*16));
+    const uint64_t trace_capacity_64 = performance_mode ? 0 :
+        params.expert_io_trace_capacity != 0 ? params.expert_io_trace_capacity :
+            std::min<uint64_t>(65536, std::max<uint64_t>(1024, request_capacity_64*16));
     const auto & prefetch = pimpl->expert_prefetch_config.value;
     const bool predictive_prefetch = pimpl->expert_prefetch_config.supplied &&
         prefetch.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF;
@@ -3309,6 +3321,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
         /*.expert_weights_mode         =*/ LLAMA_EXPERT_WEIGHTS_MODE_DISABLED,
+        /*.expert_runtime_mode         =*/ LLAMA_EXPERT_RUNTIME_MODE_COMPLIANCE,
         /*.expert_hot_cache_capacity   =*/ 0,
         /*.expert_cold_cache_bytes     =*/ 0,
         /*.expert_transfer_ring_bytes  =*/ 0,

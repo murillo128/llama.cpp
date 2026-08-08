@@ -231,7 +231,7 @@ struct llm_expert_transfer_ring::impl {
     };
 
     impl(llm_transfer_ring_config config, llm_transfer_ring_faults faults) : config(config), faults(faults) {
-        if (config.byte_budget == 0 || config.minimum_lanes == 0 || config.trace_capacity == 0 ||
+        if (config.byte_budget == 0 || config.minimum_lanes == 0 ||
             config.target_device == nullptr ||
             (!config.allow_non_cuda_target_for_testing && !device_is_cuda(config.target_device))) {
             throw std::invalid_argument("invalid transfer-ring budget or target");
