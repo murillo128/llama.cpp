@@ -1903,67 +1903,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
-static __global__ void prepare_inactive_mmid_ids(
-        const int32_t * ids, int32_t * fast_ids,
-        int64_t n_expert_used, int64_t n_tokens, int64_t n_expert,
-        size_t ids_nb0, size_t ids_nb1) {
-    const int64_t token = blockIdx.x;
-    if (token >= n_tokens || threadIdx.x != 0) {
-        return;
-    }
-    const char * token_ids = reinterpret_cast<const char *>(ids) + token*ids_nb1;
-    char * token_fast_ids = reinterpret_cast<char *>(fast_ids) + token*ids_nb1;
-    for (int64_t lane = 0; lane < n_expert_used; ++lane) {
-        *reinterpret_cast<int32_t *>(token_fast_ids + lane*ids_nb0) =
-            *reinterpret_cast<const int32_t *>(token_ids + lane*ids_nb0);
-    }
-    int32_t replacement = 0;
-    for (int64_t lane = 0; lane < n_expert_used; ++lane) {
-        int32_t * id = reinterpret_cast<int32_t *>(token_fast_ids + lane*ids_nb0);
-        if (*id != -1) {
-            continue;
-        }
-        for (;;) {
-            bool used = false;
-            for (int64_t other = 0; other < n_expert_used; ++other) {
-                if (*reinterpret_cast<const int32_t *>(token_fast_ids + other*ids_nb0) == replacement) {
-                    used = true;
-                    break;
-                }
-            }
-            if (!used) {
-                break;
-            }
-            replacement++;
-        }
-        if (replacement >= n_expert) {
-            __trap();
-        }
-        *id = replacement++;
-    }
-}
-
-static __global__ void zero_inactive_mmid_rows(
-        const int32_t * ids, float * dst,
-        int64_t n_expert_used, int64_t n_tokens, int64_t row_elements,
-        size_t ids_nb0, size_t ids_nb1, size_t dst_nb1, size_t dst_nb2) {
-    const int64_t lane = blockIdx.x;
-    const int64_t token = blockIdx.y;
-    if (lane >= n_expert_used || token >= n_tokens) {
-        return;
-    }
-    const auto * id = reinterpret_cast<const int32_t *>(
-        reinterpret_cast<const char *>(ids) + token*ids_nb1 + lane*ids_nb0);
-    if (*id != -1) {
-        return;
-    }
-    auto * row = reinterpret_cast<float *>(
-        reinterpret_cast<char *>(dst) + token*dst_nb2 + lane*dst_nb1);
-    for (int64_t element = threadIdx.x; element < row_elements; element += blockDim.x) {
-        row[element] = 0.0f;
-    }
-}
-
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2010,29 +1949,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
 
-    cudaStream_t stream = ctx.stream();
-    const int64_t n_expert_used = ids->ne[0];
-    const int64_t ne_get_rows = ne12 * n_expert_used;
-    if (allow_inactive && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-            ne02 >= n_expert_used) {
-        ggml_cuda_pool_alloc<char> fast_ids_data(ctx.pool(), ggml_nbytes(ids));
-        prepare_inactive_mmid_ids<<<ne12, 1, 0, stream>>>(
-            static_cast<const int32_t *>(ids->data), reinterpret_cast<int32_t *>(fast_ids_data.ptr),
-            n_expert_used, ne12, ne02, ids->nb[0], ids->nb[1]);
-        CUDA_CHECK(cudaGetLastError());
-        ggml_tensor fast_ids = *ids;
-        fast_ids.data = fast_ids_data.ptr;
-        if (try_fast_path(&fast_ids)) {
-            zero_inactive_mmid_rows<<<dim3(n_expert_used, ne12), 256, 0, stream>>>(
-                static_cast<const int32_t *>(ids->data), static_cast<float *>(dst->data),
-                n_expert_used, ne12, ne0, ids->nb[0], ids->nb[1], nb1, nb2);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-    }
-
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
+    cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
@@ -2042,6 +1961,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_type type_dst_sorted  = GGML_TYPE_F32;
     const size_t ts_src1_sorted = ggml_type_size(type_src1_sorted);
     const size_t ts_dst_sorted  = ggml_type_size(type_dst_sorted);
+
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows = ne12 * n_expert_used;
 
     std::vector<int32_t> ids_to_sorted_host;
     ids_to_sorted_host.reserve(ne_get_rows);
