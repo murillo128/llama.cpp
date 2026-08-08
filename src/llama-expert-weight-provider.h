@@ -1011,9 +1011,23 @@ struct llm_expert_graph_diagnostics {
     int32_t graphs_reused = 0;
 };
 
+using llm_expert_transport_endpoint_id = uint16_t;
+constexpr llm_expert_transport_endpoint_id LLM_EXPERT_TRANSPORT_ENDPOINT_ID_INVALID = UINT16_MAX;
+
 struct llm_expert_peer_transport_diagnostics {
-    llm_expert_device_id source_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
-    llm_expert_device_id device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    llm_expert_transport_endpoint_id source_endpoint_id = LLM_EXPERT_TRANSPORT_ENDPOINT_ID_INVALID;
+    llm_expert_transport_endpoint_id endpoint_id = LLM_EXPERT_TRANSPORT_ENDPOINT_ID_INVALID;
+    llm_expert_device_id source_expert_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    llm_expert_device_id expert_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    int32_t source_cuda_ordinal = -1;
+    int32_t cuda_ordinal = -1;
+    std::string source_pci_bdf;
+    std::string pci_bdf;
+    std::string source_uuid;
+    std::string uuid;
+    bool source_is_resident = false;
+    bool is_resident = false;
+    bool endpoint_mapping_valid = false;
     uint64_t host_staged_bytes = 0;
     uint64_t host_staged_copies = 0;
     uint64_t host_staging_slots = 0;

@@ -240,6 +240,11 @@ void test_expert_role_resolution_and_ownership() {
     GGML_ASSERT(local_model->expert_device_count() == 1);
     GGML_ASSERT(local_model->expert_transport_device_count() == 1);
     GGML_ASSERT(local_model->expert_hot_cache_capacity() == 7);
+    const auto local_endpoints = llm_expert_transport_endpoints(local_plan);
+    GGML_ASSERT(local_endpoints.size() == 1);
+    GGML_ASSERT(local_endpoints[0].endpoint_id == 0 && local_endpoints[0].resident);
+    GGML_ASSERT(local_endpoints[0].expert_device_id == 0);
+    GGML_ASSERT(local_endpoints[0].device == local_plan.resident.device);
     local_devices[0].hot_slots = 99;
     local.expert_device_count = 0;
     GGML_ASSERT(local_model->expert_role_plan().experts[0].hot_slots == 7);
@@ -320,6 +325,12 @@ void test_expert_role_resolution_and_ownership() {
     GGML_ASSERT(first_plan.experts[1].hot_slots == 11);
     GGML_ASSERT(first->expert_device_count() == 2);
     GGML_ASSERT(first->expert_transport_device_count() == 2);
+    const auto striped_endpoints = llm_expert_transport_endpoints(first_plan);
+    GGML_ASSERT(striped_endpoints.size() == 2);
+    GGML_ASSERT(striped_endpoints[0].endpoint_id == 0 && striped_endpoints[0].resident &&
+        striped_endpoints[0].expert_device_id == 0);
+    GGML_ASSERT(striped_endpoints[1].endpoint_id == 1 && !striped_endpoints[1].resident &&
+        striped_endpoints[1].expert_device_id == 1);
 
     llama_expert_role_device remote_device = {devices[1], 13};
     llama_expert_role_config remote = {
@@ -332,6 +343,13 @@ void test_expert_role_resolution_and_ownership() {
     GGML_ASSERT(remote_model->expert_role_plan().experts[0].hot_slots == 13);
     GGML_ASSERT(remote_model->expert_device_count() == 1);
     GGML_ASSERT(remote_model->expert_transport_device_count() == 2);
+    const auto remote_endpoints = llm_expert_transport_endpoints(remote_model->expert_role_plan());
+    GGML_ASSERT(remote_endpoints.size() == 2);
+    GGML_ASSERT(remote_endpoints[0].endpoint_id == 0 && remote_endpoints[0].resident &&
+        remote_endpoints[0].expert_device_id == LLM_EXPERT_DEVICE_ID_INVALID);
+    GGML_ASSERT(remote_endpoints[1].endpoint_id == 1 && !remote_endpoints[1].resident &&
+        remote_endpoints[1].expert_device_id == 0);
+    GGML_ASSERT(remote_endpoints[1].uuid == remote_model->expert_role_plan().experts[0].uuid);
 
     std::reverse(requested.begin(), requested.end());
     striped.expert_devices = requested.data();

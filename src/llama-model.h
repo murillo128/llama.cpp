@@ -53,7 +53,15 @@ struct llm_expert_role_plan {
     bool explicit_config = false;
 };
 
+struct llm_expert_transport_endpoint_plan : llm_expert_physical_device {
+    llm_expert_transport_endpoint_id endpoint_id = LLM_EXPERT_TRANSPORT_ENDPOINT_ID_INVALID;
+    llm_expert_device_id expert_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
+    bool resident = false;
+};
+
 void llm_expert_role_canonicalize(std::vector<llm_expert_role_device_plan> & experts);
+std::vector<llm_expert_transport_endpoint_plan> llm_expert_transport_endpoints(
+    const llm_expert_role_plan & roles);
 bool llm_expert_transport_edge_required(uint32_t source, uint32_t destination, uint32_t device_count) noexcept;
 
 struct llm_deferred_expert_diagnostics {
@@ -718,7 +726,7 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     uint32_t expert_device_count() const;
-    uint32_t expert_transport_device_count() const noexcept;
+    uint32_t expert_transport_device_count() const;
     uint32_t expert_hot_cache_capacity() const;
     const llm_expert_role_plan & expert_role_plan() const;
     ggml_backend_dev_t expert_resident_device() const noexcept;

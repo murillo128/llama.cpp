@@ -992,8 +992,25 @@ int main(int argc, char ** argv) {
         }
         json peer_diagnostics = json::array();
         for (const auto & device : peer_transport_diagnostics) {
+            const auto source_role = device.source_is_resident ?
+                (device.source_expert_device_id == LLM_EXPERT_DEVICE_ID_INVALID ?
+                    "RESIDENT" : "RESIDENT_AND_EXPERT") : "EXPERT";
+            const auto destination_role = device.is_resident ?
+                (device.expert_device_id == LLM_EXPERT_DEVICE_ID_INVALID ?
+                    "RESIDENT" : "RESIDENT_AND_EXPERT") : "EXPERT";
             peer_diagnostics.push_back({
-                {"source_device_id", device.source_device_id}, {"device_id", device.device_id},
+                {"source_transport_endpoint_id", device.source_endpoint_id},
+                {"transport_endpoint_id", device.endpoint_id},
+                {"source_role", source_role}, {"role", destination_role},
+                {"source_expert_device_id", device.source_expert_device_id ==
+                    LLM_EXPERT_DEVICE_ID_INVALID ? -1 : int64_t(device.source_expert_device_id)},
+                {"expert_device_id", device.expert_device_id ==
+                    LLM_EXPERT_DEVICE_ID_INVALID ? -1 : int64_t(device.expert_device_id)},
+                {"source_cuda_ordinal", device.source_cuda_ordinal},
+                {"cuda_ordinal", device.cuda_ordinal},
+                {"source_pci_bdf", device.source_pci_bdf}, {"pci_bdf", device.pci_bdf},
+                {"source_uuid", device.source_uuid}, {"uuid", device.uuid},
+                {"endpoint_mapping_valid", device.endpoint_mapping_valid},
                 {"host_staged_bytes", device.host_staged_bytes},
                 {"host_staged_copies", device.host_staged_copies},
                 {"host_staging_slots", device.host_staging_slots},

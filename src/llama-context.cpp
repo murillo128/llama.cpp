@@ -1068,7 +1068,8 @@ llm_expert_graph_diagnostics llama_context::expert_graph_diagnostics() const {
 std::vector<llm_expert_peer_transport_diagnostics>
 llama_context::expert_peer_transport_diagnostics() const {
     std::vector<llm_expert_peer_transport_diagnostics> result;
-    const uint32_t device_count = model.expert_transport_device_count();
+    const auto endpoints = llm_expert_transport_endpoints(model.expert_role_plan());
+    const uint32_t device_count = uint32_t(endpoints.size());
     result.reserve(device_count > 1 ? 2*(device_count - 1) : 0);
     using diagnostics_fn = int (*)(ggml_backend_t, uint32_t, uint64_t *, size_t);
     for (uint32_t destination = 0;
@@ -1080,13 +1081,30 @@ llama_context::expert_peer_transport_diagnostics() const {
             reg, "ggml_backend_cuda_expert_peer_diagnostics")) : nullptr;
         for (uint32_t source = 0; source < device_count; ++source) {
             if (!llm_expert_transport_edge_required(source, destination, device_count)) continue;
+            const auto & source_endpoint = endpoints[source];
+            const auto & destination_endpoint = endpoints[destination];
             llm_expert_peer_transport_diagnostics diagnostics;
-            diagnostics.source_device_id = llm_expert_device_id(source);
-            diagnostics.device_id = llm_expert_device_id(destination);
+            diagnostics.source_endpoint_id = source_endpoint.endpoint_id;
+            diagnostics.endpoint_id = destination_endpoint.endpoint_id;
+            diagnostics.source_expert_device_id = source_endpoint.expert_device_id;
+            diagnostics.expert_device_id = destination_endpoint.expert_device_id;
+            diagnostics.source_cuda_ordinal = source_endpoint.cuda_ordinal;
+            diagnostics.cuda_ordinal = destination_endpoint.cuda_ordinal;
+            diagnostics.source_pci_bdf = source_endpoint.pci_bdf;
+            diagnostics.pci_bdf = destination_endpoint.pci_bdf;
+            diagnostics.source_uuid = source_endpoint.uuid;
+            diagnostics.uuid = destination_endpoint.uuid;
+            diagnostics.source_is_resident = source_endpoint.resident;
+            diagnostics.is_resident = destination_endpoint.resident;
+            const bool physical_mapping_valid =
+                source < backends.size() && destination < backends.size() &&
+                ggml_backend_get_device(backends[source].get()) == source_endpoint.device &&
+                ggml_backend_get_device(backends[destination].get()) == destination_endpoint.device;
             uint64_t values[24] = {};
             if (query != nullptr && query(backend, source, values, 24) == 0) {
-                diagnostics.source_device_id = llm_expert_device_id(values[0]);
-                diagnostics.device_id = llm_expert_device_id(values[1]);
+                diagnostics.endpoint_mapping_valid = physical_mapping_valid &&
+                    values[0] == source_endpoint.endpoint_id &&
+                    values[1] == destination_endpoint.endpoint_id;
                 diagnostics.host_staged_bytes = values[2];
                 diagnostics.host_staged_copies = values[3];
                 diagnostics.host_staging_slots = values[4];

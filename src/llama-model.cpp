@@ -1204,6 +1204,51 @@ void llm_expert_role_canonicalize(std::vector<llm_expert_role_device_plan> & exp
     });
 }
 
+std::vector<llm_expert_transport_endpoint_plan> llm_expert_transport_endpoints(
+        const llm_expert_role_plan & roles) {
+    const auto same_physical_device = [](const llm_expert_physical_device & lhs,
+                                         const llm_expert_physical_device & rhs) {
+        return lhs.device != nullptr && lhs.device == rhs.device &&
+            lhs.cuda_ordinal == rhs.cuda_ordinal && lhs.pci_bdf == rhs.pci_bdf &&
+            lhs.uuid == rhs.uuid;
+    };
+    if (roles.resident.device == nullptr || roles.resident.cuda_ordinal < 0 ||
+        roles.resident.pci_bdf.empty() || roles.resident.uuid.empty()) {
+        throw std::invalid_argument("invalid resident transport endpoint identity");
+    }
+
+    std::vector<llm_expert_transport_endpoint_plan> result;
+    result.reserve(roles.experts.size() + 1);
+    llm_expert_transport_endpoint_plan resident;
+    static_cast<llm_expert_physical_device &>(resident) = roles.resident;
+    resident.endpoint_id = 0;
+    resident.resident = true;
+    for (size_t index = 0; index < roles.experts.size(); ++index) {
+        if (same_physical_device(roles.resident, roles.experts[index])) {
+            if (resident.expert_device_id != LLM_EXPERT_DEVICE_ID_INVALID) {
+                throw std::invalid_argument("duplicate resident ExpertPool identity");
+            }
+            resident.expert_device_id = llm_expert_device_id(index);
+        }
+    }
+    result.push_back(std::move(resident));
+
+    for (size_t index = 0; index < roles.experts.size(); ++index) {
+        const auto & expert = roles.experts[index];
+        if (same_physical_device(roles.resident, expert)) continue;
+        if (expert.device == nullptr || expert.cuda_ordinal < 0 ||
+            expert.pci_bdf.empty() || expert.uuid.empty()) {
+            throw std::invalid_argument("invalid expert transport endpoint identity");
+        }
+        llm_expert_transport_endpoint_plan endpoint;
+        static_cast<llm_expert_physical_device &>(endpoint) = expert;
+        endpoint.endpoint_id = llm_expert_transport_endpoint_id(result.size());
+        endpoint.expert_device_id = llm_expert_device_id(index);
+        result.push_back(std::move(endpoint));
+    }
+    return result;
+}
+
 bool llm_expert_transport_edge_required(
         uint32_t source, uint32_t destination, uint32_t device_count) noexcept {
     return source < device_count && destination < device_count && source != destination &&
@@ -2825,16 +2870,9 @@ uint32_t llama_model::expert_device_count() const {
         uint32_t(pimpl->expert_role_plan.experts.size()) : params.expert_device_count;
 }
 
-uint32_t llama_model::expert_transport_device_count() const noexcept {
+uint32_t llama_model::expert_transport_device_count() const {
     if (!pimpl->expert_role_plan_resolved) return params.expert_device_count;
-    uint32_t result = 1;
-    for (const auto & expert : pimpl->expert_role_plan.experts) {
-        if (expert.uuid != pimpl->expert_role_plan.resident.uuid ||
-            expert.pci_bdf != pimpl->expert_role_plan.resident.pci_bdf) {
-            result++;
-        }
-    }
-    return result;
+    return uint32_t(llm_expert_transport_endpoints(pimpl->expert_role_plan).size());
 }
 
 uint32_t llama_model::expert_hot_cache_capacity() const {
