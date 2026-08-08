@@ -78,6 +78,9 @@ struct arguments {
     uint64_t peer_staging_bytes = 0;
     uint32_t delayed_device = UINT32_MAX;
     uint64_t device_delay_us = 0;
+    uint32_t failed_device = UINT32_MAX;
+    bool expect_device_failure = false;
+    bool fail_device_decode_only = false;
     uint32_t queue_depth = 0;
     uint32_t trace_capacity = 0;
     uint32_t ratio = 7500;
@@ -152,6 +155,14 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
             if (!parse_u32(value, result.delayed_device)) return false;
         } else if (option == "--device-delay-us") {
             if (!parse_u64(value, result.device_delay_us) || result.device_delay_us > 1000000) return false;
+        } else if (option == "--fail-device") {
+            if (!parse_u32(value, result.failed_device)) return false;
+        } else if (option == "--expect-device-failure") {
+            if (std::string(value) != "0" && std::string(value) != "1") return false;
+            result.expect_device_failure = std::string(value) == "1";
+        } else if (option == "--fail-device-decode-only") {
+            if (std::string(value) != "0" && std::string(value) != "1") return false;
+            result.fail_device_decode_only = std::string(value) == "1";
         }
         else if (option == "--queue-depth") { if (!parse_u32(value, result.queue_depth)) return false; }
         else if (option == "--trace-capacity") { if (!parse_u32(value, result.trace_capacity)) return false; }
@@ -189,6 +200,9 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
                 result.peer_staging_bytes == 0)) &&
         ((result.delayed_device == UINT32_MAX && result.device_delay_us == 0) ||
             (result.delayed_device < result.expert_devices && result.device_delay_us != 0)) &&
+        ((result.failed_device == UINT32_MAX && !result.expect_device_failure) ||
+            (result.failed_device < result.expert_devices && result.expect_device_failure)) &&
+        (!result.fail_device_decode_only || result.failed_device < result.expert_devices) &&
         (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold");
 }
 
@@ -571,11 +585,15 @@ int main(int argc, char ** argv) {
         context_params.n_batch = args.n_batch;
         context_params.n_ubatch = args.n_ubatch;
         context_params.no_perf = false;
-        llama_context_ptr context(llama_init_from_model(model.get(), context_params));
-        if (!context) return 6;
         if (provider != nullptr && args.delayed_device != UINT32_MAX &&
             !provider->debug_set_device_delay_for_testing(
                 llm_expert_device_id(args.delayed_device), args.device_delay_us).is_ready()) return 4;
+        if (provider != nullptr && args.failed_device != UINT32_MAX &&
+            !provider->debug_set_device_failure_for_testing(
+                llm_expert_device_id(args.failed_device), true,
+                args.fail_device_decode_only).is_ready()) return 4;
+        llama_context_ptr context(llama_init_from_model(model.get(), context_params));
+        if (!context) return 6;
         route_capture routes;
         if (args.observe_routes &&
             llama_set_route_observer(context.get(), capture_route, &routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 7;
@@ -585,6 +603,7 @@ int main(int argc, char ** argv) {
         std::vector<uint64_t> latency_us;
         llama_batch batch = llama_batch_get_one(prompt.data(), prompt.size());
         const int n_vocab = llama_vocab_n_tokens(vocab);
+        bool expected_device_failure_observed = false;
         for (int step = 0; step < args.max_generate; ++step) {
             const auto phase = step == 0 ? LLAMA_ROUTE_PHASE_PREFILL : LLAMA_ROUTE_PHASE_DECODE;
             if (args.observe_routes &&
@@ -612,6 +631,11 @@ int main(int argc, char ** argv) {
                     failed.effective_capacity, failed.cold_effective_slots, failed.last_logical_ids.size(),
                     (unsigned long long) failed.cpu_execution_lanes,
                     (unsigned long long) failed.gpu_execution_lanes);
+                if (args.expect_device_failure &&
+                    failed.last_remap_error == llm_expert_provider_error::copy_failed) {
+                    expected_device_failure_observed = true;
+                    break;
+                }
                 return 9;
             }
             llama_synchronize(context.get());
@@ -699,6 +723,10 @@ int main(int argc, char ** argv) {
             if (llama_vocab_is_eog(vocab, next)) break;
             batch = llama_batch_get_one(&generated.back(), 1);
         }
+        if (args.expect_device_failure && !expected_device_failure_observed) {
+            std::fprintf(stderr, "phase9-cache-policy-probe: expected device failure was not observed\n");
+            return 9;
+        }
         const auto peer_transport_diagnostics = context->expert_peer_transport_diagnostics();
         // Releasing the context closes the provider request, drains or cancels
         // every background flight, and emits all reserved policy terminals.
@@ -780,6 +808,10 @@ int main(int argc, char ** argv) {
                 {"ring_h2d_bytes", device.ring_h2d_bytes},
                 {"ring_h2d_time_us", device.ring_h2d_time_us},
                 {"ring_waves", device.ring_waves},
+                {"ring_async_enqueues", device.ring_async_enqueues},
+                {"ring_h2d_event_records", device.ring_h2d_event_records},
+                {"ring_h2d_event_waits", device.ring_h2d_event_waits},
+                {"ring_h2d_event_synchronizations", device.ring_h2d_event_synchronizations},
                 {"ring_live_events", device.ring_live_events},
                 {"ring_peak_in_flight_lanes", device.ring_peak_in_flight_lanes},
                 {"ring_first_h2d_enqueue_us", device.ring_first_h2d_enqueue_us},
@@ -807,10 +839,21 @@ int main(int argc, char ** argv) {
         json peer_diagnostics = json::array();
         for (const auto & device : peer_transport_diagnostics) {
             peer_diagnostics.push_back({
-                {"device_id", device.device_id}, {"host_staged_bytes", device.host_staged_bytes},
+                {"source_device_id", device.source_device_id}, {"device_id", device.device_id},
+                {"host_staged_bytes", device.host_staged_bytes},
                 {"host_staged_copies", device.host_staged_copies},
+                {"host_staging_slots", device.host_staging_slots},
+                {"host_staging_peak_in_flight", device.host_staging_peak_in_flight},
+                {"host_staging_reuse_waits", device.host_staging_reuse_waits},
+                {"cross_device_event_waits", device.cross_device_event_waits},
                 {"host_staged_blocking_us", device.host_staged_blocking_us},
+                {"host_staging_enqueues", device.host_staging_enqueues},
+                {"host_staging_completions", device.host_staging_completions},
+                {"unexpected_host_synchronizations", device.unexpected_host_synchronizations},
                 {"peer_bytes", device.peer_bytes}, {"peer_copies", device.peer_copies},
+                {"branch_delay_enqueues_for_testing", device.branch_delay_enqueues_for_testing},
+                {"branch_delay_completions_for_testing", device.branch_delay_completions_for_testing},
+                {"branch_delay_requested_us_for_testing", device.branch_delay_requested_us_for_testing},
             });
         }
         json output = {
@@ -826,7 +869,28 @@ int main(int argc, char ** argv) {
                 {"peer_staging_bytes", args.peer_staging_bytes},
                 {"delayed_device", args.delayed_device == UINT32_MAX ? -1 : int64_t(args.delayed_device)},
                 {"device_delay_us", args.device_delay_us},
+                {"failed_device", args.failed_device == UINT32_MAX ? -1 : int64_t(args.failed_device)},
+                {"failed_device_decode_only", args.fail_device_decode_only},
+                {"expected_device_failure", args.expect_device_failure},
+                {"expected_device_failure_observed", expected_device_failure_observed},
                 {"physical_feasibility_skips", diagnostics.physical_feasibility_skips},
+                {"physical_feasibility_scan_calls", diagnostics.physical_feasibility_scan_calls},
+                {"physical_feasibility_scan_time_ns", diagnostics.physical_feasibility_scan_time_ns},
+                {"physical_feasibility_scan_max_ns", diagnostics.physical_feasibility_scan_max_ns},
+                {"physical_feasibility_scan_decode_calls", diagnostics.physical_feasibility_scan_decode_calls},
+                {"physical_feasibility_scan_decode_time_ns", diagnostics.physical_feasibility_scan_decode_time_ns},
+                {"physical_feasibility_scan_decode_max_ns", diagnostics.physical_feasibility_scan_decode_max_ns},
+                {"provider_h2d_join_waves", diagnostics.provider_h2d_join_waves},
+                {"provider_h2d_join_time_ns", diagnostics.provider_h2d_join_time_ns},
+                {"provider_h2d_join_max_ns", diagnostics.provider_h2d_join_max_ns},
+                {"provider_h2d_join_decode_waves", diagnostics.provider_h2d_join_decode_waves},
+                {"provider_h2d_join_decode_time_ns", diagnostics.provider_h2d_join_decode_time_ns},
+                {"provider_h2d_join_decode_max_ns", diagnostics.provider_h2d_join_decode_max_ns},
+                {"provider_h2d_async_decode_waves", diagnostics.provider_h2d_async_decode_waves},
+                {"provider_h2d_async_branch_waits", diagnostics.provider_h2d_async_branch_waits},
+                {"injected_device_failure_waves", diagnostics.injected_device_failure_waves},
+                {"injected_device_failure_participants", diagnostics.injected_device_failure_participants},
+                {"injected_device_failure_drained_waves", diagnostics.injected_device_failure_drained_waves},
                 {"directory_device_cells", diagnostics.directory_device_cells},
                 {"directory_owner_only_violations", diagnostics.directory_owner_only_violations},
                 {"peer_diagnostics", peer_diagnostics},

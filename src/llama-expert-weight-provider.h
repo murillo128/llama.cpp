@@ -295,6 +295,13 @@ struct llm_expert_graph_binding {
     bool hybrid = false;
 
     struct device_binding {
+        struct h2d_dependency {
+            uint32_t lane = 0;
+            uint64_t lane_generation = 0;
+            llm_expert_layout_class_id layout_class_id = LLM_EXPERT_LAYOUT_CLASS_INVALID;
+            uint32_t hot_slot = 0;
+            uint64_t hot_generation = 0;
+        };
         llm_expert_device_id device_id = LLM_EXPERT_DEVICE_ID_INVALID;
         ggml_backend_dev_t target_device = nullptr;
         llm_expert_projection_descriptor up;
@@ -303,6 +310,13 @@ struct llm_expert_graph_binding {
         llm_expert_projection_descriptor down;
         ggml_tensor * execution_ids = nullptr;
         std::shared_ptr<void> generation_lease;
+        // Evidence-only seam captured before graph construction. Production
+        // bindings always leave this zero.
+        uint64_t completion_delay_us_for_testing = 0;
+        // Bounded decode-only dependencies. The provider populates these
+        // after H2D enqueue and clears them after inserting device-local event
+        // waits on this branch's compute backend.
+        mutable std::vector<h2d_dependency> h2d_dependencies;
     };
     std::vector<device_binding> devices;
     bool multi_device = false;
@@ -494,6 +508,10 @@ struct llm_hot_cache_diagnostics {
         uint64_t ring_h2d_bytes = 0;
         uint64_t ring_h2d_time_us = 0;
         uint64_t ring_waves = 0;
+        uint64_t ring_async_enqueues = 0;
+        uint64_t ring_h2d_event_records = 0;
+        uint64_t ring_h2d_event_waits = 0;
+        uint64_t ring_h2d_event_synchronizations = 0;
         uint64_t ring_live_events = 0;
         uint64_t ring_peak_in_flight_lanes = 0;
         uint64_t ring_first_h2d_enqueue_us = 0;
@@ -520,6 +538,23 @@ struct llm_hot_cache_diagnostics {
     uint64_t directory_device_cells = 0;
     uint64_t directory_owner_only_violations = 0;
     uint64_t physical_feasibility_skips = 0;
+    uint64_t physical_feasibility_scan_calls = 0;
+    uint64_t physical_feasibility_scan_time_ns = 0;
+    uint64_t physical_feasibility_scan_max_ns = 0;
+    uint64_t physical_feasibility_scan_decode_calls = 0;
+    uint64_t physical_feasibility_scan_decode_time_ns = 0;
+    uint64_t physical_feasibility_scan_decode_max_ns = 0;
+    uint64_t provider_h2d_join_waves = 0;
+    uint64_t provider_h2d_join_time_ns = 0;
+    uint64_t provider_h2d_join_max_ns = 0;
+    uint64_t provider_h2d_join_decode_waves = 0;
+    uint64_t provider_h2d_join_decode_time_ns = 0;
+    uint64_t provider_h2d_join_decode_max_ns = 0;
+    uint64_t provider_h2d_async_decode_waves = 0;
+    uint64_t provider_h2d_async_branch_waits = 0;
+    uint64_t injected_device_failure_waves = 0;
+    uint64_t injected_device_failure_participants = 0;
+    uint64_t injected_device_failure_drained_waves = 0;
     llama_expert_peer_transport peer_transport = LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED;
     uint64_t peer_staging_bytes = 0;
     struct auto_decision {
@@ -970,12 +1005,23 @@ struct llm_expert_graph_diagnostics {
 };
 
 struct llm_expert_peer_transport_diagnostics {
+    llm_expert_device_id source_device_id = LLM_EXPERT_DEVICE_ID_INVALID;
     llm_expert_device_id device_id = LLM_EXPERT_DEVICE_ID_INVALID;
     uint64_t host_staged_bytes = 0;
     uint64_t host_staged_copies = 0;
+    uint64_t host_staging_slots = 0;
+    uint64_t host_staging_peak_in_flight = 0;
+    uint64_t host_staging_reuse_waits = 0;
+    uint64_t cross_device_event_waits = 0;
     uint64_t host_staged_blocking_us = 0;
+    uint64_t host_staging_enqueues = 0;
+    uint64_t host_staging_completions = 0;
+    uint64_t unexpected_host_synchronizations = 0;
     uint64_t peer_bytes = 0;
     uint64_t peer_copies = 0;
+    uint64_t branch_delay_enqueues_for_testing = 0;
+    uint64_t branch_delay_completions_for_testing = 0;
+    uint64_t branch_delay_requested_us_for_testing = 0;
 };
 
 class llm_expert_weight_provider;
@@ -1099,6 +1145,18 @@ public:
         (void) abort_callback_data;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
+    virtual llm_expert_provider_result remap_checkpoint_tensor_multi_device(
+            const llm_expert_graph_binding & binding,
+            ggml_backend_t execution_backend,
+            const ggml_backend_t * device_backends,
+            size_t device_backend_count,
+            bool (*abort_callback)(void *) = nullptr,
+            void * abort_callback_data = nullptr) noexcept {
+        (void) device_backends;
+        (void) device_backend_count;
+        return remap_checkpoint_tensor(
+            binding, execution_backend, abort_callback, abort_callback_data);
+    }
     virtual llm_expert_provider_result cleanup_failed_slots() noexcept {
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
@@ -1191,6 +1249,13 @@ public:
             llm_expert_device_id device, uint64_t delay_us) noexcept {
         (void) device;
         (void) delay_us;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    virtual llm_expert_provider_result debug_set_device_failure_for_testing(
+            llm_expert_device_id device, bool fail, bool decode_only = false) noexcept {
+        (void) device;
+        (void) fail;
+        (void) decode_only;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
     // Internal focused-test seams. Production execution never calls these.

@@ -351,8 +351,10 @@ llama_context::llama_context(
             if (backends.size() != device_count) {
                 throw std::runtime_error("routed-expert backend count does not match the sealed device topology");
             }
-            using configure_peer_fn = int (*)(ggml_backend_t, int, size_t);
+            using configure_peer_fn = int (*)(ggml_backend_t, int, size_t, uint32_t, uint32_t);
+            using configure_peer_edge_fn = int (*)(ggml_backend_t, ggml_backend_t);
             using peer_capability_fn = int (*)(ggml_backend_t, ggml_backend_t, int);
+            std::vector<configure_peer_edge_fn> configure_peer_edges(device_count, nullptr);
             std::vector<peer_capability_fn> peer_capabilities(device_count, nullptr);
             const uint64_t total_staging = model.expert_peer_staging_bytes();
             const size_t per_device_staging = model.expert_peer_transport() ==
@@ -364,13 +366,25 @@ llama_context::llama_context(
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
                 auto configure = reg ? reinterpret_cast<configure_peer_fn>(ggml_backend_reg_get_proc_address(
                     reg, "ggml_backend_cuda_expert_configure_peer_transport")) : nullptr;
+                auto configure_edge = reg ? reinterpret_cast<configure_peer_edge_fn>(ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_expert_configure_peer_edge")) : nullptr;
                 auto capability = reg ? reinterpret_cast<peer_capability_fn>(ggml_backend_reg_get_proc_address(
                     reg, "ggml_backend_cuda_expert_peer_capability")) : nullptr;
-                if (configure == nullptr || capability == nullptr ||
-                    configure(backend, int(model.expert_peer_transport()), per_device_staging) != 0) {
+                if (configure == nullptr || configure_edge == nullptr || capability == nullptr ||
+                    configure(backend, int(model.expert_peer_transport()), per_device_staging,
+                        device, device_count) != 0) {
                     throw std::runtime_error("failed to configure the explicit routed-expert CUDA peer transport");
                 }
+                configure_peer_edges[device] = configure_edge;
                 peer_capabilities[device] = capability;
+            }
+            for (uint32_t src = 0; src < device_count; ++src) {
+                for (uint32_t dst = 0; dst < device_count; ++dst) {
+                    if (src != dst && configure_peer_edges[src](
+                            backends[src].get(), backends[dst].get()) != 0) {
+                        throw std::runtime_error("failed to seal a routed-expert directed CUDA edge");
+                    }
+                }
             }
             if (model.expert_peer_transport() == LLAMA_EXPERT_PEER_TRANSPORT_P2P) {
                 for (uint32_t src = 0; src < device_count; ++src) {
@@ -1053,25 +1067,42 @@ std::vector<llm_expert_peer_transport_diagnostics>
 llama_context::expert_peer_transport_diagnostics() const {
     std::vector<llm_expert_peer_transport_diagnostics> result;
     const uint32_t device_count = model.expert_device_count();
-    result.reserve(device_count);
-    using diagnostics_fn = int (*)(ggml_backend_t, uint64_t *, size_t);
-    for (uint32_t device = 0; device < device_count && device < backends.size(); ++device) {
-        llm_expert_peer_transport_diagnostics diagnostics;
-        diagnostics.device_id = llm_expert_device_id(device);
-        ggml_backend_t backend = backends[device].get();
+    result.reserve(size_t(device_count)*(device_count > 0 ? device_count - 1 : 0));
+    using diagnostics_fn = int (*)(ggml_backend_t, uint32_t, uint64_t *, size_t);
+    for (uint32_t destination = 0;
+            destination < device_count && destination < backends.size(); ++destination) {
+        ggml_backend_t backend = backends[destination].get();
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
         auto query = reg ? reinterpret_cast<diagnostics_fn>(ggml_backend_reg_get_proc_address(
             reg, "ggml_backend_cuda_expert_peer_diagnostics")) : nullptr;
-        uint64_t values[5] = {};
-        if (query != nullptr && query(backend, values, 5) == 0) {
-            diagnostics.host_staged_bytes = values[0];
-            diagnostics.host_staged_copies = values[1];
-            diagnostics.host_staged_blocking_us = values[2];
-            diagnostics.peer_bytes = values[3];
-            diagnostics.peer_copies = values[4];
+        for (uint32_t source = 0; source < device_count; ++source) {
+            if (source == destination) continue;
+            llm_expert_peer_transport_diagnostics diagnostics;
+            diagnostics.source_device_id = llm_expert_device_id(source);
+            diagnostics.device_id = llm_expert_device_id(destination);
+            uint64_t values[17] = {};
+            if (query != nullptr && query(backend, source, values, 17) == 0) {
+                diagnostics.source_device_id = llm_expert_device_id(values[0]);
+                diagnostics.device_id = llm_expert_device_id(values[1]);
+                diagnostics.host_staged_bytes = values[2];
+                diagnostics.host_staged_copies = values[3];
+                diagnostics.host_staging_slots = values[4];
+                diagnostics.host_staging_peak_in_flight = values[5];
+                diagnostics.host_staging_reuse_waits = values[6];
+                diagnostics.cross_device_event_waits = values[7];
+                diagnostics.host_staged_blocking_us = values[8];
+                diagnostics.host_staging_enqueues = values[9];
+                diagnostics.host_staging_completions = values[10];
+                diagnostics.unexpected_host_synchronizations = values[11];
+                diagnostics.peer_bytes = values[12];
+                diagnostics.peer_copies = values[13];
+                diagnostics.branch_delay_enqueues_for_testing = values[14];
+                diagnostics.branch_delay_completions_for_testing = values[15];
+                diagnostics.branch_delay_requested_us_for_testing = values[16];
+            }
+            result.push_back(diagnostics);
         }
-        result.push_back(diagnostics);
     }
     return result;
 }
@@ -1922,10 +1953,62 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
             ctx->expert_abort_callback_for_testing : ctx->abort_callback;
         void * expert_abort_callback_data = ctx->expert_abort_callback_for_testing != nullptr ?
             ctx->expert_abort_callback_data_for_testing : ctx->abort_callback_data;
-        ctx->expert_eval_result = ctx->expert_weight_provider->remap_checkpoint_tensor(
-            *checkpoint, execution_backend, expert_abort_callback, expert_abort_callback_data);
+        ggml_backend_t device_backends[LLM_EXPERT_MAX_DEVICES] = {};
+        if (checkpoint->multi_device) {
+            if (checkpoint->devices.size() > LLM_EXPERT_MAX_DEVICES) {
+                ctx->expert_eval_result = llm_expert_provider_result::failure(
+                    llm_expert_provider_error::unsupported_configuration);
+                return false;
+            }
+            for (const auto & device : checkpoint->devices) {
+                if (device.device_id >= checkpoint->devices.size()) {
+                    ctx->expert_eval_result = llm_expert_provider_result::failure(
+                        llm_expert_provider_error::invalid_binding);
+                    return false;
+                }
+                for (const auto & candidate : ctx->backends) {
+                    if (ggml_backend_get_device(candidate.get()) == device.target_device) {
+                        device_backends[device.device_id] = candidate.get();
+                        break;
+                    }
+                }
+                if (device_backends[device.device_id] == nullptr) {
+                    ctx->expert_eval_result = llm_expert_provider_result::failure(
+                        llm_expert_provider_error::invalid_binding);
+                    return false;
+                }
+            }
+        }
+        ctx->expert_eval_result = checkpoint->multi_device ?
+            ctx->expert_weight_provider->remap_checkpoint_tensor_multi_device(
+                *checkpoint, execution_backend, device_backends, checkpoint->devices.size(),
+                expert_abort_callback, expert_abort_callback_data) :
+            ctx->expert_weight_provider->remap_checkpoint_tensor(
+                *checkpoint, execution_backend, expert_abort_callback, expert_abort_callback_data);
         if (!ctx->expert_eval_result.is_ready()) {
             return false;
+        }
+        if (checkpoint->multi_device) {
+            using enqueue_delay_fn = int (*)(ggml_backend_t, uint64_t);
+            for (const auto & device : checkpoint->devices) {
+                if (device.completion_delay_us_for_testing == 0) continue;
+                ggml_backend_t backend = nullptr;
+                for (const auto & candidate : ctx->backends) {
+                    if (ggml_backend_get_device(candidate.get()) == device.target_device) {
+                        backend = candidate.get();
+                        break;
+                    }
+                }
+                ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto enqueue = reg ? reinterpret_cast<enqueue_delay_fn>(ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_expert_enqueue_stream_delay")) : nullptr;
+                if (enqueue == nullptr || enqueue(backend, device.completion_delay_us_for_testing) != 0) {
+                    ctx->expert_eval_result = llm_expert_provider_result::failure(
+                        llm_expert_provider_error::copy_failed);
+                    return false;
+                }
+            }
         }
     }
 

@@ -1913,6 +1913,10 @@ public:
             throw std::invalid_argument("invalid hot-cache capacity or topology");
         }
         multi_device = config.devices.size() > 1;
+        device_transfer_delay_us.assign(std::max<size_t>(config.devices.size(), 1), 0);
+        device_transfer_failure_for_testing.assign(std::max<size_t>(config.devices.size(), 1), false);
+        device_transfer_failure_decode_only_for_testing.assign(
+            std::max<size_t>(config.devices.size(), 1), false);
         if (!config.devices.empty()) {
             uint64_t total_capacity = 0;
             std::string prior_bdf;
@@ -2280,7 +2284,9 @@ public:
                         llm_expert_device_id(index), config.devices[index].target_device,
                         device_bundle.up, device_bundle.gate, device_bundle.gate_up, device_bundle.down,
                         device_ids, std::static_pointer_cast<void>(device_pools[index]),
+                        device_transfer_delay_us[index], {},
                     });
+                    binding.devices.back().h2d_dependencies.reserve(config.n_expert_used);
                 }
             } else if (cpu_execution_ids != nullptr) {
                 const auto & cpu = cold_cache->bundle(class_id);
@@ -2477,6 +2483,17 @@ public:
             ggml_backend_t execution_backend,
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
+        return remap_checkpoint_tensor_multi_device(
+            binding, execution_backend, nullptr, 0, abort_callback, abort_callback_data);
+    }
+
+    llm_expert_provider_result remap_checkpoint_tensor_multi_device(
+            const llm_expert_graph_binding & binding,
+            ggml_backend_t execution_backend,
+            const ggml_backend_t * device_backends,
+            size_t device_backend_count,
+            bool (*abort_callback)(void *),
+            void * abort_callback_data) noexcept override {
         LLM_EXPERT_TRACE_SCOPE("k3.provider", "remap_checkpoint_tensor", "layer", binding.layer,
             "layout_class_id", binding.layout_class_id, "graph_epoch", binding.graph_epoch);
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
@@ -2503,6 +2520,7 @@ public:
         auto result = binding.multi_device ?
             remap_checkpoint_multi_device_locked(
                 binding, logical_id_scratch.data(), count,
+                device_backends, device_backend_count,
                 abort_callback, abort_callback_data, &lock) :
             remap_checkpoint_locked(
                 binding, logical_id_scratch.data(), count, execution_id_scratch.data(),
@@ -2535,6 +2553,8 @@ public:
             const llm_expert_graph_binding & binding,
             const int32_t * logical_ids,
             size_t logical_id_count,
+            const ggml_backend_t * device_backends,
+            size_t device_backend_count,
             bool (*abort_callback)(void *),
             void * abort_callback_data,
             std::unique_lock<std::mutex> * provider_lock) noexcept {
@@ -2601,6 +2621,30 @@ public:
 
         const auto requested_phase = binding.execution_ids->ne[1] > 1 ?
             llm_expert_cache_policy_phase::prefill : llm_expert_cache_policy_phase::decode;
+        const bool runtime_device_backends = device_backends != nullptr || device_backend_count != 0;
+        if (runtime_device_backends &&
+            (device_backends == nullptr || device_backend_count != device_pools.size())) {
+            return fail(llm_expert_provider_result::failure(
+                llm_expert_provider_error::invalid_binding));
+        }
+        bool async_decode_transfers = runtime_device_backends &&
+            requested_phase == llm_expert_cache_policy_phase::decode;
+        for (size_t device = 0; device < binding.devices.size(); ++device) {
+            if (!binding.devices[device].h2d_dependencies.empty()) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::stale_generation));
+            }
+            if (!runtime_device_backends) continue;
+            if (device_backends[device] == nullptr ||
+                ggml_backend_get_device(device_backends[device]) != config.devices[device].target_device) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::invalid_binding));
+            }
+            if (async_decode_transfers && !transfer_rings[device]->diagnostics().event_capable) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::unsupported_configuration));
+            }
+        }
         if (request_ubatch_ordinal == UINT64_MAX) {
             return fail(llm_expert_provider_result::failure(
                 llm_expert_provider_error::unsupported_configuration));
@@ -2677,11 +2721,35 @@ public:
             unique_slots[unique_index] = selected;
         }
 
+        if (async_decode_transfers) {
+            std::vector<uint32_t> per_device_misses(device_pools.size(), 0);
+            for (size_t index = 0; index < miss_count; ++index) {
+                const auto owner = llm_expert_owner_device(
+                    unique_keys[miss_unique_indices[index]].expert, uint32_t(device_pools.size()));
+                per_device_misses[owner]++;
+            }
+            for (size_t device = 0; device < per_device_misses.size(); ++device) {
+                if (per_device_misses[device] >
+                    transfer_rings[device]->diagnostics().effective_lanes) {
+                    return fail(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::unsupported_configuration));
+                }
+            }
+        }
+
         std::vector<llm_expert_request_handle> scheduler_handles(miss_count);
         std::vector<llm_expert_request_state> scheduler_states(
             miss_count, llm_expert_request_state::free);
         std::vector<std::vector<llm_transfer_binding>> device_transfers(device_pools.size());
+        std::vector<std::vector<uint64_t>> device_transfer_hot_generations(device_pools.size());
         auto fail_multi = [&](llm_expert_provider_result failure) {
+            for (size_t device = 0; device < binding.devices.size(); ++device) {
+                for (const auto & dependency : binding.devices[device].h2d_dependencies) {
+                    (void) transfer_rings[device]->cancel_after_h2d({
+                        dependency.lane, dependency.lane_generation, dependency.layout_class_id });
+                }
+                binding.devices[device].h2d_dependencies.clear();
+            }
             for (auto & ring : transfer_rings) (void) ring->cleanup_failed_lanes();
             (void) release_request_pins_locked();
             for (size_t index = 0; index < miss_count; ++index) {
@@ -2724,14 +2792,90 @@ public:
         };
         auto flush_device_transfers = [&]() noexcept {
             auto wave_result = llm_expert_provider_result::success();
+            size_t participating_devices = 0;
+            bool inject_failure = false;
+            const auto device_failure_active = [&](size_t device) {
+                return device_transfer_failure_for_testing[device] &&
+                    (!device_transfer_failure_decode_only_for_testing[device] ||
+                        hot_policy_phase == llm_expert_cache_policy_phase::decode);
+            };
+            for (size_t device = 0; device < device_transfers.size(); ++device) {
+                if (device_transfers[device].empty()) continue;
+                participating_devices++;
+                inject_failure = inject_failure || device_failure_active(device);
+            }
+            if (participating_devices == 0) return wave_result;
+
+            if (async_decode_transfers) {
+                if (inject_failure) {
+                    injected_device_failure_waves++;
+                    injected_device_failure_participants += participating_devices;
+                }
+                for (size_t device = 0; device < device_transfers.size(); ++device) {
+                    if (device_transfers[device].empty() ||
+                        device_failure_active(device)) continue;
+                    wave_result = transfer_rings[device]->transfer_wave(
+                        device_backends[device], device_transfers[device]);
+                    if (!wave_result.is_ready()) break;
+                    auto & dependencies = binding.devices[device].h2d_dependencies;
+                    GGML_ASSERT(device_transfers[device].size() ==
+                        device_transfer_hot_generations[device].size());
+                    for (size_t index = 0; index < device_transfers[device].size(); ++index) {
+                        const auto & transfer = device_transfers[device][index];
+                        dependencies.push_back({
+                            transfer.lane.lane, transfer.lane.generation,
+                            transfer.lane.layout_class_id, transfer.hot_slot,
+                            device_transfer_hot_generations[device][index],
+                        });
+                    }
+                }
+                if (wave_result.is_ready() && inject_failure) {
+                    wave_result = llm_expert_provider_result::failure(
+                        llm_expert_provider_error::copy_failed);
+                }
+                if (!wave_result.is_ready()) {
+                    for (size_t device = 0; device < binding.devices.size(); ++device) {
+                        for (const auto & dependency : binding.devices[device].h2d_dependencies) {
+                            (void) transfer_rings[device]->cancel_after_h2d({
+                                dependency.lane, dependency.lane_generation,
+                                dependency.layout_class_id });
+                        }
+                        binding.devices[device].h2d_dependencies.clear();
+                    }
+                    if (inject_failure) injected_device_failure_drained_waves++;
+                    return wave_result;
+                }
+                for (size_t device = 0; device < device_transfers.size(); ++device) {
+                    device_transfers[device].clear();
+                    device_transfer_hot_generations[device].clear();
+                }
+                provider_h2d_async_decode_waves++;
+                LLM_EXPERT_TRACE_INSTANT("k3.transfer", "provider_h2d_async_enqueue",
+                    "layer", binding.layer, "participating_devices", participating_devices);
+                return wave_result;
+            }
+
+            const auto join_started = std::chrono::steady_clock::now();
             try {
+                if (inject_failure) {
+                    injected_device_failure_waves++;
+                    injected_device_failure_participants += participating_devices;
+                }
+                std::atomic<size_t> started_devices { 0 };
                 std::vector<std::future<llm_expert_provider_result>> transfers;
                 transfers.reserve(device_transfers.size());
                 for (size_t device = 0; device < device_transfers.size(); ++device) {
                     if (device_transfers[device].empty()) continue;
                     transfers.emplace_back(std::async(std::launch::async, [&, device] {
-                        if (device < device_transfer_delay_us.size() && device_transfer_delay_us[device] != 0) {
-                            std::this_thread::sleep_for(std::chrono::microseconds(device_transfer_delay_us[device]));
+                        if (inject_failure) {
+                            started_devices.fetch_add(1, std::memory_order_release);
+                            while (started_devices.load(std::memory_order_acquire) < participating_devices) {
+                                std::this_thread::yield();
+                            }
+                            if (device_failure_active(device)) {
+                                return llm_expert_provider_result::failure(
+                                    llm_expert_provider_error::copy_failed);
+                            }
                         }
                         return transfer_rings[device]->transfer_wave_blocking(device_transfers[device]);
                     }));
@@ -2740,12 +2884,29 @@ public:
                     const auto transferred = transfer.get();
                     if (wave_result.is_ready() && !transferred.is_ready()) wave_result = transferred;
                 }
+                if (inject_failure) injected_device_failure_drained_waves++;
             } catch (...) {
                 wave_result = llm_expert_provider_result::failure(
                     llm_expert_provider_error::allocation_failed);
             }
+            const uint64_t join_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - join_started).count());
+            provider_h2d_join_waves++;
+            provider_h2d_join_time_ns += join_ns;
+            provider_h2d_join_max_ns = std::max(provider_h2d_join_max_ns, join_ns);
+            if (hot_policy_phase == llm_expert_cache_policy_phase::decode) {
+                provider_h2d_join_decode_waves++;
+                provider_h2d_join_decode_time_ns += join_ns;
+                provider_h2d_join_decode_max_ns = std::max(provider_h2d_join_decode_max_ns, join_ns);
+            }
+            LLM_EXPERT_TRACE_INSTANT("k3.transfer", "provider_h2d_join",
+                "layer", binding.layer, "wait_ns", join_ns,
+                "participating_devices", participating_devices);
             if (wave_result.is_ready()) {
-                for (auto & bindings : device_transfers) bindings.clear();
+                for (size_t device = 0; device < device_transfers.size(); ++device) {
+                    device_transfers[device].clear();
+                    device_transfer_hot_generations[device].clear();
+                }
             }
             return wave_result;
         };
@@ -2825,6 +2986,7 @@ public:
                 device_pools[owner]->bundles[cold_references[index].layout_class_id],
                 entry.device_slot,
             });
+            device_transfer_hot_generations[owner].push_back(entry.generation);
             if (config.scheduler->transition(scheduled.handle,
                     llm_expert_request_state::host_ready,
                     llm_expert_request_state::h2d_in_flight) !=
@@ -2849,6 +3011,23 @@ public:
         if (abort_requested()) {
             return fail_multi(llm_expert_provider_result::failure(
                 llm_expert_provider_error::cancelled));
+        }
+        if (async_decode_transfers) {
+            for (size_t device = 0; device < binding.devices.size(); ++device) {
+                auto & dependencies = binding.devices[device].h2d_dependencies;
+                for (const auto & dependency : dependencies) {
+                    result = transfer_rings[device]->wait_for_hot(
+                        device_backends[device], dependency.hot_slot,
+                        dependency.hot_generation, false);
+                    if (!result.is_ready()) return fail_multi(result);
+                    provider_h2d_async_branch_waits++;
+                }
+                if (!dependencies.empty()) {
+                    LLM_EXPERT_TRACE_INSTANT("k3.transfer", "device_h2d_branch_waits",
+                        "layer", binding.layer, "device_id", device,
+                        "event_count", dependencies.size());
+                }
+            }
         }
 
         for (size_t index = 0; index < miss_count; ++index) {
@@ -2882,6 +3061,7 @@ public:
             h2d_bytes += transferred_bytes;
             device_runtime_stats[entry.device_id].h2d_bytes += transferred_bytes;
         }
+        for (auto & device : binding.devices) device.h2d_dependencies.clear();
         for (size_t index = 0; index < unique_count; ++index) {
             if (unique_slots[index] < 0) continue;
             bool already_pinned = false;
@@ -5290,7 +5470,9 @@ public:
             for (auto & device_pool : pool_candidates) device_pool->id = ++generation;
             device_pools = std::move(pool_candidates);
             device_runtime_stats.assign(device_pools.size(), {});
-            device_transfer_delay_us.assign(device_pools.size(), 0);
+            GGML_ASSERT(device_transfer_delay_us.size() == device_pools.size());
+            GGML_ASSERT(device_transfer_failure_for_testing.size() == device_pools.size());
+            GGML_ASSERT(device_transfer_failure_decode_only_for_testing.size() == device_pools.size());
             pool = device_pools.front();
             cold_cache = std::move(cold_candidate);
             if (config.cold_mode) {
@@ -5836,6 +6018,23 @@ public:
             phase10_route_ids.begin(),
             phase10_route_ids.begin() + phase10_route_id_count);
         result.physical_feasibility_skips = physical_feasibility_skips;
+        result.physical_feasibility_scan_calls = physical_feasibility_scan_calls;
+        result.physical_feasibility_scan_time_ns = physical_feasibility_scan_time_ns;
+        result.physical_feasibility_scan_max_ns = physical_feasibility_scan_max_ns;
+        result.physical_feasibility_scan_decode_calls = physical_feasibility_scan_decode_calls;
+        result.physical_feasibility_scan_decode_time_ns = physical_feasibility_scan_decode_time_ns;
+        result.physical_feasibility_scan_decode_max_ns = physical_feasibility_scan_decode_max_ns;
+        result.provider_h2d_join_waves = provider_h2d_join_waves;
+        result.provider_h2d_join_time_ns = provider_h2d_join_time_ns;
+        result.provider_h2d_join_max_ns = provider_h2d_join_max_ns;
+        result.provider_h2d_join_decode_waves = provider_h2d_join_decode_waves;
+        result.provider_h2d_join_decode_time_ns = provider_h2d_join_decode_time_ns;
+        result.provider_h2d_join_decode_max_ns = provider_h2d_join_decode_max_ns;
+        result.provider_h2d_async_decode_waves = provider_h2d_async_decode_waves;
+        result.provider_h2d_async_branch_waits = provider_h2d_async_branch_waits;
+        result.injected_device_failure_waves = injected_device_failure_waves;
+        result.injected_device_failure_participants = injected_device_failure_participants;
+        result.injected_device_failure_drained_waves = injected_device_failure_drained_waves;
         const uint32_t directory_device_count = multi_device ? uint32_t(config.devices.size()) : 1;
         result.directory_device_cells = uint64_t(config.total_expert_keys)*directory_device_count;
         if (multi_device) {
@@ -5901,6 +6100,10 @@ public:
                 device.ring_h2d_bytes = ring.h2d_bytes;
                 device.ring_h2d_time_us = ring.h2d_time_us;
                 device.ring_waves = ring.waves;
+                device.ring_async_enqueues = ring.async_enqueues;
+                device.ring_h2d_event_records = ring.h2d_event_records;
+                device.ring_h2d_event_waits = ring.h2d_event_waits;
+                device.ring_h2d_event_synchronizations = ring.h2d_event_synchronizations;
                 device.ring_live_events = ring.live_events;
                 device.ring_peak_in_flight_lanes = ring.peak_in_flight_lanes;
                 device.ring_first_h2d_enqueue_us = ring.first_h2d_enqueue_us;
@@ -6157,10 +6360,21 @@ public:
     llm_expert_provider_result debug_set_device_delay_for_testing(
             llm_expert_device_id device, uint64_t delay_us) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
-        if (!multi_device || active_request || device >= device_pools.size() || delay_us > 1000000) {
+        if (!multi_device || active_request || device >= config.devices.size() || delay_us > 1000000) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
         }
         device_transfer_delay_us[device] = delay_us;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result debug_set_device_failure_for_testing(
+            llm_expert_device_id device, bool fail_device, bool decode_only) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!multi_device || active_request || device >= config.devices.size()) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
+        device_transfer_failure_for_testing[device] = fail_device;
+        device_transfer_failure_decode_only_for_testing[device] = fail_device && decode_only;
         return llm_expert_provider_result::success();
     }
 
@@ -6529,6 +6743,7 @@ private:
             if (device_binding.device_id != index ||
                 device_binding.target_device != config.devices[index].target_device ||
                 device_binding.generation_lease.get() != device_pools[index].get() ||
+                device_binding.completion_delay_us_for_testing != device_transfer_delay_us[index] ||
                 !projection_identity_matches(device_binding.up, device_bundle.up) ||
                 !projection_identity_matches(device_binding.gate, device_bundle.gate) ||
                 !projection_identity_matches(device_binding.gate_up, device_bundle.gate_up) ||
@@ -8031,6 +8246,7 @@ private:
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
         if (!decision.free) {
+            const auto scan_started = std::chrono::steady_clock::now();
             for (uint32_t slot = 0; slot < directory_slots.size(); ++slot) {
                 const auto & skipped = directory_slots[slot];
                 if (skipped.device_id != target_device &&
@@ -8038,6 +8254,17 @@ private:
                     hot_policy.resident_precedes(slot, decision.slot)) {
                     physical_feasibility_skips++;
                 }
+            }
+            const uint64_t scan_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - scan_started).count());
+            physical_feasibility_scan_calls++;
+            physical_feasibility_scan_time_ns += scan_ns;
+            physical_feasibility_scan_max_ns = std::max(physical_feasibility_scan_max_ns, scan_ns);
+            if (hot_policy_phase == llm_expert_cache_policy_phase::decode) {
+                physical_feasibility_scan_decode_calls++;
+                physical_feasibility_scan_decode_time_ns += scan_ns;
+                physical_feasibility_scan_decode_max_ns = std::max(
+                    physical_feasibility_scan_decode_max_ns, scan_ns);
             }
         }
         selected_slot = int32_t(decision.slot);
@@ -8597,6 +8824,8 @@ private:
     };
     std::vector<device_runtime_counters> device_runtime_stats;
     std::vector<uint64_t> device_transfer_delay_us;
+    std::vector<bool> device_transfer_failure_for_testing;
+    std::vector<bool> device_transfer_failure_decode_only_for_testing;
     uint64_t successful_bindings = 0;
     bool initialization_in_progress = false;
     bool initialization_failed = false;
@@ -8752,6 +8981,23 @@ private:
     uint64_t evictions = 0;
     uint64_t no_writeback_evictions = 0;
     uint64_t physical_feasibility_skips = 0;
+    uint64_t physical_feasibility_scan_calls = 0;
+    uint64_t physical_feasibility_scan_time_ns = 0;
+    uint64_t physical_feasibility_scan_max_ns = 0;
+    uint64_t physical_feasibility_scan_decode_calls = 0;
+    uint64_t physical_feasibility_scan_decode_time_ns = 0;
+    uint64_t physical_feasibility_scan_decode_max_ns = 0;
+    uint64_t provider_h2d_join_waves = 0;
+    uint64_t provider_h2d_join_time_ns = 0;
+    uint64_t provider_h2d_join_max_ns = 0;
+    uint64_t provider_h2d_join_decode_waves = 0;
+    uint64_t provider_h2d_join_decode_time_ns = 0;
+    uint64_t provider_h2d_join_decode_max_ns = 0;
+    uint64_t provider_h2d_async_decode_waves = 0;
+    uint64_t provider_h2d_async_branch_waits = 0;
+    uint64_t injected_device_failure_waves = 0;
+    uint64_t injected_device_failure_participants = 0;
+    uint64_t injected_device_failure_drained_waves = 0;
     uint64_t generation_changes = 0;
     uint64_t stale_generation_failures = 0;
     uint64_t metadata_mismatches = 0;
