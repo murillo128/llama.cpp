@@ -508,6 +508,9 @@ struct llm_hot_cache_diagnostics {
         uint64_t ring_actual_bytes = 0;
         uint64_t ring_pinned_or_registered_bytes = 0;
         uint64_t ring_lane_reservations = 0;
+        uint64_t ring_direct_storage_reservations = 0;
+        uint64_t ring_direct_storage_completions = 0;
+        uint64_t ring_direct_storage_bytes = 0;
         uint64_t ring_stage_bytes = 0;
         uint64_t ring_h2d_bytes = 0;
         uint64_t ring_h2d_time_us = 0;
@@ -860,6 +863,9 @@ struct llm_hot_cache_diagnostics {
     bool ring_pageable_fallback = false;
     uint64_t ring_fallback_count = 0;
     uint64_t ring_lane_reservations = 0;
+    uint64_t ring_direct_storage_reservations = 0;
+    uint64_t ring_direct_storage_completions = 0;
+    uint64_t ring_direct_storage_bytes = 0;
     uint64_t ring_stage_bytes = 0;
     uint64_t ring_stage_time_us = 0;
     uint64_t ring_async_enqueues = 0;

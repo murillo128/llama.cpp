@@ -823,8 +823,8 @@ void test_blocking_cold_seed_uses_storage_ring_and_ordinary_lru() {
     const int32_t slot_zero = find_slot(diagnostics, 0);
     const int32_t slot_two = find_slot(diagnostics, 2);
     GGML_ASSERT(slot_zero >= 0 && slot_two >= 0);
-    GGML_ASSERT(diagnostics.slots[slot_zero].has_cold_backing &&
-        diagnostics.slots[slot_two].has_cold_backing);
+    GGML_ASSERT(!diagnostics.slots[slot_zero].has_cold_backing &&
+        !diagnostics.slots[slot_two].has_cold_backing && diagnostics.cold_current_hot_refs == 0);
     GGML_ASSERT(diagnostics.slots[slot_zero].origin == llm_expert_residency_origin::static_seed &&
         diagnostics.slots[slot_two].origin == llm_expert_residency_origin::static_seed);
     GGML_ASSERT(diagnostics.slots[slot_zero].last_use > diagnostics.slots[slot_two].last_use);
@@ -1731,6 +1731,13 @@ void test_exact_issue_ahead_and_serial_evidence_control() {
         issued.storage_reads_submitted_before_first_wait == 2 &&
         issued.first_wait_after_all_storage_submissions && !issued.serial_control);
     GGML_ASSERT(issued.demand_ready_before_use == 2 && issued.all_demand_ready_before_use);
+    GGML_ASSERT(parallel.diagnostics.ring_direct_storage_reservations == 2);
+    GGML_ASSERT(parallel.diagnostics.ring_direct_storage_completions == 2);
+    GGML_ASSERT(parallel.diagnostics.ring_direct_storage_bytes > 0);
+    GGML_ASSERT(parallel.diagnostics.ring_direct_storage_bytes ==
+        parallel.diagnostics.ring_h2d_bytes);
+    GGML_ASSERT(parallel.diagnostics.ring_stage_bytes == 0);
+    GGML_ASSERT(parallel.diagnostics.cold_admissions == 0);
     GGML_ASSERT(issued.first_take_us != 0 && issued.first_wait_us >= issued.first_take_us &&
         issued.last_demand_ready_us >= issued.first_wait_us &&
         issued.demand_completion_us >= issued.last_demand_ready_us);
@@ -1754,6 +1761,63 @@ void test_exact_issue_ahead_and_serial_evidence_control() {
     phase10_evidence.routes_equal = parallel.execution_ids == serial.execution_ids;
     GGML_ASSERT(joined.execution_ids == parallel.execution_ids && joined.demand_promotions == 1);
     phase10_evidence.joined_same_generation = true;
+}
+
+void test_direct_storage_failure_drains_without_cold_admission() {
+    tensor_fixture tensors(8, 16, 4, 1, 2);
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+    llm_expert_scheduler scheduler({
+        1, 4, 16, 2, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 2, 2,
+    });
+    failing_async_reader reader(source_file.bytes, 0);
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 2;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    async_config.read_override_for_testing = &reader;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+
+    auto provider = llm_create_cold_cache_expert_weight_provider(
+        phase10_issue_ahead_config(storage, transport, scheduler, false, 2));
+    auto binding = initialize_hot_binding(*provider, tensors);
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 2, execution_ids).error ==
+        llm_expert_provider_error::copy_failed);
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.ring_direct_storage_reservations == 2);
+    GGML_ASSERT(diagnostics.ring_direct_storage_completions == 0);
+    GGML_ASSERT(diagnostics.ring_stage_bytes == 0);
+    GGML_ASSERT(diagnostics.cold_admissions == 0);
+    GGML_ASSERT(diagnostics.ring_live_events == 0);
+    GGML_ASSERT(scheduler.diagnostics().active_requests == 0);
+    GGML_ASSERT(transport.diagnostics().active_read_requests == 0);
+
+    plan.reset();
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.shutdown());
 }
 
 void test_exact_demand_joins_submitted_same_generation_with_ready_cold_data() {
@@ -1788,6 +1852,7 @@ void test_exact_demand_joins_submitted_same_generation_with_ready_cold_data() {
     provider_config.cold_cache_bytes = 16U << 20;
     auto provider = llm_create_cold_cache_expert_weight_provider(provider_config);
     auto binding = initialize_hot_binding(*provider, tensors);
+    GGML_ASSERT(provider->debug_warm_all_cold_for_testing().is_ready());
     llm_expert_execution_plan plan;
     GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
     std::array<int32_t, 2> execution{};
@@ -2257,7 +2322,7 @@ void test_cold_provider_uses_bounded_transfer_waves() {
     plan.reset();
 }
 
-void test_cold_provider_reserves_one_demand_width_beyond_hot_capacity() {
+void test_cold_provider_uses_independent_minimum_capacity() {
     tensor_fixture tensors;
     auto sizing_config = cold_test_config(2);
     auto sizing = llm_create_cold_cache_expert_weight_provider(sizing_config);
@@ -2272,9 +2337,10 @@ void test_cold_provider_reserves_one_demand_width_beyond_hot_capacity() {
     const auto sizing_diagnostics = sizing->hot_cache_diagnostics();
     GGML_ASSERT(sizing_diagnostics.cold_effective_slots == 4);
     GGML_ASSERT(sizing_diagnostics.cold_slot_footprint > 0);
+    GGML_ASSERT(sizing_diagnostics.cold_actual_bytes > 0);
 
     auto insufficient_config = sizing_config;
-    insufficient_config.cold_cache_bytes = sizing_diagnostics.cold_slot_footprint*3;
+    insufficient_config.cold_cache_bytes = sizing_diagnostics.cold_actual_bytes/4;
     auto insufficient = llm_create_cold_cache_expert_weight_provider(insufficient_config);
     binding = {};
     GGML_ASSERT(insufficient->bind(
@@ -2283,12 +2349,14 @@ void test_cold_provider_reserves_one_demand_width_beyond_hot_capacity() {
         llm_expert_provider_error::unsupported_configuration);
 
     auto exact_config = sizing_config;
-    exact_config.cold_cache_bytes = sizing_diagnostics.cold_slot_footprint*4;
+    exact_config.cold_cache_bytes = sizing_diagnostics.cold_actual_bytes*3/4;
     auto exact = llm_create_cold_cache_expert_weight_provider(exact_config);
     binding = {};
     GGML_ASSERT(exact->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
     GGML_ASSERT(exact->initialize_after_reserve().is_ready());
-    GGML_ASSERT(exact->hot_cache_diagnostics().cold_effective_slots == 4);
+    const auto exact_diagnostics = exact->hot_cache_diagnostics();
+    GGML_ASSERT(exact_diagnostics.cold_effective_slots >= 2 &&
+        exact_diagnostics.cold_effective_slots < sizing_diagnostics.cold_effective_slots);
 }
 
 void test_context_extent_matrix_and_prepare_revalidation() {
@@ -2552,10 +2620,21 @@ void test_directory_multi_token_atomic_dedup_and_no_allocation() {
     plan.reset();
 }
 
-void test_cold_provider_inclusive_promotion_and_hits() {
+void test_cold_provider_independent_tier_promotion_and_hits() {
     tensor_fixture tensors(8, 16, 4, 1, 2);
-    auto provider = llm_create_cold_cache_expert_weight_provider(cold_test_config());
+    auto config = cold_test_config(4);
+    {
+        auto sizing = llm_create_cold_cache_expert_weight_provider(config);
+        const auto sizing_binding = initialize_hot_binding(*sizing, tensors);
+        (void) sizing_binding;
+        const auto sizing_diagnostics = sizing->hot_cache_diagnostics();
+        GGML_ASSERT(sizing_diagnostics.cold_effective_slots == 4);
+        config.cold_cache_bytes = sizing_diagnostics.cold_actual_bytes*3/4;
+    }
+    auto provider = llm_create_cold_cache_expert_weight_provider(config);
     const auto binding = initialize_hot_binding(*provider, tensors);
+    GGML_ASSERT(provider->hot_cache_diagnostics().cold_effective_slots >= 2);
+    GGML_ASSERT(provider->hot_cache_diagnostics().cold_effective_slots < 4);
     llm_expert_execution_plan plan;
     GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
 
@@ -2569,13 +2648,13 @@ void test_cold_provider_inclusive_promotion_and_hits() {
     GGML_ASSERT(diagnostics.cold_admissions == 2 && diagnostics.cold_source_copy_bundles == 2);
     GGML_ASSERT(diagnostics.ring_waves == 1 && diagnostics.ring_synchronous_copies == 18);
     GGML_ASSERT(diagnostics.ring_async_enqueues == 0 && diagnostics.ring_wave_synchronizations == 0);
-    GGML_ASSERT(diagnostics.cold_current_hot_refs == 2);
+    GGML_ASSERT(diagnostics.cold_current_hot_refs == 0);
     GGML_ASSERT(diagnostics.cold_current_transfer_refs == 0);
     GGML_ASSERT(diagnostics.source_pageable && diagnostics.source_pinned_bytes == 0);
     GGML_ASSERT(diagnostics.ring_acquisition_method == "pageable-cpu");
     GGML_ASSERT(diagnostics.ring_fallback_reason == "forced-for-testing");
     for (int32_t index = 0; index < 2; ++index) {
-        GGML_ASSERT(diagnostics.slots[execution_ids[index]].has_cold_backing);
+        GGML_ASSERT(!diagnostics.slots[execution_ids[index]].has_cold_backing);
         assert_bundle_slot_matches(tensors, binding, first_ids[index], execution_ids[index]);
     }
 
@@ -2587,7 +2666,19 @@ void test_cold_provider_inclusive_promotion_and_hits() {
     const int32_t second_ids[] = { 2, 3 };
     GGML_ASSERT(provider->remap_checkpoint(binding, second_ids, 2, execution_ids).is_ready());
     diagnostics = provider->hot_cache_diagnostics();
-    GGML_ASSERT(diagnostics.evictions == 2 && diagnostics.no_writeback_evictions == 2);
+    GGML_ASSERT(diagnostics.evictions == 0 && diagnostics.no_writeback_evictions == 0);
+    GGML_ASSERT(diagnostics.cold_evictions >= 1);
+    GGML_ASSERT(diagnostics.cold_current_hot_refs == 0);
+    for (const auto & slot : diagnostics.slots) {
+        GGML_ASSERT(slot.state == llm_hot_cache_diagnostics::slot::ready ||
+            slot.state == llm_hot_cache_diagnostics::slot::pinned);
+        GGML_ASSERT(!slot.has_cold_backing);
+    }
+    const uint64_t bytes_after_cold_reclaim = diagnostics.cold_source_copy_bytes;
+    GGML_ASSERT(provider->remap_checkpoint(binding, first_ids, 2, execution_ids).is_ready());
+    diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.hits == 4);
+    GGML_ASSERT(diagnostics.cold_source_copy_bytes == bytes_after_cold_reclaim);
     plan.reset();
 
     GGML_ASSERT(provider->trim().is_ready());
@@ -2733,7 +2824,7 @@ void test_cold_provider_copy_failure_cleanup_and_retry() {
     GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
     GGML_ASSERT(provider->remap_checkpoint(binding, logical_ids, 2, execution_ids).is_ready());
     diagnostics = provider->hot_cache_diagnostics();
-    GGML_ASSERT(diagnostics.cold_current_hot_refs == 2);
+    GGML_ASSERT(diagnostics.cold_current_hot_refs == 0);
     GGML_ASSERT(diagnostics.cold_current_transfer_refs == 0);
     plan.reset();
 }
@@ -3235,7 +3326,7 @@ int main(int argc, char ** argv) {
     test_initialization_stage_and_descriptor_only_scale();
     test_configuration_matrix();
     test_cold_provider_uses_bounded_transfer_waves();
-    test_cold_provider_reserves_one_demand_width_beyond_hot_capacity();
+    test_cold_provider_uses_independent_minimum_capacity();
     test_context_extent_matrix_and_prepare_revalidation();
     test_cold_provider_rejects_cuda_host_source();
     test_pool_lifetime_trim_surrender_and_epoch();
@@ -3244,7 +3335,7 @@ int main(int argc, char ** argv) {
     test_allocation_failure_is_recoverable_and_empty_prepare_is_safe();
     test_directory_hit_eviction_generation_and_copy();
     test_directory_multi_token_atomic_dedup_and_no_allocation();
-    test_cold_provider_inclusive_promotion_and_hits();
+    test_cold_provider_independent_tier_promotion_and_hits();
     test_three_layout_classes_share_one_cache_and_full_data_path();
     test_cold_provider_copy_failure_cleanup_and_retry();
     test_directory_composite_layer_expert_keys();
@@ -3254,6 +3345,7 @@ int main(int argc, char ** argv) {
     test_blocking_hot_seed_atomic_publication_and_failure();
     test_blocking_cold_seed_uses_storage_ring_and_ordinary_lru();
     test_exact_issue_ahead_and_serial_evidence_control();
+    test_direct_storage_failure_drains_without_cold_admission();
     test_cancelling_speculative_retry_attempts_all_demands_before_wait();
     test_predictive_runtime_late_join_same_generation();
     test_predictive_request_end_cancels_and_drains_storage();
