@@ -358,11 +358,16 @@ struct failing_async_reader final : llm_expert_async_read_override {
 struct gated_async_reader final : llm_expert_async_read_override {
     const std::vector<uint8_t> & bytes;
     uint64_t gated_offset = 0;
+    bool gate_from_offset = true;
     std::atomic<bool> release { false };
     std::atomic<uint64_t> entered { 0 };
+    std::atomic<uint64_t> blocked { 0 };
 
-    gated_async_reader(const std::vector<uint8_t> & bytes, uint64_t gated_offset) :
-        bytes(bytes), gated_offset(gated_offset) {}
+    gated_async_reader(
+            const std::vector<uint8_t> & bytes,
+            uint64_t gated_offset,
+            bool gate_from_offset = true) :
+        bytes(bytes), gated_offset(gated_offset), gate_from_offset(gate_from_offset) {}
 
     int64_t read_at(
             intptr_t,
@@ -371,8 +376,12 @@ struct gated_async_reader final : llm_expert_async_read_override {
             uint64_t offset,
             int &) noexcept override {
         entered.fetch_add(1, std::memory_order_release);
-        while (offset >= gated_offset && !release.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+        if ((gate_from_offset && offset >= gated_offset) ||
+                (!gate_from_offset && offset == gated_offset)) {
+            blocked.fetch_add(1, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
         }
         if (offset > bytes.size() || size > bytes.size() - size_t(offset)) return 0;
         std::memcpy(data, bytes.data() + offset, size);
@@ -1761,6 +1770,216 @@ void test_exact_issue_ahead_and_serial_evidence_control() {
     phase10_evidence.routes_equal = parallel.execution_ids == serial.execution_ids;
     GGML_ASSERT(joined.execution_ids == parallel.execution_ids && joined.demand_promotions == 1);
     phase10_evidence.joined_same_generation = true;
+}
+
+void test_mixed_cold_hit_h2d_precedes_direct_storage_completion() {
+    tensor_fixture tensors(8, 16, 4, 2, 2);
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+
+    llm_expert_scheduler scheduler({
+        1, 4, 16, 4, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 4, 2,
+    });
+    const uint64_t gated_offset = source_file.bundles[1].front().file_offset;
+    gated_async_reader reader(source_file.bytes, gated_offset, false);
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 4;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    async_config.read_override_for_testing = &reader;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+
+    auto provider = llm_create_cold_cache_expert_weight_provider(
+        phase10_issue_ahead_config(storage, transport, scheduler, false));
+    auto binding = initialize_hot_binding(*provider, tensors);
+    GGML_ASSERT(provider->debug_warm_cold_key_for_testing({ 0, 0 }).is_ready());
+    GGML_ASSERT(provider->debug_cold_ready({ 0, 0 }));
+    GGML_ASSERT(!provider->debug_hot_mapping({ 0, 0 }));
+
+    llm_expert_execution_plan mixed_plan;
+    GGML_ASSERT(provider->prepare({ binding }, mixed_plan).is_ready());
+    const int32_t mixed_ids[] = { 0, 1, 0, 1 };
+    std::array<int32_t, 4> execution_ids = { -1, -1, -1, -1 };
+    auto remap = std::async(std::launch::async, [&] {
+        return provider->remap_checkpoint(
+            binding, mixed_ids, 4, execution_ids.data());
+    });
+
+    bool cold_h2d_while_storage_blocked = false;
+    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+        if (reader.blocked.load(std::memory_order_acquire) != 0) {
+            const auto diagnostics = provider->hot_cache_diagnostics();
+            cold_h2d_while_storage_blocked = diagnostics.ring_stage_bytes > 0 &&
+                diagnostics.ring_h2d_bytes > 0 &&
+                transport.diagnostics().active_read_requests > 0;
+            if (cold_h2d_while_storage_blocked) break;
+        }
+        std::this_thread::yield();
+    }
+    reader.release.store(true, std::memory_order_release);
+    const auto remap_result = remap.get();
+    GGML_ASSERT(remap_result.is_ready());
+    GGML_ASSERT(cold_h2d_while_storage_blocked);
+    GGML_ASSERT(reader.blocked.load(std::memory_order_acquire) == 1);
+    GGML_ASSERT(execution_ids[0] != execution_ids[1] &&
+        execution_ids[0] == execution_ids[2] && execution_ids[1] == execution_ids[3]);
+
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.cold_hits >= 1 && diagnostics.cold_misses >= 2);
+    GGML_ASSERT(diagnostics.ring_stage_bytes == expert_payload_bytes(tensors));
+    GGML_ASSERT(diagnostics.ring_direct_storage_reservations == 1 &&
+        diagnostics.ring_direct_storage_completions == 1);
+    mixed_plan.reset();
+    binding = {};
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.shutdown());
+}
+
+void test_multi_device_mixed_cold_hit_h2d_precedes_direct_storage_completion() {
+    ggml_backend_load_all();
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        auto * device = ggml_backend_dev_get(index);
+        auto * reg = ggml_backend_dev_backend_reg(device);
+        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU && reg != nullptr &&
+            std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            devices.push_back(device);
+        }
+    }
+    if (devices.size() < 2) return;
+
+    tensor_fixture tensors(8, 16, 4, 1, 2);
+    temporary_expert_storage_file source_file(tensors);
+    llama_file loader(source_file.path.c_str(), "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1U << 20 }, {
+        { 0, &loader, 1, source_file.path.c_str() },
+    });
+    source_file.populate(storage);
+
+    llm_expert_scheduler_config scheduler_config = {
+        1, 4, 16, 4, 0,
+        4, 1U << 20, 1U << 20, 1U << 20, 1U << 20, 4, 4, 2,
+    };
+    scheduler_config.device_count = 2;
+    scheduler_config.per_device_request_capacity = 8;
+    scheduler_config.per_device_inflight_capacity = 4;
+    llm_expert_scheduler scheduler(scheduler_config);
+
+    const uint64_t gated_offset = source_file.bundles[2].front().file_offset;
+    gated_async_reader reader(source_file.bytes, gated_offset, false);
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 8;
+    async_config.effective_hot_capacity = 4;
+    async_config.request_capacity = 16;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = 1U << 20;
+    async_config.source_file_capacity = 1;
+    async_config.read_override_for_testing = &reader;
+    llm_expert_async_transport transport(async_config);
+    std::array<intptr_t, 1> handles{};
+    size_t handle_count = 0;
+    GGML_ASSERT(storage.copy_source_native_handles(
+        handles.data(), handles.size(), handle_count).is_ready());
+    GGML_ASSERT(transport.register_files(handles.data(), handle_count) ==
+        llm_expert_async_result::ready);
+
+    auto config = test_config(4, 1, 4, 2);
+    config.target_device = devices[0];
+    config.target_buffer_type = ggml_backend_dev_buffer_type(devices[0]);
+    config.cold_mode = true;
+    config.cold_cache_bytes = 1U << 20;
+    config.transfer_ring_bytes = 1U << 20;
+    config.force_pageable_transfer_for_testing = true;
+    config.storage = &storage;
+    config.async_transport = &transport;
+    config.scheduler = &scheduler;
+    config.peer_staging_bytes = 64;
+    config.devices = {
+        { 0, devices[0], ggml_backend_dev_buffer_type(devices[0]), 2,
+            0, "00000000:00:08.0", "GPU-mixed-0" },
+        { 1, devices[1], ggml_backend_dev_buffer_type(devices[1]), 2,
+            1, "00000000:00:0a.0", "GPU-mixed-1" },
+    };
+
+    auto provider = llm_create_cold_cache_expert_weight_provider(config);
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(provider->bind(tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    GGML_ASSERT(binding.bootstrap);
+    binding = {};
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+    GGML_ASSERT(provider->debug_warm_cold_key_for_testing({ 0, 0 }).is_ready());
+
+    ggml_init_params graph_params = { ggml_tensor_overhead()*32, nullptr, true };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    GGML_ASSERT(graph_ctx);
+    GGML_ASSERT(provider->bind_graph(
+        graph_ctx.get(), tensors.bundle(0), tensors.selection(0), binding).is_ready());
+    ggml_backend_buffer_ptr graph_buffer(ggml_backend_alloc_ctx_tensors_from_buft(
+        graph_ctx.get(), ggml_backend_cpu_buffer_type()));
+    GGML_ASSERT(graph_buffer && binding.multi_device && binding.checkpoint_ids != nullptr);
+
+    llm_expert_execution_plan mixed_plan;
+    GGML_ASSERT(provider->prepare({ binding }, mixed_plan).is_ready());
+    const int32_t mixed_ids[] = { 0, 2 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, mixed_ids, 0, sizeof(mixed_ids));
+    auto remap = std::async(std::launch::async, [&] {
+        return provider->remap_checkpoint_tensor_multi_device(
+            binding, nullptr, nullptr, 0);
+    });
+
+    bool cold_h2d_while_storage_blocked = false;
+    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+        if (reader.blocked.load(std::memory_order_acquire) != 0) {
+            const auto diagnostics = provider->hot_cache_diagnostics();
+            cold_h2d_while_storage_blocked = diagnostics.ring_stage_bytes > 0 &&
+                diagnostics.ring_h2d_bytes > 0 &&
+                transport.diagnostics().active_read_requests > 0;
+            if (cold_h2d_while_storage_blocked) break;
+        }
+        std::this_thread::yield();
+    }
+    reader.release.store(true, std::memory_order_release);
+    const auto remap_result = remap.get();
+    if (!remap_result.is_ready()) {
+        std::fprintf(stderr, "multi-device mixed remap failed: status=%u error=%u\n",
+            unsigned(remap_result.status), unsigned(remap_result.error));
+    }
+    GGML_ASSERT(remap_result.is_ready());
+    GGML_ASSERT(cold_h2d_while_storage_blocked);
+    GGML_ASSERT(reader.blocked.load(std::memory_order_acquire) == 1);
+
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.cold_hits >= 1 && diagnostics.cold_misses >= 2);
+    GGML_ASSERT(diagnostics.devices.size() == 2 &&
+        diagnostics.devices[0].ring_stage_bytes == expert_payload_bytes(tensors));
+    GGML_ASSERT(diagnostics.devices[0].ring_direct_storage_reservations == 1 &&
+        diagnostics.devices[0].ring_direct_storage_completions == 1);
+    mixed_plan.reset();
+    binding = {};
+    graph_buffer.reset();
+    graph_ctx.reset();
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+    provider.reset();
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(scheduler.shutdown());
 }
 
 void test_direct_storage_failure_drains_without_cold_admission() {
@@ -3345,6 +3564,8 @@ int main(int argc, char ** argv) {
     test_blocking_hot_seed_atomic_publication_and_failure();
     test_blocking_cold_seed_uses_storage_ring_and_ordinary_lru();
     test_exact_issue_ahead_and_serial_evidence_control();
+    test_mixed_cold_hit_h2d_precedes_direct_storage_completion();
+    test_multi_device_mixed_cold_hit_h2d_precedes_direct_storage_completion();
     test_direct_storage_failure_drains_without_cold_admission();
     test_cancelling_speculative_retry_attempts_all_demands_before_wait();
     test_predictive_runtime_late_join_same_generation();

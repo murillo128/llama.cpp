@@ -3141,10 +3141,34 @@ public:
             }
             const auto submit_admissible_direct_reads = [&]() {
                 size_t admitted = 0;
+                std::array<uint32_t, LLM_EXPERT_MAX_DEVICES> pending_cold_by_device = {};
+                std::array<uint32_t, LLM_EXPERT_MAX_DEVICES> active_direct_by_device = {};
+                std::array<uint32_t, LLM_EXPERT_MAX_DEVICES> admitted_direct_by_device = {};
+                for (size_t index = 0; index < miss_count; ++index) {
+                    const auto & flight = async_flights[index];
+                    if (flight.flight_id.target_device >= device_pools.size()) {
+                        return llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch);
+                    }
+                    if (flight.cold_hit && !flight.processed) {
+                        pending_cold_by_device[flight.flight_id.target_device]++;
+                    }
+                    if (flight.direct_storage && flight.submitted && !flight.processed) {
+                        active_direct_by_device[flight.flight_id.target_device]++;
+                    }
+                }
                 for (size_t index = 0; index < miss_count; ++index) {
                     auto & flight = async_flights[index];
                     if (!flight.direct_storage || flight.submitted || flight.read_completed ||
                             !flight.scheduler_taken) continue;
+                    const auto owner = flight.flight_id.target_device;
+                    // Every ring is initialized with at least two lanes. Keep
+                    // one available for ready cold data instead of allowing
+                    // direct reads to recreate a per-device phase barrier.
+                    const uint32_t direct_lane_limit = device_lane_capacities[owner] -
+                        uint32_t(pending_cold_by_device[owner] != 0);
+                    if (active_direct_by_device[owner] + admitted_direct_by_device[owner] >=
+                            direct_lane_limit) continue;
                     const uint32_t unique_index = miss_unique_indices[index];
                     const auto & key = unique_keys[unique_index];
                     const uint32_t global_slot = candidate_slots[index];
@@ -3191,6 +3215,7 @@ public:
                     flight.read_active = true;
                     submitted_count++;
                     admitted++;
+                    admitted_direct_by_device[owner]++;
                     if (config.scheduler->transition(flight.handle,
                             llm_expert_request_state::submitting,
                             llm_expert_request_state::io_in_flight) !=
@@ -3220,13 +3245,27 @@ public:
                 return completed;
             };
 
-            size_t direct_remaining = 0;
-            for (size_t index = 0; index < miss_count; ++index) {
-                direct_remaining += async_flights[index].direct_storage;
-            }
-            while (direct_remaining != 0) {
+            size_t completed_count = 0;
+            while (completed_count < miss_count) {
                 result = submit_admissible_direct_reads();
                 if (!result.is_ready()) return fail_multi(result);
+                size_t index = miss_count;
+                for (size_t candidate = 0; candidate < miss_count; ++candidate) {
+                    if (async_flights[candidate].cold_hit &&
+                            !async_flights[candidate].processed) {
+                        index = candidate;
+                        break;
+                    }
+                }
+                if (index != miss_count) {
+                    result = stage_miss(index);
+                    if (result.is_ready()) result = flush_and_wait_exact_h2d(index);
+                    if (!result.is_ready()) return fail_multi(result);
+                    async_flights[index].h2d_submitted = true;
+                    async_flights[index].processed = true;
+                    completed_count++;
+                    continue;
+                }
                 size_t pending_count = 0;
                 for (size_t index = 0; index < miss_count; ++index) {
                     if (async_flights[index].read_active) {
@@ -3244,7 +3283,7 @@ public:
                     async_handles.data(), pending_count, completed_handle, completion,
                     abort_callback, abort_callback_data);
                 if (provider_lock != nullptr) provider_lock->lock();
-                size_t index = miss_count;
+                index = miss_count;
                 for (size_t candidate = 0; candidate < miss_count; ++candidate) {
                     const auto & flight = async_flights[candidate];
                     if (flight.read_active && flight.handle.slot == completed_handle.slot &&
@@ -3299,16 +3338,7 @@ public:
                 if (!result.is_ready()) return fail_multi(result);
                 flight.h2d_submitted = true;
                 flight.processed = true;
-                direct_remaining--;
-            }
-
-            for (size_t index = 0; index < miss_count; ++index) {
-                if (async_flights[index].direct_storage) continue;
-                result = stage_miss(index);
-                if (result.is_ready()) result = flush_and_wait_exact_h2d(index);
-                if (!result.is_ready()) return fail_multi(result);
-                async_flights[index].h2d_submitted = true;
-                async_flights[index].processed = true;
+                completed_count++;
             }
             LLM_EXPERT_TRACE_INSTANT("k3.storage", "multi_device_issue_ahead",
                 "layer", binding.layer, "demand_count", miss_count,
@@ -3394,12 +3424,20 @@ public:
             }
         }
 
+        // Storage and cold-ready flights may prepare hot-policy loads in a
+        // different order than they complete. Mark every terminal before
+        // publishing or pinning so deterministic terminal flushing can retire
+        // the complete operation-ordinal prefix without a transport barrier.
         for (size_t index = 0; index < miss_count; ++index) {
-            const uint32_t unique_index = miss_unique_indices[index];
             const uint32_t slot = candidate_slots[index];
             auto & entry = directory_slots[slot];
             result = cache_policy_result(hot_policy.load_complete(slot, entry.generation));
             if (!result.is_ready()) return fail_multi(result);
+        }
+        for (size_t index = 0; index < miss_count; ++index) {
+            const uint32_t unique_index = miss_unique_indices[index];
+            const uint32_t slot = candidate_slots[index];
+            auto & entry = directory_slots[slot];
             entry.state = hot_slot_state::ready;
             entry.last_use = ++use_clock;
             directory_forward[forward_index(entry.key)] = { int32_t(slot), entry.generation };
@@ -4667,6 +4705,20 @@ public:
 
                 const auto submit_admissible_direct_reads = [&]() {
                     size_t admitted = 0;
+                    size_t pending_cold = 0;
+                    size_t active_direct = 0;
+                    for (size_t index = 0; index < miss_count; ++index) {
+                        const auto & flight = async_flights[index];
+                        pending_cold += !flight.processed && (flight.cold_hit ||
+                            (!flight.direct_storage && flight.read_completed &&
+                             cold_cache->ready(flight.cold)));
+                        active_direct += flight.direct_storage && flight.submitted &&
+                            !flight.processed;
+                    }
+                    // Leave one lane available while cold-ready work is
+                    // pending; direct reads regain the full ring afterward.
+                    const size_t direct_lane_limit = transfer_lane_capacity -
+                        size_t(pending_cold != 0);
                     bool serial_read_active = false;
                     if (config.phase10_serial_issue_for_testing) {
                         for (size_t index = 0; index < miss_count; ++index) {
@@ -4677,6 +4729,7 @@ public:
                         auto & flight = async_flights[index];
                         if (!flight.direct_storage || flight.submitted || flight.read_completed ||
                                 !flight.scheduler_taken) continue;
+                        if (active_direct + admitted >= direct_lane_limit) break;
                         if (config.phase10_serial_issue_for_testing &&
                                 (serial_read_active || admitted != 0)) break;
                         const uint32_t slot = candidate_slots[index];
@@ -4736,23 +4789,20 @@ public:
                     copy_result = submit_admissible_direct_reads();
                     if (!copy_result.is_ready()) break;
                     size_t index = miss_count;
-                    bool unfinished_direct = false;
                     for (size_t candidate = 0; candidate < miss_count; ++candidate) {
                         const auto & candidate_flight = async_flights[candidate];
-                        unfinished_direct |= candidate_flight.direct_storage &&
-                            !candidate_flight.processed;
-                        if (!candidate_flight.processed && candidate_flight.direct_storage &&
-                                candidate_flight.direct_storage_completed) {
+                        if (!candidate_flight.processed && (candidate_flight.cold_hit ||
+                                (!candidate_flight.direct_storage && candidate_flight.read_completed &&
+                                 cold_cache->ready(candidate_flight.cold)))) {
                             index = candidate;
                             break;
                         }
                     }
-                    if (index == miss_count && !unfinished_direct) {
+                    if (index == miss_count) {
                         for (size_t candidate = 0; candidate < miss_count; ++candidate) {
                             const auto & candidate_flight = async_flights[candidate];
-                            if (!candidate_flight.processed && (candidate_flight.cold_hit ||
-                                    (candidate_flight.read_completed &&
-                                     cold_cache->ready(candidate_flight.cold)))) {
+                            if (!candidate_flight.processed && candidate_flight.direct_storage &&
+                                    candidate_flight.direct_storage_completed) {
                                 index = candidate;
                                 break;
                             }
@@ -6948,6 +6998,30 @@ public:
             }
             if (!result.is_ready()) break;
         }
+        const auto ended = cold_cache->policy_request_end(result.is_ready(), false);
+        if (result.is_ready()) result = ended;
+        if (result.is_ready()) result = validate_tier_invariants_locked();
+        return result;
+    }
+
+    llm_expert_provider_result debug_warm_cold_key_for_testing(
+            llm_expert_key key) noexcept override {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!config.cold_mode || !cold_cache || !config.storage || active_request ||
+                !key.is_valid(LLAMA_MAX_LAYERS, n_expert)) {
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::unsupported_configuration);
+        }
+        auto result = cold_cache->policy_request_begin();
+        if (!result.is_ready()) return result;
+        storage_load_context storage_context = {
+            config.storage, nullptr, nullptr, config.integrity_mode, &lock, {}, false, nullptr, nullptr,
+        };
+        storage_context.layer_ids = &layout_registry.layer_ids;
+        storage_context.layout_registry = &layout_registry;
+        llm_cold_reference reference;
+        result = cold_cache->find_or_admit_with_loader(
+            key, reference, load_storage_bundle, &storage_context);
         const auto ended = cold_cache->policy_request_end(result.is_ready(), false);
         if (result.is_ready()) result = ended;
         if (result.is_ready()) result = validate_tier_invariants_locked();
