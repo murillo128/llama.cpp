@@ -632,7 +632,19 @@ void test_native_async_cold_fill_is_best_effort_and_drained() {
     GGML_ASSERT(successful.complete_direct_storage(success_lane, success_bytes).is_ready());
     GGML_ASSERT(successful.transfer_wave(
         backend.get(), { { success_lane, hot.bundle(), 0 } }).is_ready());
-    GGML_ASSERT(successful.try_queue_cold_fill(successful_cold, success_lane).is_ready());
+    const auto queue_cold_fill = [](llm_expert_transfer_ring & ring,
+                                   llm_cold_expert_cache & cold_cache,
+                                   llm_transfer_lane_reference lane) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        do {
+            const auto result = ring.try_queue_cold_fill(cold_cache, lane);
+            if (result.is_ready()) return;
+            GGML_ASSERT(result.error == llm_expert_provider_error::busy);
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        GGML_ABORT("timed out queueing asynchronous cold fill");
+    };
+    queue_cold_fill(successful, successful_cold, success_lane);
     const auto reservation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     do {
         if (successful_cold.diagnostics().reservations == 1) break;
@@ -680,7 +692,7 @@ void test_native_async_cold_fill_is_best_effort_and_drained() {
     const uint64_t failed_bytes = populate_direct_lane(failed, failed_lane, source, 3);
     GGML_ASSERT(failed.complete_direct_storage(failed_lane, failed_bytes).is_ready());
     GGML_ASSERT(failed.transfer_wave(backend.get(), { { failed_lane, hot.bundle(), 0 } }).is_ready());
-    GGML_ASSERT(failed.try_queue_cold_fill(failed_cold, failed_lane).is_ready());
+    queue_cold_fill(failed, failed_cold, failed_lane);
     GGML_ASSERT(failed.wait_for_hot(backend.get(), 0, 2).is_ready());
     assert_slot_matches(source, hot, 3, 0);
     const auto failure_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -711,7 +723,7 @@ void test_native_async_cold_fill_is_best_effort_and_drained() {
     GGML_ASSERT(cancelled.complete_direct_storage(cancelled_lane, cancelled_bytes).is_ready());
     GGML_ASSERT(cancelled.transfer_wave(
         backend.get(), { { cancelled_lane, hot.bundle(), 0 } }).is_ready());
-    GGML_ASSERT(cancelled.try_queue_cold_fill(cancelled_cold, cancelled_lane).is_ready());
+    queue_cold_fill(cancelled, cancelled_cold, cancelled_lane);
     GGML_ASSERT(cancelled.cancel_after_h2d(cancelled_lane).is_ready());
     const auto cancel_diagnostics = cancelled.diagnostics();
     GGML_ASSERT(cancel_diagnostics.cold_fill_active == 0 &&

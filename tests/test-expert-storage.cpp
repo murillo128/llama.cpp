@@ -275,7 +275,8 @@ void test_direct_source_identity_and_explicit_support() {
     GGML_ASSERT(storage.add_bundle({ 0, 0 }, separate_bundle()).is_ready());
     GGML_ASSERT(storage.seal().is_ready());
     const auto diagnostics = storage.diagnostics();
-    GGML_ASSERT(diagnostics.direct_source_count + diagnostics.direct_unsupported_source_count == 2);
+    GGML_ASSERT(diagnostics.direct_source_count == 2);
+    GGML_ASSERT(diagnostics.direct_unsupported_source_count == 0);
     std::array<uint8_t, 5> up{};
     std::array<uint8_t, 6> gate{};
     std::array<uint8_t, 4> down{};
@@ -294,40 +295,26 @@ void test_direct_source_identity_and_explicit_support() {
     GGML_ASSERT(storage.copy_source_native_handles(transport_handles.data(), transport_handles.size(),
         transport_handle_count, true).is_ready());
     GGML_ASSERT(transport_handle_count == 2);
-    if (operations[0].direct_native_handle >= 0) {
-        GGML_ASSERT(operations[0].direct_native_handle >= 0);
-        GGML_ASSERT(operations[0].direct_alignment == diagnostics.maximum_direct_alignment);
-        GGML_ASSERT(transport_handles[0] == operations[0].direct_native_handle);
-        bool identity_rejected = false;
-        try {
-            llm_expert_storage rejected({ 1, 1, 1, 64 }, {
-                { 0, &buffered, 32, second.path.c_str(), true },
-                { 1, &buffered_second, 32, second.path.c_str(), true },
-            });
-        } catch (const std::runtime_error &) {
-            identity_rejected = true;
-        }
-        GGML_ASSERT(identity_rejected);
-    } else {
-        GGML_ASSERT(diagnostics.direct_unsupported_source_count > 0);
-        GGML_ASSERT(diagnostics.first_direct_error != 0);
+    GGML_ASSERT(operations[0].direct_native_handle >= 0);
+    GGML_ASSERT(operations[0].direct_alignment == diagnostics.maximum_direct_alignment);
+    GGML_ASSERT(transport_handles[0] == operations[0].direct_native_handle);
+    bool identity_rejected = false;
+    try {
+        llm_expert_storage rejected({ 1, 1, 1, 64 }, {
+            { 0, &buffered, 32, second.path.c_str(), true },
+            { 1, &buffered_second, 32, second.path.c_str(), true },
+        });
+    } catch (const std::runtime_error &) {
+        identity_rejected = true;
     }
+    GGML_ASSERT(identity_rejected);
 
-    llm_expert_storage unsupported({ 1, 1, 1, 64 }, {
-        { 0, &buffered, 32, nullptr, true },
-        { 1, &buffered_second, 32, nullptr, true },
+    expect_invalid([&] {
+        llm_expert_storage unsupported({ 1, 1, 1, 64 }, {
+            { 0, &buffered, 32, nullptr, true },
+            { 1, &buffered_second, 32, nullptr, true },
+        });
     });
-    GGML_ASSERT(unsupported.add_bundle({ 0, 0 }, separate_bundle()).is_ready());
-    GGML_ASSERT(unsupported.seal().is_ready());
-    const auto unsupported_diagnostics = unsupported.diagnostics();
-    GGML_ASSERT(unsupported_diagnostics.direct_source_count == 0);
-    GGML_ASSERT(unsupported_diagnostics.direct_unsupported_source_count == 2);
-    GGML_ASSERT(unsupported_diagnostics.first_direct_error == ENOTSUP);
-    transport_handle_count = 0;
-    GGML_ASSERT(unsupported.copy_source_native_handles(transport_handles.data(), transport_handles.size(),
-        transport_handle_count, true).is_ready());
-    GGML_ASSERT(transport_handle_count == 2);
-    GGML_ASSERT(transport_handles[0] >= 0 && transport_handles[1] >= 0);
 #endif
 }
 

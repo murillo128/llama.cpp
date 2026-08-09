@@ -101,25 +101,20 @@ llm_expert_storage::llm_expert_storage(llm_expert_storage_config config,
         uint64_t direct_alignment = 0;
         if (item.direct_requested) {
             if (item.path == nullptr || item.path[0] == '\0') {
-                pimpl->counters.direct_unsupported_source_count++;
-                if (pimpl->counters.first_direct_error == 0) pimpl->counters.first_direct_error = ENOTSUP;
+                throw std::invalid_argument("direct expert storage source path is required");
             } else {
                 llama_file direct_file(item.path, "rb", true);
-                if (direct_file.has_direct_io()) {
-                    direct_handle = direct_file.duplicate_read_handle();
-                    if (!(direct_handle.identity() == handle.identity()) || direct_handle.size() != handle.size()) {
-                        throw std::runtime_error("direct expert source identity or size mismatch");
-                    }
-                    direct_alignment = direct_file.read_alignment();
-                    pimpl->counters.direct_source_count++;
-                    pimpl->counters.maximum_direct_alignment = std::max(
-                        pimpl->counters.maximum_direct_alignment, direct_alignment);
-                } else {
-                    pimpl->counters.direct_unsupported_source_count++;
-                    if (pimpl->counters.first_direct_error == 0) {
-                        pimpl->counters.first_direct_error = direct_file.direct_io_error();
-                    }
+                if (!direct_file.has_direct_io()) {
+                    throw std::runtime_error("direct expert storage source is unavailable");
                 }
+                direct_handle = direct_file.duplicate_read_handle();
+                if (!(direct_handle.identity() == handle.identity()) || direct_handle.size() != handle.size()) {
+                    throw std::runtime_error("direct expert source identity or size mismatch");
+                }
+                direct_alignment = direct_file.read_alignment();
+                pimpl->counters.direct_source_count++;
+                pimpl->counters.maximum_direct_alignment = std::max(
+                    pimpl->counters.maximum_direct_alignment, direct_alignment);
             }
         }
         pimpl->sources.push_back({ item.split_index, item.alignment, std::move(handle),
@@ -358,7 +353,7 @@ llm_expert_storage_result llm_expert_storage::copy_source_native_handles(
     }
     for (const auto & source : pimpl->sources) {
         const intptr_t direct = source.direct_handle.native_handle();
-        const intptr_t handle = prefer_direct && direct >= 0 ? direct : source.handle.native_handle();
+        const intptr_t handle = prefer_direct ? direct : source.handle.native_handle();
         if (handle < 0) {
             handle_count = 0;
             return { llm_expert_storage_error::io_error, 0 };

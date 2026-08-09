@@ -87,7 +87,10 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) {
+        if (use_direct_io) {
+            throw std::runtime_error("direct I/O is not supported on Windows");
+        }
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -186,15 +189,19 @@ struct llama_file::impl {
         }
     }
 #else
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
-        // Try unbuffered I/O for read only
+        // An explicit direct-I/O request must not silently become page-cache-backed.
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
             if (init_fd()) {
                 return;
             }
-            LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
-                           fname, strerror(direct_error));
+            throw std::runtime_error(format(
+                "failed to open %s with direct I/O: %s", fname, strerror(direct_error)));
+        }
+#else
+        if (use_direct_io) {
+            throw std::runtime_error("direct I/O is not supported on this platform");
         }
 #endif
         init_fp(mode);

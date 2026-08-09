@@ -993,19 +993,27 @@ void test_shutdown_drains_inflight_read() {
 #endif
 }
 
-void test_direct_alignment_fallback_and_retry() {
+void test_direct_requirements_fail_closed() {
 #if defined(__linux__)
+    struct outcome {
+        llm_expert_async_result submission = llm_expert_async_result::invalid;
+        llm_expert_async_read_completion completion;
+        llm_expert_async_diagnostics diagnostics;
+    };
     auto run = [](scripted_async_reader & reader, uint64_t source_size,
-                  llm_expert_async_read_completion & completion) {
+                  uint64_t requested_staging_bytes = 0,
+                  intptr_t direct_native_handle = 18) {
+        outcome result;
         auto cfg = config(8);
         cfg.read_override_for_testing = &reader;
         cfg.direct_io_requested = true;
         cfg.maximum_direct_alignment = 8;
+        cfg.requested_staging_bytes = requested_staging_bytes;
         llm_expert_async_transport transport(cfg);
         std::array<uint8_t, 8> destination{};
         llm_expert_storage_read_operation read;
         read.native_handle = 17;
-        read.direct_native_handle = 18;
+        read.direct_native_handle = direct_native_handle;
         read.direct_alignment = 8;
         read.source_size = source_size;
         read.file_offset = 3;
@@ -1017,47 +1025,74 @@ void test_direct_alignment_fallback_and_retry() {
             1, { 0, 3 }, 0, { 0, 5 }, llm_expert_readiness::host_ready,
             llm_expert_priority::demand_current_layer,
         };
-        GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) == llm_expert_async_result::ready);
-        const auto result = transport.wait_read(identity.request, completion);
-        const auto diagnostics = transport.diagnostics();
-        if (result == llm_expert_async_result::ready) {
+        result.submission = transport.submit_read_plan(identity, &read, 1);
+        if (result.submission == llm_expert_async_result::ready) {
+            GGML_ASSERT(transport.wait_read(identity.request, result.completion) ==
+                result.completion.result);
+        }
+        result.diagnostics = transport.diagnostics();
+        if (result.completion.result == llm_expert_async_result::ready &&
+            result.submission == llm_expert_async_result::ready) {
             GGML_ASSERT(std::memcmp(destination.data(), reader.bytes.data() + 3, destination.size()) == 0);
         }
-        GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
-        return diagnostics;
+        if (result.submission == llm_expert_async_result::ready) {
+            GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+        }
+        return result;
     };
 
     scripted_async_reader aligned_reader;
-    llm_expert_async_read_completion completion;
-    const auto aligned = run(aligned_reader, 64, completion);
-    GGML_ASSERT(completion.result == llm_expert_async_result::ready);
-    GGML_ASSERT(aligned.direct_read_operations == 1 && aligned.direct_useful_bytes == 8);
-    GGML_ASSERT(aligned.direct_aligned_bytes == 16 && aligned.direct_scatter_bytes == 8);
-    GGML_ASSERT(aligned.buffered_fallback_operations == 0);
+    const auto aligned = run(aligned_reader, 64);
+    GGML_ASSERT(aligned.submission == llm_expert_async_result::ready &&
+        aligned.completion.result == llm_expert_async_result::ready);
+    GGML_ASSERT(aligned.diagnostics.direct_read_operations == 1 &&
+        aligned.diagnostics.direct_useful_bytes == 8);
+    GGML_ASSERT(aligned.diagnostics.direct_aligned_bytes == 16 &&
+        aligned.diagnostics.direct_scatter_bytes == 8);
+    GGML_ASSERT(aligned.diagnostics.buffered_fallback_operations == 0);
 
     scripted_async_reader tail_reader;
-    const auto tail = run(tail_reader, 11, completion);
-    GGML_ASSERT(completion.result == llm_expert_async_result::ready);
-    GGML_ASSERT(tail.direct_read_operations == 0 && tail.buffered_fallback_operations == 1);
-    GGML_ASSERT(tail.buffered_fallback_bytes == 8);
-    GGML_ASSERT((tail.fallback_reason_mask &
+    const auto tail = run(tail_reader, 11);
+    GGML_ASSERT(tail.submission == llm_expert_async_result::invalid);
+    GGML_ASSERT(tail.diagnostics.direct_read_operations == 0 &&
+        tail.diagnostics.buffered_fallback_operations == 0);
+    GGML_ASSERT((tail.diagnostics.fallback_reason_mask &
         fallback_bit(llm_expert_async_fallback_reason::direct_eof)) != 0);
+
+    scripted_async_reader staging_reader;
+    const auto staging = run(staging_reader, 64, 4);
+    GGML_ASSERT(staging.submission == llm_expert_async_result::invalid);
+    GGML_ASSERT(staging.diagnostics.buffered_fallback_operations == 0 &&
+        staging.diagnostics.direct_staging_error == ENOBUFS);
+    GGML_ASSERT((staging.diagnostics.fallback_reason_mask &
+        fallback_bit(llm_expert_async_fallback_reason::direct_staging)) != 0);
+
+    scripted_async_reader unavailable_reader;
+    const auto unavailable = run(unavailable_reader, 64, 0, -1);
+    GGML_ASSERT(unavailable.submission == llm_expert_async_result::invalid);
+    GGML_ASSERT(unavailable.diagnostics.direct_read_operations == 0 &&
+        unavailable.diagnostics.buffered_fallback_operations == 0);
+    GGML_ASSERT((unavailable.diagnostics.fallback_reason_mask &
+        fallback_bit(llm_expert_async_fallback_reason::direct_alignment)) != 0);
 
     scripted_async_reader capability_reader;
     capability_reader.error_code = EINVAL;
     capability_reader.actions = { scripted_async_reader::action::error };
-    const auto capability = run(capability_reader, 64, completion);
-    GGML_ASSERT(completion.result == llm_expert_async_result::ready);
-    GGML_ASSERT(capability.direct_capability_retries == 1);
-    GGML_ASSERT(capability.buffered_fallback_operations == 1);
-    GGML_ASSERT((capability.fallback_reason_mask &
-        fallback_bit(llm_expert_async_fallback_reason::direct_capability)) != 0);
+    const auto capability = run(capability_reader, 64);
+    GGML_ASSERT(capability.submission == llm_expert_async_result::ready &&
+        capability.completion.result == llm_expert_async_result::invalid &&
+        capability.completion.native_error == EINVAL);
+    GGML_ASSERT(capability.diagnostics.direct_capability_retries == 0 &&
+        capability.diagnostics.buffered_fallback_operations == 0);
 
     scripted_async_reader hard_error_reader;
     hard_error_reader.actions = { scripted_async_reader::action::error };
-    const auto hard_error = run(hard_error_reader, 64, completion);
-    GGML_ASSERT(completion.result == llm_expert_async_result::invalid && completion.native_error == EIO);
-    GGML_ASSERT(hard_error.direct_capability_retries == 0 && hard_error.buffered_fallback_operations == 0);
+    const auto hard_error = run(hard_error_reader, 64);
+    GGML_ASSERT(hard_error.submission == llm_expert_async_result::ready &&
+        hard_error.completion.result == llm_expert_async_result::invalid &&
+        hard_error.completion.native_error == EIO);
+    GGML_ASSERT(hard_error.diagnostics.direct_capability_retries == 0 &&
+        hard_error.diagnostics.buffered_fallback_operations == 0);
 #endif
 }
 
@@ -1206,7 +1241,7 @@ int main() {
     test_model_owner_drains_before_provider_destination_destroy();
     test_fallback_retry_error_and_cancel_races();
     test_shutdown_drains_inflight_read();
-    test_direct_alignment_fallback_and_retry();
+    test_direct_requirements_fail_closed();
     test_direct_positional_workers_use_independent_staging();
     test_concurrent_bounded_access();
     test_reversed_fake_cq_and_saturation();

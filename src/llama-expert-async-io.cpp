@@ -349,8 +349,6 @@ struct llm_expert_async_transport::impl {
     uint64_t staging_bytes = 0;
     uint64_t staging_stride_bytes = 0;
     uint64_t staging_alignment = 0;
-    std::vector<intptr_t> direct_disabled_handles;
-    uint32_t direct_disabled_handle_count = 0;
     bool staging_registered = false;
     bool ring_submit_paused_for_testing = false;
     bool read_cqe_injected_for_testing = false;
@@ -392,27 +390,12 @@ struct llm_expert_async_transport::impl {
         }
     }
 
-    bool direct_is_disabled(intptr_t handle) const {
-        for (uint32_t index = 0; index < direct_disabled_handle_count; ++index) {
-            if (direct_disabled_handles[index] == handle) return true;
-        }
-        return false;
-    }
-
-    bool disable_direct(intptr_t handle) {
-        if (handle < 0 || direct_is_disabled(handle)) return handle >= 0;
-        if (direct_disabled_handle_count == direct_disabled_handles.size()) return false;
-        direct_disabled_handles[direct_disabled_handle_count++] = handle;
-        return true;
-    }
-
     bool prepare_direct(const operation_record & operation, void * direct_staging,
             uint64_t direct_staging_bytes, uint64_t & aligned_offset,
             uint64_t & aligned_bytes) const {
         aligned_offset = 0;
         aligned_bytes = 0;
         if (!config.direct_io_requested || operation.read.direct_native_handle < 0 ||
-            direct_is_disabled(operation.read.direct_native_handle) ||
             operation.read.direct_alignment == 0 || operation.read.direct_alignment > staging_alignment ||
             direct_staging == nullptr || !is_power_of_two(operation.read.direct_alignment)) return false;
         uint64_t useful_end = 0;
@@ -424,6 +407,43 @@ struct llm_expert_async_transport::impl {
         if (rounded_end < aligned_offset || rounded_end > operation.read.source_size) return false;
         aligned_bytes = rounded_end - aligned_offset;
         return aligned_bytes != 0 && aligned_bytes <= direct_staging_bytes && aligned_bytes <= UINT32_MAX;
+    }
+
+    llm_expert_async_fallback_reason direct_requirement_failure(
+            const operation_record & operation, void * direct_staging,
+            uint64_t direct_staging_bytes, int & native_error) const {
+        native_error = EINVAL;
+        if (operation.read.direct_native_handle < 0 || operation.read.direct_alignment == 0 ||
+            !is_power_of_two(operation.read.direct_alignment) ||
+            operation.read.direct_alignment > staging_alignment) {
+            native_error = operation.read.direct_native_handle < 0 ? ENOTSUP : EINVAL;
+            return llm_expert_async_fallback_reason::direct_alignment;
+        }
+        if (direct_staging == nullptr || direct_staging_bytes == 0) {
+            native_error = ENOBUFS;
+            return llm_expert_async_fallback_reason::direct_staging;
+        }
+        uint64_t useful_end = 0;
+        uint64_t rounded_end = 0;
+        const uint64_t aligned_offset = operation.read.file_offset &
+            ~(operation.read.direct_alignment - 1);
+        if (!checked_add(operation.read.file_offset, operation.read.byte_count, useful_end) ||
+            !checked_add(useful_end, operation.read.direct_alignment - 1, rounded_end)) {
+            return llm_expert_async_fallback_reason::direct_alignment;
+        }
+        rounded_end &= ~(operation.read.direct_alignment - 1);
+        if (rounded_end < aligned_offset || rounded_end > operation.read.source_size) {
+            return llm_expert_async_fallback_reason::direct_eof;
+        }
+        const uint64_t aligned_bytes = rounded_end - aligned_offset;
+        if (aligned_bytes == 0 || aligned_bytes > UINT32_MAX) {
+            return llm_expert_async_fallback_reason::direct_alignment;
+        }
+        if (aligned_bytes > direct_staging_bytes) {
+            native_error = ENOBUFS;
+            return llm_expert_async_fallback_reason::direct_staging;
+        }
+        return llm_expert_async_fallback_reason::direct_alignment;
     }
 
 #if defined(__linux__)
@@ -440,6 +460,8 @@ struct llm_expert_async_transport::impl {
             sqe.off = direct_offset;
             sqe.fd = int(operation.read.direct_native_handle);
             if (staging_registered) sqe.buf_index = 0;
+        } else if (config.direct_io_requested) {
+            return false;
         } else if (operation.read.segment_count == 1) {
             const auto & segment = operation.read.segments[0];
             sqe.opcode = IORING_OP_READ;
@@ -800,8 +822,7 @@ struct llm_expert_async_transport::impl {
     }
 
     bool run_ring(llm_expert_request_handle handle, llm_expert_async_read_completion & completion,
-            intptr_t & direct_capability_handle, bool & transport_failed) {
-        direct_capability_handle = -1;
+            bool & transport_failed) {
         transport_failed = false;
         size_t next = 0;
         size_t remaining = 0;
@@ -823,12 +844,26 @@ struct llm_expert_async_transport::impl {
                     completion.result = llm_expert_async_result::closed;
                     return false;
                 }
+                if (config.direct_io_requested) {
+                    uint64_t direct_offset = 0;
+                    uint64_t direct_bytes = 0;
+                    if (!prepare_direct(operation, staging, staging_bytes,
+                            direct_offset, direct_bytes)) {
+                        completion.result = llm_expert_async_result::invalid;
+                        completion.native_error = EINVAL;
+                        return false;
+                    }
+                }
                 io_uring_sqe * sqe = ring.acquire_sqe();
                 if (sqe == nullptr) break;
                 batch_slots[batch] = uint32_t(next);
                 operation.ring_completed = false;
                 operation.cancel_submitted = false;
-                (void) fill_read_sqe(uint32_t(next), *sqe);
+                if (!fill_read_sqe(uint32_t(next), *sqe)) {
+                    completion.result = llm_expert_async_result::invalid;
+                    completion.native_error = EINVAL;
+                    return false;
+                }
                 batch++;
                 if (config.direct_io_requested) {
                     ++next;
@@ -848,7 +883,7 @@ struct llm_expert_async_transport::impl {
                     // submission cannot safely leave the unpublished tail for a later request.
                     // Closing the ring blocks until the kernel releases every submitted file,
                     // iovec, and destination reference; the complete unpublished bundle can
-                    // then be retried by the buffered positional fallback.
+                    // then be retried by the positional path without changing its I/O mode.
                     ring.close_ring();
                     {
                         std::lock_guard<std::mutex> guard(mutex);
@@ -1025,13 +1060,6 @@ struct llm_expert_async_transport::impl {
                     "completed_bytes", cqe.res > 0 ? uint64_t(cqe.res) : 0, "native_result", cqe.res);
                 read_completions_left--;
                 if (cqe.res < 0) {
-                    uint64_t ignored_offset = 0;
-                    uint64_t ignored_bytes = 0;
-                    const bool direct = prepare_direct(
-                        operation, staging, staging_bytes, ignored_offset, ignored_bytes);
-                    if (direct && (cqe.res == -EINVAL || cqe.res == -EOPNOTSUPP || cqe.res == -ENOTSUP)) {
-                        direct_capability_handle = operation.read.direct_native_handle;
-                    }
                     if (cqe.res != -ECANCELED || !cancel_requested) {
                         if (first_error == llm_expert_async_result::ready) {
                             first_error = llm_expert_async_result::invalid;
@@ -1065,24 +1093,14 @@ struct llm_expert_async_transport::impl {
                     counters.direct_aligned_bytes += direct_bytes;
                     counters.direct_scatter_bytes += operation.read.byte_count;
                 } else {
-                    completion.bytes_completed += uint64_t(cqe.res);
-                    operation.completed_bytes = uint64_t(cqe.res);
                     if (config.direct_io_requested) {
-                        counters.buffered_fallback_operations++;
-                        counters.buffered_fallback_bytes += operation.read.byte_count;
-                        uint64_t useful_end = 0;
-                        uint64_t rounded_end = 0;
-                        const bool eof_tail = operation.read.direct_alignment != 0 &&
-                            checked_add(operation.read.file_offset, operation.read.byte_count, useful_end) &&
-                            checked_add(useful_end, operation.read.direct_alignment - 1, rounded_end) &&
-                            (rounded_end & ~(operation.read.direct_alignment - 1)) > operation.read.source_size;
-                        const auto reason = eof_tail ? llm_expert_async_fallback_reason::direct_eof :
-                            (staging == nullptr || staging_bytes == 0 ?
-                                llm_expert_async_fallback_reason::direct_staging :
-                                llm_expert_async_fallback_reason::direct_alignment);
-                        record_fallback(reason, 0, eof_tail ? "direct-eof" :
-                            (reason == llm_expert_async_fallback_reason::direct_staging ?
-                                "direct-staging" : "direct-alignment"));
+                        if (first_error == llm_expert_async_result::ready) {
+                            first_error = llm_expert_async_result::invalid;
+                            first_native_error = EINVAL;
+                        }
+                    } else {
+                        completion.bytes_completed += uint64_t(cqe.res);
+                        operation.completed_bytes = uint64_t(cqe.res);
                     }
                 }
                 counters.ring_completions++;
@@ -1169,34 +1187,15 @@ struct llm_expert_async_transport::impl {
             if (counters.io_uring_enabled && config.read_override_for_testing == nullptr) {
                 used_ring = true;
                 execute_fallback = false;
-                intptr_t direct_capability_handle = -1;
                 bool transport_failed = false;
-                bool ring_ready = run_ring(handle, completion, direct_capability_handle, transport_failed);
-                if (!ring_ready && !transport_failed &&
-                    completion.result == llm_expert_async_result::invalid && direct_capability_handle >= 0 &&
-                    (completion.native_error == EINVAL || completion.native_error == EOPNOTSUPP ||
-                     completion.native_error == ENOTSUP)) {
-                    {
-                        std::lock_guard<std::mutex> guard(mutex);
-                        (void) disable_direct(direct_capability_handle);
-                        counters.direct_capability_retries++;
-                        record_fallback(llm_expert_async_fallback_reason::direct_capability,
-                            completion.native_error, "direct-capability");
-                    }
-                    completion = {};
-                    completion.result = llm_expert_async_result::ready;
-                    completion.submit_us = uint64_t(ggml_time_us());
-                    completion.request = handle;
-                    direct_capability_handle = -1;
-                    ring_ready = run_ring(handle, completion, direct_capability_handle, transport_failed);
-                }
+                bool ring_ready = run_ring(handle, completion, transport_failed);
                 if (!ring_ready && transport_failed) {
                     completion = {};
                     completion.result = llm_expert_async_result::ready;
                     completion.submit_us = uint64_t(ggml_time_us());
                     completion.request = handle;
                     execute_fallback = true;
-                    ring_fallback_buffered = true;
+                    ring_fallback_buffered = !config.direct_io_requested;
                     used_ring = false;
                 }
             }
@@ -1306,44 +1305,11 @@ struct llm_expert_async_transport::impl {
                         counters.direct_aligned_bytes += aligned_bytes;
                         counters.direct_scatter_bytes += operation.byte_count;
                     }
-                    if (completion.result == llm_expert_async_result::invalid &&
-                        (completion.native_error == EINVAL || completion.native_error == EOPNOTSUPP ||
-                         completion.native_error == ENOTSUP)) {
-                        const int direct_error = completion.native_error;
-                        force_buffered = true;
-                        const uint64_t submit_us = completion.submit_us;
-                        completion = {};
-                        completion.result = llm_expert_async_result::ready;
-                        completion.submit_us = submit_us;
-                        completion.request = handle;
-                        operation_index = size_t(-1);
-                        std::lock_guard<std::mutex> guard(mutex);
-                        (void) disable_direct(operation.direct_native_handle);
-                        counters.direct_capability_retries++;
-                        record_fallback(llm_expert_async_fallback_reason::direct_capability,
-                            direct_error, "direct-capability");
-                        continue;
-                    }
                 } else {
-                    {
-                        std::lock_guard<std::mutex> guard(mutex);
-                        if (config.direct_io_requested) {
-                            counters.buffered_fallback_operations++;
-                            counters.buffered_fallback_bytes += operation.byte_count;
-                            uint64_t useful_end = 0;
-                            uint64_t rounded_end = 0;
-                            const bool eof_tail = operation.direct_alignment != 0 &&
-                                checked_add(operation.file_offset, operation.byte_count, useful_end) &&
-                                checked_add(useful_end, operation.direct_alignment - 1, rounded_end) &&
-                                (rounded_end & ~(operation.direct_alignment - 1)) > operation.source_size;
-                            const auto reason = eof_tail ? llm_expert_async_fallback_reason::direct_eof :
-                                (worker_staging == nullptr || worker_staging_bytes == 0 ?
-                                    llm_expert_async_fallback_reason::direct_staging :
-                                    llm_expert_async_fallback_reason::direct_alignment);
-                            record_fallback(reason, 0, eof_tail ? "direct-eof" :
-                                (reason == llm_expert_async_fallback_reason::direct_staging ?
-                                    "direct-staging" : "direct-alignment"));
-                        }
+                    if (config.direct_io_requested) {
+                        completion.result = llm_expert_async_result::invalid;
+                        completion.native_error = EINVAL;
+                        break;
                     }
                     for (uint8_t segment_index = 0; segment_index < operation.segment_count; ++segment_index) {
                         const auto & segment = operation.segments[segment_index];
@@ -1484,7 +1450,6 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     pimpl->group_handles.resize(config.request_capacity);
     pimpl->workers.reserve(config.worker_count);
     pimpl->registered_files.resize(config.source_file_capacity == 0 ? 256 : config.source_file_capacity);
-    pimpl->direct_disabled_handles.resize(pimpl->registered_files.size());
     for (auto & operation : pimpl->operations) {
         operation.generation = config.initial_operation_generation_for_testing;
     }
@@ -1506,8 +1471,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
         pimpl->batch_slots.capacity()*sizeof(uint32_t) +
         pimpl->group_handles.capacity()*sizeof(llm_expert_request_handle) +
         pimpl->workers.capacity()*sizeof(std::thread) +
-        pimpl->registered_files.capacity()*sizeof(int) +
-        pimpl->direct_disabled_handles.capacity()*sizeof(intptr_t);
+        pimpl->registered_files.capacity()*sizeof(int);
 #if defined(__linux__)
     if (config.direct_io_requested && staging_allocation_bytes != 0 &&
         config.maximum_direct_alignment != 0) {
@@ -1808,6 +1772,29 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
     for (size_t index = 0; index < read_count; ++index) {
         if (reads[index].layout_class_id != identity.layout_class_id) {
             return llm_expert_async_result::invalid;
+        }
+        if (pimpl->config.direct_io_requested) {
+            impl::operation_record candidate;
+            candidate.read = reads[index];
+            uint64_t aligned_offset = 0;
+            uint64_t aligned_bytes = 0;
+            const uint64_t direct_staging_bytes = pimpl->staging_stride_bytes != 0 ?
+                pimpl->staging_stride_bytes : pimpl->staging_bytes;
+            if (!pimpl->prepare_direct(candidate, pimpl->staging, direct_staging_bytes,
+                    aligned_offset, aligned_bytes)) {
+                int native_error = 0;
+                const auto reason = pimpl->direct_requirement_failure(
+                    candidate, pimpl->staging, direct_staging_bytes, native_error);
+                const char * detail = reason == llm_expert_async_fallback_reason::direct_eof ?
+                    "direct-eof" : reason == llm_expert_async_fallback_reason::direct_staging ?
+                        "direct-staging" : "direct-alignment";
+                pimpl->record_fallback(reason, native_error, detail);
+                if (reason == llm_expert_async_fallback_reason::direct_staging &&
+                    pimpl->counters.direct_staging_error == 0) {
+                    pimpl->counters.direct_staging_error = native_error;
+                }
+                return llm_expert_async_result::invalid;
+            }
         }
     }
     auto & request = pimpl->read_requests[identity.request.slot];
