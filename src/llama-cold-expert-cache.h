@@ -31,6 +31,7 @@ struct llm_cold_reference {
 };
 
 enum class llm_cold_demand_lookup {
+    missing,
     reserved,
     joined_loading,
     ready,
@@ -173,6 +174,10 @@ public:
             llm_cold_reference & reference,
             bool & hit) noexcept;
     llm_expert_provider_result reserve_or_join_demand(
+            llm_expert_key key,
+            llm_cold_reference & reference,
+            llm_cold_demand_lookup & lookup) noexcept;
+    llm_expert_provider_result lookup_demand(
             llm_expert_key key,
             llm_cold_reference & reference,
             llm_cold_demand_lookup & lookup) noexcept;

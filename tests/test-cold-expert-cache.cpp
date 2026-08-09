@@ -541,6 +541,36 @@ void test_demand_joins_loading_speculative_cold_generation() {
     GGML_ASSERT(cache.surrender().is_ready());
 }
 
+void test_lookup_only_demand_does_not_admit_or_evict() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+
+    llm_cold_reference reference;
+    llm_cold_demand_lookup lookup = llm_cold_demand_lookup::ready;
+    GGML_ASSERT(cache.lookup_demand({ 0, 3 }, reference, lookup).is_ready());
+    GGML_ASSERT(lookup == llm_cold_demand_lookup::missing);
+    auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.requests == 1 && diagnostics.misses == 1 &&
+        diagnostics.reservations == 0 && diagnostics.admissions == 0 && diagnostics.evictions == 0);
+
+    llm_cold_reference loading;
+    bool hit = false;
+    GGML_ASSERT(cache.reserve_or_find({ 0, 1 }, loading, hit).is_ready() && !hit);
+    GGML_ASSERT(cache.lookup_demand({ 0, 1 }, reference, lookup).is_ready());
+    GGML_ASSERT(lookup == llm_cold_demand_lookup::joined_loading &&
+        reference.slot == loading.slot && reference.generation == loading.generation);
+    GGML_ASSERT(cache.publish_ready({ 0, 1 }, loading).is_ready());
+    GGML_ASSERT(cache.lookup_demand({ 0, 1 }, reference, lookup).is_ready());
+    GGML_ASSERT(lookup == llm_cold_demand_lookup::ready &&
+        reference.slot == loading.slot && reference.generation == loading.generation);
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.reservations == 1 && diagnostics.admissions == 1 &&
+        diagnostics.evictions == 0 && diagnostics.hits == 1);
+    GGML_ASSERT(cache.validate_invariants().is_ready());
+    GGML_ASSERT(cache.surrender().is_ready());
+}
+
 } // namespace
 
 int main() {
@@ -557,6 +587,7 @@ int main() {
     test_loader_publication_failure_cleanup_and_reread();
     test_speculative_free_or_speculative_admission_and_reclassification();
     test_demand_joins_loading_speculative_cold_generation();
+    test_lookup_only_demand_does_not_admit_or_evict();
     std::cout << "cold expert cache tests passed\n";
     return 0;
 }

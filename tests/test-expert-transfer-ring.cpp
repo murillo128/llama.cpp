@@ -1,5 +1,6 @@
 #include "llama-expert-transfer-ring.h"
 #include "llama-expert-scheduler.h"
+#include "llama-expert-storage.h"
 #include "llama-hparams.h"
 
 #include "ggml-cpp.h"
@@ -136,6 +137,54 @@ void test_budget_fallback_and_wave() {
     GGML_ASSERT(diagnostics.synchronous_copies == 6);
     GGML_ASSERT(diagnostics.h2d_bytes == diagnostics.lane_payload_bytes*2);
     GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+    GGML_ASSERT(ring.validate_invariants().is_ready());
+}
+
+void test_direct_storage_lane_bypasses_cold_staging() {
+    fixture source(4);
+    fixture hot(2, false);
+    llm_expert_transfer_ring ring(ring_config(1U << 20));
+    GGML_ASSERT(ring.initialize(source.bundle()).is_ready());
+
+    llm_transfer_lane_reference lane;
+    const llm_expert_flight_id flight = { 1, 2, 3, { 0, 2 }, 0, 0 };
+    GGML_ASSERT(ring.reserve_direct_storage(0, 1, 7, lane, flight).is_ready());
+    std::array<llm_expert_storage_destination, 12> destinations;
+    size_t destination_count = 0;
+    GGML_ASSERT(ring.storage_destinations(
+        lane, destinations.data(), destinations.size(), destination_count).is_ready());
+    GGML_ASSERT(destination_count == 3);
+    uint64_t copied = 0;
+    const auto source_bundle = source.bundle();
+    for (size_t index = 0; index < destination_count; ++index) {
+        const auto & destination = destinations[index];
+        const ggml_tensor * tensor = destination.projection == llm_expert_storage_projection::up ?
+            source_bundle.up.weight : destination.projection == llm_expert_storage_projection::gate ?
+                source_bundle.gate.weight : source_bundle.down.weight;
+        GGML_ASSERT(destination.sidecar == llm_expert_storage_sidecar::weight &&
+            tensor != nullptr && destination.extent == tensor->nb[2]);
+        std::memcpy(destination.data,
+            static_cast<const uint8_t *>(tensor->data) + 2*tensor->nb[2], destination.extent);
+        copied += destination.extent;
+    }
+    GGML_ASSERT(ring.complete_direct_storage(lane, copied).is_ready());
+    GGML_ASSERT(ring.complete_direct_storage(lane, copied).error ==
+        llm_expert_provider_error::metadata_mismatch);
+    GGML_ASSERT(ring.diagnostics().lanes[lane.lane].direct_storage_complete);
+    GGML_ASSERT(ring.transfer_wave(nullptr, { { lane, hot.bundle(), 1 } }).is_ready());
+    assert_slot_matches(source, hot, 2, 1);
+    auto diagnostics = ring.diagnostics();
+    GGML_ASSERT(diagnostics.direct_storage_reservations == 1 &&
+        diagnostics.direct_storage_completions == 1 && diagnostics.direct_storage_bytes == copied &&
+        diagnostics.stage_bytes == 0 && diagnostics.lanes[lane.lane].state == llm_transfer_lane_state::free);
+    GGML_ASSERT(ring.validate_invariants().is_ready());
+
+    GGML_ASSERT(ring.reserve_direct_storage(0, 0, 8, lane).is_ready());
+    GGML_ASSERT(ring.discard_staging(lane).is_ready());
+    diagnostics = ring.diagnostics();
+    GGML_ASSERT(diagnostics.direct_storage_reservations == 2 &&
+        diagnostics.direct_storage_completions == 1 &&
+        diagnostics.lanes[lane.lane].state == llm_transfer_lane_state::free);
     GGML_ASSERT(ring.validate_invariants().is_ready());
 }
 
@@ -522,6 +571,7 @@ void test_native_event_ordering_reuse_and_unload() {
 
 int main() {
     test_budget_fallback_and_wave();
+    test_direct_storage_lane_bypasses_cold_staging();
     test_three_layout_classes_reuse_universal_lanes();
     test_failures_cleanup_and_busy_surrender();
     test_budget_and_generation_rejection();

@@ -1,4 +1,5 @@
 #include "llama-expert-transfer-ring.h"
+#include "llama-expert-storage.h"
 #include "llama-perfetto-trace.h"
 
 #include "ggml-cpp.h"
@@ -279,6 +280,8 @@ struct llm_expert_transfer_ring::impl {
         lane.compute_monitoring = false;
         lane.ordered_release = false;
         lane.cancelled = false;
+        lane.direct_storage = false;
+        lane.direct_storage_complete = false;
         lane.background_queued = false;
         lane.background_running = false;
         lane.background_cold = {};
@@ -320,7 +323,7 @@ struct llm_expert_transfer_ring::impl {
                     { uint32_t(&lane - lanes.data()), lane.generation, lane.layout_class_id }, lane.hot_slot, lane.hot_generation,
                     lane.h2d_enqueue_us, lane.h2d_complete_us, lane.compute_begin_us,
                     lane.compute_complete_us, payload_for(lane.layout_class_id),
-                    lane.compute_work_id, lane.compute_work, lane.cancelled };
+                    lane.compute_work_id, lane.compute_work, lane.cancelled, lane.direct_storage };
             } else {
                 counters.trace_records_dropped++;
             }
@@ -844,6 +847,129 @@ llm_expert_provider_result llm_expert_transfer_ring::reserve(
     return llm_expert_provider_result::success();
 }
 
+llm_expert_provider_result llm_expert_transfer_ring::reserve_direct_storage(
+        llm_expert_layout_class_id layout_class_id,
+        uint32_t hot_slot,
+        uint64_t hot_generation,
+        llm_transfer_lane_reference & reference,
+        llm_expert_flight_id flight,
+        bool wait_for_lane) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.transfer", "direct_storage_lane_reserve",
+        "layout_class_id", layout_class_id, "hot_slot", hot_slot,
+        "hot_generation", hot_generation, "flight_slot", flight.request_slot,
+        "flight_generation", flight.request_generation, "device_id", flight.target_device);
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->arena) return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
+    uint32_t index = 0;
+    while (index < pimpl->lanes.size() && pimpl->lanes[index].state != llm_transfer_lane_state::free) index++;
+    if (index == pimpl->lanes.size() && wait_for_lane) {
+        pimpl->condition.wait(lock, [&] {
+            for (const auto & lane : pimpl->lanes) {
+                if (lane.state == llm_transfer_lane_state::free ||
+                    (lane.state == llm_transfer_lane_state::in_flight && lane.event_complete &&
+                     !lane.hold_after_h2d && (!lane.compute_pending || lane.compute_complete))) return true;
+            }
+            return false;
+        });
+        for (index = 0; index < pimpl->lanes.size(); ++index) {
+            if (pimpl->lanes[index].state == llm_transfer_lane_state::free) break;
+            if (pimpl->lanes[index].state == llm_transfer_lane_state::in_flight &&
+                pimpl->lanes[index].event_complete && !pimpl->lanes[index].hold_after_h2d &&
+                (!pimpl->lanes[index].compute_pending || pimpl->lanes[index].compute_complete)) {
+                pimpl->release_lane(pimpl->lanes[index]);
+                break;
+            }
+        }
+    }
+    if (index == pimpl->lanes.size()) return llm_expert_provider_result::failure(llm_expert_provider_error::busy);
+    auto & lane = pimpl->lanes[index];
+    if (lane.generation == std::numeric_limits<uint64_t>::max()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::generation_exhausted);
+    }
+    if (layout_class_id >= pimpl->spans_by_class.size() ||
+        (flight.valid() && flight.layout_class_id != layout_class_id)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    lane.generation++;
+    lane.state = llm_transfer_lane_state::staging;
+    lane.layout_class_id = layout_class_id;
+    lane.hot_slot = hot_slot;
+    lane.hot_generation = hot_generation;
+    lane.flight = flight;
+    lane.direct_storage = true;
+    lane.direct_storage_complete = false;
+    reference = { index, lane.generation, layout_class_id };
+    pimpl->counters.lane_reservations++;
+    pimpl->counters.direct_storage_reservations++;
+    LLM_EXPERT_TRACE_INSTANT("k3.transfer", "direct_storage_lane_reserved", "lane", index,
+        "event_generation", lane.generation, "layout_class_id", layout_class_id,
+        "device_id", flight.target_device);
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "transfer_lane_occupancy", 6, pimpl->occupied_lanes());
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::storage_destinations(
+        llm_transfer_lane_reference reference,
+        llm_expert_storage_destination * destinations,
+        size_t destination_capacity,
+        size_t & destination_count) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    destination_count = 0;
+    if (!pimpl->valid_lane(reference) ||
+        pimpl->lanes[reference.lane].state != llm_transfer_lane_state::staging ||
+        !pimpl->lanes[reference.lane].direct_storage) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    const auto * spans = pimpl->spans_for(reference.layout_class_id);
+    if (spans == nullptr || destinations == nullptr || destination_capacity < spans->size()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    }
+    for (const auto & span : *spans) {
+        destinations[destination_count++] = {
+            static_cast<llm_expert_storage_projection>(span.projection),
+            static_cast<llm_expert_storage_sidecar>(span.member),
+            pimpl->base + size_t(reference.lane)*pimpl->counters.lane_footprint + span.offset,
+            span.bytes,
+            reference.layout_class_id,
+        };
+    }
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::complete_direct_storage(
+        llm_transfer_lane_reference reference,
+        uint64_t bytes) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->valid_lane(reference) ||
+        pimpl->lanes[reference.lane].state != llm_transfer_lane_state::staging ||
+        !pimpl->lanes[reference.lane].direct_storage ||
+        pimpl->lanes[reference.lane].direct_storage_complete ||
+        bytes != pimpl->payload_for(reference.layout_class_id)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    pimpl->counters.direct_storage_completions++;
+    pimpl->counters.direct_storage_bytes += bytes;
+    pimpl->lanes[reference.lane].direct_storage_complete = true;
+    LLM_EXPERT_TRACE_INSTANT("k3.transfer", "direct_storage_complete", "lane", reference.lane,
+        "event_generation", reference.generation, "layout_class_id", reference.layout_class_id,
+        "bytes", bytes);
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_expert_transfer_ring::discard_staging(
+        llm_transfer_lane_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (reference.lane >= pimpl->lanes.size() ||
+        pimpl->lanes[reference.lane].generation != reference.generation ||
+        pimpl->lanes[reference.lane].layout_class_id != reference.layout_class_id ||
+        pimpl->lanes[reference.lane].state != llm_transfer_lane_state::staging) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    pimpl->release_lane(pimpl->lanes[reference.lane]);
+    pimpl->condition.notify_all();
+    return llm_expert_provider_result::success();
+}
+
 llm_expert_provider_result llm_expert_transfer_ring::stage(
         llm_transfer_lane_reference reference,
         const llm_expert_bundle_descriptor & cold_bundle) noexcept {
@@ -930,7 +1056,9 @@ llm_expert_provider_result llm_expert_transfer_ring::transfer_wave(
     for (const auto & binding : bindings) {
         if (!pimpl->valid_lane(binding.lane) ||
             pimpl->lanes[binding.lane.lane].state != llm_transfer_lane_state::staging ||
-            pimpl->lanes[binding.lane.lane].hot_slot != binding.hot_slot) {
+            pimpl->lanes[binding.lane.lane].hot_slot != binding.hot_slot ||
+            (pimpl->lanes[binding.lane.lane].direct_storage &&
+             !pimpl->lanes[binding.lane.lane].direct_storage_complete)) {
             fail_bindings();
             return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
         }
@@ -1537,7 +1665,13 @@ llm_expert_provider_result llm_expert_transfer_ring::validate_invariants() noexc
         if (lane.state == llm_transfer_lane_state::free && lane.cold_cache != nullptr) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
-        if (lane.state != llm_transfer_lane_state::free && lane.cold_cache == nullptr) {
+        if (lane.state != llm_transfer_lane_state::free && lane.cold_cache == nullptr && !lane.direct_storage) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        if (lane.cold_cache != nullptr && lane.direct_storage) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        if (lane.direct_storage_complete && !lane.direct_storage) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
         inflight += lane.state == llm_transfer_lane_state::in_flight;

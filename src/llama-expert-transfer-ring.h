@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+struct llm_expert_storage_destination;
+
 enum class llm_transfer_lane_state {
     free,
     staging,
@@ -51,6 +53,7 @@ struct llm_transfer_interval {
     uint64_t compute_work_id = 0;
     uint64_t compute_work = 0;
     bool cancelled = false;
+    bool direct_storage = false;
 };
 
 struct llm_transfer_ring_faults {
@@ -85,6 +88,9 @@ struct llm_transfer_ring_diagnostics {
     uint64_t pinned_or_registered_bytes = 0;
     uint64_t fallback_count = 0;
     uint64_t lane_reservations = 0;
+    uint64_t direct_storage_reservations = 0;
+    uint64_t direct_storage_completions = 0;
+    uint64_t direct_storage_bytes = 0;
     uint64_t stage_bytes = 0;
     std::vector<uint64_t> class_stage_bundles;
     std::vector<uint64_t> class_stage_bytes;
@@ -143,6 +149,8 @@ struct llm_transfer_ring_diagnostics {
         llm_cold_reference cold;
         uint32_t hot_slot = 0;
         uint64_t hot_generation = 0;
+        bool direct_storage = false;
+        bool direct_storage_complete = false;
     };
     std::vector<lane> lanes;
 };
@@ -174,6 +182,23 @@ public:
         uint64_t hot_generation,
         llm_transfer_lane_reference & lane,
         llm_expert_flight_id flight = {}) noexcept;
+    llm_expert_provider_result reserve_direct_storage(
+        llm_expert_layout_class_id layout_class_id,
+        uint32_t hot_slot,
+        uint64_t hot_generation,
+        llm_transfer_lane_reference & lane,
+        llm_expert_flight_id flight = {},
+        bool wait_for_lane = true) noexcept;
+    llm_expert_provider_result storage_destinations(
+        llm_transfer_lane_reference lane,
+        llm_expert_storage_destination * destinations,
+        size_t destination_capacity,
+        size_t & destination_count) noexcept;
+    llm_expert_provider_result complete_direct_storage(
+        llm_transfer_lane_reference lane,
+        uint64_t bytes) noexcept;
+    llm_expert_provider_result discard_staging(
+        llm_transfer_lane_reference lane) noexcept;
     llm_expert_provider_result stage(
         llm_transfer_lane_reference lane,
         const llm_expert_bundle_descriptor & cold_bundle) noexcept;
