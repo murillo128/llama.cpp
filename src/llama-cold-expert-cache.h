@@ -214,7 +214,8 @@ public:
     llm_expert_provider_result policy_request_begin() noexcept;
     llm_expert_provider_result policy_set_ubatch_ordinal(uint64_t ordinal) noexcept;
     llm_expert_provider_result policy_phase_transition(llm_expert_cache_policy_phase phase) noexcept;
-    llm_expert_provider_result policy_request_end(bool success, bool cancelled) noexcept;
+    llm_expert_provider_result policy_request_end(
+        bool success, bool cancelled, bool allow_deferred_terminals = false) noexcept;
     llm_expert_provider_result trim() noexcept;
     llm_expert_provider_result surrender() noexcept;
     llm_expert_provider_result validate_invariants(

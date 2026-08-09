@@ -36,6 +36,7 @@ struct llm_transfer_ring_config {
     bool allow_controlled_compute_for_testing = false;
     ggml_backend_event_t h2d_gate_event_for_testing = nullptr;
     uint32_t delay_background_stage_ms_for_testing = 0;
+    uint32_t delay_cold_fill_ms_for_testing = 0;
     llm_expert_phase8_test_control * phase8_test_control = nullptr;
 };
 
@@ -61,6 +62,7 @@ struct llm_transfer_ring_faults {
     size_t fail_stage_after_spans = SIZE_MAX;
     bool fail_pre_enqueue = false;
     bool fail_cleanup = false;
+    bool fail_cold_fill = false;
 };
 
 struct llm_transfer_binding {
@@ -91,6 +93,15 @@ struct llm_transfer_ring_diagnostics {
     uint64_t direct_storage_reservations = 0;
     uint64_t direct_storage_completions = 0;
     uint64_t direct_storage_bytes = 0;
+    uint64_t cold_fill_attempts = 0;
+    uint64_t cold_fill_queued = 0;
+    uint64_t cold_fill_dropped = 0;
+    uint64_t cold_fill_completed = 0;
+    uint64_t cold_fill_failed = 0;
+    uint64_t cold_fill_bytes = 0;
+    uint64_t cold_fill_time_us = 0;
+    uint32_t cold_fill_active = 0;
+    uint32_t cold_fill_peak_active = 0;
     uint64_t stage_bytes = 0;
     std::vector<uint64_t> class_stage_bundles;
     std::vector<uint64_t> class_stage_bytes;
@@ -197,6 +208,9 @@ public:
     llm_expert_provider_result complete_direct_storage(
         llm_transfer_lane_reference lane,
         uint64_t bytes) noexcept;
+    llm_expert_provider_result try_queue_cold_fill(
+        llm_cold_expert_cache & cold_cache,
+        llm_transfer_lane_reference lane) noexcept;
     llm_expert_provider_result discard_staging(
         llm_transfer_lane_reference lane) noexcept;
     llm_expert_provider_result stage(
@@ -208,7 +222,8 @@ public:
     // Model-load seed path: use the ring's bounded transfer backend and wait
     // until every destination is device-ready before returning.
     llm_expert_provider_result transfer_wave_blocking(
-        const std::vector<llm_transfer_binding> & bindings) noexcept;
+        const std::vector<llm_transfer_binding> & bindings,
+        llm_cold_expert_cache * cold_fill_cache = nullptr) noexcept;
     // Atomically reserve and queue a background transfer. The Phase 8 path
     // does not wait for the ring mutex; explicit Phase 9 policy ordering may
     // wait for that bounded critical section, but never for a free lane.

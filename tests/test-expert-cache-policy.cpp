@@ -191,6 +191,22 @@ void test_free_pin_failure_and_exhaustion() {
     require(active_load.validate_free(0),
         "failed ordered terminal restores policy free state");
 
+    llm_expert_cache_policy deferred_load;
+    require(deferred_load.initialize(make_config(LLAMA_EXPERT_CACHE_POLICY_LRU),
+        llm_expert_cache_policy_tier::cold, layers, 1, 4, 1, 1, 128, 8).is_ready(),
+        "initialize deferred cold-load fixture");
+    begin(deferred_load);
+    demand(deferred_load, 0, 0);
+    require(deferred_load.load_begin(0, 1, { 0, 0 }, 64, 128).is_ready() &&
+        deferred_load.request_end(true, false, true).is_ready(),
+        "opt-in cold fill may outlive its originating request");
+    require(deferred_load.load_complete(0, 1).is_ready() &&
+        deferred_load.validate_resident(0, 1, { 0, 0 }),
+        "deferred cold terminal publishes after request end");
+    begin(deferred_load);
+    require(deferred_load.request_end(true, false).is_ready(),
+        "deferred cold terminal leaves the next request well formed");
+
     llm_expert_cache_policy multi_pin;
     require(multi_pin.initialize(make_config(LLAMA_EXPERT_CACHE_POLICY_LRU),
         llm_expert_cache_policy_tier::hot, layers, 1, 4, 1, 1, 128, 7).is_ready(),

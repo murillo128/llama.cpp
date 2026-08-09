@@ -866,6 +866,16 @@ struct llm_hot_cache_diagnostics {
     uint64_t ring_direct_storage_reservations = 0;
     uint64_t ring_direct_storage_completions = 0;
     uint64_t ring_direct_storage_bytes = 0;
+    bool async_cold_fill_configured = false;
+    uint64_t ring_cold_fill_attempts = 0;
+    uint64_t ring_cold_fill_queued = 0;
+    uint64_t ring_cold_fill_dropped = 0;
+    uint64_t ring_cold_fill_completed = 0;
+    uint64_t ring_cold_fill_failed = 0;
+    uint64_t ring_cold_fill_bytes = 0;
+    uint64_t ring_cold_fill_time_us = 0;
+    uint32_t ring_cold_fill_active = 0;
+    uint32_t ring_cold_fill_peak_active = 0;
     uint64_t ring_stage_bytes = 0;
     uint64_t ring_stage_time_us = 0;
     uint64_t ring_async_enqueues = 0;
@@ -1373,6 +1383,7 @@ struct llm_hot_cache_config {
     uint32_t trace_capacity = 256;
     llama_expert_miss_policy miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
     bool background_promotion = false;
+    bool async_cold_fill = false;
     bool phase10_lead_trace = false;
     llm_expert_prefetch_config_internal prefetch_config = {};
     llm_expert_prefetch_profile prefetch_profile = {};

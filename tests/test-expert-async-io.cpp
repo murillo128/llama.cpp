@@ -206,11 +206,12 @@ void test_configuration() {
     invalid_workers.worker_count = 2;
     expect_invalid([&] { llm_expert_async_transport invalid(invalid_workers); });
 
-    auto invalid_direct_workers = config(8);
-    invalid_direct_workers.force_positional_reads = true;
-    invalid_direct_workers.direct_io_requested = true;
-    invalid_direct_workers.worker_count = llm_expert_resolve_io_worker_count(0, 2, false);
-    expect_invalid([&] { llm_expert_async_transport invalid(invalid_direct_workers); });
+    auto direct_positional_workers = config(8);
+    direct_positional_workers.force_positional_reads = true;
+    direct_positional_workers.direct_io_requested = true;
+    direct_positional_workers.worker_count = llm_expert_resolve_io_worker_count(2, 1, true);
+    llm_expert_async_transport direct_positional(direct_positional_workers);
+    GGML_ASSERT(direct_positional.diagnostics().worker_count == 2);
 }
 
 void test_ring_layout_validation() {
@@ -1060,6 +1061,78 @@ void test_direct_alignment_fallback_and_retry() {
 #endif
 }
 
+void test_direct_positional_workers_use_independent_staging() {
+#if defined(__linux__)
+    struct concurrent_reader final : llm_expert_async_read_override {
+        int64_t read_at(intptr_t, void * destination, size_t byte_count,
+                uint64_t file_offset, int &) noexcept override {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                arrived++;
+                condition.notify_all();
+                condition.wait(lock, [&] { return arrived == 2; });
+            }
+            auto * bytes = static_cast<uint8_t *>(destination);
+            for (size_t index = 0; index < byte_count; ++index) {
+                bytes[index] = uint8_t(file_offset + index);
+            }
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                filled++;
+                condition.notify_all();
+                condition.wait(lock, [&] { return filled == 2; });
+            }
+            return int64_t(byte_count);
+        }
+
+        std::mutex mutex;
+        std::condition_variable condition;
+        uint32_t arrived = 0;
+        uint32_t filled = 0;
+    } reader;
+
+    auto cfg = config(8);
+    cfg.read_override_for_testing = &reader;
+    cfg.direct_io_requested = true;
+    cfg.maximum_direct_alignment = 8;
+    cfg.force_positional_reads = true;
+    cfg.worker_count = 2;
+    llm_expert_async_transport transport(cfg);
+    std::array<std::array<uint8_t, 8>, 2> destinations{};
+    for (uint32_t index = 0; index < 2; ++index) {
+        llm_expert_storage_read_operation read;
+        read.native_handle = 17;
+        read.direct_native_handle = 18;
+        read.direct_alignment = 8;
+        read.source_size = 64;
+        read.file_offset = index*16;
+        read.byte_count = destinations[index].size();
+        read.segment_count = 1;
+        read.segments[0] = { destinations[index].data(), destinations[index].size(),
+            read.file_offset, llm_expert_storage_projection::up,
+            llm_expert_storage_sidecar::weight };
+        const llm_expert_async_operation_identity identity = {
+            1, { index, uint64_t(index) + 1 }, 0, { 0, int32_t(index) },
+            llm_expert_readiness::host_ready, llm_expert_priority::demand_current_layer,
+        };
+        GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) ==
+            llm_expert_async_result::ready);
+    }
+    for (uint32_t index = 0; index < 2; ++index) {
+        const llm_expert_request_handle handle = { index, uint64_t(index) + 1 };
+        llm_expert_async_read_completion completion;
+        GGML_ASSERT(transport.wait_read(handle, completion) == llm_expert_async_result::ready);
+        for (size_t byte = 0; byte < destinations[index].size(); ++byte) {
+            GGML_ASSERT(destinations[index][byte] == uint8_t(index*16 + byte));
+        }
+        GGML_ASSERT(transport.release_read(handle) == llm_expert_async_result::ready);
+    }
+    const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(diagnostics.direct_read_operations == 2);
+    GGML_ASSERT(diagnostics.staging_ceiling_bytes == 8U*1024U*1024U);
+#endif
+}
+
 void test_concurrent_bounded_access() {
     llm_expert_async_transport transport(config(8));
     std::vector<std::thread> threads;
@@ -1134,6 +1207,7 @@ int main() {
     test_fallback_retry_error_and_cancel_races();
     test_shutdown_drains_inflight_read();
     test_direct_alignment_fallback_and_retry();
+    test_direct_positional_workers_use_independent_staging();
     test_concurrent_bounded_access();
     test_reversed_fake_cq_and_saturation();
     return 0;

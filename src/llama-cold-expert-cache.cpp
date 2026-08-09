@@ -1753,10 +1753,11 @@ llm_expert_provider_result llm_cold_expert_cache::policy_phase_transition(
 }
 
 llm_expert_provider_result llm_cold_expert_cache::policy_request_end(
-        bool success, bool cancelled) noexcept {
+        bool success, bool cancelled, bool allow_deferred_terminals) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (!pimpl->policy_request_active) return llm_expert_provider_result::success();
-    const auto result = policy_result(pimpl->policy.request_end(success, cancelled));
+    const auto result = policy_result(pimpl->policy.request_end(
+        success, cancelled, allow_deferred_terminals));
     if (result.is_ready()) pimpl->policy_request_active = false;
     return result;
 }

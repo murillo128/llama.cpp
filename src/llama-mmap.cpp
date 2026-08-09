@@ -214,27 +214,34 @@ struct llama_file::impl {
             }
 
             size = file_stats.st_size;
+            bool alignment_reported = false;
 #if defined(STATX_DIOALIGN)
             struct statx direct_info{};
             const int statx_result = statx(
                 fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT, STATX_DIOALIGN, &direct_info);
-            if (statx_result != 0 || (direct_info.stx_mask & STATX_DIOALIGN) == 0 ||
-                direct_info.stx_dio_mem_align == 0 || direct_info.stx_dio_offset_align == 0 ||
-                (direct_info.stx_dio_mem_align & (direct_info.stx_dio_mem_align - 1)) != 0 ||
-                (direct_info.stx_dio_offset_align & (direct_info.stx_dio_offset_align - 1)) != 0) {
-                direct_error = statx_result != 0 ? errno : EOPNOTSUPP;
-                close(fd);
-                fd = -1;
-                return false;
+            if (statx_result == 0 && (direct_info.stx_mask & STATX_DIOALIGN) != 0 &&
+                direct_info.stx_dio_mem_align != 0 && direct_info.stx_dio_offset_align != 0 &&
+                (direct_info.stx_dio_mem_align & (direct_info.stx_dio_mem_align - 1)) == 0 &&
+                (direct_info.stx_dio_offset_align & (direct_info.stx_dio_offset_align - 1)) == 0) {
+                alignment = std::max<size_t>({ direct_info.stx_dio_mem_align,
+                    direct_info.stx_dio_offset_align, sizeof(void *) });
+                alignment_reported = true;
             }
-            alignment = std::max<size_t>({ direct_info.stx_dio_mem_align,
-                direct_info.stx_dio_offset_align, sizeof(void *) });
-#else
-            direct_error = EOPNOTSUPP;
-            close(fd);
-            fd = -1;
-            return false;
 #endif
+            if (!alignment_reported) {
+                const size_t block_alignment = file_stats.st_blksize > 0 ?
+                    size_t(file_stats.st_blksize) : 0;
+                if (block_alignment < sizeof(void *) ||
+                    (block_alignment & (block_alignment - 1)) != 0) {
+                    direct_error = EOPNOTSUPP;
+                    close(fd);
+                    fd = -1;
+                    return false;
+                }
+                // Some ext4/kernel combinations support O_DIRECT but do not report
+                // STATX_DIOALIGN. The aligned read probe below remains authoritative.
+                alignment = block_alignment;
+            }
 
             void * probe = nullptr;
             const int allocation_error = posix_memalign(&probe, alignment, alignment);
@@ -461,6 +468,14 @@ size_t llama_file::size() const { return pimpl->size; }
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 int llama_file::direct_io_error() const { return pimpl->direct_io_error(); }
+
+int llama_file::advise_random() const {
+#if defined(_WIN32) || !defined(POSIX_FADV_RANDOM)
+    return EINVAL;
+#else
+    return posix_fadvise(file_id(), 0, 0, POSIX_FADV_RANDOM);
+#endif
+}
 
 int llama_file::file_id() const {
 #ifdef _WIN32

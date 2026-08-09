@@ -2040,8 +2040,13 @@ public:
             throw std::invalid_argument("invalid expert miss policy");
         }
         if (!config.cold_mode && (hybrid_policy || config.background_promotion ||
-                                  config.auto_cost_model.version != 0 || config.auto_cost_model_digest != 0)) {
+                                  config.async_cold_fill || config.auto_cost_model.version != 0 ||
+                                  config.auto_cost_model_digest != 0)) {
             throw std::invalid_argument("miss-policy configuration outside cold mode");
+        }
+        if (config.async_cold_fill &&
+            config.miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
+            throw std::invalid_argument("async cold fill requires PROMOTE_AND_GPU");
         }
         if (config.prefetch_profile_loaded != phase10_active ||
             (!config.prefetch_config.supplied && config.phase10_serial_issue_for_testing)) {
@@ -2896,6 +2901,12 @@ public:
                     wave_result = transfer_rings[device]->transfer_wave(
                         device_backends[device], device_transfers[device]);
                     if (!wave_result.is_ready()) break;
+                    if (config.async_cold_fill) {
+                        for (const auto & transfer : device_transfers[device]) {
+                            (void) transfer_rings[device]->try_queue_cold_fill(
+                                *cold_cache, transfer.lane);
+                        }
+                    }
                     auto & dependencies = binding.devices[device].h2d_dependencies;
                     GGML_ASSERT(device_transfers[device].size() ==
                         device_transfer_hot_generations[device].size());
@@ -2956,7 +2967,8 @@ public:
                                     llm_expert_provider_error::copy_failed);
                             }
                         }
-                        return transfer_rings[device]->transfer_wave_blocking(device_transfers[device]);
+                        return transfer_rings[device]->transfer_wave_blocking(
+                            device_transfers[device], config.async_cold_fill ? cold_cache.get() : nullptr);
                     }));
                 }
                 for (auto & transfer : transfers) {
@@ -3095,8 +3107,12 @@ public:
                 result = cold_cache->lookup_demand(flight.key, flight.cold, lookup);
                 if (!result.is_ready()) return fail_multi(result);
                 if (lookup == llm_cold_demand_lookup::joined_loading) {
-                    return fail_multi(llm_expert_provider_result::failure(
-                        llm_expert_provider_error::metadata_mismatch));
+                    if (!config.async_cold_fill) {
+                        return fail_multi(llm_expert_provider_result::failure(
+                            llm_expert_provider_error::metadata_mismatch));
+                    }
+                    flight.cold = {};
+                    lookup = llm_cold_demand_lookup::missing;
                 }
                 flight.cold_hit = lookup == llm_cold_demand_lookup::ready;
                 flight.direct_storage = lookup == llm_cold_demand_lookup::missing;
@@ -4575,7 +4591,11 @@ public:
                     llm_cold_demand_lookup lookup = llm_cold_demand_lookup::missing;
                     copy_result = cold_cache->lookup_demand(flight.key, flight.cold, lookup);
                     if (!copy_result.is_ready()) break;
-                    if (!flight.scheduler_active && lookup == llm_cold_demand_lookup::joined_loading) {
+                    if (config.async_cold_fill && lookup == llm_cold_demand_lookup::joined_loading) {
+                        flight.cold = {};
+                        lookup = llm_cold_demand_lookup::missing;
+                    } else if (!flight.scheduler_active &&
+                            lookup == llm_cold_demand_lookup::joined_loading) {
                         record_first_wait();
                         if (provider_lock != nullptr) provider_lock->unlock();
                         copy_result = cold_cache->wait_until_ready(flight.cold);
@@ -4893,6 +4913,10 @@ public:
                             pool->bundles[flight.flight_id.layout_class_id], slot });
                         copy_result = transfer_ring->transfer_wave(execution_backend, transfer_bindings);
                         if (copy_result.is_ready()) flight.h2d_submitted = true;
+                        if (copy_result.is_ready() && config.async_cold_fill && flight.direct_storage) {
+                            (void) transfer_ring->try_queue_cold_fill(
+                                *cold_cache, transfer_lanes[index]);
+                        }
                         if (copy_result.is_ready()) {
                             copy_result = inject_remote_failure_after_enqueue();
                         }
@@ -6183,6 +6207,7 @@ public:
         llm_hot_cache_diagnostics result;
         result.configured_miss_policy = config.miss_policy;
         result.background_promotion_configured = config.background_promotion;
+        result.async_cold_fill_configured = config.async_cold_fill;
         result.auto_cost_model_version = config.auto_cost_model.version;
         result.auto_cost_model_digest = config.auto_cost_model_digest;
         result.hybrid_bindings = hybrid_bindings;
@@ -6584,6 +6609,16 @@ public:
             }
             if (index < transfer_rings.size() && transfer_rings[index]) {
                 const auto ring = transfer_rings[index]->diagnostics();
+                result.ring_cold_fill_attempts += ring.cold_fill_attempts;
+                result.ring_cold_fill_queued += ring.cold_fill_queued;
+                result.ring_cold_fill_dropped += ring.cold_fill_dropped;
+                result.ring_cold_fill_completed += ring.cold_fill_completed;
+                result.ring_cold_fill_failed += ring.cold_fill_failed;
+                result.ring_cold_fill_bytes += ring.cold_fill_bytes;
+                result.ring_cold_fill_time_us += ring.cold_fill_time_us;
+                result.ring_cold_fill_active += ring.cold_fill_active;
+                result.ring_cold_fill_peak_active = std::max(
+                    result.ring_cold_fill_peak_active, ring.cold_fill_peak_active);
                 device.ring_requested_bytes = ring.requested_bytes;
                 device.ring_actual_bytes = ring.actual_bytes;
                 device.ring_pinned_or_registered_bytes = ring.pinned_or_registered_bytes;
@@ -6665,6 +6700,15 @@ public:
             result.ring_direct_storage_reservations = ring.direct_storage_reservations;
             result.ring_direct_storage_completions = ring.direct_storage_completions;
             result.ring_direct_storage_bytes = ring.direct_storage_bytes;
+            result.ring_cold_fill_attempts = ring.cold_fill_attempts;
+            result.ring_cold_fill_queued = ring.cold_fill_queued;
+            result.ring_cold_fill_dropped = ring.cold_fill_dropped;
+            result.ring_cold_fill_completed = ring.cold_fill_completed;
+            result.ring_cold_fill_failed = ring.cold_fill_failed;
+            result.ring_cold_fill_bytes = ring.cold_fill_bytes;
+            result.ring_cold_fill_time_us = ring.cold_fill_time_us;
+            result.ring_cold_fill_active = ring.cold_fill_active;
+            result.ring_cold_fill_peak_active = ring.cold_fill_peak_active;
             result.ring_stage_bytes = ring.stage_bytes;
             result.ring_stage_time_us = ring.stage_time_us;
             result.ring_async_enqueues = ring.async_enqueues;
@@ -9112,7 +9156,7 @@ private:
     llm_expert_provider_result end_policy_request_locked(bool success, bool cancelled) noexcept {
         auto result = cache_policy_result(hot_policy.request_end(success, cancelled));
         if (result.is_ready() && cold_cache) {
-            result = cold_cache->policy_request_end(success, cancelled);
+            result = cold_cache->policy_request_end(success, cancelled, config.async_cold_fill);
         }
         return result;
     }

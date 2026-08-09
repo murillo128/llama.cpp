@@ -70,6 +70,12 @@ void test_model_parameter_validation_and_copy() {
     outside_cold = defaults;
     outside_cold.expert_background_promotion = true;
     expect_invalid([&] { validation_model model(outside_cold); });
+    outside_cold = defaults;
+    outside_cold.expert_async_cold_fill = true;
+    expect_invalid([&] { validation_model model(outside_cold); });
+    outside_cold = defaults;
+    outside_cold.expert_io_random_access = true;
+    expect_invalid([&] { validation_model model(outside_cold); });
 
     auto cost = valid_cost_model();
     auto non_auto_cost = defaults;
@@ -100,6 +106,22 @@ void test_model_parameter_validation_and_copy() {
     const auto original_decode_cost = copied.copied_cost()->cpu_fixed_decode_ns;
     cost.cpu_fixed_decode_ns++;
     GGML_ASSERT(copied.copied_cost()->cpu_fixed_decode_ns == original_decode_cost);
+
+    auto async_fill = automatic;
+    async_fill.expert_miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
+    async_fill.expert_auto_cost_model = nullptr;
+    async_fill.expert_async_cold_fill = true;
+    validation_model async_fill_model(async_fill);
+
+    async_fill.expert_miss_policy = LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
+    expect_invalid([&] { validation_model model(async_fill); });
+
+    auto random_direct = async_fill;
+    random_direct.expert_miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
+    random_direct.expert_async_cold_fill = false;
+    random_direct.expert_io_random_access = true;
+    random_direct.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+    expect_invalid([&] { validation_model model(random_direct); });
 }
 
 void mark_inactive_capable(ggml_tensor * tensor) {
@@ -114,6 +136,7 @@ void test_defaults_and_lane_validation() {
     const auto params = llama_model_default_params();
     GGML_ASSERT(params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU);
     GGML_ASSERT(!params.expert_background_promotion);
+    GGML_ASSERT(!params.expert_async_cold_fill);
     GGML_ASSERT(params.expert_auto_cost_model == nullptr);
 
     const int32_t gpu[] = { 0, -1, 1, -1 };

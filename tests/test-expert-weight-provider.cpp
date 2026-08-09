@@ -116,6 +116,9 @@ void test_default_and_model_ownership() {
     GGML_ASSERT(params.expert_cold_cache_bytes == 0);
     GGML_ASSERT(params.expert_transfer_ring_bytes == 0);
     GGML_ASSERT(params.expert_device_count == 1);
+    GGML_ASSERT(params.expert_io_worker_count == 0);
+    GGML_ASSERT(!params.expert_io_force_positional_reads);
+    GGML_ASSERT(!params.expert_io_random_access);
     GGML_ASSERT(params.expert_peer_transport == LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED);
     GGML_ASSERT(params.expert_peer_staging_bytes == 0);
     GGML_ASSERT(params.expert_role_config == nullptr);

@@ -1386,12 +1386,17 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     const bool hybrid_policy = params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
         params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
     if (!cold_mode && !uma_mode && (hybrid_policy || params.expert_background_promotion ||
-                       params.expert_auto_cost_model != nullptr)) {
+                       params.expert_async_cold_fill || params.expert_auto_cost_model != nullptr)) {
         throw std::invalid_argument("non-default expert miss configuration requires cold-cache mode");
     }
     if (uma_mode && (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU ||
-        params.expert_background_promotion || params.expert_auto_cost_model != nullptr)) {
+        params.expert_background_promotion || params.expert_async_cold_fill ||
+        params.expert_auto_cost_model != nullptr)) {
         throw std::invalid_argument("UMA-cache mode requires PROMOTE_AND_GPU without background promotion");
+    }
+    if (params.expert_async_cold_fill &&
+        params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
+        throw std::invalid_argument("async expert cold fill requires PROMOTE_AND_GPU");
     }
     if (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_AUTO &&
         params.expert_auto_cost_model != nullptr) {
@@ -1430,6 +1435,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     }
     if ((cold_mode || uma_mode) && params.load_mode != LLAMA_LOAD_MODE_MMAP && params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO) {
         throw std::invalid_argument("cold-cache and UMA-cache modes require mmap or direct-I/O source tensors");
+    }
+    if (params.expert_io_random_access &&
+        ((!cold_mode && !uma_mode) || params.load_mode != LLAMA_LOAD_MODE_MMAP)) {
+        throw std::invalid_argument("expert random-access advice requires buffered cold/UMA-cache mode");
     }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1650,6 +1659,7 @@ void llama_model::init_expert_weight_provider() {
                 config.trace_capacity = pimpl->expert_async_transport->diagnostics().trace_capacity;
                 config.miss_policy = params.expert_miss_policy;
                 config.background_promotion = params.expert_background_promotion;
+                config.async_cold_fill = params.expert_async_cold_fill;
                 config.peer_transport = params.expert_peer_transport;
                 config.peer_staging_bytes = params.expert_peer_staging_bytes;
                 if (distributed_roles) {
@@ -1806,8 +1816,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     }
     const uint32_t hot_capacity = expert_hot_cache_capacity();
     const uint32_t expert_devices = expert_device_count();
-    const bool positional_reads = params.expert_io_force_positional_reads &&
-        params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO;
+    const bool positional_reads = params.expert_io_force_positional_reads;
     const uint32_t io_worker_count = llm_expert_resolve_io_worker_count(
         params.expert_io_worker_count, expert_devices, positional_reads);
     if (io_worker_count == 0) {
@@ -2399,6 +2408,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, llama_load_mode_name(params.load_mode));
+
+    if (params.expert_io_random_access) {
+        for (const auto & file : ml.files) {
+            const int error = file->advise_random();
+            if (error != 0) {
+                throw std::runtime_error(format(
+                    "%s: POSIX_FADV_RANDOM failed: %s", __func__, std::strerror(error)));
+            }
+        }
+    }
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -3567,8 +3586,10 @@ llama_model_params llama_model_default_params() {
         /*.expert_io_trace_capacity    =*/ 0,
         /*.expert_io_staging_bytes     =*/ 0,
         /*.expert_io_force_positional_reads =*/ false,
+        /*.expert_io_random_access     =*/ false,
         /*.expert_miss_policy          =*/ LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU,
         /*.expert_background_promotion =*/ false,
+        /*.expert_async_cold_fill      =*/ false,
         /*.expert_auto_cost_model      =*/ nullptr,
         /*.expert_hot_cache_policy     =*/ nullptr,
         /*.expert_cold_cache_policy    =*/ nullptr,
