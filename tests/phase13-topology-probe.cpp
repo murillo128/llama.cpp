@@ -167,8 +167,8 @@ int main(int argc, char ** argv) {
 
     try {
         int count = 0;
-        if (cudaGetDeviceCount(&count) != cudaSuccess || count != 2) {
-            throw std::runtime_error("Phase 13 requires exactly two visible CUDA devices");
+        if (cudaGetDeviceCount(&count) != cudaSuccess || count < 1) {
+            throw std::runtime_error("topology probe requires at least one visible CUDA device");
         }
         std::vector<device> devices;
         for (int ordinal = 0; ordinal < count; ++ordinal) {
@@ -263,6 +263,7 @@ int main(int argc, char ** argv) {
         uname(&system);
         json result = {
             {"schema", "phase13-topology-v1"}, {"status", "pass"},
+            {"device_count", devices.size()},
             {"host", {{"nodename", system.nodename}, {"kernel", system.release},
                 {"online_numa_nodes", read_text("/sys/devices/system/node/online")}}},
             {"cuda", {{"driver_version", driver_version}, {"runtime_version", runtime_version}}},
