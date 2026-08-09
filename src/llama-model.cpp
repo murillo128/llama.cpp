@@ -1255,6 +1255,12 @@ bool llm_expert_transport_edge_required(
         (source == 0 || destination == 0);
 }
 
+uint32_t llm_expert_resolve_io_worker_count(
+        uint32_t requested_count, uint32_t legacy_count, bool positional_reads) noexcept {
+    if (requested_count == 0) return legacy_count;
+    return positional_reads && requested_count <= 8 ? requested_count : 0;
+}
+
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     LLM_EXPERT_TRACE_SCOPE("k3.request", "model_create", "expert_weights_mode", uint32_t(params.expert_weights_mode));
     if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_DISABLED &&
@@ -1802,12 +1808,11 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     const uint32_t expert_devices = expert_device_count();
     const bool positional_reads = params.expert_io_force_positional_reads &&
         params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO;
-    if (params.expert_io_worker_count != 0 &&
-        (!positional_reads || params.expert_io_worker_count > 8)) {
+    const uint32_t io_worker_count = llm_expert_resolve_io_worker_count(
+        params.expert_io_worker_count, expert_devices, positional_reads);
+    if (io_worker_count == 0) {
         throw std::invalid_argument("invalid explicit expert I/O worker count");
     }
-    const uint32_t io_worker_count = params.expert_io_worker_count != 0 ?
-        params.expert_io_worker_count : (positional_reads ? expert_devices : 1);
     const uint64_t request_capacity_64 = std::max<uint64_t>(16, uint64_t(hot_capacity)*4);
     if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
     const uint32_t request_capacity = uint32_t(request_capacity_64);

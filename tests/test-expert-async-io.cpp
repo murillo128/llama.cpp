@@ -136,6 +136,12 @@ private:
 };
 
 void test_configuration() {
+    GGML_ASSERT(llm_expert_resolve_io_worker_count(0, 2, false) == 2);
+    GGML_ASSERT(llm_expert_resolve_io_worker_count(0, 2, true) == 2);
+    GGML_ASSERT(llm_expert_resolve_io_worker_count(2, 1, true) == 2);
+    GGML_ASSERT(llm_expert_resolve_io_worker_count(1, 2, false) == 0);
+    GGML_ASSERT(llm_expert_resolve_io_worker_count(9, 2, true) == 0);
+
     expect_invalid([] { llm_expert_async_transport transport({}); });
     expect_invalid([] { llm_expert_async_transport transport(config(7)); });
     expect_invalid([] { llm_expert_async_transport transport(config(4097)); });
@@ -199,6 +205,12 @@ void test_configuration() {
     auto invalid_workers = config(8);
     invalid_workers.worker_count = 2;
     expect_invalid([&] { llm_expert_async_transport invalid(invalid_workers); });
+
+    auto invalid_direct_workers = config(8);
+    invalid_direct_workers.force_positional_reads = true;
+    invalid_direct_workers.direct_io_requested = true;
+    invalid_direct_workers.worker_count = llm_expert_resolve_io_worker_count(0, 2, false);
+    expect_invalid([&] { llm_expert_async_transport invalid(invalid_direct_workers); });
 }
 
 void test_ring_layout_validation() {
