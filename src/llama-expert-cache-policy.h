@@ -222,7 +222,8 @@ public:
     llm_expert_cache_policy_result load_failed(uint32_t slot, uint64_t generation) noexcept;
     llm_expert_cache_policy_result pin(uint32_t slot, uint64_t generation) noexcept;
     llm_expert_cache_policy_result unpin(uint32_t slot, uint64_t generation) noexcept;
-    llm_expert_cache_policy_result request_end(bool success, bool cancelled) noexcept;
+    llm_expert_cache_policy_result request_end(
+        bool success, bool cancelled, bool allow_deferred_terminals = false) noexcept;
     llm_expert_cache_policy_result validate_event_capacity(size_t count) const noexcept;
     llm_expert_cache_policy_result remove_resident(uint32_t slot, uint64_t generation) noexcept;
     llm_expert_cache_policy_result reset() noexcept;

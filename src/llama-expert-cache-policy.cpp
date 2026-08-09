@@ -1029,8 +1029,10 @@ llm_expert_cache_policy_result llm_expert_cache_policy::unpin(uint32_t slot, uin
     return result;
 }
 
-llm_expert_cache_policy_result llm_expert_cache_policy::request_end(bool success, bool cancelled) noexcept {
-    if (!request_active || (success && cancelled) || reserved_terminal_events != 0) {
+llm_expert_cache_policy_result llm_expert_cache_policy::request_end(
+        bool success, bool cancelled, bool allow_deferred_terminals) noexcept {
+    if (!request_active || (success && cancelled) ||
+        (!allow_deferred_terminals && reserved_terminal_events != 0)) {
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::invalid_event);
     }
     const auto capacity = preflight_events();

@@ -1,5 +1,6 @@
 #include "llama-expert-transfer-ring.h"
 #include "llama-expert-scheduler.h"
+#include "llama-expert-storage.h"
 #include "llama-hparams.h"
 
 #include "ggml-cpp.h"
@@ -99,6 +100,49 @@ void assert_slot_matches(const fixture & source, const fixture & hot, int32_t ex
     }
 }
 
+void assert_bundle_slot_matches(
+        const fixture & source,
+        const llm_expert_bundle_descriptor & destination,
+        int32_t expert,
+        uint32_t slot) {
+    const auto source_bundle = source.bundle();
+    for (const auto & pair : {
+            std::pair<const ggml_tensor *, const ggml_tensor *>(source_bundle.up.weight, destination.up.weight),
+            std::pair<const ggml_tensor *, const ggml_tensor *>(source_bundle.gate.weight, destination.gate.weight),
+            std::pair<const ggml_tensor *, const ggml_tensor *>(source_bundle.down.weight, destination.down.weight) }) {
+        const size_t span = pair.first->nb[2];
+        std::vector<uint8_t> expected(span), actual(span);
+        ggml_backend_tensor_get(pair.first, expected.data(), size_t(expert)*span, span);
+        ggml_backend_tensor_get(pair.second, actual.data(), size_t(slot)*pair.second->nb[2], span);
+        GGML_ASSERT(expected == actual);
+    }
+}
+
+uint64_t populate_direct_lane(
+        llm_expert_transfer_ring & ring,
+        llm_transfer_lane_reference lane,
+        const fixture & source,
+        int32_t expert) {
+    std::array<llm_expert_storage_destination, 12> destinations;
+    size_t destination_count = 0;
+    GGML_ASSERT(ring.storage_destinations(
+        lane, destinations.data(), destinations.size(), destination_count).is_ready());
+    const auto source_bundle = source.bundle();
+    uint64_t copied = 0;
+    for (size_t index = 0; index < destination_count; ++index) {
+        const auto & destination = destinations[index];
+        const ggml_tensor * tensor = destination.projection == llm_expert_storage_projection::up ?
+            source_bundle.up.weight : destination.projection == llm_expert_storage_projection::gate ?
+                source_bundle.gate.weight : source_bundle.down.weight;
+        GGML_ASSERT(destination.sidecar == llm_expert_storage_sidecar::weight && tensor != nullptr &&
+            destination.extent == tensor->nb[2]);
+        std::memcpy(destination.data,
+            static_cast<const uint8_t *>(tensor->data) + size_t(expert)*tensor->nb[2], destination.extent);
+        copied += destination.extent;
+    }
+    return copied;
+}
+
 void test_budget_fallback_and_wave() {
     fixture source(4);
     fixture hot(2, false);
@@ -136,6 +180,54 @@ void test_budget_fallback_and_wave() {
     GGML_ASSERT(diagnostics.synchronous_copies == 6);
     GGML_ASSERT(diagnostics.h2d_bytes == diagnostics.lane_payload_bytes*2);
     GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
+    GGML_ASSERT(ring.validate_invariants().is_ready());
+}
+
+void test_direct_storage_lane_bypasses_cold_staging() {
+    fixture source(4);
+    fixture hot(2, false);
+    llm_expert_transfer_ring ring(ring_config(1U << 20));
+    GGML_ASSERT(ring.initialize(source.bundle()).is_ready());
+
+    llm_transfer_lane_reference lane;
+    const llm_expert_flight_id flight = { 1, 2, 3, { 0, 2 }, 0, 0 };
+    GGML_ASSERT(ring.reserve_direct_storage(0, 1, 7, lane, flight).is_ready());
+    std::array<llm_expert_storage_destination, 12> destinations;
+    size_t destination_count = 0;
+    GGML_ASSERT(ring.storage_destinations(
+        lane, destinations.data(), destinations.size(), destination_count).is_ready());
+    GGML_ASSERT(destination_count == 3);
+    uint64_t copied = 0;
+    const auto source_bundle = source.bundle();
+    for (size_t index = 0; index < destination_count; ++index) {
+        const auto & destination = destinations[index];
+        const ggml_tensor * tensor = destination.projection == llm_expert_storage_projection::up ?
+            source_bundle.up.weight : destination.projection == llm_expert_storage_projection::gate ?
+                source_bundle.gate.weight : source_bundle.down.weight;
+        GGML_ASSERT(destination.sidecar == llm_expert_storage_sidecar::weight &&
+            tensor != nullptr && destination.extent == tensor->nb[2]);
+        std::memcpy(destination.data,
+            static_cast<const uint8_t *>(tensor->data) + 2*tensor->nb[2], destination.extent);
+        copied += destination.extent;
+    }
+    GGML_ASSERT(ring.complete_direct_storage(lane, copied).is_ready());
+    GGML_ASSERT(ring.complete_direct_storage(lane, copied).error ==
+        llm_expert_provider_error::metadata_mismatch);
+    GGML_ASSERT(ring.diagnostics().lanes[lane.lane].direct_storage_complete);
+    GGML_ASSERT(ring.transfer_wave(nullptr, { { lane, hot.bundle(), 1 } }).is_ready());
+    assert_slot_matches(source, hot, 2, 1);
+    auto diagnostics = ring.diagnostics();
+    GGML_ASSERT(diagnostics.direct_storage_reservations == 1 &&
+        diagnostics.direct_storage_completions == 1 && diagnostics.direct_storage_bytes == copied &&
+        diagnostics.stage_bytes == 0 && diagnostics.lanes[lane.lane].state == llm_transfer_lane_state::free);
+    GGML_ASSERT(ring.validate_invariants().is_ready());
+
+    GGML_ASSERT(ring.reserve_direct_storage(0, 0, 8, lane).is_ready());
+    GGML_ASSERT(ring.discard_staging(lane).is_ready());
+    diagnostics = ring.diagnostics();
+    GGML_ASSERT(diagnostics.direct_storage_reservations == 2 &&
+        diagnostics.direct_storage_completions == 1 &&
+        diagnostics.lanes[lane.lane].state == llm_transfer_lane_state::free);
     GGML_ASSERT(ring.validate_invariants().is_ready());
 }
 
@@ -518,14 +610,140 @@ void test_native_event_ordering_reuse_and_unload() {
     GGML_ASSERT(cold.diagnostics().current_transfer_refs == 0);
 }
 
+void test_native_async_cold_fill_is_best_effort_and_drained() {
+    ggml_backend_load_all();
+    auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (device == nullptr) return;
+    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+    GGML_ASSERT(backend);
+    fixture source(4);
+    fixture hot(2, false, ggml_backend_dev_buffer_type(device));
+
+    auto successful_cold = make_cold(source);
+    llm_transfer_ring_config success_config = { 1U << 20, 3, device, false, false, false, 0, 32 };
+    success_config.delay_cold_fill_ms_for_testing = 150;
+    llm_expert_transfer_ring successful(success_config);
+    GGML_ASSERT(successful.initialize(source.bundle()).is_ready());
+    llm_transfer_lane_reference success_lane;
+    const llm_expert_flight_id success_flight = { 9, 1, 1, { 0, 2 }, 0, 0 };
+    GGML_ASSERT(successful.reserve_direct_storage(
+        0, 0, 1, success_lane, success_flight).is_ready());
+    const uint64_t success_bytes = populate_direct_lane(successful, success_lane, source, 2);
+    GGML_ASSERT(successful.complete_direct_storage(success_lane, success_bytes).is_ready());
+    GGML_ASSERT(successful.transfer_wave(
+        backend.get(), { { success_lane, hot.bundle(), 0 } }).is_ready());
+    const auto queue_cold_fill = [](llm_expert_transfer_ring & ring,
+                                   llm_cold_expert_cache & cold_cache,
+                                   llm_transfer_lane_reference lane) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        do {
+            const auto result = ring.try_queue_cold_fill(cold_cache, lane);
+            if (result.is_ready()) return;
+            GGML_ASSERT(result.error == llm_expert_provider_error::busy);
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        GGML_ABORT("timed out queueing asynchronous cold fill");
+    };
+    queue_cold_fill(successful, successful_cold, success_lane);
+    const auto reservation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    do {
+        if (successful_cold.diagnostics().reservations == 1) break;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < reservation_deadline);
+    GGML_ASSERT(successful_cold.diagnostics().reservations == 1);
+    GGML_ASSERT(successful_cold.policy_request_end(true, false, true).is_ready());
+    GGML_ASSERT(successful.wait_for_hot(backend.get(), 0, 1).is_ready());
+    assert_slot_matches(source, hot, 2, 0);
+    auto success_diagnostics = successful.diagnostics();
+    GGML_ASSERT(success_diagnostics.cold_fill_active == 1 &&
+        success_diagnostics.cold_fill_completed == 0);
+    const auto success_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        success_diagnostics = successful.diagnostics();
+        if (success_diagnostics.cold_fill_completed == 1) break;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < success_deadline);
+    GGML_ASSERT(success_diagnostics.cold_fill_attempts == 1 &&
+        success_diagnostics.cold_fill_queued == 1 && success_diagnostics.cold_fill_dropped == 0 &&
+        success_diagnostics.cold_fill_completed == 1 && success_diagnostics.cold_fill_failed == 0 &&
+        success_diagnostics.cold_fill_bytes == success_bytes && success_diagnostics.cold_fill_active == 0 &&
+        success_diagnostics.cold_fill_peak_active == 1);
+    llm_cold_reference filled_reference;
+    llm_cold_demand_lookup filled_lookup = llm_cold_demand_lookup::missing;
+    GGML_ASSERT(successful_cold.lookup_demand(
+        { 0, 2 }, filled_reference, filled_lookup).is_ready());
+    GGML_ASSERT(filled_lookup == llm_cold_demand_lookup::ready &&
+        successful_cold.ready(filled_reference));
+    assert_bundle_slot_matches(source, successful_cold.bundle(), 2, filled_reference.slot);
+    GGML_ASSERT(successful.validate_invariants().is_ready());
+    GGML_ASSERT(successful.surrender().is_ready());
+    GGML_ASSERT(successful_cold.surrender().is_ready());
+
+    auto failed_cold = make_cold(source);
+    auto failure_config = success_config;
+    failure_config.delay_cold_fill_ms_for_testing = 0;
+    llm_transfer_ring_faults failure_faults;
+    failure_faults.fail_cold_fill = true;
+    llm_expert_transfer_ring failed(failure_config, failure_faults);
+    GGML_ASSERT(failed.initialize(source.bundle()).is_ready());
+    llm_transfer_lane_reference failed_lane;
+    const llm_expert_flight_id failed_flight = { 9, 2, 1, { 0, 3 }, 0, 0 };
+    GGML_ASSERT(failed.reserve_direct_storage(0, 0, 2, failed_lane, failed_flight).is_ready());
+    const uint64_t failed_bytes = populate_direct_lane(failed, failed_lane, source, 3);
+    GGML_ASSERT(failed.complete_direct_storage(failed_lane, failed_bytes).is_ready());
+    GGML_ASSERT(failed.transfer_wave(backend.get(), { { failed_lane, hot.bundle(), 0 } }).is_ready());
+    queue_cold_fill(failed, failed_cold, failed_lane);
+    GGML_ASSERT(failed.wait_for_hot(backend.get(), 0, 2).is_ready());
+    assert_slot_matches(source, hot, 3, 0);
+    const auto failure_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    llm_transfer_ring_diagnostics failure_diagnostics;
+    do {
+        failure_diagnostics = failed.diagnostics();
+        if (failure_diagnostics.cold_fill_failed == 1) break;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < failure_deadline);
+    GGML_ASSERT(failure_diagnostics.cold_fill_failed == 1 &&
+        failure_diagnostics.cold_fill_completed == 0 && failure_diagnostics.cold_fill_active == 0);
+    GGML_ASSERT(failed_cold.diagnostics().failed_copies == 1);
+    GGML_ASSERT(failed_cold.cleanup_failed_slots().is_ready());
+    GGML_ASSERT(failed.validate_invariants().is_ready());
+    GGML_ASSERT(failed.surrender().is_ready());
+    GGML_ASSERT(failed_cold.surrender().is_ready());
+
+    auto cancelled_cold = make_cold(source);
+    auto cancel_config = success_config;
+    cancel_config.delay_cold_fill_ms_for_testing = 100;
+    llm_expert_transfer_ring cancelled(cancel_config);
+    GGML_ASSERT(cancelled.initialize(source.bundle()).is_ready());
+    llm_transfer_lane_reference cancelled_lane;
+    const llm_expert_flight_id cancelled_flight = { 9, 3, 1, { 0, 1 }, 0, 0 };
+    GGML_ASSERT(cancelled.reserve_direct_storage(
+        0, 0, 3, cancelled_lane, cancelled_flight).is_ready());
+    const uint64_t cancelled_bytes = populate_direct_lane(cancelled, cancelled_lane, source, 1);
+    GGML_ASSERT(cancelled.complete_direct_storage(cancelled_lane, cancelled_bytes).is_ready());
+    GGML_ASSERT(cancelled.transfer_wave(
+        backend.get(), { { cancelled_lane, hot.bundle(), 0 } }).is_ready());
+    queue_cold_fill(cancelled, cancelled_cold, cancelled_lane);
+    GGML_ASSERT(cancelled.cancel_after_h2d(cancelled_lane).is_ready());
+    const auto cancel_diagnostics = cancelled.diagnostics();
+    GGML_ASSERT(cancel_diagnostics.cold_fill_active == 0 &&
+        cancel_diagnostics.live_events == 0 && cancel_diagnostics.cold_fill_queued == 1 &&
+        cancel_diagnostics.cold_fill_completed + cancel_diagnostics.cold_fill_dropped == 1);
+    GGML_ASSERT(cancelled.validate_invariants().is_ready());
+    GGML_ASSERT(cancelled.surrender().is_ready());
+    GGML_ASSERT(cancelled_cold.surrender().is_ready());
+}
+
 } // namespace
 
 int main() {
     test_budget_fallback_and_wave();
+    test_direct_storage_lane_bypasses_cold_staging();
     test_three_layout_classes_reuse_universal_lanes();
     test_failures_cleanup_and_busy_surrender();
     test_budget_and_generation_rejection();
     test_native_event_ordering_reuse_and_unload();
+    test_native_async_cold_fill_is_best_effort_and_drained();
     std::cout << "expert transfer ring tests passed\n";
     return 0;
 }

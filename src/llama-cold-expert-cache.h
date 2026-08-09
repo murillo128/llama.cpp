@@ -31,6 +31,7 @@ struct llm_cold_reference {
 };
 
 enum class llm_cold_demand_lookup {
+    missing,
     reserved,
     joined_loading,
     ready,
@@ -176,6 +177,10 @@ public:
             llm_expert_key key,
             llm_cold_reference & reference,
             llm_cold_demand_lookup & lookup) noexcept;
+    llm_expert_provider_result lookup_demand(
+            llm_expert_key key,
+            llm_cold_reference & reference,
+            llm_cold_demand_lookup & lookup) noexcept;
     llm_expert_provider_result wait_until_ready(llm_cold_reference reference) noexcept;
     llm_expert_provider_result reserve_or_find_speculative(
             llm_expert_key key,
@@ -209,7 +214,8 @@ public:
     llm_expert_provider_result policy_request_begin() noexcept;
     llm_expert_provider_result policy_set_ubatch_ordinal(uint64_t ordinal) noexcept;
     llm_expert_provider_result policy_phase_transition(llm_expert_cache_policy_phase phase) noexcept;
-    llm_expert_provider_result policy_request_end(bool success, bool cancelled) noexcept;
+    llm_expert_provider_result policy_request_end(
+        bool success, bool cancelled, bool allow_deferred_terminals = false) noexcept;
     llm_expert_provider_result trim() noexcept;
     llm_expert_provider_result surrender() noexcept;
     llm_expert_provider_result validate_invariants(

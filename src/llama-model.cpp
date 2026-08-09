@@ -1255,6 +1255,12 @@ bool llm_expert_transport_edge_required(
         (source == 0 || destination == 0);
 }
 
+uint32_t llm_expert_resolve_io_worker_count(
+        uint32_t requested_count, uint32_t legacy_count, bool positional_reads) noexcept {
+    if (requested_count == 0) return legacy_count;
+    return positional_reads && requested_count <= 8 ? requested_count : 0;
+}
+
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     LLM_EXPERT_TRACE_SCOPE("k3.request", "model_create", "expert_weights_mode", uint32_t(params.expert_weights_mode));
     if (params.expert_weights_mode != LLAMA_EXPERT_WEIGHTS_MODE_DISABLED &&
@@ -1380,12 +1386,17 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     const bool hybrid_policy = params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
         params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
     if (!cold_mode && !uma_mode && (hybrid_policy || params.expert_background_promotion ||
-                       params.expert_auto_cost_model != nullptr)) {
+                       params.expert_async_cold_fill || params.expert_auto_cost_model != nullptr)) {
         throw std::invalid_argument("non-default expert miss configuration requires cold-cache mode");
     }
     if (uma_mode && (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU ||
-        params.expert_background_promotion || params.expert_auto_cost_model != nullptr)) {
+        params.expert_background_promotion || params.expert_async_cold_fill ||
+        params.expert_auto_cost_model != nullptr)) {
         throw std::invalid_argument("UMA-cache mode requires PROMOTE_AND_GPU without background promotion");
+    }
+    if (params.expert_async_cold_fill &&
+        params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU) {
+        throw std::invalid_argument("async expert cold fill requires PROMOTE_AND_GPU");
     }
     if (params.expert_miss_policy != LLAMA_EXPERT_MISS_POLICY_AUTO &&
         params.expert_auto_cost_model != nullptr) {
@@ -1424,6 +1435,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     }
     if ((cold_mode || uma_mode) && params.load_mode != LLAMA_LOAD_MODE_MMAP && params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO) {
         throw std::invalid_argument("cold-cache and UMA-cache modes require mmap or direct-I/O source tensors");
+    }
+    if (params.expert_io_random_access &&
+        ((!cold_mode && !uma_mode) || params.load_mode != LLAMA_LOAD_MODE_MMAP)) {
+        throw std::invalid_argument("expert random-access advice requires buffered cold/UMA-cache mode");
     }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1644,6 +1659,7 @@ void llama_model::init_expert_weight_provider() {
                 config.trace_capacity = pimpl->expert_async_transport->diagnostics().trace_capacity;
                 config.miss_policy = params.expert_miss_policy;
                 config.background_promotion = params.expert_background_promotion;
+                config.async_cold_fill = params.expert_async_cold_fill;
                 config.peer_transport = params.expert_peer_transport;
                 config.peer_staging_bytes = params.expert_peer_staging_bytes;
                 if (distributed_roles) {
@@ -1800,6 +1816,12 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     }
     const uint32_t hot_capacity = expert_hot_cache_capacity();
     const uint32_t expert_devices = expert_device_count();
+    const bool positional_reads = params.expert_io_force_positional_reads;
+    const uint32_t io_worker_count = llm_expert_resolve_io_worker_count(
+        params.expert_io_worker_count, expert_devices, positional_reads);
+    if (io_worker_count == 0) {
+        throw std::invalid_argument("invalid explicit expert I/O worker count");
+    }
     const uint64_t request_capacity_64 = std::max<uint64_t>(16, uint64_t(hot_capacity)*4);
     if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
     const uint32_t request_capacity = uint32_t(request_capacity_64);
@@ -1827,8 +1849,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         predictive_prefetch ? prefetch.max_speculative_cold_slots : 0,
         predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
         uint32_t(std::min<int64_t>(hparams.n_expert, hot_capacity)),
-        params.expert_io_force_positional_reads && params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO ?
-            expert_devices : 1,
+        positional_reads ? expert_devices : 1,
         0,
         0,
     };
@@ -1870,7 +1891,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         false,
         params.expert_io_force_positional_reads,
         pimpl->expert_integrity_mode,
-        expert_devices,
+        io_worker_count,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;
@@ -2387,6 +2408,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, llama_load_mode_name(params.load_mode));
+
+    if (params.expert_io_random_access) {
+        for (const auto & file : ml.files) {
+            const int error = file->advise_random();
+            if (error != 0) {
+                throw std::runtime_error(format(
+                    "%s: POSIX_FADV_RANDOM failed: %s", __func__, std::strerror(error)));
+            }
+        }
+    }
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -3551,11 +3582,14 @@ llama_model_params llama_model_default_params() {
         /*.expert_peer_transport       =*/ LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED,
         /*.expert_peer_staging_bytes   =*/ 0,
         /*.expert_io_queue_depth       =*/ 0,
+        /*.expert_io_worker_count      =*/ 0,
         /*.expert_io_trace_capacity    =*/ 0,
         /*.expert_io_staging_bytes     =*/ 0,
         /*.expert_io_force_positional_reads =*/ false,
+        /*.expert_io_random_access     =*/ false,
         /*.expert_miss_policy          =*/ LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU,
         /*.expert_background_promotion =*/ false,
+        /*.expert_async_cold_fill      =*/ false,
         /*.expert_auto_cost_model      =*/ nullptr,
         /*.expert_hot_cache_policy     =*/ nullptr,
         /*.expert_cold_cache_policy    =*/ nullptr,

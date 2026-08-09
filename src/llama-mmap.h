@@ -39,6 +39,7 @@ struct llama_file {
     size_t read_alignment() const;
     bool has_direct_io() const;
     int direct_io_error() const;
+    int advise_random() const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

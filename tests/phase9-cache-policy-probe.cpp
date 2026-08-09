@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <sys/resource.h>
 #include <vector>
@@ -150,6 +151,7 @@ struct arguments {
     bool expect_device_failure = false;
     bool fail_device_decode_only = false;
     uint32_t queue_depth = 0;
+    uint32_t io_workers = 0;
     uint32_t trace_capacity = 0;
     uint32_t ratio = 7500;
     uint32_t window = 1024;
@@ -159,10 +161,13 @@ struct arguments {
     uint32_t n_ubatch = 1;
     int max_generate = 2;
     bool background = false;
+    bool async_cold_fill = false;
     bool observe_routes = true;
     std::string transport = "BUFFERED";
+    std::string io_access = "NORMAL";
     std::string config_source = "EXPLICIT";
     std::string integrity = "NONE";
+    bool prewarm_cold_all = false;
 };
 
 bool parse_u64(const char * text, uint64_t & value) {
@@ -267,6 +272,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
             result.fail_device_decode_only = std::string(value) == "1";
         }
         else if (option == "--queue-depth") { if (!parse_u32(value, result.queue_depth)) return false; }
+        else if (option == "--io-workers") { if (!parse_u32(value, result.io_workers)) return false; }
         else if (option == "--trace-capacity") { if (!parse_u32(value, result.trace_capacity)) return false; }
         else if (option == "--ratio") { if (!parse_u32(value, result.ratio)) return false; }
         else if (option == "--window") { if (!parse_u32(value, result.window)) return false; }
@@ -280,19 +286,29 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         } else if (option == "--background") {
             if (std::string(value) != "0" && std::string(value) != "1") return false;
             result.background = std::string(value) == "1";
+        } else if (option == "--async-cold-fill") {
+            if (std::string(value) != "0" && std::string(value) != "1") return false;
+            result.async_cold_fill = std::string(value) == "1";
         } else if (option == "--observe-routes") {
             if (std::string(value) != "0" && std::string(value) != "1") return false;
             result.observe_routes = std::string(value) == "1";
         } else if (option == "--transport") {
             result.transport = value;
             if (result.transport != "POSITIONAL" && result.transport != "BUFFERED" &&
-                result.transport != "DIRECT_IO") return false;
+                result.transport != "DIRECT_IO" &&
+                result.transport != "DIRECT_IO_POSITIONAL") return false;
+        } else if (option == "--io-access") {
+            result.io_access = value;
+            if (result.io_access != "NORMAL" && result.io_access != "RANDOM") return false;
         } else if (option == "--config-source") {
             result.config_source = value;
             if (result.config_source != "EXPLICIT" && result.config_source != "NULL") return false;
         } else if (option == "--integrity") {
             result.integrity = value;
             if (result.integrity != "NONE" && result.integrity != "FNV64_END_TO_END") return false;
+        } else if (option == "--prewarm-cold-all") {
+            if (std::string(value) != "0" && std::string(value) != "1") return false;
+            result.prewarm_cold_all = std::string(value) == "1";
         } else return false;
     }
     if (result.role_config == "EXPLICIT") {
@@ -314,6 +330,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         ((result.failed_device == UINT32_MAX && !result.expect_device_failure) ||
             (result.failed_device < result.expert_devices && result.expect_device_failure)) &&
         (!result.fail_device_decode_only || result.failed_device < result.expert_devices) &&
+        (!result.prewarm_cold_all || result.mode == "cold") &&
         (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold");
 }
 
@@ -590,6 +607,31 @@ json async_read_intervals_json(const std::vector<llm_expert_async_read_interval>
     return result;
 }
 
+json hierarchy_residency_json(const llm_hot_cache_diagnostics & diagnostics) {
+    std::set<std::pair<int32_t, int32_t>> hot;
+    std::set<std::pair<int32_t, int32_t>> cold;
+    for (const auto & slot : diagnostics.slots) {
+        if (slot.state == llm_hot_cache_diagnostics::slot::ready ||
+            slot.state == llm_hot_cache_diagnostics::slot::pinned) {
+            hot.emplace(slot.layer, slot.expert);
+        }
+    }
+    for (const auto & slot : diagnostics.cold_slots) {
+        if (slot.state == llm_hot_cache_diagnostics::cold_slot::ready) {
+            cold.emplace(slot.layer, slot.expert);
+        }
+    }
+    uint64_t duplicate_keys = 0;
+    for (const auto & key : hot) duplicate_keys += cold.count(key);
+    return {
+        {"hot_keys", hot.size()},
+        {"cold_keys", cold.size()},
+        {"duplicate_keys", duplicate_keys},
+        {"distinct_keys", hot.size() + cold.size() - duplicate_keys},
+        {"hot_without_cold_keys", hot.size() - duplicate_keys},
+    };
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -598,6 +640,8 @@ int main(int argc, char ** argv) {
         if (!parse_arguments(argc, argv, args)) {
             std::fprintf(stderr,
                 "usage: %s --model GGUF --output JSON [--mode disabled|hot|cold] "
+                "[--prewarm-cold-all 0|1] "
+                "[--async-cold-fill 0|1] "
                 "[--integrity NONE|FNV64_END_TO_END (internal evidence only)] [policy/capacity options]\n",
                 argv[0]);
             return 2;
@@ -680,10 +724,15 @@ int main(int argc, char ** argv) {
         model_params.devices = args.role_config == "LEGACY" ? legacy_devices.data() : nullptr;
         model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
         model_params.main_gpu = 0;
-        model_params.load_mode = args.transport == "DIRECT_IO" ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
+        const bool direct_io = args.transport == "DIRECT_IO" ||
+            args.transport == "DIRECT_IO_POSITIONAL";
+        model_params.load_mode = direct_io ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         model_params.expert_io_queue_depth = args.queue_depth;
+        model_params.expert_io_worker_count = args.io_workers;
         model_params.expert_io_trace_capacity = args.trace_capacity;
-        model_params.expert_io_force_positional_reads = args.transport == "POSITIONAL";
+        model_params.expert_io_force_positional_reads =
+            args.transport == "POSITIONAL" || args.transport == "DIRECT_IO_POSITIONAL";
+        model_params.expert_io_random_access = args.io_access == "RANDOM";
         model_params.n_gpu_layers = -1;
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_weights_mode = args.mode == "disabled" ? LLAMA_EXPERT_WEIGHTS_MODE_DISABLED :
@@ -707,12 +756,16 @@ int main(int argc, char ** argv) {
                 model_params.expert_auto_cost_model = &auto_cost;
             }
             model_params.expert_background_promotion = args.background;
+            model_params.expert_async_cold_fill = args.async_cold_fill;
             model_params.expert_cold_cache_policy = args.config_source == "NULL" ? nullptr : &cold_config;
         }
         llama_model_ptr model(llama_model_load_from_file(args.model.c_str(), model_params));
         if (!model) return 3;
         auto * provider = model->expert_weight_provider();
         if ((args.mode == "disabled") == (provider != nullptr)) return 4;
+        llm_expert_storage_diagnostics prewarm_storage_before;
+        llm_expert_storage_diagnostics prewarm_storage_after;
+        bool prewarm_completed = false;
         const auto * vocab = llama_model_get_vocab(model.get());
         const std::string & prompt_text = args.prompt;
         const int prompt_count = -llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), nullptr, 0, true, true);
@@ -733,6 +786,17 @@ int main(int argc, char ** argv) {
                 args.fail_device_decode_only).is_ready()) return 4;
         llama_context_ptr context(llama_init_from_model(model.get(), context_params));
         if (!context) return 6;
+        if (args.prewarm_cold_all) {
+            prewarm_storage_before = model->expert_storage()->diagnostics();
+            const auto warmed = provider->debug_warm_all_cold_for_testing();
+            if (!warmed.is_ready()) {
+                std::fprintf(stderr, "phase9-cache-policy-probe: full cold prewarm failed error=%u\n",
+                    unsigned(warmed.error));
+                return 4;
+            }
+            prewarm_storage_after = model->expert_storage()->diagnostics();
+            prewarm_completed = true;
+        }
         route_capture routes;
         if (args.observe_routes &&
             llama_set_route_observer(context.get(), capture_route, &routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 7;
@@ -958,6 +1022,9 @@ int main(int argc, char ** argv) {
                 {"ring_actual_bytes", device.ring_actual_bytes},
                 {"ring_pinned_or_registered_bytes", device.ring_pinned_or_registered_bytes},
                 {"ring_lane_reservations", device.ring_lane_reservations},
+                {"ring_direct_storage_reservations", device.ring_direct_storage_reservations},
+                {"ring_direct_storage_completions", device.ring_direct_storage_completions},
+                {"ring_direct_storage_bytes", device.ring_direct_storage_bytes},
                 {"ring_stage_bytes", device.ring_stage_bytes},
                 {"ring_h2d_bytes", device.ring_h2d_bytes},
                 {"ring_h2d_time_us", device.ring_h2d_time_us},
@@ -1049,6 +1116,8 @@ int main(int argc, char ** argv) {
             {"expert_runtime_mode", args.expert_runtime_mode},
             {"prompt", prompt_text},
             {"transport_requested", args.transport},
+            {"io_access_requested", args.io_access},
+            {"io_access_effective", args.io_access},
             {"config_source", args.config_source},
             {"role_config_source", args.role_config},
             {"miss_policy", args.miss_policy}, {"background", args.background},
@@ -1124,6 +1193,21 @@ int main(int argc, char ** argv) {
             {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},
             {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
             {"perfetto", perfetto_diagnostics},
+            {"cold_prewarm", {
+                {"requested", args.prewarm_cold_all},
+                {"completed", prewarm_completed},
+                {"read_requests", prewarm_completed ?
+                    prewarm_storage_after.read_requests - prewarm_storage_before.read_requests : 0},
+                {"read_bytes", prewarm_completed ?
+                    prewarm_storage_after.read_bytes - prewarm_storage_before.read_bytes : 0},
+                {"measured_read_requests", prewarm_completed ?
+                    storage_diagnostics.read_requests - prewarm_storage_after.read_requests :
+                    storage_diagnostics.read_requests},
+                {"measured_read_bytes", prewarm_completed ?
+                    storage_diagnostics.read_bytes - prewarm_storage_after.read_bytes :
+                    storage_diagnostics.read_bytes},
+            }},
+            {"hierarchy_residency", hierarchy_residency_json(diagnostics)},
             {"topology", {
                 {"routed_layers", routed_layers}, {"experts_per_layer", diagnostics.n_expert},
                 {"hot_physical_slot_footprint_bytes", hot_footprint},
@@ -1166,7 +1250,9 @@ int main(int argc, char ** argv) {
                 {"ring_unused_budget_bytes", diagnostics.ring_requested_bytes - diagnostics.ring_actual_bytes},
                 {"ring_pinned_or_registered_bytes", diagnostics.ring_pinned_or_registered_bytes},
                 {"io_queue_depth_requested", args.queue_depth},
+                {"io_worker_count_requested", args.io_workers},
                 {"io_trace_capacity_requested", args.trace_capacity},
+                {"async_cold_fill_requested", args.async_cold_fill},
             }},
             {"async_io", {
                 {"diagnostics", async_diagnostics_json(async_diagnostics)},
@@ -1196,6 +1282,16 @@ int main(int argc, char ** argv) {
                 {"cold_source_copy_bundles", diagnostics.cold_source_copy_bundles},
                 {"cold_source_copy_bytes", diagnostics.cold_source_copy_bytes},
                 {"cold_source_copy_time_us", diagnostics.cold_source_copy_time_us},
+                {"async_cold_fill_configured", diagnostics.async_cold_fill_configured},
+                {"async_cold_fill_attempts", diagnostics.ring_cold_fill_attempts},
+                {"async_cold_fill_queued", diagnostics.ring_cold_fill_queued},
+                {"async_cold_fill_dropped", diagnostics.ring_cold_fill_dropped},
+                {"async_cold_fill_completed", diagnostics.ring_cold_fill_completed},
+                {"async_cold_fill_failed", diagnostics.ring_cold_fill_failed},
+                {"async_cold_fill_bytes", diagnostics.ring_cold_fill_bytes},
+                {"async_cold_fill_time_us", diagnostics.ring_cold_fill_time_us},
+                {"async_cold_fill_active", diagnostics.ring_cold_fill_active},
+                {"async_cold_fill_peak_active", diagnostics.ring_cold_fill_peak_active},
                 {"h2d_bytes", diagnostics.h2d_bytes}, {"background_useful", diagnostics.background_useful},
                 {"background_wasted", diagnostics.background_wasted},
                 {"active_background_flights", diagnostics.active_background_flights},
@@ -1205,6 +1301,9 @@ int main(int argc, char ** argv) {
                 {"pageable_fallback", diagnostics.ring_pageable_fallback},
                 {"fallback_reason", diagnostics.ring_fallback_reason},
                 {"lane_reservations", diagnostics.ring_lane_reservations},
+                {"direct_storage_reservations", diagnostics.ring_direct_storage_reservations},
+                {"direct_storage_completions", diagnostics.ring_direct_storage_completions},
+                {"direct_storage_bytes", diagnostics.ring_direct_storage_bytes},
                 {"stage_bytes", diagnostics.ring_stage_bytes},
                 {"stage_time_us", diagnostics.ring_stage_time_us},
                 {"h2d_bytes", diagnostics.ring_h2d_bytes},
@@ -1220,6 +1319,13 @@ int main(int argc, char ** argv) {
                 {"trace_capacity", diagnostics.ring_trace_capacity},
                 {"trace_records", diagnostics.ring_trace_records},
                 {"trace_records_dropped", diagnostics.ring_trace_records_dropped},
+                {"disk_h2d_overlap_us", diagnostics.disk_h2d_overlap_us},
+                {"disk_h2d_overlap_bytes", diagnostics.disk_h2d_overlap_bytes},
+                {"disk_h2d_overlap_read_bytes", diagnostics.disk_h2d_overlap_read_bytes},
+                {"disk_h2d_overlap_flights", diagnostics.disk_h2d_overlap_flights},
+                {"disk_h2d_overlap_events", diagnostics.disk_h2d_overlap_events},
+                {"disk_h2d_overlap_pairs", diagnostics.disk_h2d_overlap_pairs},
+                {"disk_h2d_overlap_pair_digest", diagnostics.disk_h2d_overlap_pair_digest},
                 {"failed_cleanup", diagnostics.ring_failed_cleanup},
             }},
             {"storage", {
