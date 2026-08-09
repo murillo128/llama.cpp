@@ -114,6 +114,14 @@ def parse_args() -> argparse.Namespace:
         help="(Experimental) Read safetensors file remotely without downloading to disk. Config and tokenizer files will still be downloaded. To use this feature, you need to specify Hugging Face model repo name instead of a local directory. For example: 'HuggingFaceTB/SmolLM2-1.7B-Instruct'. Note: To access gated repo, set HF_TOKEN environment variable to your Hugging Face token.",
     )
     parser.add_argument(
+        "--remote-revision", type=str, default="main",
+        help="Hugging Face revision used by --remote for both metadata and safetensor range reads (default: main).",
+    )
+    parser.add_argument(
+        "--remote-cache-dir", type=Path,
+        help="Cache one complete remote safetensor shard at a time in this directory (used by converters that opt in).",
+    )
+    parser.add_argument(
         "--mmproj", action="store_true",
         help="Export multimodal projector (mmproj) for vision models. This will only work on some vision models. An 'mmproj-' prefix will be added to the output file name.",
     )
@@ -184,12 +192,13 @@ def main() -> None:
     if args.remote:
         hf_repo_id = args.model
         from huggingface_hub import snapshot_download
-        allowed_patterns = ["LICENSE", "*.json", "*.md", "*.txt", "tokenizer.model"]
+        allowed_patterns = ["LICENSE", "*.json", "*.md", "*.txt", "*.model", "*.py"]
         if args.sentence_transformers_dense_modules:
             # include sentence-transformers dense modules safetensors files
             allowed_patterns.append("*.safetensors")
         local_dir = snapshot_download(
             repo_id=hf_repo_id,
+            revision=args.remote_revision,
             allow_patterns=allowed_patterns)
         dir_model = Path(local_dir)
         logger.info(f"Downloaded config and tokenizer to {local_dir}")
@@ -274,7 +283,9 @@ def main() -> None:
                                      split_max_tensors=args.split_max_tensors,
                                      split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
                                      small_first_shard=args.no_tensor_first_split,
-                                     remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
+                                     remote_hf_model_id=hf_repo_id, remote_hf_model_revision=args.remote_revision,
+                                     remote_cache_dir=args.remote_cache_dir,
+                                     disable_mistral_community_chat_template=disable_mistral_community_chat_template,
                                      sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
