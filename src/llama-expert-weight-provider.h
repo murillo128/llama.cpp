@@ -1263,6 +1263,9 @@ public:
         bytes.clear();
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
+    virtual llm_expert_provider_result debug_warm_all_cold_for_testing() noexcept {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
     virtual llm_expert_provider_result debug_set_miss_policy_for_testing(
             llama_expert_miss_policy policy) noexcept {
         (void) policy;

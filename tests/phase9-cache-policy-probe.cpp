@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <sys/resource.h>
 #include <vector>
@@ -163,6 +164,7 @@ struct arguments {
     std::string transport = "BUFFERED";
     std::string config_source = "EXPLICIT";
     std::string integrity = "NONE";
+    bool prewarm_cold_all = false;
 };
 
 bool parse_u64(const char * text, uint64_t & value) {
@@ -293,6 +295,9 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         } else if (option == "--integrity") {
             result.integrity = value;
             if (result.integrity != "NONE" && result.integrity != "FNV64_END_TO_END") return false;
+        } else if (option == "--prewarm-cold-all") {
+            if (std::string(value) != "0" && std::string(value) != "1") return false;
+            result.prewarm_cold_all = std::string(value) == "1";
         } else return false;
     }
     if (result.role_config == "EXPLICIT") {
@@ -314,6 +319,7 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         ((result.failed_device == UINT32_MAX && !result.expect_device_failure) ||
             (result.failed_device < result.expert_devices && result.expect_device_failure)) &&
         (!result.fail_device_decode_only || result.failed_device < result.expert_devices) &&
+        (!result.prewarm_cold_all || result.mode == "cold") &&
         (result.mode == "disabled" || result.mode == "hot" || result.mode == "cold");
 }
 
@@ -590,6 +596,31 @@ json async_read_intervals_json(const std::vector<llm_expert_async_read_interval>
     return result;
 }
 
+json hierarchy_residency_json(const llm_hot_cache_diagnostics & diagnostics) {
+    std::set<std::pair<int32_t, int32_t>> hot;
+    std::set<std::pair<int32_t, int32_t>> cold;
+    for (const auto & slot : diagnostics.slots) {
+        if (slot.state == llm_hot_cache_diagnostics::slot::ready ||
+            slot.state == llm_hot_cache_diagnostics::slot::pinned) {
+            hot.emplace(slot.layer, slot.expert);
+        }
+    }
+    for (const auto & slot : diagnostics.cold_slots) {
+        if (slot.state == llm_hot_cache_diagnostics::cold_slot::ready) {
+            cold.emplace(slot.layer, slot.expert);
+        }
+    }
+    uint64_t duplicate_keys = 0;
+    for (const auto & key : hot) duplicate_keys += cold.count(key);
+    return {
+        {"hot_keys", hot.size()},
+        {"cold_keys", cold.size()},
+        {"duplicate_keys", duplicate_keys},
+        {"distinct_keys", hot.size() + cold.size() - duplicate_keys},
+        {"hot_without_cold_keys", hot.size() - duplicate_keys},
+    };
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -598,6 +629,7 @@ int main(int argc, char ** argv) {
         if (!parse_arguments(argc, argv, args)) {
             std::fprintf(stderr,
                 "usage: %s --model GGUF --output JSON [--mode disabled|hot|cold] "
+                "[--prewarm-cold-all 0|1] "
                 "[--integrity NONE|FNV64_END_TO_END (internal evidence only)] [policy/capacity options]\n",
                 argv[0]);
             return 2;
@@ -713,6 +745,9 @@ int main(int argc, char ** argv) {
         if (!model) return 3;
         auto * provider = model->expert_weight_provider();
         if ((args.mode == "disabled") == (provider != nullptr)) return 4;
+        llm_expert_storage_diagnostics prewarm_storage_before;
+        llm_expert_storage_diagnostics prewarm_storage_after;
+        bool prewarm_completed = false;
         const auto * vocab = llama_model_get_vocab(model.get());
         const std::string & prompt_text = args.prompt;
         const int prompt_count = -llama_tokenize(vocab, prompt_text.data(), prompt_text.size(), nullptr, 0, true, true);
@@ -733,6 +768,17 @@ int main(int argc, char ** argv) {
                 args.fail_device_decode_only).is_ready()) return 4;
         llama_context_ptr context(llama_init_from_model(model.get(), context_params));
         if (!context) return 6;
+        if (args.prewarm_cold_all) {
+            prewarm_storage_before = model->expert_storage()->diagnostics();
+            const auto warmed = provider->debug_warm_all_cold_for_testing();
+            if (!warmed.is_ready()) {
+                std::fprintf(stderr, "phase9-cache-policy-probe: full cold prewarm failed error=%u\n",
+                    unsigned(warmed.error));
+                return 4;
+            }
+            prewarm_storage_after = model->expert_storage()->diagnostics();
+            prewarm_completed = true;
+        }
         route_capture routes;
         if (args.observe_routes &&
             llama_set_route_observer(context.get(), capture_route, &routes) != LLAMA_ROUTE_OBSERVER_STATUS_OK) return 7;
@@ -1124,6 +1170,21 @@ int main(int argc, char ** argv) {
             {"cpu_user_time_us", cpu_user_time_us}, {"cpu_system_time_us", cpu_system_time_us},
             {"peak_rss_kib", usage.ru_maxrss}, {"routes", route_json(routes)},
             {"perfetto", perfetto_diagnostics},
+            {"cold_prewarm", {
+                {"requested", args.prewarm_cold_all},
+                {"completed", prewarm_completed},
+                {"read_requests", prewarm_completed ?
+                    prewarm_storage_after.read_requests - prewarm_storage_before.read_requests : 0},
+                {"read_bytes", prewarm_completed ?
+                    prewarm_storage_after.read_bytes - prewarm_storage_before.read_bytes : 0},
+                {"measured_read_requests", prewarm_completed ?
+                    storage_diagnostics.read_requests - prewarm_storage_after.read_requests :
+                    storage_diagnostics.read_requests},
+                {"measured_read_bytes", prewarm_completed ?
+                    storage_diagnostics.read_bytes - prewarm_storage_after.read_bytes :
+                    storage_diagnostics.read_bytes},
+            }},
+            {"hierarchy_residency", hierarchy_residency_json(diagnostics)},
             {"topology", {
                 {"routed_layers", routed_layers}, {"experts_per_layer", diagnostics.n_expert},
                 {"hot_physical_slot_footprint_bytes", hot_footprint},

@@ -6840,6 +6840,36 @@ public:
         return present;
     }
 
+    llm_expert_provider_result debug_warm_all_cold_for_testing() noexcept override {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!config.cold_mode || !cold_cache || !config.storage || active_request) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
+        if (cold_cache->diagnostics().effective_slots < config.total_expert_keys) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+        }
+        auto result = cold_cache->policy_request_begin();
+        if (!result.is_ready()) return result;
+        storage_load_context storage_context = {
+            config.storage, nullptr, nullptr, config.integrity_mode, &lock, {}, false, nullptr, nullptr,
+        };
+        storage_context.layer_ids = &layout_registry.layer_ids;
+        storage_context.layout_registry = &layout_registry;
+        for (int32_t layer : config.routed_layers) {
+            for (uint32_t expert = 0; expert < n_expert; ++expert) {
+                llm_cold_reference reference;
+                result = cold_cache->find_or_admit_with_loader(
+                    { layer, int32_t(expert) }, reference, load_storage_bundle, &storage_context);
+                if (!result.is_ready()) break;
+            }
+            if (!result.is_ready()) break;
+        }
+        const auto ended = cold_cache->policy_request_end(result.is_ready(), false);
+        if (result.is_ready()) result = ended;
+        if (result.is_ready()) result = validate_inclusive_locked();
+        return result;
+    }
+
     bool debug_cold_ready(
             llm_expert_key key,
             uint64_t * generation,
