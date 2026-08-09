@@ -1800,6 +1800,14 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     }
     const uint32_t hot_capacity = expert_hot_cache_capacity();
     const uint32_t expert_devices = expert_device_count();
+    const bool positional_reads = params.expert_io_force_positional_reads &&
+        params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO;
+    if (params.expert_io_worker_count != 0 &&
+        (!positional_reads || params.expert_io_worker_count > 8)) {
+        throw std::invalid_argument("invalid explicit expert I/O worker count");
+    }
+    const uint32_t io_worker_count = params.expert_io_worker_count != 0 ?
+        params.expert_io_worker_count : (positional_reads ? expert_devices : 1);
     const uint64_t request_capacity_64 = std::max<uint64_t>(16, uint64_t(hot_capacity)*4);
     if (request_capacity_64 > UINT32_MAX) throw std::overflow_error("expert async request capacity overflow");
     const uint32_t request_capacity = uint32_t(request_capacity_64);
@@ -1827,8 +1835,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         predictive_prefetch ? prefetch.max_speculative_cold_slots : 0,
         predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
         uint32_t(std::min<int64_t>(hparams.n_expert, hot_capacity)),
-        params.expert_io_force_positional_reads && params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO ?
-            expert_devices : 1,
+        positional_reads ? expert_devices : 1,
         0,
         0,
     };
@@ -1870,7 +1877,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         false,
         params.expert_io_force_positional_reads,
         pimpl->expert_integrity_mode,
-        expert_devices,
+        io_worker_count,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;
@@ -3551,6 +3558,7 @@ llama_model_params llama_model_default_params() {
         /*.expert_peer_transport       =*/ LLAMA_EXPERT_PEER_TRANSPORT_HOST_STAGED,
         /*.expert_peer_staging_bytes   =*/ 0,
         /*.expert_io_queue_depth       =*/ 0,
+        /*.expert_io_worker_count      =*/ 0,
         /*.expert_io_trace_capacity    =*/ 0,
         /*.expert_io_staging_bytes     =*/ 0,
         /*.expert_io_force_positional_reads =*/ false,
