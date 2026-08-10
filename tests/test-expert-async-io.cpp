@@ -144,8 +144,9 @@ private:
 };
 
 void test_configuration() {
-    GGML_ASSERT(llm_expert_resolve_io_worker_count(0, 2, false) == 2);
+    GGML_ASSERT(llm_expert_resolve_io_worker_count(0, 2, false) == 1);
     GGML_ASSERT(llm_expert_resolve_io_worker_count(0, 2, true) == 2);
+    GGML_ASSERT(llm_expert_resolve_io_worker_count(0, 4, false) == 1);
     GGML_ASSERT(llm_expert_resolve_io_worker_count(2, 1, true) == 2);
     GGML_ASSERT(llm_expert_resolve_io_worker_count(1, 2, false) == 0);
     GGML_ASSERT(llm_expert_resolve_io_worker_count(9, 2, true) == 0);

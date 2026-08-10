@@ -1262,7 +1262,7 @@ bool llm_expert_transport_edge_required(
 
 uint32_t llm_expert_resolve_io_worker_count(
         uint32_t requested_count, uint32_t legacy_count, bool positional_reads) noexcept {
-    if (requested_count == 0) return legacy_count;
+    if (requested_count == 0) return positional_reads ? legacy_count : 1;
     return positional_reads && requested_count <= 8 ? requested_count : 0;
 }
 
@@ -1860,7 +1860,8 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         predictive_prefetch ? prefetch.max_speculative_cold_slots : 0,
         predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
         uint32_t(std::min<int64_t>(hparams.n_expert, hot_capacity)),
-        positional_reads ? expert_devices : 1,
+        // Scheduling targets expert devices independently of the shared I/O transport.
+        expert_devices,
         0,
         0,
     };
