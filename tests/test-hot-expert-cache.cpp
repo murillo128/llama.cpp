@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1820,7 +1821,8 @@ void test_mixed_cold_hit_h2d_precedes_direct_storage_completion() {
     });
 
     bool cold_h2d_while_storage_blocked = false;
-    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+    const auto overlap_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < overlap_deadline) {
         if (reader.blocked.load(std::memory_order_acquire) != 0) {
             const auto diagnostics = provider->hot_cache_diagnostics();
             cold_h2d_while_storage_blocked = diagnostics.ring_stage_bytes > 0 &&
@@ -1945,7 +1947,8 @@ void test_multi_device_mixed_cold_hit_h2d_precedes_direct_storage_completion() {
     });
 
     bool cold_h2d_while_storage_blocked = false;
-    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+    const auto overlap_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < overlap_deadline) {
         if (reader.blocked.load(std::memory_order_acquire) != 0) {
             const auto diagnostics = provider->hot_cache_diagnostics();
             cold_h2d_while_storage_blocked = diagnostics.ring_stage_bytes > 0 &&
