@@ -1836,13 +1836,16 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
     if (performance_mode && params.expert_io_trace_capacity != 0) {
         throw std::invalid_argument("performance expert runtime mode disables internal evidence traces");
     }
+    constexpr uint32_t maximum_compliance_trace_capacity = 1048576;
     if (params.expert_io_trace_capacity != 0 &&
-        (params.expert_io_trace_capacity < 1024 || params.expert_io_trace_capacity > 65536)) {
+        (params.expert_io_trace_capacity < 1024 ||
+         params.expert_io_trace_capacity > maximum_compliance_trace_capacity)) {
         throw std::invalid_argument("invalid expert async trace capacity");
     }
     const uint64_t trace_capacity_64 = performance_mode ? 0 :
         params.expert_io_trace_capacity != 0 ? params.expert_io_trace_capacity :
-            std::min<uint64_t>(65536, std::max<uint64_t>(1024, request_capacity_64*16));
+            std::min<uint64_t>(maximum_compliance_trace_capacity,
+                std::max<uint64_t>(1024, request_capacity_64*16));
     const auto & prefetch = pimpl->expert_prefetch_config.value;
     const bool predictive_prefetch = pimpl->expert_prefetch_config.supplied &&
         prefetch.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF;
