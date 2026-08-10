@@ -15,6 +15,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 uint64_t fallback_bit(llm_expert_async_fallback_reason reason) {
@@ -51,6 +56,7 @@ struct scripted_async_reader : llm_expert_async_read_override {
     bool entered = false;
     bool released = false;
     int error_code = EIO;
+    uint64_t source_size = std::numeric_limits<uint64_t>::max();
 
     scripted_async_reader() {
         for (size_t index = 0; index < bytes.size(); ++index) bytes[index] = uint8_t(0x50 + index);
@@ -70,7 +76,9 @@ struct scripted_async_reader : llm_expert_async_read_override {
         if (current == action::interrupted) { native_error = EINTR; return -1; }
         if (current == action::would_block) { native_error = EAGAIN; return -1; }
         if (current == action::error) { native_error = error_code; return -1; }
-        const size_t count = current == action::partial ? std::min<size_t>(3, byte_count) : byte_count;
+        if (file_offset >= source_size) return 0;
+        const size_t available = size_t(std::min<uint64_t>(source_size - file_offset, byte_count));
+        const size_t count = current == action::partial ? std::min<size_t>(3, available) : available;
         std::memcpy(destination, bytes.data() + file_offset, count);
         return int64_t(count);
     }
@@ -1009,6 +1017,7 @@ void test_direct_requirements_fail_closed() {
         cfg.direct_io_requested = true;
         cfg.maximum_direct_alignment = 8;
         cfg.requested_staging_bytes = requested_staging_bytes;
+        reader.source_size = source_size;
         llm_expert_async_transport transport(cfg);
         std::array<uint8_t, 8> destination{};
         llm_expert_storage_read_operation read;
@@ -1053,10 +1062,21 @@ void test_direct_requirements_fail_closed() {
 
     scripted_async_reader tail_reader;
     const auto tail = run(tail_reader, 11);
-    GGML_ASSERT(tail.submission == llm_expert_async_result::invalid);
-    GGML_ASSERT(tail.diagnostics.direct_read_operations == 0 &&
+    GGML_ASSERT(tail.submission == llm_expert_async_result::ready &&
+        tail.completion.result == llm_expert_async_result::ready);
+    GGML_ASSERT(tail.diagnostics.direct_read_operations == 1 &&
+        tail.diagnostics.direct_aligned_bytes == 11 &&
+        tail.diagnostics.direct_eof_short_reads == 1 &&
+        tail.diagnostics.direct_eof_shortfall_bytes == 5 &&
+        tail.diagnostics.short_positive_reads == 0 &&
         tail.diagnostics.buffered_fallback_operations == 0);
-    GGML_ASSERT((tail.diagnostics.fallback_reason_mask &
+
+    scripted_async_reader past_eof_reader;
+    const auto past_eof = run(past_eof_reader, 10);
+    GGML_ASSERT(past_eof.submission == llm_expert_async_result::invalid);
+    GGML_ASSERT(past_eof.diagnostics.direct_read_operations == 0 &&
+        past_eof.diagnostics.buffered_fallback_operations == 0);
+    GGML_ASSERT((past_eof.diagnostics.fallback_reason_mask &
         fallback_bit(llm_expert_async_fallback_reason::direct_eof)) != 0);
 
     scripted_async_reader staging_reader;
@@ -1168,6 +1188,70 @@ void test_direct_positional_workers_use_independent_staging() {
 #endif
 }
 
+void test_direct_positional_eof_tail() {
+#if defined(__linux__)
+    char path[] = "/tmp/llama-expert-direct-tail-XXXXXX";
+    const int native_handle = mkstemp(path);
+    GGML_ASSERT(native_handle >= 0);
+    const std::array<uint8_t, 11> source = { 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 42 };
+    GGML_ASSERT(write(native_handle, source.data(), source.size()) == int64_t(source.size()));
+    GGML_ASSERT(fsync(native_handle) == 0);
+    const int direct_native_handle = open(path, O_RDONLY | O_DIRECT);
+    const int direct_open_error = direct_native_handle < 0 ? errno : 0;
+    GGML_ASSERT(unlink(path) == 0);
+    if (direct_native_handle < 0 &&
+            (direct_open_error == EINVAL || direct_open_error == ENOTSUP ||
+                direct_open_error == EOPNOTSUPP)) {
+        GGML_ASSERT(close(native_handle) == 0);
+        return;
+    }
+    GGML_ASSERT(direct_native_handle >= 0);
+
+    auto cfg = config(8);
+    cfg.direct_io_requested = true;
+    cfg.maximum_direct_alignment = 4096;
+    cfg.requested_staging_bytes = 4096;
+    cfg.force_positional_reads = true;
+    llm_expert_async_transport transport(cfg);
+    std::array<uint8_t, 8> destination{};
+    llm_expert_storage_read_operation read;
+    read.native_handle = native_handle;
+    read.direct_native_handle = direct_native_handle;
+    read.direct_alignment = 4096;
+    read.source_size = source.size();
+    read.file_offset = 3;
+    read.byte_count = destination.size();
+    read.segment_count = 1;
+    read.segments[0] = { destination.data(), destination.size(), read.file_offset,
+        llm_expert_storage_projection::up, llm_expert_storage_sidecar::weight };
+    const llm_expert_async_operation_identity identity = {
+        1, { 0, 1 }, 0, { 0, 3 }, llm_expert_readiness::host_ready,
+        llm_expert_priority::demand_current_layer,
+    };
+    GGML_ASSERT(transport.submit_read_plan(identity, &read, 1) ==
+        llm_expert_async_result::ready);
+    llm_expert_async_read_completion completion;
+    GGML_ASSERT(transport.wait_read(identity.request, completion) ==
+        llm_expert_async_result::ready);
+    GGML_ASSERT(std::equal(destination.begin(), destination.end(), source.begin() + 3));
+    const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(diagnostics.direct_read_operations == 1 &&
+        diagnostics.direct_useful_bytes == destination.size() &&
+        diagnostics.direct_aligned_bytes == source.size() &&
+        diagnostics.direct_scatter_bytes == destination.size());
+    GGML_ASSERT(diagnostics.direct_eof_short_reads == 1 &&
+        diagnostics.direct_eof_shortfall_bytes == 4096 - source.size() &&
+        diagnostics.short_positive_reads == 0 &&
+        diagnostics.buffered_fallback_operations == 0);
+    GGML_ASSERT((diagnostics.fallback_reason_mask &
+        fallback_bit(llm_expert_async_fallback_reason::direct_eof)) == 0);
+    GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(close(direct_native_handle) == 0);
+    GGML_ASSERT(close(native_handle) == 0);
+#endif
+}
+
 void test_concurrent_bounded_access() {
     llm_expert_async_transport transport(config(8));
     std::vector<std::thread> threads;
@@ -1243,6 +1327,7 @@ int main() {
     test_shutdown_drains_inflight_read();
     test_direct_requirements_fail_closed();
     test_direct_positional_workers_use_independent_staging();
+    test_direct_positional_eof_tail();
     test_concurrent_bounded_access();
     test_reversed_fake_cq_and_saturation();
     return 0;

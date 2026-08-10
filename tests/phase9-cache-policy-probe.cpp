@@ -558,6 +558,8 @@ json async_diagnostics_json(const llm_expert_async_diagnostics & value) {
         {"short_positive_reads", value.short_positive_reads},
         {"direct_read_operations", value.direct_read_operations}, {"direct_useful_bytes", value.direct_useful_bytes},
         {"direct_aligned_bytes", value.direct_aligned_bytes}, {"direct_scatter_bytes", value.direct_scatter_bytes},
+        {"direct_eof_short_reads", value.direct_eof_short_reads},
+        {"direct_eof_shortfall_bytes", value.direct_eof_shortfall_bytes},
         {"buffered_fallback_operations", value.buffered_fallback_operations},
         {"buffered_fallback_bytes", value.buffered_fallback_bytes},
         {"direct_capability_retries", value.direct_capability_retries},

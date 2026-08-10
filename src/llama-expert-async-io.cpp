@@ -404,9 +404,23 @@ struct llm_expert_async_transport::impl {
         if (!checked_add(operation.read.file_offset, operation.read.byte_count, useful_end) ||
             !checked_add(useful_end, operation.read.direct_alignment - 1, rounded_end)) return false;
         rounded_end &= ~(operation.read.direct_alignment - 1);
-        if (rounded_end < aligned_offset || rounded_end > operation.read.source_size) return false;
+        if (rounded_end < aligned_offset || useful_end > operation.read.source_size) return false;
         aligned_bytes = rounded_end - aligned_offset;
         return aligned_bytes != 0 && aligned_bytes <= direct_staging_bytes && aligned_bytes <= UINT32_MAX;
+    }
+
+    bool direct_completion_ready(
+            const operation_record & operation, uint64_t aligned_offset,
+            uint64_t aligned_bytes, uint64_t completed_bytes) const {
+        if (completed_bytes == aligned_bytes) return true;
+        // A block-aligned O_DIRECT request may extend beyond an unaligned file EOF;
+        // Linux completes that request with the exact remaining tail bytes.
+        uint64_t useful_end = 0;
+        uint64_t completed_end = 0;
+        return completed_bytes != 0 && completed_bytes < aligned_bytes &&
+            checked_add(operation.read.file_offset, operation.read.byte_count, useful_end) &&
+            checked_add(aligned_offset, completed_bytes, completed_end) &&
+            completed_end == operation.read.source_size && useful_end <= completed_end;
     }
 
     llm_expert_async_fallback_reason direct_requirement_failure(
@@ -432,7 +446,7 @@ struct llm_expert_async_transport::impl {
             return llm_expert_async_fallback_reason::direct_alignment;
         }
         rounded_end &= ~(operation.read.direct_alignment - 1);
-        if (rounded_end < aligned_offset || rounded_end > operation.read.source_size) {
+        if (rounded_end < aligned_offset || useful_end > operation.read.source_size) {
             return llm_expert_async_fallback_reason::direct_eof;
         }
         const uint64_t aligned_bytes = rounded_end - aligned_offset;
@@ -1074,7 +1088,9 @@ struct llm_expert_async_transport::impl {
                 const bool direct = prepare_direct(
                     operation, staging, staging_bytes, direct_offset, direct_bytes);
                 const uint64_t expected_bytes = direct ? direct_bytes : operation.read.byte_count;
-                if (uint64_t(cqe.res) != expected_bytes) {
+                if ((direct && !direct_completion_ready(
+                            operation, direct_offset, direct_bytes, uint64_t(cqe.res))) ||
+                        (!direct && uint64_t(cqe.res) != expected_bytes)) {
                     if (first_error == llm_expert_async_result::ready) first_error = llm_expert_async_result::invalid;
                     counters.ring_completions++;
                     continue;
@@ -1090,8 +1106,12 @@ struct llm_expert_async_transport::impl {
                     operation.completed_bytes = operation.read.byte_count;
                     counters.direct_read_operations++;
                     counters.direct_useful_bytes += operation.read.byte_count;
-                    counters.direct_aligned_bytes += direct_bytes;
+                    counters.direct_aligned_bytes += uint64_t(cqe.res);
                     counters.direct_scatter_bytes += operation.read.byte_count;
+                    if (uint64_t(cqe.res) != direct_bytes) {
+                        counters.direct_eof_short_reads++;
+                        counters.direct_eof_shortfall_bytes += direct_bytes - uint64_t(cqe.res);
+                    }
                 } else {
                     if (config.direct_io_requested) {
                         if (first_error == llm_expert_async_result::ready) {
@@ -1228,7 +1248,8 @@ struct llm_expert_async_transport::impl {
                 lock.unlock();
                 if (completion.result != llm_expert_async_result::ready) break;
                 auto read_all = [&](intptr_t native_handle, void * destination,
-                                    uint64_t byte_count, uint64_t file_offset) {
+                                    uint64_t byte_count, uint64_t file_offset,
+                                    uint64_t permitted_eof, uint64_t * actual_bytes) {
                     uint64_t completed = 0;
                     while (completed < byte_count) {
 #if defined(__linux__)
@@ -1266,11 +1287,17 @@ struct llm_expert_async_transport::impl {
                             completion.native_error = 0;
                             break;
                         }
-                        if (uint64_t(result) < byte_count - completed) {
+                        completed += uint64_t(result);
+                        uint64_t completed_end = 0;
+                        if (completed < byte_count && permitted_eof != 0 &&
+                                checked_add(file_offset, completed, completed_end) &&
+                                completed_end == permitted_eof) {
+                            break;
+                        }
+                        if (completed < byte_count) {
                             std::lock_guard<std::mutex> guard(mutex);
                             counters.short_positive_reads++;
                         }
-                        completed += uint64_t(result);
 #else
                         completion.result = llm_expert_async_result::invalid;
                         completion.native_error = ENOSYS;
@@ -1282,7 +1309,12 @@ struct llm_expert_async_transport::impl {
                             break;
                         }
                     }
-                    return completion.result == llm_expert_async_result::ready;
+                    if (actual_bytes != nullptr) *actual_bytes = completed;
+                    uint64_t completed_end = 0;
+                    return completion.result == llm_expert_async_result::ready &&
+                        (completed == byte_count ||
+                            (permitted_eof != 0 && checked_add(file_offset, completed, completed_end) &&
+                                completed_end == permitted_eof));
                 };
 
                 uint64_t aligned_offset = 0;
@@ -1290,7 +1322,11 @@ struct llm_expert_async_transport::impl {
                 const bool direct = !force_buffered && prepare_direct(
                     stored, worker_staging, worker_staging_bytes, aligned_offset, aligned_bytes);
                 if (direct) {
-                    if (read_all(operation.direct_native_handle, worker_staging, aligned_bytes, aligned_offset)) {
+                    uint64_t direct_completed_bytes = 0;
+                    if (read_all(operation.direct_native_handle, worker_staging, aligned_bytes, aligned_offset,
+                            operation.source_size, &direct_completed_bytes) &&
+                            direct_completion_ready(
+                                stored, aligned_offset, aligned_bytes, direct_completed_bytes)) {
                         for (uint8_t segment_index = 0; segment_index < operation.segment_count; ++segment_index) {
                             const auto & segment = operation.segments[segment_index];
                             std::memcpy(segment.data,
@@ -1302,8 +1338,14 @@ struct llm_expert_async_transport::impl {
                         std::lock_guard<std::mutex> guard(mutex);
                         counters.direct_read_operations++;
                         counters.direct_useful_bytes += operation.byte_count;
-                        counters.direct_aligned_bytes += aligned_bytes;
+                        counters.direct_aligned_bytes += direct_completed_bytes;
                         counters.direct_scatter_bytes += operation.byte_count;
+                        if (direct_completed_bytes != aligned_bytes) {
+                            counters.direct_eof_short_reads++;
+                            counters.direct_eof_shortfall_bytes += aligned_bytes - direct_completed_bytes;
+                        }
+                    } else if (completion.result == llm_expert_async_result::ready) {
+                        completion.result = llm_expert_async_result::invalid;
                     }
                 } else {
                     if (config.direct_io_requested) {
@@ -1313,7 +1355,8 @@ struct llm_expert_async_transport::impl {
                     }
                     for (uint8_t segment_index = 0; segment_index < operation.segment_count; ++segment_index) {
                         const auto & segment = operation.segments[segment_index];
-                        if (!read_all(operation.native_handle, segment.data, segment.byte_count, segment.file_offset)) break;
+                        if (!read_all(operation.native_handle, segment.data, segment.byte_count,
+                                segment.file_offset, 0, nullptr)) break;
                         completion.bytes_completed += segment.byte_count;
                     }
                 }
