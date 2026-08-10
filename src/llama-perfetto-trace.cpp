@@ -26,7 +26,9 @@ PERFETTO_TRACK_EVENT_STATIC_STORAGE();
 namespace {
 
 constexpr uint64_t k_cupti_retained_bytes_max = UINT64_C(256)*1024U*1024U;
-constexpr size_t k_cupti_buffer_bytes = 1024U*1024U;
+// Keep individual activity buffers small enough for the concurrent context
+// and stream fan-out of a four-GPU routed decode window.
+constexpr size_t k_cupti_buffer_bytes = 256U*1024U;
 // Multi-device captures can require one concurrently active CUPTI buffer for
 // many contexts and streams before the completion callbacks reclaim them.
 // Keep the accepted total bound unchanged while splitting it evenly between
