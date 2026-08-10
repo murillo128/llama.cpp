@@ -276,6 +276,11 @@ struct llm_expert_graph_binding {
 
     ggml_tensor * execution_ids = nullptr;
 
+    // Device that owns the default cached branch. This stays null for
+    // resident/bootstrap bindings and makes local ExpertPool placement
+    // independent from the ordinary layer backend.
+    ggml_backend_dev_t default_target_device = nullptr;
+
     // Keeps cache-owned tensor storage alive for as long as the graph binding
     // can be reused. Resident/bootstrap bindings leave this empty.
     std::shared_ptr<void> generation_lease;
@@ -283,14 +288,19 @@ struct llm_expert_graph_binding {
     bool bootstrap = false;
     ggml_tensor * logical_ids = nullptr;
 
-    // Present only for the Phase 8 hybrid graph. The existing fields above
-    // remain the GPU/default branch so PROMOTE_AND_GPU retains its Phase 7
-    // aggregate layout and graph shape.
+    // Cached execution observes logical IDs at this CPU checkpoint before a
+    // dependent duplicate transports remapped physical IDs to a device branch.
+    // Multi-device execution retains the checkpoint explicitly and supplies
+    // per-device input tensors instead of a dependent duplicate.
+    ggml_tensor * checkpoint_ids = nullptr;
+
+    // Present only for the Phase 8 hybrid graph. The existing projections
+    // above remain the GPU/default branch so PROMOTE_AND_GPU retains its
+    // Phase 7 aggregate layout and graph shape.
     llm_expert_projection_descriptor cpu_up;
     llm_expert_projection_descriptor cpu_gate;
     llm_expert_projection_descriptor cpu_gate_up;
     llm_expert_projection_descriptor cpu_down;
-    ggml_tensor * checkpoint_ids = nullptr;
     ggml_tensor * cpu_execution_ids = nullptr;
     bool hybrid = false;
 
@@ -1023,6 +1033,7 @@ struct llm_expert_graph_diagnostics {
     int32_t node_count = 0;
     int32_t binding_count = 0;
     int32_t binding_capacity = 0;
+    int32_t local_device_bindings = 0;
     uint64_t inflight_handles = 0;
     int32_t graphs_reused = 0;
 };

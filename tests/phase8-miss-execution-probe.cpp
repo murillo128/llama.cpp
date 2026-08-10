@@ -18,6 +18,7 @@ struct checkpoint_callback_data {
     const int32_t * cpu_values;
     size_t bytes;
     bool fired;
+    bool cancel;
 };
 
 bool checkpoint_callback(ggml_tensor * tensor, bool ask, void * user_data) {
@@ -28,9 +29,12 @@ bool checkpoint_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     if (ask) {
         return true;
     }
+    data->fired = true;
+    if (data->cancel) {
+        return false;
+    }
     ggml_backend_tensor_set(data->checkpoint, data->gpu_values, 0, data->bytes);
     ggml_backend_tensor_set(data->cpu_ids, data->cpu_values, 0, data->bytes);
-    data->fired = true;
     return true;
 }
 
@@ -43,7 +47,8 @@ uint64_t measure(
         probe_mode mode,
         ggml_backend_t cpu,
         ggml_backend_t gpu,
-        int64_t extent) {
+        int64_t extent,
+        bool cancel_after_checkpoint = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*12 + ggml_graph_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -140,12 +145,18 @@ uint64_t measure(
 
     checkpoint_callback_data callback_data = {
         gpu_ids, cpu_ids, gpu_id_values.data(), cpu_id_values.data(),
-        gpu_id_values.size()*sizeof(int32_t), false,
+        gpu_id_values.size()*sizeof(int32_t), false, cancel_after_checkpoint,
     };
     if (mode == probe_mode::mixed) {
         ggml_backend_sched_set_eval_callback(sched.get(), checkpoint_callback, &callback_data);
     }
-    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph) == GGML_STATUS_SUCCESS);
+    const auto first_status = ggml_backend_sched_graph_compute_async(sched.get(), graph);
+    if (cancel_after_checkpoint) {
+        GGML_ASSERT(first_status == GGML_STATUS_ABORTED);
+        GGML_ASSERT(callback_data.fired);
+        return 0;
+    }
+    GGML_ASSERT(first_status == GGML_STATUS_SUCCESS);
     ggml_backend_sched_synchronize(sched.get());
     GGML_ASSERT(mode != probe_mode::mixed || callback_data.fired);
 
@@ -177,12 +188,13 @@ int main() {
     GGML_ASSERT(cpu && gpu);
 
     constexpr int64_t extent = 3072;
+    (void) measure(probe_mode::mixed, cpu.get(), gpu.get(), 64, true);
     const uint64_t cpu_us = measure(probe_mode::cpu, cpu.get(), gpu.get(), extent);
     const uint64_t gpu_us = measure(probe_mode::gpu, cpu.get(), gpu.get(), extent);
     const uint64_t mixed_us = measure(probe_mode::mixed, cpu.get(), gpu.get(), extent);
     const uint64_t sequential_us = cpu_us + gpu_us;
     const uint64_t overlap_us = sequential_us > mixed_us ? sequential_us - mixed_us : 0;
-    std::printf("PHASE8_OVERLAP\tstatus=%s\textent=%lld\tcpu_us=%llu\tgpu_us=%llu\tmixed_us=%llu\tsequential_us=%llu\toverlap_us=%llu\n",
+    std::printf("PHASE8_OVERLAP\tstatus=%s\tcallback_cancelled=1\textent=%lld\tcpu_us=%llu\tgpu_us=%llu\tmixed_us=%llu\tsequential_us=%llu\toverlap_us=%llu\n",
         overlap_us > 0 ? "pass" : "fail", (long long) extent,
         (unsigned long long) cpu_us, (unsigned long long) gpu_us,
         (unsigned long long) mixed_us, (unsigned long long) sequential_us,

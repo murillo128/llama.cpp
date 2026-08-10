@@ -204,11 +204,12 @@ class KimiK3Model(TextModel):
 
         def load(fns: list[tuple[Callable[[], Tensor], Callable[[], Tensor]]]) -> np.ndarray:
             out = np.empty(byte_shape, dtype=np.uint8)
-            for eid, (packed_fn, scale_fn) in enumerate(fns):
-                out[eid] = repack_mxfp4_blocks(
-                    LazyTorchTensor.to_eager(packed_fn()),
-                    LazyTorchTensor.to_eager(scale_fn()),
-                )
+            with gguf.utility.SafetensorRemote.full_file_cache():
+                for eid, (packed_fn, scale_fn) in enumerate(fns):
+                    out[eid] = repack_mxfp4_blocks(
+                        LazyTorchTensor.to_eager(packed_fn()),
+                        LazyTorchTensor.to_eager(scale_fn()),
+                    )
             return out
 
         # loaders goes through args rather than the closure so that `func` matches

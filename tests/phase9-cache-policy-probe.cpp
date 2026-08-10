@@ -159,6 +159,7 @@ struct arguments {
     uint32_t n_ctx = 64;
     uint32_t n_batch = 64;
     uint32_t n_ubatch = 1;
+    int32_t n_gpu_layers = -1;
     int max_generate = 2;
     bool background = false;
     bool async_cold_fill = false;
@@ -280,8 +281,12 @@ bool parse_arguments(int argc, char ** argv, arguments & result) {
         else if (option == "--n-ctx") { if (!parse_u32(value, result.n_ctx)) return false; }
         else if (option == "--n-batch") { if (!parse_u32(value, result.n_batch)) return false; }
         else if (option == "--n-ubatch") { if (!parse_u32(value, result.n_ubatch)) return false; }
+        else if (option == "--n-gpu-layers") {
+            uint32_t parsed = 0; if (!parse_u32(value, parsed) || parsed > INT32_MAX) return false;
+            result.n_gpu_layers = int32_t(parsed);
+        }
         else if (option == "--max-generate") {
-            uint32_t parsed = 0; if (!parse_u32(value, parsed) || parsed == 0 || parsed > 128) return false;
+            uint32_t parsed = 0; if (!parse_u32(value, parsed) || parsed == 0 || parsed > 4096) return false;
             result.max_generate = int(parsed);
         } else if (option == "--background") {
             if (std::string(value) != "0" && std::string(value) != "1") return false;
@@ -553,6 +558,8 @@ json async_diagnostics_json(const llm_expert_async_diagnostics & value) {
         {"short_positive_reads", value.short_positive_reads},
         {"direct_read_operations", value.direct_read_operations}, {"direct_useful_bytes", value.direct_useful_bytes},
         {"direct_aligned_bytes", value.direct_aligned_bytes}, {"direct_scatter_bytes", value.direct_scatter_bytes},
+        {"direct_eof_short_reads", value.direct_eof_short_reads},
+        {"direct_eof_shortfall_bytes", value.direct_eof_shortfall_bytes},
         {"buffered_fallback_operations", value.buffered_fallback_operations},
         {"buffered_fallback_bytes", value.buffered_fallback_bytes},
         {"direct_capability_retries", value.direct_capability_retries},
@@ -642,6 +649,7 @@ int main(int argc, char ** argv) {
                 "usage: %s --model GGUF --output JSON [--mode disabled|hot|cold] "
                 "[--prewarm-cold-all 0|1] "
                 "[--async-cold-fill 0|1] "
+                "[--n-gpu-layers N] "
                 "[--integrity NONE|FNV64_END_TO_END (internal evidence only)] [policy/capacity options]\n",
                 argv[0]);
             return 2;
@@ -733,7 +741,7 @@ int main(int argc, char ** argv) {
         model_params.expert_io_force_positional_reads =
             args.transport == "POSITIONAL" || args.transport == "DIRECT_IO_POSITIONAL";
         model_params.expert_io_random_access = args.io_access == "RANDOM";
-        model_params.n_gpu_layers = -1;
+        model_params.n_gpu_layers = args.n_gpu_layers;
         model_params.tensor_buft_overrides = overrides;
         model_params.expert_weights_mode = args.mode == "disabled" ? LLAMA_EXPERT_WEIGHTS_MODE_DISABLED :
             args.mode == "cold" ? LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE : LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE;
@@ -962,6 +970,7 @@ int main(int argc, char ** argv) {
                     {"n_ctx", args.n_ctx},
                     {"n_batch", args.n_batch},
                     {"n_ubatch", args.n_ubatch},
+                    {"n_gpu_layers", args.n_gpu_layers},
                     {"max_generate", args.max_generate},
                 }},
                 {"prompt_ids", prompt}, {"generated_ids", generated}, {"generated_text", generated_text},
@@ -1170,6 +1179,7 @@ int main(int argc, char ** argv) {
                 {"graph_operation_hash", graph_diagnostics.operation_hash},
                 {"graph_node_count", graph_diagnostics.node_count},
                 {"graph_binding_count", graph_diagnostics.binding_count},
+                {"local_device_bindings", graph_diagnostics.local_device_bindings},
                 {"graphs_reused", graph_diagnostics.graphs_reused},
                 {"provider_bind_calls", provider_stats.bind_calls},
                 {"remote_single_bindings", diagnostics.remote_single_bindings},
@@ -1185,6 +1195,7 @@ int main(int argc, char ** argv) {
                 {"n_ctx", args.n_ctx},
                 {"n_batch", args.n_batch},
                 {"n_ubatch", args.n_ubatch},
+                {"n_gpu_layers", args.n_gpu_layers},
                 {"max_generate", args.max_generate},
             }},
             {"sampling", {{"seed", 1}, {"temperature", 0.0}, {"selection", "argmax"}}},

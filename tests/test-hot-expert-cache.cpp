@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1820,7 +1821,8 @@ void test_mixed_cold_hit_h2d_precedes_direct_storage_completion() {
     });
 
     bool cold_h2d_while_storage_blocked = false;
-    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+    const auto overlap_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < overlap_deadline) {
         if (reader.blocked.load(std::memory_order_acquire) != 0) {
             const auto diagnostics = provider->hot_cache_diagnostics();
             cold_h2d_while_storage_blocked = diagnostics.ring_stage_bytes > 0 &&
@@ -1945,7 +1947,8 @@ void test_multi_device_mixed_cold_hit_h2d_precedes_direct_storage_completion() {
     });
 
     bool cold_h2d_while_storage_blocked = false;
-    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
+    const auto overlap_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < overlap_deadline) {
         if (reader.blocked.load(std::memory_order_acquire) != 0) {
             const auto diagnostics = provider->hot_cache_diagnostics();
             cold_h2d_while_storage_blocked = diagnostics.ring_stage_bytes > 0 &&
@@ -2235,7 +2238,7 @@ bool count_execution_id_callbacks(ggml_tensor * tensor, bool ask, void * user_da
     auto * counts = static_cast<eval_callback_counts *>(user_data);
     if (ask) {
         counts->asks++;
-        return std::strncmp(tensor->name, "expert_execution_ids-", 21) == 0;
+        return std::strncmp(tensor->name, "expert_checkpoint_ids-", 22) == 0;
     }
     counts->observations++;
     return true;
@@ -3342,7 +3345,7 @@ void test_cuda_model_cross_epoch_hits(const char * model_path) {
     GGML_ASSERT(hot_routes.weights == disabled_routes.weights);
     const auto hot_graph = first->expert_graph_diagnostics();
     GGML_ASSERT(hot_graph.binding_count == 7);
-    GGML_ASSERT(hot_graph.node_count == disabled_graph.node_count + 7);
+    GGML_ASSERT(hot_graph.node_count == disabled_graph.node_count + 14);
     GGML_ASSERT(hot_graph.operation_hash != disabled_graph.operation_hash);
     auto * provider = model->expert_weight_provider();
     const auto cold = provider->hot_cache_diagnostics();
@@ -3386,6 +3389,102 @@ void test_cuda_model_cross_epoch_hits(const char * model_path) {
     llama_free(first);
     GGML_ASSERT(provider->surrender().is_ready());
     llama_model_free(model);
+}
+
+void test_cuda_model_explicit_local_cold_partial_offload(const char * model_path) {
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    GGML_ASSERT(gpu != nullptr);
+    const llama_model_tensor_buft_override overrides[] = {
+        { "ffn_(gate|up|down)_exps\\.weight", ggml_backend_cpu_buffer_type() },
+        { nullptr, nullptr },
+    };
+    const llama_expert_role_device expert_device = { gpu, 4 };
+    const llama_expert_role_config roles = {
+        LLAMA_EXPERT_ROLE_CONFIG_VERSION_1, gpu, &expert_device, 1,
+    };
+    llama_context_params context_params = llama_context_default_params();
+    context_params.n_ctx = 64;
+    context_params.n_batch = 64;
+    context_params.n_ubatch = 2;
+    llama_token token = 1;
+
+    llama_model_params baseline_params = llama_model_default_params();
+    baseline_params.devices = nullptr;
+    baseline_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+    baseline_params.main_gpu = 0;
+    baseline_params.n_gpu_layers = 1;
+    baseline_params.tensor_buft_overrides = overrides;
+    baseline_params.expert_role_config = &roles;
+    llama_model * baseline_model = llama_model_load_from_file(model_path, baseline_params);
+    GGML_ASSERT(baseline_model != nullptr);
+    llama_context * baseline_context = llama_init_from_model(baseline_model, context_params);
+    GGML_ASSERT(baseline_context != nullptr);
+    route_capture baseline_routes;
+    GGML_ASSERT(llama_set_route_observer(baseline_context, capture_routes, &baseline_routes) ==
+        LLAMA_ROUTE_OBSERVER_STATUS_OK);
+    GGML_ASSERT(llama_route_observer_begin(baseline_context, 1, LLAMA_ROUTE_PHASE_DECODE) ==
+        LLAMA_ROUTE_OBSERVER_STATUS_OK);
+    GGML_ASSERT(llama_decode(baseline_context, llama_batch_get_one(&token, 1)) == 0);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(baseline_model));
+    const float * baseline_logits = llama_get_logits_ith(baseline_context, -1);
+    GGML_ASSERT(baseline_logits != nullptr);
+    const int32_t baseline_argmax = int32_t(std::max_element(
+        baseline_logits, baseline_logits + n_vocab) - baseline_logits);
+
+    llama_model_params cached_params = baseline_params;
+    cached_params.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+    cached_params.expert_cold_cache_bytes = 16U*1024U*1024U;
+    cached_params.expert_transfer_ring_bytes = 16U*1024U*1024U;
+    cached_params.expert_io_queue_depth = 16;
+    cached_params.expert_io_worker_count = 4;
+    cached_params.expert_io_force_positional_reads = true;
+    llama_model * cached_model = llama_model_load_from_file(model_path, cached_params);
+    GGML_ASSERT(cached_model != nullptr);
+    llama_context * cached_context = llama_init_from_model(cached_model, context_params);
+    GGML_ASSERT(cached_context != nullptr);
+    route_capture cached_routes;
+    GGML_ASSERT(llama_set_route_observer(cached_context, capture_routes, &cached_routes) ==
+        LLAMA_ROUTE_OBSERVER_STATUS_OK);
+    GGML_ASSERT(llama_route_observer_begin(cached_context, 1, LLAMA_ROUTE_PHASE_DECODE) ==
+        LLAMA_ROUTE_OBSERVER_STATUS_OK);
+    GGML_ASSERT(llama_decode(cached_context, llama_batch_get_one(&token, 1)) == 0);
+    const float * cached_logits = llama_get_logits_ith(cached_context, -1);
+    GGML_ASSERT(cached_logits != nullptr);
+    const int32_t cached_argmax = int32_t(std::max_element(
+        cached_logits, cached_logits + n_vocab) - cached_logits);
+    GGML_ASSERT(cached_argmax == baseline_argmax);
+    GGML_ASSERT(cached_routes.layers == baseline_routes.layers);
+    GGML_ASSERT(cached_routes.ids == baseline_routes.ids);
+    GGML_ASSERT(cached_routes.weights == baseline_routes.weights);
+    const auto graph = cached_context->expert_graph_diagnostics();
+    GGML_ASSERT(graph.binding_count == 7);
+    GGML_ASSERT(graph.local_device_bindings == graph.binding_count);
+    auto * provider = cached_model->expert_weight_provider();
+    GGML_ASSERT(provider != nullptr);
+    const auto diagnostics = provider->hot_cache_diagnostics();
+    GGML_ASSERT(diagnostics.remap_checkpoints == 7);
+    GGML_ASSERT(diagnostics.current_pins == 0);
+
+    for (int repetition = 0; repetition < 8; ++repetition) {
+        GGML_ASSERT(llama_route_observer_begin(
+            cached_context, uint64_t(repetition + 2), LLAMA_ROUTE_PHASE_DECODE) ==
+            LLAMA_ROUTE_OBSERVER_STATUS_OK);
+        GGML_ASSERT(llama_decode(cached_context, llama_batch_get_one(&token, 1)) == 0);
+        const float * repeated_logits = llama_get_logits_ith(cached_context, -1);
+        GGML_ASSERT(repeated_logits != nullptr);
+        GGML_ASSERT(std::all_of(repeated_logits, repeated_logits + n_vocab, [](float value) {
+            return std::isfinite(value);
+        }));
+    }
+    GGML_ASSERT(cached_context->expert_graph_diagnostics().graphs_reused > 0);
+    GGML_ASSERT(provider->hot_cache_diagnostics().remap_checkpoints == 63);
+    GGML_ASSERT(provider->hot_cache_diagnostics().current_pins == 0);
+
+    llama_free(cached_context);
+    GGML_ASSERT(provider->surrender().is_ready());
+    llama_model_free(cached_model);
+    llama_free(baseline_context);
+    llama_model_free(baseline_model);
 }
 
 void test_cuda_model_multi_token_all_expert_capacity(const char * model_path) {
@@ -3586,6 +3685,7 @@ int main(int argc, char ** argv) {
         test_cuda_directory_copy();
         test_cuda_model_pool_smoke(argv[1]);
         test_cuda_model_cross_epoch_hits(argv[1]);
+        test_cuda_model_explicit_local_cold_partial_offload(argv[1]);
         test_cuda_model_multi_token_all_expert_capacity(argv[1]);
         llama_backend_free();
     } else if (argc != 1) {

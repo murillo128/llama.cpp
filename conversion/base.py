@@ -142,6 +142,7 @@ class ModelBase:
     metadata: gguf.Metadata
     dir_model_card: Path
     remote_hf_model_id: str | None
+    remote_hf_model_revision: str
     target_model_dir: Path | None
 
     # subclasses should define this!
@@ -168,6 +169,8 @@ class ModelBase:
                  metadata_override: Path | None = None, model_name: str | None = None,
                  split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False,
                  small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None,
+                 remote_hf_model_revision: str = "main",
+                 remote_cache_dir: Path | None = None,
                  disable_mistral_community_chat_template: bool = False,
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
@@ -190,6 +193,8 @@ class ModelBase:
         self.lazy = not eager or (remote_hf_model_id is not None)
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
+        self.remote_hf_model_revision = remote_hf_model_revision
+        gguf.utility.SafetensorRemote.configure_file_cache(remote_cache_dir)
         self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
         self.target_model_dir = target_model_dir
         self.fuse_gate_up_exps = fuse_gate_up_exps
@@ -252,7 +257,8 @@ class ModelBase:
             is_safetensors = True
 
             logger.info(f"Using remote model with HuggingFace id: {remote_hf_model_id}")
-            remote_tensors = gguf.utility.SafetensorRemote.get_list_tensors_hf_model(remote_hf_model_id)
+            remote_tensors = gguf.utility.SafetensorRemote.get_list_tensors_hf_model(
+                remote_hf_model_id, revision=self.remote_hf_model_revision)
             for name, remote_tensor in remote_tensors.items():
                 data_gen = lambda r=remote_tensor: LazyTorchTensor.from_remote_tensor(r)  # noqa: E731
                 if titem := self.filter_tensors((name, data_gen)):

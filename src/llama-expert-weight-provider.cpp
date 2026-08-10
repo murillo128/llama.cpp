@@ -1116,7 +1116,10 @@ llm_expert_provider_result llm_expert_graph_binding::validate(const llm_expert_s
     }
     if (remote_single) {
         const bool merged = remote_device.gate_up.weight != nullptr;
-        if (hybrid || multi_device || !devices.empty() || checkpoint_ids != nullptr ||
+        if (hybrid || multi_device || !devices.empty() || checkpoint_ids == nullptr ||
+            checkpoint_ids == execution_ids || checkpoint_ids == logical_ids ||
+            checkpoint_ids->type != GGML_TYPE_I32 || checkpoint_ids->ne[0] != selection.n_expert_used ||
+            checkpoint_ids->ne[1] != selection.n_tokens ||
             remote_device.device_id != 0 || remote_device.target_device == nullptr ||
             remote_device.execution_ids != execution_ids ||
             remote_device.down.weight == nullptr || merged != uses_merged_gate_up() ||
@@ -1168,10 +1171,18 @@ llm_expert_provider_result llm_expert_graph_binding::validate(const llm_expert_s
             (cpu_merged ? (cpu_up.weight != nullptr || cpu_gate.weight != nullptr) : cpu_up.weight == nullptr)) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
         }
-    } else if (remote_device.target_device != nullptr || checkpoint_ids != nullptr ||
-               cpu_execution_ids != nullptr || cpu_up.weight != nullptr || cpu_gate.weight != nullptr ||
-               cpu_gate_up.weight != nullptr || cpu_down.weight != nullptr) {
-        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+    } else {
+        const bool local_cached = default_target_device != nullptr && execution_ids != logical_ids;
+        if (remote_device.target_device != nullptr ||
+            cpu_execution_ids != nullptr || cpu_up.weight != nullptr || cpu_gate.weight != nullptr ||
+            cpu_gate_up.weight != nullptr || cpu_down.weight != nullptr ||
+            (local_cached && (checkpoint_ids == nullptr || checkpoint_ids == execution_ids ||
+                checkpoint_ids == logical_ids || checkpoint_ids->type != GGML_TYPE_I32 ||
+                checkpoint_ids->ne[0] != selection.n_expert_used ||
+                checkpoint_ids->ne[1] != selection.n_tokens)) ||
+            (!local_cached && checkpoint_ids != nullptr)) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_binding);
+        }
     }
     return llm_expert_provider_result::success();
 }
@@ -2294,7 +2305,9 @@ public:
                     ggml_set_input(cpu_execution_ids);
                     ggml_format_name(cpu_execution_ids, "expert_cpu_execution_ids-%d", bundle.layer);
                 } else {
-                    execution_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                    checkpoint_ids = ggml_dup(graph_ctx, selection.logical_ids);
+                    ggml_format_name(checkpoint_ids, "expert_checkpoint_ids-%d", bundle.layer);
+                    execution_ids = ggml_dup(graph_ctx, checkpoint_ids);
                     ggml_format_name(execution_ids, "expert_execution_ids-%d", bundle.layer);
                 }
             }
@@ -2307,6 +2320,9 @@ public:
             binding.gate_up = hot_bundle.gate_up;
             binding.down = hot_bundle.down;
             binding.execution_ids = execution_ids;
+            binding.checkpoint_ids = checkpoint_ids;
+            binding.default_target_device = config.target_device != nullptr ?
+                config.target_device : ggml_backend_buft_get_device(config.target_buffer_type);
             binding.generation_lease = std::static_pointer_cast<void>(pool);
             binding.graph_epoch = epoch;
             counters.hot_bindings++;
@@ -2555,7 +2571,7 @@ public:
         if (deterministic_policy_terminals) ordered_lock.lock();
         std::unique_lock<std::mutex> lock(mutex);
         (void) execution_backend;
-        ggml_tensor * checkpoint_ids = (binding.hybrid || binding.multi_device) ?
+        ggml_tensor * checkpoint_ids = binding.checkpoint_ids != nullptr ?
             binding.checkpoint_ids : binding.execution_ids;
         if (checkpoint_ids == nullptr || binding.execution_ids == nullptr ||
             binding.execution_ids == binding.logical_ids || binding.execution_ids->type != GGML_TYPE_I32 ||

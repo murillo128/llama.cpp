@@ -26,8 +26,14 @@ PERFETTO_TRACK_EVENT_STATIC_STORAGE();
 namespace {
 
 constexpr uint64_t k_cupti_retained_bytes_max = UINT64_C(256)*1024U*1024U;
-constexpr size_t k_cupti_buffer_bytes = 1024U*1024U;
-constexpr uint64_t k_cupti_activity_buffer_reserve_bytes = UINT64_C(32)*1024U*1024U;
+// Keep individual activity buffers small enough for the concurrent context
+// and stream fan-out of a four-GPU routed decode window.
+constexpr size_t k_cupti_buffer_bytes = 256U*1024U;
+// Multi-device captures can require one concurrently active CUPTI buffer for
+// many contexts and streams before the completion callbacks reclaim them.
+// Keep the accepted total bound unchanged while splitting it evenly between
+// active activity buffers and retained records.
+constexpr uint64_t k_cupti_activity_buffer_reserve_bytes = UINT64_C(64)*1024U*1024U;
 std::atomic<bool> g_trace_active { false };
 std::atomic<uint64_t> g_next_trace_id { 1 };
 std::atomic<uint64_t> g_cupti_active_buffer_bytes { 0 };

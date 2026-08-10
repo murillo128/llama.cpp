@@ -62,6 +62,8 @@ struct llm_expert_transport_endpoint_plan : llm_expert_physical_device {
 void llm_expert_role_canonicalize(std::vector<llm_expert_role_device_plan> & experts);
 std::vector<llm_expert_transport_endpoint_plan> llm_expert_transport_endpoints(
     const llm_expert_role_plan & roles);
+bool llm_expert_role_has_independent_cold_target(
+    enum llama_expert_weights_mode mode, const llm_expert_role_plan & roles) noexcept;
 bool llm_expert_transport_edge_required(uint32_t source, uint32_t destination, uint32_t device_count) noexcept;
 uint32_t llm_expert_resolve_io_worker_count(
     uint32_t requested_count, uint32_t legacy_count, bool positional_reads) noexcept;

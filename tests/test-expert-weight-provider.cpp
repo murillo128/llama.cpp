@@ -233,6 +233,10 @@ void test_expert_role_resolution_and_ownership() {
     const auto & local_plan = local_model->expert_role_plan();
     GGML_ASSERT(local_plan.explicit_config);
     GGML_ASSERT(local_plan.shape == llm_expert_role_shape::local_single);
+    GGML_ASSERT(llm_expert_role_has_independent_cold_target(
+        LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE, local_plan));
+    GGML_ASSERT(!llm_expert_role_has_independent_cold_target(
+        LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE, local_plan));
     GGML_ASSERT(local_plan.experts.size() == 1);
     GGML_ASSERT(local_plan.experts[0].hot_slots == 7);
     GGML_ASSERT(local_plan.experts[0].pci_bdf.size() == 16);

@@ -150,6 +150,8 @@ struct llm_expert_async_diagnostics {
     uint64_t direct_useful_bytes = 0;
     uint64_t direct_aligned_bytes = 0;
     uint64_t direct_scatter_bytes = 0;
+    uint64_t direct_eof_short_reads = 0;
+    uint64_t direct_eof_shortfall_bytes = 0;
     uint64_t buffered_fallback_operations = 0;
     uint64_t buffered_fallback_bytes = 0;
     uint64_t direct_capability_retries = 0;

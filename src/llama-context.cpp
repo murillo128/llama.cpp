@@ -1047,6 +1047,12 @@ llm_expert_graph_diagnostics llama_context::expert_graph_diagnostics() const {
     result.node_count = graph ? ggml_graph_n_nodes(graph) : 0;
     result.binding_count = int32_t(gf_res_prev->get_expert_bindings().size());
     result.binding_capacity = int32_t(gf_res_prev->get_expert_binding_capacity());
+    result.local_device_bindings = int32_t(std::count_if(
+        gf_res_prev->get_expert_bindings().begin(), gf_res_prev->get_expert_bindings().end(),
+        [](const llm_expert_graph_binding & binding) {
+            return binding.default_target_device != nullptr && !binding.hybrid &&
+                !binding.remote_single && !binding.multi_device;
+        }));
 
     uint64_t hash = 1469598103934665603ULL;
     constexpr uint64_t prime = 1099511628211ULL;
@@ -1944,7 +1950,7 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
         for (const auto & binding : *ctx->expert_eval_bindings) {
             if (!binding.bootstrap && binding.logical_ids != nullptr &&
                 binding.execution_ids != binding.logical_ids &&
-                ((binding.hybrid || binding.multi_device) ?
+                (binding.checkpoint_ids != nullptr ?
                     binding.checkpoint_ids : binding.execution_ids) == tensor) {
                 checkpoint = &binding;
                 break;
