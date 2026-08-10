@@ -1204,6 +1204,11 @@ void llm_expert_role_canonicalize(std::vector<llm_expert_role_device_plan> & exp
     });
 }
 
+bool llm_expert_role_has_independent_cold_target(
+        enum llama_expert_weights_mode mode, const llm_expert_role_plan & roles) noexcept {
+    return mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE && roles.explicit_config && !roles.experts.empty();
+}
+
 std::vector<llm_expert_transport_endpoint_plan> llm_expert_transport_endpoints(
         const llm_expert_role_plan & roles) {
     const auto same_physical_device = [](const llm_expert_physical_device & lhs,
@@ -1471,6 +1476,9 @@ void llama_model::init_expert_weight_provider() {
         case LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE:
         case LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE: {
             const bool uma_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
+            const auto & roles = expert_role_plan();
+            const bool independent_cold_target =
+                llm_expert_role_has_independent_cold_target(params.expert_weights_mode, roles);
             ggml_backend_dev_t target = nullptr;
             uint32_t routed_layer_count = 0;
             std::vector<int32_t> routed_layers;
@@ -1482,7 +1490,7 @@ void llama_model::init_expert_weight_provider() {
                 ggml_backend_dev_t layer_target = dev_layer(il);
                 if (target == nullptr) {
                     target = layer_target;
-                } else if (target != layer_target) {
+                } else if (!independent_cold_target && target != layer_target) {
                     throw std::invalid_argument("hot-cache routed layers must target one device");
                 }
                 routed_layer_count++;
@@ -1591,9 +1599,9 @@ void llama_model::init_expert_weight_provider() {
             if (directory_entries > UINT32_MAX) {
                 throw std::overflow_error("hot-cache expert directory exceeds uint32_t capacity");
             }
-            const auto & roles = expert_role_plan();
             const bool distributed_roles = roles.shape != llm_expert_role_shape::local_single;
-            ggml_backend_dev_t provider_target = distributed_roles ? roles.experts.front().device : target;
+            ggml_backend_dev_t provider_target = independent_cold_target || distributed_roles ?
+                roles.experts.front().device : target;
             llm_hot_cache_config config;
             config.capacity = hot_capacity;
             config.n_expert_used = uint32_t(hparams.n_expert_used);
