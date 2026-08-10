@@ -2043,6 +2043,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     llm_expert_graph_binding::device_binding remote_execution_binding;
     bool multi_device_execution = false;
     std::vector<llm_expert_graph_binding::device_binding> device_execution_bindings;
+    ggml_backend_dev_t default_execution_target_device = nullptr;
 
     if (expert_weight_provider && res->get_expert_provider_result().is_ready()) {
         const llm_expert_bundle_descriptor bundle = {
@@ -2075,20 +2076,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             execution_gate_exps_s = binding.gate.scale;
             execution_down_exps_s = binding.down.scale;
             execution_ids = binding.execution_ids;
+            default_execution_target_device = binding.default_target_device;
             hybrid_execution = binding.hybrid;
             remote_single_execution = binding.remote_single;
             if (remote_single_execution) {
                 remote_execution_binding = binding.remote_device;
             }
             multi_device_execution = binding.multi_device;
+            if (binding.checkpoint_ids != nullptr && !hybrid_execution) {
+                // Retain the logical-ID checkpoint explicitly. The scheduler
+                // callback remaps it before the dependent device-local duplicate
+                // transports physical IDs to the cached branch.
+                ggml_build_forward_expand(gf, binding.checkpoint_ids);
+            }
             if (multi_device_execution) {
                 device_execution_bindings = binding.devices;
-                // Unlike the hybrid graph, the per-device execution-id inputs do
-                // not depend on the logical-id checkpoint.  Retain the checkpoint
-                // explicitly so the scheduler callback can remap those inputs
-                // before either device branch executes.
-                GGML_ASSERT(binding.checkpoint_ids != nullptr);
-                ggml_build_forward_expand(gf, binding.checkpoint_ids);
             }
             if (hybrid_execution) {
                 cpu_up = binding.cpu_up;
@@ -2107,7 +2109,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // that checkpoint on the CPU scheduler backend so observing it never
                 // host-synchronizes the CUDA compute backend.
                 ggml_backend_sched_set_tensor_backend(
-                    sched, (hybrid_execution || multi_device_execution) ?
+                    sched, binding.checkpoint_ids != nullptr ?
                         binding.checkpoint_ids : execution_ids, backend_cpu);
                 if (cpu_execution_ids != nullptr) {
                     ggml_backend_sched_set_tensor_backend(sched, cpu_execution_ids, backend_cpu);
@@ -2148,6 +2150,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         GGML_ASSERT(hybrid_gpu_backend != nullptr && hybrid_gpu_backend != backend_cpu);
     }
+    ggml_backend_t local_cached_execution_backend = nullptr;
+    const bool local_cached_execution =
+        !hybrid_execution && !remote_single_execution && !multi_device_execution &&
+        execution_ids != selected_experts && !res->get_expert_bindings().empty();
+    if (local_cached_execution) {
+        GGML_ASSERT(default_execution_target_device != nullptr);
+        for (int backend_index = 0; backend_index < ggml_backend_sched_get_n_backends(sched); ++backend_index) {
+            ggml_backend_t candidate = ggml_backend_sched_get_backend(sched, backend_index);
+            if (ggml_backend_get_device(candidate) == default_execution_target_device) {
+                local_cached_execution_backend = candidate;
+                break;
+            }
+        }
+        GGML_ASSERT(local_cached_execution_backend != nullptr &&
+            local_cached_execution_backend != backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, execution_ids, local_cached_execution_backend);
+    }
     std::vector<ggml_backend_t> device_execution_backends;
     if (multi_device_execution) {
         device_execution_backends.resize(device_execution_bindings.size());
@@ -2173,6 +2192,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
         GGML_ASSERT(remote_execution_backend != nullptr && remote_execution_backend != backend_cpu);
+        ggml_backend_sched_set_tensor_backend(
+            sched, remote_execution_binding.execution_ids, remote_execution_backend);
     }
     ggml_backend_t resident_execution_backend = nullptr;
     if (remote_single_execution || multi_device_execution) {
@@ -2211,7 +2232,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 char tagged[96];
                 snprintf(tagged, sizeof(tagged), "%s_%s", name, branch_name);
                 cb(tensor, tagged, il);
-                GGML_ASSERT(branch_backend != nullptr);
+            }
+            if (branch_backend != nullptr) {
                 ggml_backend_sched_set_tensor_backend(sched, tensor, branch_backend);
             }
         };
@@ -2417,7 +2439,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             execution_gate_up_exps, execution_gate_up_exps_b, execution_down_exps, execution_down_exps_b,
             execution_up_exps_s, execution_gate_exps_s, execution_down_exps_s, execution_ids,
             hybrid_execution, hybrid_execution ? "gpu" : nullptr,
-            hybrid_execution ? hybrid_gpu_backend : nullptr);
+            hybrid_execution ? hybrid_gpu_backend : local_cached_execution_backend);
     }
     if (hybrid_execution) {
         ggml_tensor * cpu_experts = build_expert_branch(
@@ -2431,8 +2453,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
-        if (remote_single_execution || multi_device_execution) {
-            ggml_backend_sched_set_tensor_backend(sched, experts, resident_execution_backend);
+        if (remote_single_execution || multi_device_execution || local_cached_execution) {
+            ggml_backend_sched_set_tensor_backend(sched, experts,
+                local_cached_execution ? local_cached_execution_backend : resident_execution_backend);
         }
         cb(experts, "ffn_moe_weighted", il);
     }
@@ -2458,8 +2481,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
-        if (remote_single_execution || multi_device_execution) {
-            ggml_backend_sched_set_tensor_backend(sched, moe_out, resident_execution_backend);
+        if (remote_single_execution || multi_device_execution || local_cached_execution) {
+            ggml_backend_sched_set_tensor_backend(sched, moe_out,
+                local_cached_execution ? local_cached_execution_backend : resident_execution_backend);
         }
 
         ggml_build_forward_expand(gf, moe_out);

@@ -1177,6 +1177,7 @@ int main(int argc, char ** argv) {
                 {"graph_operation_hash", graph_diagnostics.operation_hash},
                 {"graph_node_count", graph_diagnostics.node_count},
                 {"graph_binding_count", graph_diagnostics.binding_count},
+                {"local_device_bindings", graph_diagnostics.local_device_bindings},
                 {"graphs_reused", graph_diagnostics.graphs_reused},
                 {"provider_bind_calls", provider_stats.bind_calls},
                 {"remote_single_bindings", diagnostics.remote_single_bindings},
