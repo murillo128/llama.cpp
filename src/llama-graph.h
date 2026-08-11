@@ -712,6 +712,9 @@ struct llm_graph_params {
     uint32_t n_outputs;
 
     bool observe_routes;
+    uint32_t route_observer_candidate_count;
+    bool cache_aware_routing_enabled;
+    uint32_t cache_aware_routing_candidate_count;
 
     llm_graph_cb cb;
 
@@ -784,6 +787,9 @@ struct llm_graph_params {
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             observe_routes                  == other.observe_routes                  &&
+            route_observer_candidate_count  == other.route_observer_candidate_count  &&
+            cache_aware_routing_enabled      == other.cache_aware_routing_enabled      &&
+            cache_aware_routing_candidate_count == other.cache_aware_routing_candidate_count &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -803,6 +809,17 @@ struct llm_graph_route_output {
     int32_t il;
     ggml_tensor * selected_experts;
     ggml_tensor * weights;
+    ggml_tensor * candidate_experts;
+    ggml_tensor * candidate_selection_scores;
+    ggml_tensor * candidate_probabilities;
+};
+
+struct llm_graph_cache_aware_route {
+    int32_t il;
+    int32_t n_expert;
+    ggml_tensor * final_experts;
+    ggml_tensor * candidate_experts;
+    ggml_tensor * candidate_selection_scores;
 };
 
 class llm_graph_result {
@@ -841,12 +858,14 @@ public:
     void add_fused_node(llm_graph_fused_node result);
 
     void add_route_output(llm_graph_route_output output);
+    void add_cache_aware_route(llm_graph_cache_aware_route route);
     void reserve_expert_bindings(size_t capacity);
     void add_expert_binding(llm_expert_graph_binding binding);
     void set_expert_provider_result(llm_expert_provider_result result);
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
     const std::vector<llm_graph_route_output> & get_route_outputs() const { return route_outputs; }
+    const std::vector<llm_graph_cache_aware_route> & get_cache_aware_routes() const { return cache_aware_routes; }
     const std::vector<llm_expert_graph_binding> & get_expert_bindings() const { return expert_bindings; }
     size_t get_expert_binding_capacity() const { return expert_bindings.capacity(); }
     const llm_expert_provider_result & get_expert_provider_result() const { return expert_provider_result; }
@@ -871,6 +890,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::vector<llm_graph_route_output> route_outputs;
+    std::vector<llm_graph_cache_aware_route> cache_aware_routes;
     std::vector<llm_expert_graph_binding> expert_bindings;
     llm_expert_provider_result expert_provider_result;
 
@@ -942,6 +962,9 @@ struct llm_graph_context {
     const int64_t n_outputs;
     const int32_t n_ctx_orig; // yarn
     const bool observe_routes;
+    const uint32_t route_observer_candidate_count;
+    const bool cache_aware_routing_enabled;
+    const uint32_t cache_aware_routing_candidate_count;
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;

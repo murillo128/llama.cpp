@@ -2225,6 +2225,10 @@ struct route_capture {
 
 bool capture_routes(const llama_route_observation * observation, void * user_data) {
     auto * capture = static_cast<route_capture *>(user_data);
+    GGML_ASSERT(observation->n_candidates == 0);
+    GGML_ASSERT(observation->candidate_experts == nullptr);
+    GGML_ASSERT(observation->candidate_selection_scores == nullptr);
+    GGML_ASSERT(observation->candidate_probabilities == nullptr);
     capture->layers.push_back(observation->layer);
     const size_t count = size_t(observation->n_tokens)*observation->n_expert_used;
     capture->ids.insert(capture->ids.end(), observation->selected_experts,
@@ -2714,6 +2718,37 @@ void test_pool_lifetime_trim_surrender_and_epoch() {
     GGML_ASSERT(stats.trims == 1);
     GGML_ASSERT(stats.surrender_busy == 1);
     GGML_ASSERT(stats.surrender_successes == 1);
+}
+
+void test_route_service_tier_snapshot_is_current_and_read_only() {
+    tensor_fixture tensors;
+    auto provider = llm_create_hot_cache_expert_weight_provider(test_config());
+    auto binding = initialize_hot_binding(*provider, tensors);
+    GGML_ASSERT(provider->supports_route_service_tier_snapshot());
+
+    const int32_t candidates[] = { 0, 1, 2 };
+    llama_route_service_tier tiers[3] = {};
+    GGML_ASSERT(provider->route_service_tier_snapshot(0, candidates, 3, tiers).is_ready());
+    GGML_ASSERT(tiers[0] == LLAMA_ROUTE_SERVICE_TIER_BACKING &&
+        tiers[1] == LLAMA_ROUTE_SERVICE_TIER_BACKING &&
+        tiers[2] == LLAMA_ROUTE_SERVICE_TIER_BACKING);
+
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    const int32_t logical_ids[] = { 0, 1 };
+    int32_t execution_ids[] = { -1, -1 };
+    GGML_ASSERT(provider->remap_checkpoint(
+        binding, logical_ids, 2, execution_ids).is_ready());
+    plan.reset();
+    GGML_ASSERT(provider->route_service_tier_snapshot(0, candidates, 3, tiers).is_ready());
+    GGML_ASSERT(tiers[0] == LLAMA_ROUTE_SERVICE_TIER_HOT &&
+        tiers[1] == LLAMA_ROUTE_SERVICE_TIER_HOT &&
+        tiers[2] == LLAMA_ROUTE_SERVICE_TIER_BACKING);
+
+    binding = {};
+    GGML_ASSERT(provider->surrender().is_ready());
+    GGML_ASSERT(provider->route_service_tier_snapshot(0, candidates, 3, tiers).error ==
+        llm_expert_provider_error::stale_generation);
 }
 
 void test_layout_host_and_partial_initialization_rejection() {
@@ -3648,6 +3683,7 @@ int main(int argc, char ** argv) {
     test_context_extent_matrix_and_prepare_revalidation();
     test_cold_provider_rejects_cuda_host_source();
     test_pool_lifetime_trim_surrender_and_epoch();
+    test_route_service_tier_snapshot_is_current_and_read_only();
     test_layout_host_and_partial_initialization_rejection();
     test_layout_class_determinism_and_bounded_cap();
     test_allocation_failure_is_recoverable_and_empty_prepare_is_safe();

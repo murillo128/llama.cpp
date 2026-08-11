@@ -12,10 +12,12 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -318,6 +320,62 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+struct kimi_candidate_capture {
+    uint64_t records = 0;
+    uint64_t values = 0;
+    bool expect_changed = false;
+};
+
+static bool force_kimi_second_candidate(
+        const llama_cache_aware_routing_query * query,
+        llama_route_service_tier * tiers,
+        void *) {
+    if (query == nullptr || tiers == nullptr || query->n_expert_used != 1 ||
+        query->n_candidates != 2) {
+        return false;
+    }
+    for (uint32_t token = 0; token < query->n_tokens; ++token) {
+        tiers[size_t(token)*query->n_candidates] = LLAMA_ROUTE_SERVICE_TIER_BACKING;
+        tiers[size_t(token)*query->n_candidates + 1] = LLAMA_ROUTE_SERVICE_TIER_HOT;
+    }
+    return true;
+}
+
+static bool reject_kimi_tier_snapshot(
+        const llama_cache_aware_routing_query *,
+        llama_route_service_tier *,
+        void *) {
+    return false;
+}
+
+static bool capture_kimi_candidates(const llama_route_observation * observation, void * user_data) {
+    auto & capture = *static_cast<kimi_candidate_capture *>(user_data);
+    GGML_ASSERT(observation->n_expert_used == 1);
+    GGML_ASSERT(observation->n_candidates == 2);
+    GGML_ASSERT(observation->candidate_experts != nullptr);
+    GGML_ASSERT(observation->candidate_selection_scores != nullptr);
+    GGML_ASSERT(observation->candidate_probabilities != nullptr);
+    for (uint32_t token = 0; token < observation->n_tokens; ++token) {
+        const size_t selected = token*observation->n_expert_used;
+        const size_t candidate = token*observation->n_candidates;
+        const size_t expected_rank = capture.expect_changed ? 1 : 0;
+        GGML_ASSERT(observation->selected_experts[selected] ==
+            observation->candidate_experts[candidate + expected_rank]);
+        GGML_ASSERT(observation->candidate_experts[candidate] !=
+            observation->candidate_experts[candidate + 1]);
+        GGML_ASSERT(observation->candidate_selection_scores[candidate] >=
+            observation->candidate_selection_scores[candidate + 1]);
+        GGML_ASSERT(std::isfinite(observation->candidate_probabilities[candidate]));
+        GGML_ASSERT(std::isfinite(observation->candidate_probabilities[candidate + 1]));
+        GGML_ASSERT(std::isfinite(observation->weights[selected]));
+        GGML_ASSERT(std::abs(observation->weights[selected] -
+            observation->candidate_probabilities[candidate + expected_rank]) < 1e-6f);
+    }
+    capture.records++;
+    capture.values += uint64_t(observation->n_tokens)*observation->n_candidates;
+    return true;
 }
 
 static std::vector<float> get_logits(
@@ -633,7 +691,121 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        kimi_candidate_capture candidates;
+                        if (arch == LLM_ARCH_KIMI_K3) {
+                            const llama_cache_aware_routing_config missing_tier_source = {
+                                true, 2, 1, 0.01f, nullptr, nullptr, nullptr,
+                            };
+                            GGML_ASSERT(llama_set_cache_aware_routing(model_and_ctx_cpu.second.get(),
+                                &missing_tier_source) == LLAMA_ROUTE_OBSERVER_ERROR_CONFIGURATION);
+                            const llama_cache_aware_routing_config non_finite_regret = {
+                                true, 2, 1, std::numeric_limits<float>::infinity(),
+                                force_kimi_second_candidate, nullptr, nullptr,
+                            };
+                            GGML_ASSERT(llama_set_cache_aware_routing(model_and_ctx_cpu.second.get(),
+                                &non_finite_regret) == LLAMA_ROUTE_OBSERVER_ERROR_CONFIGURATION);
+                            GGML_ASSERT(llama_set_route_observer_candidate_count(
+                                model_and_ctx_cpu.second.get(), 3) ==
+                                LLAMA_ROUTE_OBSERVER_ERROR_CANDIDATE_COUNT);
+                            GGML_ASSERT(llama_set_route_observer_candidate_count(
+                                model_and_ctx_cpu.second.get(), 2) ==
+                                LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            GGML_ASSERT(llama_set_route_observer(model_and_ctx_cpu.second.get(),
+                                capture_kimi_candidates, &candidates) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            GGML_ASSERT(llama_set_route_observer_candidate_count(
+                                model_and_ctx_cpu.second.get(), 2) ==
+                                LLAMA_ROUTE_OBSERVER_ERROR_STATE);
+                            GGML_ASSERT(llama_route_observer_begin(model_and_ctx_cpu.second.get(), 1,
+                                LLAMA_ROUTE_PHASE_PREFILL) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                        }
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        if (arch == LLM_ARCH_KIMI_K3) {
+                            const auto stats = llama_route_observer_get_stats(model_and_ctx_cpu.second.get());
+                            const auto routing_stats = llama_cache_aware_routing_get_stats(
+                                model_and_ctx_cpu.second.get());
+                            GGML_ASSERT(candidates.records > 0 && candidates.values > 0);
+                            GGML_ASSERT(stats.layers == candidates.records);
+                            GGML_ASSERT(stats.copy_bytes == 16*candidates.values);
+                            GGML_ASSERT(stats.explicit_synchronizations == stats.ubatches);
+                            GGML_ASSERT(stats.failures == 0);
+                            GGML_ASSERT(routing_stats.ubatches == 0 && routing_stats.layers == 0 &&
+                                routing_stats.decisions == 0 && routing_stats.changed_decisions == 0 &&
+                                routing_stats.swaps == 0 && routing_stats.explicit_synchronizations == 0 &&
+                                routing_stats.failures == 0);
+                            GGML_ASSERT(llama_set_route_observer(model_and_ctx_cpu.second.get(), nullptr, nullptr) ==
+                                LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            GGML_ASSERT(llama_set_route_observer_candidate_count(
+                                model_and_ctx_cpu.second.get(), 0) ==
+                                LLAMA_ROUTE_OBSERVER_STATUS_OK);
+
+                            auto changed = get_model_and_ctx(
+                                gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                            kimi_candidate_capture changed_candidates;
+                            changed_candidates.expect_changed = true;
+                            const llama_cache_aware_routing_config changed_config = {
+                                true, 2, 1, std::numeric_limits<float>::max(),
+                                force_kimi_second_candidate, nullptr, nullptr,
+                            };
+                            GGML_ASSERT(llama_set_cache_aware_routing(
+                                changed.second.get(), &changed_config) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            GGML_ASSERT(llama_set_route_observer_candidate_count(
+                                changed.second.get(), 2) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            GGML_ASSERT(llama_set_route_observer(changed.second.get(),
+                                capture_kimi_candidates, &changed_candidates) ==
+                                LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            GGML_ASSERT(llama_route_observer_begin(changed.second.get(), 2,
+                                LLAMA_ROUTE_PHASE_PREFILL) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            const auto changed_logits = get_logits(
+                                changed.first.get(), changed.second.get(), tokens, encode);
+                            const auto changed_stats = llama_cache_aware_routing_get_stats(changed.second.get());
+                            GGML_ASSERT(changed_candidates.records > 0 && changed_stats.decisions > 0);
+                            GGML_ASSERT(changed_stats.changed_decisions == changed_stats.decisions);
+                            GGML_ASSERT(changed_stats.swaps == changed_stats.decisions);
+                            GGML_ASSERT(changed_stats.layers == changed_candidates.records);
+                            GGML_ASSERT(changed_stats.explicit_synchronizations == changed_stats.layers);
+                            GGML_ASSERT(changed_stats.failures == 0);
+                            GGML_ASSERT(changed_logits.size() == logits_cpu.size());
+                            GGML_ASSERT(nmse(logits_cpu, changed_logits) > 0.0);
+
+                            auto exact_control = get_model_and_ctx(
+                                gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                            const llama_cache_aware_routing_config exact_control_config = {
+                                true, 2, 1, 0.0f,
+                                force_kimi_second_candidate, nullptr, nullptr,
+                            };
+                            GGML_ASSERT(llama_set_cache_aware_routing(exact_control.second.get(),
+                                &exact_control_config) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            GGML_ASSERT(llama_cache_aware_routing_begin(exact_control.second.get(), 3,
+                                LLAMA_ROUTE_PHASE_PREFILL) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            const auto exact_control_logits = get_logits(
+                                exact_control.first.get(), exact_control.second.get(), tokens, encode);
+                            const auto exact_control_stats = llama_cache_aware_routing_get_stats(
+                                exact_control.second.get());
+                            GGML_ASSERT(exact_control_stats.decisions > 0 &&
+                                exact_control_stats.changed_decisions == 0 &&
+                                exact_control_stats.swaps == 0 && exact_control_stats.failures == 0);
+                            GGML_ASSERT(nmse(logits_cpu, exact_control_logits) == 0.0);
+
+                            auto stale = get_model_and_ctx(
+                                gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                            const llama_cache_aware_routing_config stale_config = {
+                                true, 2, 1, std::numeric_limits<float>::max(),
+                                reject_kimi_tier_snapshot, nullptr, nullptr,
+                            };
+                            GGML_ASSERT(llama_set_cache_aware_routing(
+                                stale.second.get(), &stale_config) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            GGML_ASSERT(llama_cache_aware_routing_begin(stale.second.get(), 4,
+                                LLAMA_ROUTE_PHASE_PREFILL) == LLAMA_ROUTE_OBSERVER_STATUS_OK);
+                            bool stale_failed = false;
+                            try {
+                                (void) get_logits(stale.first.get(), stale.second.get(), tokens, encode);
+                            } catch (const std::runtime_error &) {
+                                stale_failed = true;
+                            }
+                            const auto stale_stats = llama_cache_aware_routing_get_stats(stale.second.get());
+                            GGML_ASSERT(stale_failed && stale_stats.failures == 1 &&
+                                stale_stats.decisions == 0 && stale_stats.swaps == 0);
+                        }
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);

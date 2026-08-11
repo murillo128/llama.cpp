@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-cache-aware-routing.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -991,6 +992,7 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
     expert_eval_bindings = nullptr;
+    cache_aware_eval_routes = nullptr;
     expert_eval_pending_tensor = nullptr;
     expert_eval_pending_user = false;
     if (expert_plans) {
@@ -1555,6 +1557,93 @@ void llama_context::set_expert_abort_callback_for_testing(
     expert_abort_callback_data_for_testing = callback_data;
 }
 
+int32_t llama_context::set_route_observer_candidate_count(uint32_t candidate_count) {
+    synchronize();
+
+    if (route_observer_callback != nullptr || route_observer_annotation_pending ||
+        route_observer_submission_active) {
+        return LLAMA_ROUTE_OBSERVER_ERROR_STATE;
+    }
+    if (candidate_count != 0 &&
+        (model.arch != LLM_ARCH_KIMI_K3 ||
+         candidate_count < model.hparams.n_expert_used ||
+         candidate_count > std::min<uint32_t>(64, model.hparams.n_expert))) {
+        return LLAMA_ROUTE_OBSERVER_ERROR_CANDIDATE_COUNT;
+    }
+
+    route_observer_candidate_count = candidate_count;
+    sched_need_reserve = true;
+    return LLAMA_ROUTE_OBSERVER_STATUS_OK;
+}
+
+int32_t llama_context::set_cache_aware_routing(const llama_cache_aware_routing_config * config) {
+    synchronize();
+
+    if (route_observer_callback != nullptr || route_observer_annotation_pending ||
+        route_observer_submission_active) {
+        return LLAMA_ROUTE_OBSERVER_ERROR_STATE;
+    }
+    if (config == nullptr || !config->enabled) {
+        cache_aware_routing_config = {};
+        cache_aware_routing_stats = {};
+        cache_aware_candidate_ids.clear();
+        cache_aware_candidate_scores.clear();
+        cache_aware_candidate_tiers.clear();
+        cache_aware_exact_ids.clear();
+        cache_aware_final_ids.clear();
+        cache_aware_candidate_ids.shrink_to_fit();
+        cache_aware_candidate_scores.shrink_to_fit();
+        cache_aware_candidate_tiers.shrink_to_fit();
+        cache_aware_exact_ids.shrink_to_fit();
+        cache_aware_final_ids.shrink_to_fit();
+        sched_need_reserve = true;
+        return LLAMA_ROUTE_OBSERVER_STATUS_OK;
+    }
+
+    const uint32_t n_expert = model.hparams.n_expert;
+    const uint32_t n_expert_used = model.hparams.n_expert_used;
+    if (model.arch != LLM_ARCH_KIMI_K3 || n_expert_used == 0 || n_expert_used > 16 ||
+        config->candidate_count < n_expert_used ||
+        config->candidate_count > std::min<uint32_t>(64, n_expert) ||
+        config->max_swaps > n_expert_used || !std::isfinite(config->max_score_regret) ||
+        config->max_score_regret < 0.0f ||
+        (config->tier_callback == nullptr &&
+         (!expert_weight_provider || !expert_weight_provider->supports_route_service_tier_snapshot()))) {
+        return LLAMA_ROUTE_OBSERVER_ERROR_CONFIGURATION;
+    }
+    if (cparams.n_ubatch > SIZE_MAX/config->candidate_count ||
+        cparams.n_ubatch > SIZE_MAX/n_expert_used) {
+        return LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION;
+    }
+    try {
+        cache_aware_candidate_ids.resize(size_t(cparams.n_ubatch)*config->candidate_count);
+        cache_aware_candidate_scores.resize(size_t(cparams.n_ubatch)*config->candidate_count);
+        cache_aware_candidate_tiers.resize(size_t(cparams.n_ubatch)*config->candidate_count);
+        cache_aware_exact_ids.resize(size_t(cparams.n_ubatch)*n_expert_used);
+        cache_aware_final_ids.resize(size_t(cparams.n_ubatch)*n_expert_used);
+    } catch (const std::bad_alloc &) {
+        cache_aware_candidate_ids.clear();
+        cache_aware_candidate_scores.clear();
+        cache_aware_candidate_tiers.clear();
+        cache_aware_exact_ids.clear();
+        cache_aware_final_ids.clear();
+        return LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION;
+    }
+    cache_aware_routing_config = *config;
+    cache_aware_routing_stats = {};
+    sched_need_reserve = true;
+    return LLAMA_ROUTE_OBSERVER_STATUS_OK;
+}
+
+llama_cache_aware_routing_stats llama_context::cache_aware_routing_get_stats() const {
+    return cache_aware_routing_stats;
+}
+
+void llama_context::cache_aware_routing_reset_stats() {
+    synchronize();
+    cache_aware_routing_stats = {};
+}
+
 int32_t llama_context::set_route_observer(llama_route_observer_callback callback, void * user_data) {
     synchronize();
 
@@ -1573,10 +1662,16 @@ int32_t llama_context::set_route_observer(llama_route_observer_callback callback
 
     route_observer_ids.clear();
     route_observer_weights.clear();
+    route_observer_candidate_ids.clear();
+    route_observer_candidate_selection_scores.clear();
+    route_observer_candidate_probabilities.clear();
 
     if (callback == nullptr) {
         route_observer_ids.shrink_to_fit();
         route_observer_weights.shrink_to_fit();
+        route_observer_candidate_ids.shrink_to_fit();
+        route_observer_candidate_selection_scores.shrink_to_fit();
+        route_observer_candidate_probabilities.shrink_to_fit();
         sched_need_reserve = true;
         return LLAMA_ROUTE_OBSERVER_STATUS_OK;
     }
@@ -1598,14 +1693,26 @@ int32_t llama_context::set_route_observer(llama_route_observer_callback callback
     }
 
     const size_t capacity = n_rows*n_expert_used;
+    if (route_observer_candidate_count != 0 && n_rows > SIZE_MAX/route_observer_candidate_count) {
+        route_observer_callback = nullptr;
+        route_observer_user_data = nullptr;
+        return LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION;
+    }
+    const size_t candidate_capacity = n_rows*route_observer_candidate_count;
     try {
         route_observer_ids.resize(capacity);
         route_observer_weights.resize(capacity);
+        route_observer_candidate_ids.resize(candidate_capacity);
+        route_observer_candidate_selection_scores.resize(candidate_capacity);
+        route_observer_candidate_probabilities.resize(candidate_capacity);
     } catch (const std::bad_alloc &) {
         route_observer_callback = nullptr;
         route_observer_user_data = nullptr;
         route_observer_ids.clear();
         route_observer_weights.clear();
+        route_observer_candidate_ids.clear();
+        route_observer_candidate_selection_scores.clear();
+        route_observer_candidate_probabilities.clear();
         return LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION;
     }
 
@@ -1614,7 +1721,8 @@ int32_t llama_context::set_route_observer(llama_route_observer_callback callback
 }
 
 int32_t llama_context::route_observer_begin(uint64_t request_ordinal, llama_route_phase phase) {
-    if (route_observer_callback == nullptr || route_observer_latched_failure ||
+    if ((route_observer_callback == nullptr && !cache_aware_routing_config.enabled) ||
+        route_observer_latched_failure ||
         route_observer_annotation_pending || route_observer_submission_active) {
         return LLAMA_ROUTE_OBSERVER_ERROR_STATE;
     }
@@ -1641,7 +1749,7 @@ void llama_context::route_observer_reset_stats() {
 }
 
 bool llama_context::route_observer_start_submission() {
-    if (route_observer_callback == nullptr) {
+    if (route_observer_callback == nullptr && !cache_aware_routing_config.enabled) {
         return true;
     }
     if (!route_observer_annotation_pending || route_observer_latched_failure) {
@@ -1675,6 +1783,7 @@ bool llama_context::route_observer_extract(const llm_graph_result * res, const l
 
     const auto & outputs = res->get_route_outputs();
     size_t value_count = 0;
+    size_t candidate_value_count = 0;
 
     for (const auto & output : outputs) {
         ggml_tensor * ids = output.selected_experts;
@@ -1705,9 +1814,59 @@ bool llama_context::route_observer_extract(const llm_graph_result * res, const l
             return false;
         }
         value_count += count;
+
+        const bool has_candidates = output.candidate_experts != nullptr ||
+            output.candidate_selection_scores != nullptr || output.candidate_probabilities != nullptr;
+        if (has_candidates != (route_observer_candidate_count > 0) ||
+            (has_candidates && (output.candidate_experts == nullptr ||
+                                output.candidate_selection_scores == nullptr ||
+                                output.candidate_probabilities == nullptr))) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+        if (!has_candidates) {
+            continue;
+        }
+
+        ggml_tensor * candidate_ids = output.candidate_experts;
+        ggml_tensor * candidate_scores = output.candidate_selection_scores;
+        ggml_tensor * candidate_probs = output.candidate_probabilities;
+        if (candidate_ids->type != GGML_TYPE_I32 || candidate_scores->type != GGML_TYPE_F32 ||
+            candidate_probs->type != GGML_TYPE_F32 ||
+            candidate_ids->ne[0] != (int64_t) route_observer_candidate_count ||
+            candidate_ids->ne[1] != (int64_t) ubatch.n_tokens ||
+            candidate_scores->ne[0] != 1 || candidate_probs->ne[0] != 1 ||
+            candidate_scores->ne[1] != candidate_ids->ne[0] ||
+            candidate_probs->ne[1] != candidate_ids->ne[0] ||
+            candidate_scores->ne[2] != candidate_ids->ne[1] ||
+            candidate_probs->ne[2] != candidate_ids->ne[1]) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+
+        const size_t candidate_count = (size_t) ggml_nelements(candidate_ids);
+        if (candidate_count != (size_t) ggml_nelements(candidate_scores) ||
+            candidate_count != (size_t) ggml_nelements(candidate_probs) ||
+            candidate_value_count > route_observer_candidate_ids.size() ||
+            candidate_count > route_observer_candidate_ids.size() - candidate_value_count) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+        if (ggml_backend_sched_get_tensor_backend(sched.get(), candidate_ids) == nullptr ||
+            ggml_backend_sched_get_tensor_backend(sched.get(), candidate_scores) == nullptr ||
+            ggml_backend_sched_get_tensor_backend(sched.get(), candidate_probs) == nullptr) {
+            route_observer_latched_failure = true;
+            route_observer_stats.failures++;
+            return false;
+        }
+        candidate_value_count += candidate_count;
     }
 
     size_t offset = 0;
+    size_t candidate_offset = 0;
     for (const auto & output : outputs) {
         const size_t count = (size_t) ggml_nelements(output.selected_experts);
         ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched.get(), output.selected_experts);
@@ -1717,6 +1876,23 @@ bool llama_context::route_observer_extract(const llm_graph_result * res, const l
         ggml_backend_tensor_get_async(ids_backend, output.selected_experts, route_observer_ids.data() + offset, 0, count*sizeof(int32_t));
         ggml_backend_tensor_get_async(weights_backend, output.weights, route_observer_weights.data() + offset, 0, count*sizeof(float));
         offset += count;
+
+        if (output.candidate_experts != nullptr) {
+            const size_t candidate_count = (size_t) ggml_nelements(output.candidate_experts);
+            ggml_backend_t candidate_ids_backend = ggml_backend_sched_get_tensor_backend(sched.get(), output.candidate_experts);
+            ggml_backend_t candidate_scores_backend = ggml_backend_sched_get_tensor_backend(sched.get(), output.candidate_selection_scores);
+            ggml_backend_t candidate_probs_backend = ggml_backend_sched_get_tensor_backend(sched.get(), output.candidate_probabilities);
+            GGML_ASSERT(candidate_ids_backend != nullptr && candidate_scores_backend != nullptr &&
+                candidate_probs_backend != nullptr);
+
+            ggml_backend_tensor_get_async(candidate_ids_backend, output.candidate_experts,
+                route_observer_candidate_ids.data() + candidate_offset, 0, candidate_count*sizeof(int32_t));
+            ggml_backend_tensor_get_async(candidate_scores_backend, output.candidate_selection_scores,
+                route_observer_candidate_selection_scores.data() + candidate_offset, 0, candidate_count*sizeof(float));
+            ggml_backend_tensor_get_async(candidate_probs_backend, output.candidate_probabilities,
+                route_observer_candidate_probabilities.data() + candidate_offset, 0, candidate_count*sizeof(float));
+            candidate_offset += candidate_count;
+        }
     }
 
     if (!outputs.empty()) {
@@ -1725,8 +1901,11 @@ bool llama_context::route_observer_extract(const llm_graph_result * res, const l
     }
 
     offset = 0;
+    candidate_offset = 0;
     for (const auto & output : outputs) {
         const size_t count = (size_t) ggml_nelements(output.selected_experts);
+        const size_t candidate_count = output.candidate_experts == nullptr ? 0 :
+            (size_t) ggml_nelements(output.candidate_experts);
         const llama_route_observation observation = {
             /*.request_ordinal  =*/ route_observer_request,
             /*.ubatch_ordinal   =*/ route_observer_next_ubatch,
@@ -1740,6 +1919,13 @@ bool llama_context::route_observer_extract(const llm_graph_result * res, const l
             /*.seq_ids          =*/ ubatch.seq_id,
             /*.selected_experts =*/ route_observer_ids.data() + offset,
             /*.weights          =*/ route_observer_weights.data() + offset,
+            /*.n_candidates     =*/ route_observer_candidate_count,
+            /*.candidate_experts =*/ candidate_count == 0 ? nullptr :
+                route_observer_candidate_ids.data() + candidate_offset,
+            /*.candidate_selection_scores =*/ candidate_count == 0 ? nullptr :
+                route_observer_candidate_selection_scores.data() + candidate_offset,
+            /*.candidate_probabilities =*/ candidate_count == 0 ? nullptr :
+                route_observer_candidate_probabilities.data() + candidate_offset,
         };
 
         if (!route_observer_callback(&observation, route_observer_user_data)) {
@@ -1762,7 +1948,9 @@ bool llama_context::route_observer_extract(const llm_graph_result * res, const l
 
         route_observer_stats.layers++;
         route_observer_stats.copy_bytes += count*(sizeof(int32_t) + sizeof(float));
+        route_observer_stats.copy_bytes += candidate_count*(sizeof(int32_t) + 2*sizeof(float));
         offset += count;
+        candidate_offset += candidate_count;
     }
 
     route_observer_stats.ubatches++;
@@ -1946,6 +2134,7 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
     auto * ctx = static_cast<llama_context *>(user_data);
     if (!ctx->expert_eval_result.is_ready()) return false;
     const llm_expert_graph_binding * checkpoint = nullptr;
+    const llm_graph_cache_aware_route * cache_aware_route = nullptr;
     if (ctx->expert_eval_bindings != nullptr) {
         for (const auto & binding : *ctx->expert_eval_bindings) {
             if (!binding.bootstrap && binding.logical_ids != nullptr &&
@@ -1957,19 +2146,133 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
             }
         }
     }
+    if (ctx->cache_aware_eval_routes != nullptr) {
+        for (const auto & route : *ctx->cache_aware_eval_routes) {
+            if (route.final_experts == tensor) {
+                cache_aware_route = &route;
+                break;
+            }
+        }
+    }
 
     if (ask) {
         const bool user_needs_tensor = ctx->cparams.cb_eval &&
             ctx->cparams.cb_eval(tensor, true, ctx->cparams.cb_eval_user_data);
         ctx->expert_eval_pending_tensor = tensor;
         ctx->expert_eval_pending_user = user_needs_tensor;
-        return checkpoint != nullptr || user_needs_tensor;
+        return checkpoint != nullptr || cache_aware_route != nullptr || user_needs_tensor;
     }
 
     if (tensor != ctx->expert_eval_pending_tensor) {
         ctx->expert_eval_result = llm_expert_provider_result::failure(
             llm_expert_provider_error::metadata_mismatch);
         return false;
+    }
+
+    if (cache_aware_route != nullptr) {
+        const uint64_t candidate_count64 = uint64_t(cache_aware_route->candidate_experts->ne[0])*
+            uint64_t(cache_aware_route->candidate_experts->ne[1]);
+        const uint64_t final_count64 = uint64_t(cache_aware_route->final_experts->ne[0])*
+            uint64_t(cache_aware_route->final_experts->ne[1]);
+        const uint32_t n_tokens = uint32_t(cache_aware_route->final_experts->ne[1]);
+        const uint32_t n_expert_used = uint32_t(cache_aware_route->final_experts->ne[0]);
+        const uint32_t n_candidates = uint32_t(cache_aware_route->candidate_experts->ne[0]);
+        if (!ctx->cache_aware_routing_config.enabled || candidate_count64 == 0 || final_count64 == 0 ||
+            candidate_count64 > ctx->cache_aware_candidate_ids.size() ||
+            candidate_count64 > ctx->cache_aware_candidate_scores.size() ||
+            candidate_count64 > ctx->cache_aware_candidate_tiers.size() ||
+            final_count64 > ctx->cache_aware_exact_ids.size() ||
+            final_count64 > ctx->cache_aware_final_ids.size() ||
+            cache_aware_route->candidate_experts->type != GGML_TYPE_I32 ||
+            cache_aware_route->candidate_selection_scores->type != GGML_TYPE_F32 ||
+            cache_aware_route->final_experts->type != GGML_TYPE_I32 ||
+            n_candidates != ctx->cache_aware_routing_config.candidate_count) {
+            ctx->cache_aware_routing_stats.failures++;
+            ctx->expert_eval_result = llm_expert_provider_result::failure(
+                llm_expert_provider_error::invalid_selection);
+            return false;
+        }
+        const size_t candidate_count = size_t(candidate_count64);
+        const size_t final_count = size_t(final_count64);
+        ggml_backend_tensor_get(cache_aware_route->candidate_experts,
+            ctx->cache_aware_candidate_ids.data(), 0, candidate_count*sizeof(int32_t));
+        ggml_backend_tensor_get(cache_aware_route->candidate_selection_scores,
+            ctx->cache_aware_candidate_scores.data(), 0, candidate_count*sizeof(float));
+        ggml_backend_tensor_get(cache_aware_route->final_experts,
+            ctx->cache_aware_exact_ids.data(), 0, final_count*sizeof(int32_t));
+        std::copy(ctx->cache_aware_exact_ids.begin(),
+            ctx->cache_aware_exact_ids.begin() + final_count,
+            ctx->cache_aware_final_ids.begin());
+
+        const llama_cache_aware_routing_query query = {
+            ctx->route_observer_request,
+            ctx->route_observer_next_ubatch,
+            ctx->route_observer_phase,
+            cache_aware_route->il,
+            n_tokens,
+            n_expert_used,
+            n_candidates,
+            ctx->cache_aware_exact_ids.data(),
+            ctx->cache_aware_candidate_ids.data(),
+            ctx->cache_aware_candidate_scores.data(),
+        };
+        const bool snapshot_ready = ctx->cache_aware_routing_config.tier_callback != nullptr ?
+            ctx->cache_aware_routing_config.tier_callback(
+                &query, ctx->cache_aware_candidate_tiers.data(),
+                ctx->cache_aware_routing_config.user_data) :
+            ctx->expert_weight_provider->route_service_tier_snapshot(
+                query.layer, query.candidate_experts,
+                size_t(query.n_tokens)*query.n_candidates,
+                ctx->cache_aware_candidate_tiers.data()).is_ready();
+        if (!snapshot_ready) {
+            ctx->cache_aware_routing_stats.failures++;
+            ctx->expert_eval_result = llm_expert_provider_result::failure(
+                llm_expert_provider_error::stale_generation);
+            return false;
+        }
+        for (uint32_t token = 0; token < n_tokens; ++token) {
+            const size_t candidate_offset = size_t(token)*n_candidates;
+            const size_t final_offset = size_t(token)*n_expert_used;
+            const auto selected = llm_select_cache_aware_route(
+                ctx->cache_aware_exact_ids.data() + final_offset,
+                ctx->cache_aware_candidate_ids.data() + candidate_offset,
+                ctx->cache_aware_candidate_scores.data() + candidate_offset,
+                ctx->cache_aware_candidate_tiers.data() + candidate_offset,
+                uint32_t(cache_aware_route->n_expert), n_expert_used, n_candidates,
+                ctx->cache_aware_routing_config.max_swaps,
+                ctx->cache_aware_routing_config.max_score_regret,
+                ctx->cache_aware_final_ids.data() + final_offset);
+            if (!selected.is_ready()) {
+                ctx->cache_aware_routing_stats.failures++;
+                ctx->expert_eval_result = llm_expert_provider_result::failure(
+                    llm_expert_provider_error::invalid_selection);
+                return false;
+            }
+            ctx->cache_aware_routing_stats.decisions++;
+            ctx->cache_aware_routing_stats.changed_decisions += selected.swaps > 0;
+            ctx->cache_aware_routing_stats.swaps += selected.swaps;
+            ctx->cache_aware_routing_stats.cumulative_score_regret += selected.cumulative_score_regret;
+        }
+        if (ctx->cache_aware_routing_config.commit_callback != nullptr &&
+            !ctx->cache_aware_routing_config.commit_callback(
+                &query, ctx->cache_aware_final_ids.data(),
+                ctx->cache_aware_routing_config.user_data)) {
+            ctx->cache_aware_routing_stats.failures++;
+            ctx->expert_eval_result = llm_expert_provider_result::failure(
+                llm_expert_provider_error::stale_generation);
+            return false;
+        }
+        ggml_backend_tensor_set(cache_aware_route->final_experts,
+            ctx->cache_aware_final_ids.data(), 0, final_count*sizeof(int32_t));
+        ctx->cache_aware_routing_stats.layers++;
+        ctx->cache_aware_routing_stats.explicit_synchronizations++;
+        if (ctx->cache_aware_eval_routes != nullptr &&
+            cache_aware_route == &ctx->cache_aware_eval_routes->back()) {
+            ctx->cache_aware_routing_stats.ubatches++;
+            if (ctx->route_observer_callback == nullptr) {
+                ctx->route_observer_next_ubatch++;
+            }
+        }
     }
 
     if (checkpoint != nullptr) {
@@ -2153,6 +2456,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return !binding.bootstrap && binding.logical_ids != nullptr &&
                 binding.execution_ids != binding.logical_ids;
         });
+    const bool has_cache_aware_checkpoints = cache_aware_routing_config.enabled &&
+        !res->get_cache_aware_routes().empty();
     if (has_expert_checkpoints && expert_plans->inflight.handle_count() != 0) {
         synchronize();
     }
@@ -2168,13 +2473,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     expert_eval_bindings = has_expert_checkpoints ? &res->get_expert_bindings() : nullptr;
+    cache_aware_eval_routes = has_cache_aware_checkpoints ? &res->get_cache_aware_routes() : nullptr;
     expert_eval_pending_tensor = nullptr;
     expert_eval_pending_user = false;
     expert_eval_result = llm_expert_provider_result::success();
     ggml_backend_sched_set_eval_callback(
         sched.get(),
-        has_expert_checkpoints ? expert_eval_callback : cparams.cb_eval,
-        has_expert_checkpoints ? this : cparams.cb_eval_user_data);
+        has_expert_checkpoints || has_cache_aware_checkpoints ? expert_eval_callback : cparams.cb_eval,
+        has_expert_checkpoints || has_cache_aware_checkpoints ? this : cparams.cb_eval_user_data);
 
     if (expert_weight_provider) {
         GGML_ASSERT(expert_plans);
@@ -2206,14 +2512,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (!expert_eval_result.is_ready()) {
-        LLAMA_LOG_ERROR("%s: expert hot-cache remap checkpoint failed (status=%d error=%d)\n",
+        LLAMA_LOG_ERROR("%s: expert routing/materialization checkpoint failed (status=%d error=%d)\n",
             __func__, int(expert_eval_result.status), int(expert_eval_result.error));
         ggml_backend_sched_synchronize(sched.get());
-        expert_plans->pending.reset();
-        expert_plans->inflight.reset();
-        const auto cleanup_result = expert_weight_provider->cleanup_failed_slots();
-        if (!cleanup_result.is_ready()) {
-            LLAMA_LOG_ERROR("%s: expert cache failure cleanup failed\n", __func__);
+        expert_eval_bindings = nullptr;
+        cache_aware_eval_routes = nullptr;
+        expert_eval_pending_tensor = nullptr;
+        expert_eval_pending_user = false;
+        if (expert_plans) {
+            expert_plans->pending.reset();
+            expert_plans->inflight.reset();
+        }
+        if (expert_weight_provider) {
+            const auto cleanup_result = expert_weight_provider->cleanup_failed_slots();
+            if (!cleanup_result.is_ready()) {
+                LLAMA_LOG_ERROR("%s: expert cache failure cleanup failed\n", __func__);
+            }
         }
         ret = expert_eval_result.status == llm_expert_provider_status::cancelled ? GGML_STATUS_ABORTED :
             expert_eval_result.status == llm_expert_provider_status::allocation_failed ?
@@ -2630,9 +2944,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
-    const bool route_observer_enabled = route_observer_callback != nullptr;
+    const bool routed_submission_annotated = route_observer_callback != nullptr ||
+        cache_aware_routing_config.enabled;
     if (!route_observer_start_submission()) {
-        LLAMA_LOG_ERROR("%s: missing or invalid route observer annotation\n", __func__);
+        LLAMA_LOG_ERROR("%s: missing or invalid route observer/routing annotation\n", __func__);
         return -4;
     }
     struct route_observer_submission_guard {
@@ -2644,7 +2959,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ctx->route_observer_end_submission();
             }
         }
-    } route_observer_guard = { this, route_observer_enabled };
+    } route_observer_guard = { this, routed_submission_annotated };
 
     sched_reserve();
 
@@ -3386,7 +3701,13 @@ llm_graph_params llama_context::graph_params(
         /*.expert_resident_device =*/ model.expert_resident_device(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.observe_routes =*/ route_observer_submission_active,
+        /*.observe_routes =*/ route_observer_callback != nullptr && route_observer_submission_active,
+        /*.route_observer_candidate_count =*/
+            route_observer_callback != nullptr && route_observer_submission_active ?
+            route_observer_candidate_count : 0,
+        /*.cache_aware_routing_enabled =*/ cache_aware_routing_config.enabled,
+        /*.cache_aware_routing_candidate_count =*/ cache_aware_routing_config.enabled ?
+            cache_aware_routing_config.candidate_count : 0,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -4625,6 +4946,31 @@ int32_t llama_set_route_observer(
     llama_route_observer_callback   callback,
                                void * user_data) {
     return ctx->set_route_observer(callback, user_data);
+}
+
+int32_t llama_set_route_observer_candidate_count(
+        llama_context * ctx, uint32_t candidate_count) {
+    return ctx->set_route_observer_candidate_count(candidate_count);
+}
+
+int32_t llama_set_cache_aware_routing(
+        llama_context * ctx, const llama_cache_aware_routing_config * config) {
+    return ctx->set_cache_aware_routing(config);
+}
+
+llama_cache_aware_routing_stats llama_cache_aware_routing_get_stats(const llama_context * ctx) {
+    return ctx->cache_aware_routing_get_stats();
+}
+
+void llama_cache_aware_routing_reset_stats(llama_context * ctx) {
+    ctx->cache_aware_routing_reset_stats();
+}
+
+int32_t llama_cache_aware_routing_begin(
+           llama_context * ctx,
+                uint64_t   request_ordinal,
+      llama_route_phase   phase) {
+    return ctx->route_observer_begin(request_ordinal, phase);
 }
 
 int32_t llama_route_observer_begin(

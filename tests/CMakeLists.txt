@@ -295,6 +295,9 @@ llama_build(phase10-prefetch-replay.cpp)
 target_include_directories(phase10-prefetch-replay PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
 llama_test(phase10-prefetch-replay LABEL "model" ARGS --self-test)
 
+llama_build(phase13-routing-probe.cpp)
+target_include_directories(phase13-routing-probe PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+
 set(LLAMA_TEST_NAME phase10-prefetch-probe)
 llama_build(phase10-prefetch-probe.cpp)
 unset(LLAMA_TEST_NAME)
@@ -328,6 +331,8 @@ target_include_directories(phase8-checkpoint-b-probe PRIVATE ${PROJECT_SOURCE_DI
 
 llama_build_and_test(test-hot-expert-cache.cpp LABEL "model")
 target_include_directories(test-hot-expert-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-cache-aware-routing.cpp LABEL "model")
+target_include_directories(test-cache-aware-routing PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 llama_build_and_test(test-cold-expert-cache.cpp LABEL "model")
 target_include_directories(test-cold-expert-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
