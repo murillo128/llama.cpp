@@ -13,12 +13,12 @@ void require(bool condition) {
 
 struct fixture {
     std::array<int32_t, 16> exact {};
-    std::array<int32_t, 20> candidates {};
-    std::array<float, 20> scores {};
-    std::array<llama_route_service_tier, 20> tiers {};
+    std::array<int32_t, 32> candidates {};
+    std::array<float, 32> scores {};
+    std::array<llama_route_service_tier, 32> tiers {};
 
     fixture() {
-        for (int32_t rank = 0; rank < 20; ++rank) {
+        for (int32_t rank = 0; rank < 32; ++rank) {
             candidates[rank] = rank;
             scores[rank] = 1.0f - float(rank)*0.01f;
             tiers[rank] = LLAMA_ROUTE_SERVICE_TIER_HOT;
@@ -83,6 +83,22 @@ void test_multi_swap_unique_cardinality() {
     }
 }
 
+void test_maximum_swap_cardinality() {
+    fixture value;
+    for (uint32_t rank = 0; rank < 16; ++rank) {
+        value.tiers[rank] = LLAMA_ROUTE_SERVICE_TIER_BACKING;
+    }
+    std::array<int32_t, 16> final {};
+    const auto result = select(value, 32, 16, 1.0f, final);
+    require(result.is_ready() && result.swaps == 16);
+    for (uint32_t rank = 0; rank < final.size(); ++rank) {
+        require(final[rank] >= 16 && final[rank] < 32);
+        for (uint32_t previous = 0; previous < rank; ++previous) {
+            require(final[rank] != final[previous]);
+        }
+    }
+}
+
 void test_equal_score_tie_break_preserves_better_selected_rank() {
     fixture value;
     value.tiers[14] = LLAMA_ROUTE_SERVICE_TIER_BACKING;
@@ -115,6 +131,7 @@ int main() {
     test_exact_controls();
     test_bounded_deterministic_selection();
     test_multi_swap_unique_cardinality();
+    test_maximum_swap_cardinality();
     test_equal_score_tie_break_preserves_better_selected_rank();
     test_invalid_inputs_fail_closed();
     std::puts("cache-aware routing tests passed");
