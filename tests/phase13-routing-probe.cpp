@@ -419,15 +419,23 @@ struct route_lru {
                 }
             }
         }
+        // The routing tiers were observed from one immutable provider snapshot. Count the
+        // committed batch against that same pre-commit state before changing recency.
         for (const uint64_t value : unique_scratch) {
             requests++;
             const int32_t found = find(value);
             if (found >= 0) {
                 hits++;
+            } else {
+                misses++;
+            }
+        }
+        for (const uint64_t value : unique_scratch) {
+            const int32_t found = find(value);
+            if (found >= 0) {
                 last_use[uint32_t(found)] = ++use_clock;
                 continue;
             }
-            misses++;
             uint32_t slot = occupancy;
             if (occupancy < capacity) {
                 occupancy++;
