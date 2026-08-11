@@ -17,6 +17,7 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-cache-aware-routing.cpp
             llama-cold-expert-cache.cpp
             llama-expert-cache-policy.cpp
             llama-expert-prefetch.cpp

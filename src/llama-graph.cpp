@@ -1210,6 +1210,7 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
     route_outputs.clear();
+    cache_aware_routes.clear();
     expert_bindings.clear();
     expert_provider_result = {};
 
@@ -1277,6 +1278,16 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     for (const auto & output : route_outputs) {
         ggml_set_output(output.selected_experts);
         ggml_set_output(output.weights);
+        if (output.candidate_experts != nullptr) {
+            ggml_set_output(output.candidate_experts);
+            ggml_set_output(output.candidate_selection_scores);
+            ggml_set_output(output.candidate_probabilities);
+        }
+    }
+    for (const auto & route : cache_aware_routes) {
+        ggml_set_output(route.final_experts);
+        ggml_set_output(route.candidate_experts);
+        ggml_set_output(route.candidate_selection_scores);
     }
 }
 
@@ -1334,6 +1345,11 @@ void llm_graph_result::add_route_output(llm_graph_route_output output) {
     route_outputs.push_back(output);
 }
 
+void llm_graph_result::add_cache_aware_route(llm_graph_cache_aware_route route) {
+    GGML_ASSERT(cache_aware_routes.empty() || cache_aware_routes.back().il <= route.il);
+    cache_aware_routes.push_back(route);
+}
+
 void llm_graph_result::reserve_expert_bindings(size_t capacity) {
     expert_bindings.reserve(capacity);
 }
@@ -1387,6 +1403,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_outputs        (params.n_outputs),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     observe_routes   (params.observe_routes),
+    route_observer_candidate_count(params.route_observer_candidate_count),
+    cache_aware_routing_enabled(params.cache_aware_routing_enabled),
+    cache_aware_routing_candidate_count(params.cache_aware_routing_candidate_count),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
     sched            (params.sched),
@@ -1977,6 +1996,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
+    ggml_tensor * exact_selected_experts = selected_experts;
+    ggml_tensor * cache_aware_candidate_experts = nullptr;
+    ggml_tensor * cache_aware_candidate_selection_scores = nullptr;
+    if (cache_aware_routing_enabled) {
+        GGML_ASSERT(arch == LLM_ARCH_KIMI_K3);
+        // Materialize the argsort result before exposing it at a host callback.
+        // The backend's direct multi-token argsort tensor can use transient
+        // workspace whose later ranks are no longer stable at that boundary.
+        cache_aware_candidate_experts = ggml_dup(ctx0, ggml_argsort_top_k(
+            ctx0, selection_probs, cache_aware_routing_candidate_count));
+        cache_aware_candidate_selection_scores = ggml_get_rows(
+            ctx0,
+            ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens),
+            cache_aware_candidate_experts);
+        selected_experts = ggml_dup(ctx0, exact_selected_experts);
+
+        cb(cache_aware_candidate_experts, "ffn_moe_cache_candidates", il);
+        cb(cache_aware_candidate_selection_scores, "ffn_moe_cache_candidate_scores", il);
+        cb(selected_experts, "ffn_moe_cache_final_ids", il);
+
+        ggml_backend_sched_set_tensor_backend(sched, cache_aware_candidate_experts, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, cache_aware_candidate_selection_scores, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, selected_experts, backend_cpu);
+        ggml_build_forward_expand(gf, cache_aware_candidate_experts);
+        ggml_build_forward_expand(gf, cache_aware_candidate_selection_scores);
+        ggml_build_forward_expand(gf, selected_experts);
+        res->add_cache_aware_route({
+            il,
+            int32_t(n_expert),
+            selected_experts,
+            cache_aware_candidate_experts,
+            cache_aware_candidate_selection_scores,
+        });
+    }
+
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
@@ -2011,6 +2065,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (observe_routes) {
         ggml_tensor * selected_experts_out = ggml_dup(ctx0, selected_experts);
         ggml_tensor * weights_out = ggml_dup(ctx0, weights);
+        ggml_tensor * candidate_experts_out = nullptr;
+        ggml_tensor * candidate_selection_scores_out = nullptr;
+        ggml_tensor * candidate_probabilities_out = nullptr;
 
         cb(selected_experts_out, "ffn_moe_topk_observed", il);
         cb(weights_out, "ffn_moe_weights_observed", il);
@@ -2018,7 +2075,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, selected_experts_out);
         ggml_build_forward_expand(gf, weights_out);
 
-        res->add_route_output({ il, selected_experts_out, weights_out });
+        if (route_observer_candidate_count > 0) {
+            ggml_tensor * candidate_experts =
+                cache_aware_candidate_experts != nullptr &&
+                    route_observer_candidate_count == cache_aware_routing_candidate_count ?
+                cache_aware_candidate_experts :
+                ggml_argsort_top_k(ctx0, selection_probs, route_observer_candidate_count);
+            ggml_tensor * candidate_selection_scores =
+                cache_aware_candidate_selection_scores != nullptr &&
+                    route_observer_candidate_count == cache_aware_routing_candidate_count ?
+                cache_aware_candidate_selection_scores :
+                ggml_get_rows(
+                    ctx0,
+                    ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens),
+                    candidate_experts);
+            ggml_tensor * candidate_probabilities = ggml_get_rows(ctx0, probs, candidate_experts);
+
+            candidate_experts_out = ggml_dup(ctx0, candidate_experts);
+            candidate_selection_scores_out = ggml_dup(ctx0, candidate_selection_scores);
+            candidate_probabilities_out = ggml_dup(ctx0, candidate_probabilities);
+
+            cb(candidate_experts_out, "ffn_moe_candidates_observed", il);
+            cb(candidate_selection_scores_out, "ffn_moe_candidate_scores_observed", il);
+            cb(candidate_probabilities_out, "ffn_moe_candidate_probs_observed", il);
+
+            ggml_build_forward_expand(gf, candidate_experts_out);
+            ggml_build_forward_expand(gf, candidate_selection_scores_out);
+            ggml_build_forward_expand(gf, candidate_probabilities_out);
+        }
+
+        res->add_route_output({
+            il,
+            selected_experts_out,
+            weights_out,
+            candidate_experts_out,
+            candidate_selection_scores_out,
+            candidate_probabilities_out,
+        });
     }
 
     ggml_tensor * execution_up_exps = up_exps;

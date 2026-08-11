@@ -6218,6 +6218,39 @@ public:
         return epoch;
     }
 
+    bool supports_route_service_tier_snapshot() const noexcept override {
+        return true;
+    }
+
+    llm_expert_provider_result route_service_tier_snapshot(
+            int32_t layer,
+            const int32_t * experts,
+            size_t expert_count,
+            llama_route_service_tier * tiers) const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (experts == nullptr || tiers == nullptr || expert_count == 0 ||
+            !pool || directory_forward.empty() || layer < 0 ||
+            size_t(layer) >= layout_registry.layer_ids.size() ||
+            layout_class_for_layer(layer) == LLM_EXPERT_LAYOUT_CLASS_INVALID) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+        }
+        for (size_t index = 0; index < expert_count; ++index) {
+            const llm_expert_key key = { layer, experts[index] };
+            if (!key.is_valid(LLAMA_MAX_LAYERS, n_expert)) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+            }
+            const auto & forward = directory_forward[forward_index(key)];
+            if (forward_entry_matches(key, forward)) {
+                tiers[index] = LLAMA_ROUTE_SERVICE_TIER_HOT;
+            } else if (cold_cache != nullptr && cold_cache->contains_ready(key)) {
+                tiers[index] = LLAMA_ROUTE_SERVICE_TIER_COLD;
+            } else {
+                tiers[index] = LLAMA_ROUTE_SERVICE_TIER_BACKING;
+            }
+        }
+        return llm_expert_provider_result::success();
+    }
+
     llm_hot_cache_diagnostics hot_cache_diagnostics() const override {
         std::lock_guard<std::mutex> lock(mutex);
         llm_hot_cache_diagnostics result;

@@ -1691,6 +1691,16 @@ bool llm_cold_expert_cache::ready(llm_cold_reference reference) const noexcept {
     return pimpl->valid_reference(reference);
 }
 
+bool llm_cold_expert_cache::contains_ready(llm_expert_key key) const noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->arena || !key.is_valid(LLAMA_MAX_LAYERS, pimpl->n_expert)) return false;
+    const auto & forward = pimpl->directory[pimpl->forward_index(key)];
+    if (forward.slot < 0 || uint32_t(forward.slot) >= pimpl->slots.size()) return false;
+    const auto & slot = pimpl->slots[uint32_t(forward.slot)];
+    return key_matches(slot.key, key) && slot.generation == forward.generation &&
+        slot.state == llm_cold_slot_state::ready;
+}
+
 llm_expert_provider_result llm_cold_expert_cache::retire_ready(llm_cold_reference reference) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (!pimpl->valid_reference(reference)) {

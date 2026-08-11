@@ -249,6 +249,8 @@ extern "C" {
         LLAMA_ROUTE_OBSERVER_ERROR_UNSUPPORTED_PHASE  = -2,
         LLAMA_ROUTE_OBSERVER_ERROR_REQUEST_ORDER      = -3,
         LLAMA_ROUTE_OBSERVER_ERROR_ALLOCATION         = -4,
+        LLAMA_ROUTE_OBSERVER_ERROR_CANDIDATE_COUNT    = -5,
+        LLAMA_ROUTE_OBSERVER_ERROR_CONFIGURATION      = -6,
     };
 
     struct llama_route_observation {
@@ -261,6 +263,7 @@ extern "C" {
         uint32_t n_expert_used;
         uint32_t n_pos;
 
+        // positions are laid out as [n_tokens][n_pos].
         const llama_pos * positions;
         const int32_t * n_seq_ids;
         const llama_seq_id * const * seq_ids;
@@ -268,11 +271,78 @@ extern "C" {
         // Arrays are laid out as [n_tokens][n_expert_used], with top-k rank as the inner dimension.
         const int32_t * selected_experts;
         const float * weights;
+
+        // Optional exact top-M routing inputs. Arrays are laid out as [n_tokens][n_candidates].
+        // candidate_selection_scores include any selection bias; candidate_probabilities do not.
+        uint32_t n_candidates;
+        const int32_t * candidate_experts;
+        const float * candidate_selection_scores;
+        const float * candidate_probabilities;
     };
 
     typedef bool (*llama_route_observer_callback)(
             const struct llama_route_observation * observation,
                                                void * user_data);
+
+    enum llama_route_service_tier {
+        LLAMA_ROUTE_SERVICE_TIER_HOT     = 0,
+        LLAMA_ROUTE_SERVICE_TIER_COLD    = 1,
+        LLAMA_ROUTE_SERVICE_TIER_BACKING = 2,
+    };
+
+    struct llama_cache_aware_routing_query {
+        uint64_t request_ordinal;
+        uint64_t ubatch_ordinal;
+        enum llama_route_phase phase;
+        int32_t layer;
+        uint32_t n_tokens;
+        uint32_t n_expert_used;
+        uint32_t n_candidates;
+
+        // Arrays use [n_tokens][inner count] row-major layout.
+        const int32_t * exact_experts;
+        const int32_t * candidate_experts;
+        const float * candidate_selection_scores;
+    };
+
+    // Fill tiers for all [n_tokens][n_candidates] entries from one
+    // contemporaneous, read-only cache-state snapshot. Returning false fails
+    // the submission before routed-expert execution.
+    typedef bool (*llama_cache_aware_routing_tier_callback)(
+            const struct llama_cache_aware_routing_query * query,
+                       enum llama_route_service_tier * tiers,
+                                                     void * user_data);
+
+    // Commit the final [n_tokens][n_expert_used] logical route to an external
+    // cache-state simulator after bounded selection. Returning false fails the
+    // submission before routed-expert execution.
+    typedef bool (*llama_cache_aware_routing_commit_callback)(
+            const struct llama_cache_aware_routing_query * query,
+                                         const int32_t * final_experts,
+                                                     void * user_data);
+
+    struct llama_cache_aware_routing_config {
+        bool enabled;
+        uint32_t candidate_count;
+        uint32_t max_swaps;
+        float max_score_regret;
+        // Null selects the context's expert provider snapshot. This is valid
+        // only when that provider advertises the bounded read-only tier query.
+        llama_cache_aware_routing_tier_callback tier_callback;
+        llama_cache_aware_routing_commit_callback commit_callback;
+        void * user_data;
+    };
+
+    struct llama_cache_aware_routing_stats {
+        uint64_t ubatches;
+        uint64_t layers;
+        uint64_t decisions;
+        uint64_t changed_decisions;
+        uint64_t swaps;
+        double cumulative_score_regret;
+        uint64_t explicit_synchronizations;
+        uint64_t failures;
+    };
 
     struct llama_route_observer_stats {
         uint64_t ubatches;
@@ -1306,6 +1376,35 @@ extern "C" {
                             struct llama_context * ctx,
                     llama_route_observer_callback   callback,
                                                void * user_data);
+
+    // Configure an optional exact top-M candidate payload for route observation.
+    // Zero disables the payload. A nonzero count is supported only for Kimi K3,
+    // must be between top-k and min(64, model expert count), and may be changed
+    // only while no route observer is installed.
+    LLAMA_API int32_t llama_set_route_observer_candidate_count(
+                            struct llama_context * ctx,
+                                         uint32_t   candidate_count);
+
+    // Configure the bounded cache-aware Kimi K3 experiment. A null config or
+    // enabled=false restores the structurally exact path. Configuration may be
+    // changed only while no route observer or routing submission is active.
+    LLAMA_API int32_t llama_set_cache_aware_routing(
+                            struct llama_context * ctx,
+            const struct llama_cache_aware_routing_config * config);
+
+    LLAMA_API struct llama_cache_aware_routing_stats llama_cache_aware_routing_get_stats(
+                            const struct llama_context * ctx);
+
+    LLAMA_API void llama_cache_aware_routing_reset_stats(
+                            struct llama_context * ctx);
+
+    // Annotate the next routed submission when cache-aware routing is enabled.
+    // This is required even when no route observer is installed, so external
+    // tier sources receive stable request/ubatch/phase identity.
+    LLAMA_API int32_t llama_cache_aware_routing_begin(
+                          struct llama_context * ctx,
+                                       uint64_t   request_ordinal,
+                         enum llama_route_phase   phase);
 
     // Annotate the next traced llama_decode() submission. PREFILL and DECODE are supported.
     // Reusing a request ordinal across submissions continues its ubatch ordinal sequence.

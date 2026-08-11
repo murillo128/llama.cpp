@@ -125,6 +125,10 @@ struct llama_context {
         bool (*abort_callback)(void * data), void * abort_callback_data);
 
     int32_t set_route_observer(llama_route_observer_callback callback, void * user_data);
+    int32_t set_route_observer_candidate_count(uint32_t candidate_count);
+    int32_t set_cache_aware_routing(const llama_cache_aware_routing_config * config);
+    llama_cache_aware_routing_stats cache_aware_routing_get_stats() const;
+    void cache_aware_routing_reset_stats();
     int32_t route_observer_begin(uint64_t request_ordinal, llama_route_phase phase);
     llama_route_observer_stats route_observer_get_stats() const;
     void route_observer_reset_stats();
@@ -396,6 +400,7 @@ private:
     // Absent in the disabled mode so the legacy path constructs no request-plan object.
     std::unique_ptr<llm_expert_context_plans> expert_plans;
     const std::vector<llm_expert_graph_binding> * expert_eval_bindings = nullptr;
+    const std::vector<llm_graph_cache_aware_route> * cache_aware_eval_routes = nullptr;
     ggml_tensor * expert_eval_pending_tensor = nullptr;
     bool expert_eval_pending_user = false;
     llm_expert_provider_result expert_eval_result;
@@ -404,7 +409,11 @@ private:
     void * route_observer_user_data = nullptr;
     std::vector<int32_t> route_observer_ids;
     std::vector<float> route_observer_weights;
+    std::vector<int32_t> route_observer_candidate_ids;
+    std::vector<float> route_observer_candidate_selection_scores;
+    std::vector<float> route_observer_candidate_probabilities;
     llama_route_observer_stats route_observer_stats = {};
+    uint32_t route_observer_candidate_count = 0;
 
     bool route_observer_annotation_pending = false;
     bool route_observer_submission_active = false;
@@ -415,6 +424,14 @@ private:
     uint64_t route_observer_next_ubatch = 0;
     llama_route_phase route_observer_pending_phase = LLAMA_ROUTE_PHASE_UNSPECIFIED;
     llama_route_phase route_observer_phase = LLAMA_ROUTE_PHASE_UNSPECIFIED;
+
+    llama_cache_aware_routing_config cache_aware_routing_config = {};
+    llama_cache_aware_routing_stats cache_aware_routing_stats = {};
+    std::vector<int32_t> cache_aware_candidate_ids;
+    std::vector<float> cache_aware_candidate_scores;
+    std::vector<llama_route_service_tier> cache_aware_candidate_tiers;
+    std::vector<int32_t> cache_aware_exact_ids;
+    std::vector<int32_t> cache_aware_final_ids;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -1275,6 +1275,22 @@ public:
     }
     virtual uint64_t graph_epoch() const noexcept { return 0; }
     virtual llm_hot_cache_diagnostics hot_cache_diagnostics() const { return {}; }
+    virtual bool supports_route_service_tier_snapshot() const noexcept { return false; }
+    // Allocation-free, read-only snapshot at the routed-layer materialization
+    // boundary. Implementations must fail rather than return stale or partial
+    // state. The caller owns the bounded output array.
+    virtual llm_expert_provider_result route_service_tier_snapshot(
+            int32_t layer,
+            const int32_t * experts,
+            size_t expert_count,
+            llama_route_service_tier * tiers) const noexcept {
+        (void) layer;
+        (void) experts;
+        (void) expert_count;
+        (void) tiers;
+        return llm_expert_provider_result::failure(
+            llm_expert_provider_error::unsupported_configuration);
+    }
     // Read-only standing-evidence seam. Production execution never calls this.
     virtual llm_expert_provider_result debug_copy_cold_bundle(
             llm_expert_key key,
