@@ -247,15 +247,17 @@ void test_serial_host_ready_equivalence() {
 
     const int32_t logical_ids[] = { 2, 0, 2, 1 };
     llm_host_resident_demand_batch batch;
-    require(coordinator.resolve(0, logical_ids, 4, batch).is_ready(), "serial demand resolve failed");
+    require(coordinator.plan(0, logical_ids, 4, batch).is_ready(), "serial demand plan failed");
     require(batch.unique_count == 3 && batch.occurrence_count == 4,
         "occurrence plan has wrong width");
     require(batch.entries[0].key.expert == 2 && batch.entries[0].occurrence_count == 2 &&
         batch.entries[1].key.expert == 0 && batch.entries[2].key.expert == 1,
         "stable first-occurrence table changed");
-    require(batch.canonical_order[0] == 1 && batch.canonical_order[1] == 2 &&
-        batch.canonical_order[2] == 0,
-        "canonical key order changed");
+    std::copy(canonical_unique.begin(), canonical_unique.end(), batch.semantic_order.begin());
+    require(coordinator.freeze_semantic_order(batch).is_ready(), "semantic order freeze failed");
+    require(batch.semantic_order[0] == 1 && batch.semantic_order[1] == 2 &&
+        batch.semantic_order[2] == 0,
+        "CPU semantic key order changed");
     require(batch.occurrence_to_unique[0] == 0 && batch.occurrence_to_unique[1] == 1 &&
         batch.occurrence_to_unique[2] == 0 && batch.occurrence_to_unique[3] == 2,
         "occurrence reconstruction changed");
@@ -263,8 +265,9 @@ void test_serial_host_ready_equivalence() {
     std::array<llm_cold_reference, 3> execution_by_unique;
     std::array<llm_cold_reference, 3> execution_refs;
     for (size_t order = 0; order < batch.unique_count; ++order) {
-        const uint32_t index = batch.canonical_order[order];
+        const uint32_t index = batch.semantic_order[order];
         auto & entry = batch.entries[index];
+        require(coordinator.resolve_serial_next(batch).is_ready(), "serial demand resolve failed");
         require(coordinator.complete_host_scheduler(entry).is_ready(), "host scheduler completion failed");
         require(coordinator.transfer_request_hold_to_cpu_execution(entry).is_ready(),
             "CPU execution hold transfer failed");
@@ -272,6 +275,7 @@ void test_serial_host_ready_equivalence() {
         execution_refs[order] = entry.reference;
         validate_slot(cache.bundle(), entry.reference.slot, entry.key.expert);
     }
+    require(coordinator.finish_serial_batch(batch).is_ready(), "serial demand finish failed");
     require(coordinator.release_request_holds(batch).is_ready(), "request hold release failed");
     require(cache.release_many(execution_refs.data(), execution_refs.size(),
         llm_cold_reference_kind::cpu_execution).is_ready(), "CPU execution release failed");
@@ -307,7 +311,7 @@ void test_serial_host_ready_equivalence() {
 
     const auto first = coordinator.diagnostics();
     require(first.batches == 1 && first.failures == 0 && first.current_request_holds == 0 &&
-        first.peak_request_holds == 3 && first.events.size() == 1,
+        first.peak_request_holds == 1 && first.events.size() == 1,
         "serial coordinator counters are inconsistent");
     const auto & event = first.events.front();
     require(event.new_reservations == 3 && event.ready_hits == 0 && event.read_plans == 3 &&
@@ -315,17 +319,25 @@ void test_serial_host_ready_equivalence() {
         !event.first_wait_after_all_enqueue_attempts &&
         !event.first_wait_after_all_admissible_submissions && event.serial_control,
         "serial-control witness changed");
+    require(event.semantic_order.size() == 3 && event.semantic_order[0].expert == 0 &&
+        event.semantic_order[1].expert == 1 && event.semantic_order[2].expert == 2 &&
+        event.physical_completion_order.size() == 3,
+        "semantic and physical order telemetry changed");
     require(scheduler.diagnostics().active_requests == 0 &&
         transport.diagnostics().active_read_requests == 0,
         "serial demand resources did not drain");
 
-    require(coordinator.resolve(0, logical_ids, 4, batch).is_ready(), "all-hit resolve failed");
+    require(coordinator.plan(0, logical_ids, 4, batch).is_ready(), "all-hit plan failed");
+    std::copy(canonical_unique.begin(), canonical_unique.end(), batch.semantic_order.begin());
+    require(coordinator.freeze_semantic_order(batch).is_ready(), "all-hit semantic freeze failed");
     for (size_t order = 0; order < batch.unique_count; ++order) {
-        auto & entry = batch.entries[batch.canonical_order[order]];
+        auto & entry = batch.entries[batch.semantic_order[order]];
+        require(coordinator.resolve_serial_next(batch).is_ready(), "all-hit resolve failed");
         require(coordinator.transfer_request_hold_to_cpu_execution(entry).is_ready(),
             "all-hit CPU execution hold transfer failed");
         execution_refs[order] = entry.reference;
     }
+    require(coordinator.finish_serial_batch(batch).is_ready(), "all-hit finish failed");
     require(cache.release_many(execution_refs.data(), batch.unique_count,
         llm_cold_reference_kind::cpu_execution).is_ready(), "all-hit CPU execution release failed");
     require(cache.policy_request_end(true, false).is_ready(), "all-hit policy close failed");
@@ -334,6 +346,333 @@ void test_serial_host_ready_equivalence() {
         second.events.back().read_plans == 0 && storage.diagnostics().read_bytes == 432,
         "all-hit path performed storage or scheduler work");
     require(cache.validate_invariants().is_ready(), "cold cache invariant failed");
+}
+
+struct semantic_hot_entry {
+    llm_expert_key key = { -1, -1 };
+    llm_cold_reference reference;
+    bool occupied = false;
+    bool pinned = false;
+};
+
+llm_expert_cache_policy_decision select_hot(
+        llm_expert_cache_policy & policy,
+        const std::array<semantic_hot_entry, 3> & entries,
+        llm_expert_key key,
+        uint64_t payload_bytes,
+        uint64_t slot_bytes) {
+    std::array<llm_expert_cache_policy_candidate, 3> candidates;
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto & entry = entries[index];
+        candidates[index] = { uint32_t(index), entry.reference.generation,
+            { entry.key.layer, entry.key.expert }, payload_bytes, slot_bytes,
+            !entry.occupied, entry.occupied && !entry.pinned };
+    }
+    llm_expert_cache_policy_decision decision;
+    require(policy.select({ key.layer, key.expert }, candidates.data(), candidates.size(), decision).is_ready(),
+        "hot semantic selection failed");
+    return decision;
+}
+
+void initialize_hot_policy(
+        llm_expert_cache_policy & policy,
+        uint64_t slot_bytes) {
+    llm_expert_cache_policy_config_internal config;
+    require(llm_expert_cache_policy_copy_config(
+        nullptr, llm_expert_cache_policy_tier::hot, config).is_ready(),
+        "hot semantic policy config failed");
+    const int32_t layers[] = { 0 };
+    require(policy.initialize(config, llm_expert_cache_policy_tier::hot,
+        layers, 1, 4, 3, 3, slot_bytes, 128).is_ready(),
+        "hot semantic policy initialization failed");
+}
+
+void test_uma_stable_first_semantic_equivalence() {
+    temporary_source source;
+    llama_file baseline_file(source.path, "rb");
+    llama_file common_file(source.path, "rb");
+    llm_expert_storage baseline_storage(
+        { 1, 4, 4, 1024 }, { { 0, &baseline_file, 512, source.path, false } });
+    llm_expert_storage common_storage(
+        { 1, 4, 4, 1024 }, { { 0, &common_file, 512, source.path, false } });
+    for (int32_t expert = 0; expert < 4; ++expert) {
+        require(baseline_storage.add_bundle({ 0, expert }, spans(uint64_t(expert)*144)).is_ready() &&
+            common_storage.add_bundle({ 0, expert }, spans(uint64_t(expert)*144)).is_ready(),
+            "UMA semantic storage directory failed");
+    }
+    require(baseline_storage.seal().is_ready() && common_storage.seal().is_ready(),
+        "UMA semantic storage seal failed");
+
+    ggml_init_params context_params = { ggml_tensor_overhead()*16, nullptr, true };
+    ggml_context_ptr context(ggml_init(context_params));
+    require(bool(context), "UMA semantic context failed");
+    const auto prototype = make_bundle(context.get());
+    llm_cold_cache_config cache_config;
+    cache_config.byte_budget = 1U << 20;
+    cache_config.minimum_slots = 4;
+    cache_config.routed_layer_count = 1;
+    cache_config.total_expert_keys = 4;
+    cache_config.routed_layers = { 0 };
+    llm_cold_expert_cache baseline_cache(cache_config);
+    llm_cold_expert_cache common_cache(cache_config);
+    require(baseline_cache.initialize(prototype).is_ready() && common_cache.initialize(prototype).is_ready(),
+        "UMA semantic cache initialization failed");
+    const uint64_t payload_bytes = baseline_cache.diagnostics().bundle_payload_bytes;
+    const uint64_t slot_bytes = baseline_cache.diagnostics().aligned_slot_footprint;
+
+    llm_expert_cache_policy baseline_hot;
+    llm_expert_cache_policy common_hot;
+    initialize_hot_policy(baseline_hot, slot_bytes);
+    initialize_hot_policy(common_hot, slot_bytes);
+    std::array<semantic_hot_entry, 3> baseline_hot_entries;
+    std::array<semantic_hot_entry, 3> common_hot_entries;
+    loader_context baseline_loader = { &baseline_storage };
+    loader_context common_loader = { &common_storage };
+    require(baseline_cache.policy_request_begin().is_ready() && common_cache.policy_request_begin().is_ready() &&
+        baseline_hot.request_begin().is_ready() && common_hot.request_begin().is_ready(),
+        "UMA semantic setup request begin failed");
+    const llm_expert_key prior_key = { 0, 3 };
+    require(baseline_hot.demand({ 0, 3 }, 1, payload_bytes, slot_bytes).is_ready() &&
+        common_hot.demand({ 0, 3 }, 1, payload_bytes, slot_bytes).is_ready(),
+        "UMA semantic setup demand failed");
+    const auto baseline_prior_decision = select_hot(
+        baseline_hot, baseline_hot_entries, prior_key, payload_bytes, slot_bytes);
+    const auto common_prior_decision = select_hot(
+        common_hot, common_hot_entries, prior_key, payload_bytes, slot_bytes);
+    llm_cold_reference baseline_prior_ref;
+    llm_cold_reference common_prior_ref;
+    require(baseline_prior_decision.free && common_prior_decision.free &&
+        baseline_cache.find_or_admit_with_loader(
+            prior_key, baseline_prior_ref, load_bundle, &baseline_loader).is_ready() &&
+        common_cache.find_or_admit_with_loader(
+            prior_key, common_prior_ref, load_bundle, &common_loader).is_ready() &&
+        baseline_hot.load_begin(baseline_prior_decision.slot, baseline_prior_ref.generation,
+            { 0, 3 }, payload_bytes, slot_bytes).is_ready() &&
+        common_hot.load_begin(common_prior_decision.slot, common_prior_ref.generation,
+            { 0, 3 }, payload_bytes, slot_bytes).is_ready() &&
+        baseline_cache.acquire(baseline_prior_ref, llm_cold_reference_kind::hot).is_ready() &&
+        common_cache.acquire(common_prior_ref, llm_cold_reference_kind::hot).is_ready() &&
+        baseline_hot.load_complete(baseline_prior_decision.slot, baseline_prior_ref.generation).is_ready() &&
+        common_hot.load_complete(common_prior_decision.slot, common_prior_ref.generation).is_ready(),
+        "UMA semantic setup publication failed");
+    baseline_hot_entries[baseline_prior_decision.slot] = { prior_key, baseline_prior_ref, true, false };
+    common_hot_entries[common_prior_decision.slot] = { prior_key, common_prior_ref, true, false };
+    require(baseline_hot.request_end(true, false).is_ready() && common_hot.request_end(true, false).is_ready() &&
+        baseline_cache.policy_request_end(true, false).is_ready() &&
+        common_cache.policy_request_end(true, false).is_ready(),
+        "UMA semantic setup request end failed");
+    require(baseline_cache.policy_request_begin().is_ready() && common_cache.policy_request_begin().is_ready() &&
+        baseline_hot.request_begin().is_ready() && common_hot.request_begin().is_ready(),
+        "UMA semantic request begin failed");
+
+    const std::array<int32_t, 3> stable_experts = { 2, 0, 1 };
+    std::array<llm_cold_reference, 3> baseline_refs;
+    std::array<llm_cold_reference, 3> common_refs;
+    std::array<uint32_t, 3> baseline_hot_slots;
+    std::array<uint32_t, 3> common_hot_slots;
+    std::array<bool, 3> baseline_free_decisions;
+    std::array<bool, 3> common_free_decisions;
+    std::vector<int32_t> baseline_readiness;
+    std::vector<int32_t> common_readiness;
+    for (size_t unique = 0; unique < stable_experts.size(); ++unique) {
+        const llm_expert_key key = { 0, stable_experts[unique] };
+        require(baseline_hot.demand(
+            { key.layer, key.expert }, unique == 0 ? 2 : 1, payload_bytes, slot_bytes).is_ready(),
+            "baseline UMA hot demand failed");
+        const auto decision = select_hot(baseline_hot, baseline_hot_entries, key, payload_bytes, slot_bytes);
+        baseline_free_decisions[unique] = decision.free;
+        if (!decision.free) {
+            const auto victim = baseline_hot_entries[decision.slot];
+            require(victim.occupied && !victim.pinned &&
+                baseline_cache.release(victim.reference, llm_cold_reference_kind::hot).is_ready() &&
+                baseline_hot.evict(decision.slot, victim.reference.generation).is_ready(),
+                "baseline UMA victim demotion failed");
+            baseline_hot_entries[decision.slot] = {};
+        }
+        require(baseline_cache.find_or_admit_with_loader(
+            key, baseline_refs[unique], load_bundle, &baseline_loader).is_ready(),
+            "baseline UMA cold load failed");
+        require(baseline_hot.load_begin(decision.slot, baseline_refs[unique].generation,
+            { key.layer, key.expert }, payload_bytes, slot_bytes).is_ready(),
+            "baseline UMA hot load begin failed");
+        baseline_readiness.push_back(key.expert);
+        require(baseline_cache.acquire(
+            baseline_refs[unique], llm_cold_reference_kind::hot).is_ready() &&
+            baseline_hot.load_complete(decision.slot, baseline_refs[unique].generation).is_ready() &&
+            baseline_cache.acquire(baseline_refs[unique], llm_cold_reference_kind::request).is_ready() &&
+            baseline_hot.pin(decision.slot, baseline_refs[unique].generation).is_ready(),
+            "baseline UMA final-reference publication failed");
+        baseline_hot_entries[decision.slot] = { key, baseline_refs[unique], true, true };
+        baseline_hot_slots[unique] = decision.slot;
+    }
+
+    llm_expert_layout_registry registry;
+    registry.classes = { { 0, 0, common_cache.diagnostics().bundle_payload_bytes, prototype } };
+    registry.layer_ids = { 0 };
+    llm_expert_scheduler_config scheduler_config;
+    scheduler_config.layer_count = 1;
+    scheduler_config.experts_per_layer = 4;
+    scheduler_config.request_capacity = 8;
+    scheduler_config.waiters_per_request = 4;
+    scheduler_config.max_current_layer_demand_flights = 4;
+    scheduler_config.device_count = 1;
+    scheduler_config.per_device_request_capacity = 8;
+    scheduler_config.per_device_inflight_capacity = 8;
+    llm_expert_scheduler scheduler(scheduler_config);
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 16;
+    async_config.effective_hot_capacity = 4;
+    async_config.request_capacity = 8;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = common_cache.diagnostics().actual_bytes;
+    async_config.maximum_aligned_read_bytes = 4096;
+    async_config.source_file_capacity = 1;
+    async_config.force_positional_reads = true;
+    llm_expert_async_transport transport(async_config);
+    intptr_t handle = -1;
+    size_t handle_count = 0;
+    require(common_storage.copy_source_native_handles(&handle, 1, handle_count).is_ready() &&
+        handle_count == 1 && transport.register_files(&handle, 1) == llm_expert_async_result::ready,
+        "UMA semantic transport registration failed");
+    llm_host_resident_demand_config demand_config;
+    demand_config.cache = &common_cache;
+    demand_config.storage = &common_storage;
+    demand_config.scheduler = &scheduler;
+    demand_config.transport = &transport;
+    demand_config.layout_registry = &registry;
+    demand_config.maximum_occurrences = 16;
+    demand_config.maximum_unique_keys = 4;
+    demand_config.trace_capacity = 16;
+    demand_config.serial_control = true;
+    demand_config.base_hold_kind = llm_cold_reference_kind::batch;
+    llm_host_resident_demand_coordinator coordinator(demand_config);
+    const int32_t logical_ids[] = { 2, 0, 2, 1 };
+    llm_host_resident_demand_batch batch;
+    require(coordinator.plan(0, logical_ids, 4, batch).is_ready(), "UMA semantic plan failed");
+    for (size_t unique = 0; unique < batch.unique_count; ++unique) {
+        batch.semantic_order[unique] = uint32_t(unique);
+    }
+    require(batch.occurrence_to_unique == std::vector<uint32_t>({ 0, 1, 0, 2 }),
+        "UMA occurrence reconstruction changed");
+    require(coordinator.freeze_semantic_order(batch).is_ready(), "UMA semantic freeze failed");
+    for (size_t order = 0; order < batch.unique_count; ++order) {
+        const uint32_t unique = batch.semantic_order[order];
+        auto & entry = batch.entries[unique];
+        const auto key = entry.key;
+        require(common_hot.demand(
+            { key.layer, key.expert }, entry.occurrence_count, payload_bytes, slot_bytes).is_ready(),
+            "common UMA hot demand failed");
+        const auto decision = select_hot(common_hot, common_hot_entries, key, payload_bytes, slot_bytes);
+        common_free_decisions[unique] = decision.free;
+        if (!decision.free) {
+            const auto victim = common_hot_entries[decision.slot];
+            require(victim.occupied && !victim.pinned &&
+                common_cache.release(victim.reference, llm_cold_reference_kind::hot).is_ready() &&
+                common_hot.evict(decision.slot, victim.reference.generation).is_ready(),
+                "common UMA victim demotion failed");
+            common_hot_entries[decision.slot] = {};
+        }
+        require(coordinator.resolve_serial_next(batch).is_ready(), "common UMA cold resolve failed");
+        require(common_hot.load_begin(decision.slot, entry.reference.generation,
+            { key.layer, key.expert }, payload_bytes, slot_bytes).is_ready(),
+            "common UMA hot load begin failed");
+        common_readiness.push_back(key.expert);
+        require(coordinator.complete_host_scheduler(entry).is_ready(),
+            "common UMA readiness terminal failed");
+        require(common_cache.acquire(entry.reference, llm_cold_reference_kind::hot).is_ready() &&
+            common_hot.load_complete(decision.slot, entry.reference.generation).is_ready() &&
+            coordinator.transfer_request_hold(entry).is_ready() &&
+            common_hot.pin(decision.slot, entry.reference.generation).is_ready(),
+            "common UMA final-reference publication failed");
+        common_refs[unique] = entry.reference;
+        common_hot_entries[decision.slot] = { key, entry.reference, true, true };
+        common_hot_slots[unique] = decision.slot;
+    }
+    require(coordinator.finish_serial_batch(batch).is_ready(), "common UMA semantic finish failed");
+
+    for (size_t reverse = stable_experts.size(); reverse-- > 0;) {
+        require(baseline_hot.unpin(baseline_hot_slots[reverse], baseline_refs[reverse].generation).is_ready() &&
+            baseline_cache.release(baseline_refs[reverse], llm_cold_reference_kind::request).is_ready() &&
+            common_hot.unpin(common_hot_slots[reverse], common_refs[reverse].generation).is_ready() &&
+            common_cache.release(common_refs[reverse], llm_cold_reference_kind::request).is_ready(),
+            "UMA semantic request release failed");
+    }
+    require(baseline_hot.request_end(true, false).is_ready() && common_hot.request_end(true, false).is_ready() &&
+        baseline_cache.policy_request_end(true, false).is_ready() &&
+        common_cache.policy_request_end(true, false).is_ready(),
+        "UMA semantic request end failed");
+
+    require(baseline_readiness == common_readiness &&
+        common_readiness == std::vector<int32_t>({ 2, 0, 1 }),
+        "UMA readiness order was canonicalized");
+    const std::array<int32_t, 4> baseline_execution = {
+        int32_t(baseline_refs[0].slot), int32_t(baseline_refs[1].slot),
+        int32_t(baseline_refs[0].slot), int32_t(baseline_refs[2].slot),
+    };
+    const std::array<int32_t, 4> common_execution = {
+        int32_t(common_refs[0].slot), int32_t(common_refs[1].slot),
+        int32_t(common_refs[0].slot), int32_t(common_refs[2].slot),
+    };
+    require(baseline_execution == common_execution && baseline_hot_slots == common_hot_slots &&
+        baseline_free_decisions == common_free_decisions &&
+        baseline_free_decisions == std::array<bool, 3>({ true, true, false }),
+        "UMA execution IDs or hot admission decisions changed");
+    for (size_t unique = 0; unique < stable_experts.size(); ++unique) {
+        require(baseline_refs[unique].slot == common_refs[unique].slot &&
+            baseline_refs[unique].generation == common_refs[unique].generation,
+            "UMA cold slot or generation changed");
+    }
+    const auto baseline_cold = baseline_cache.diagnostics();
+    const auto common_cold = common_cache.diagnostics();
+    require(baseline_cold.policy.state_digest == common_cold.policy.state_digest &&
+        baseline_cold.policy_events.size() == common_cold.policy_events.size() &&
+        baseline_cold.current_hot_refs == 3 && common_cold.current_hot_refs == 3 &&
+        baseline_cold.current_request_refs == 0 && common_cold.current_request_refs == 0 &&
+        baseline_cold.current_transfer_refs == 0 && common_cold.current_transfer_refs == 0 &&
+        baseline_cold.current_cpu_execution_refs == 0 && common_cold.current_cpu_execution_refs == 0 &&
+        baseline_cold.current_batch_refs == 0 && common_cold.current_batch_refs == 0 &&
+        baseline_cold.slots.size() == common_cold.slots.size(),
+        "UMA cold policy or terminal references changed");
+    for (size_t index = 0; index < baseline_cold.policy_events.size(); ++index) {
+        require(same_policy_event(baseline_cold.policy_events[index], common_cold.policy_events[index]),
+            "UMA cold policy transcript changed");
+    }
+    for (size_t index = 0; index < baseline_cold.slots.size(); ++index) {
+        const auto & lhs = baseline_cold.slots[index];
+        const auto & rhs = common_cold.slots[index];
+        require(lhs.key.layer == rhs.key.layer && lhs.key.expert == rhs.key.expert &&
+            lhs.layout_class_id == rhs.layout_class_id && lhs.generation == rhs.generation &&
+            lhs.state == rhs.state &&
+            lhs.hot_refs == rhs.hot_refs && lhs.request_refs == rhs.request_refs &&
+            lhs.transfer_refs == rhs.transfer_refs &&
+            lhs.cpu_execution_refs == rhs.cpu_execution_refs && lhs.batch_refs == rhs.batch_refs,
+            "UMA cold directory contents changed");
+    }
+    require(baseline_hot.diagnostics().state_digest == common_hot.diagnostics().state_digest &&
+        baseline_hot.transcript_size() == common_hot.transcript_size(),
+        "UMA hot policy digest changed");
+    for (size_t index = 0; index < baseline_hot.transcript_size(); ++index) {
+        require(same_policy_event(baseline_hot.transcript()[index], common_hot.transcript()[index]),
+            "UMA hot policy transcript changed");
+    }
+    const auto baseline_reads = baseline_storage.diagnostics();
+    const auto common_reads = common_storage.diagnostics();
+    require(baseline_reads.read_requests == common_reads.read_requests &&
+        baseline_reads.read_chunks == common_reads.read_chunks &&
+        baseline_reads.read_bytes == common_reads.read_bytes,
+        "UMA backing read plan or bytes changed");
+    const auto demand_diagnostics = coordinator.diagnostics();
+    require(demand_diagnostics.events.size() == 1 &&
+        demand_diagnostics.events[0].semantic_order.size() == 3 &&
+        demand_diagnostics.events[0].semantic_order[0].expert == 2 &&
+        demand_diagnostics.events[0].semantic_order[1].expert == 0 &&
+        demand_diagnostics.events[0].semantic_order[2].expert == 1 &&
+        demand_diagnostics.events[0].physical_completion_order.size() == 3,
+        "UMA semantic and physical telemetry were not separated");
+    require(scheduler.diagnostics().active_requests == 0,
+        "UMA semantic scheduler did not drain");
+    require(transport.diagnostics().active_read_requests == 0,
+        "UMA semantic transport did not drain");
 }
 
 void test_cpu_provider_serial_adapter() {
@@ -471,6 +810,7 @@ void test_cpu_provider_serial_adapter() {
 
 int main() {
     test_serial_host_ready_equivalence();
+    test_uma_stable_first_semantic_equivalence();
     test_cpu_provider_serial_adapter();
     std::puts("EXPERT_RESIDENT_DEMAND_SERIAL_OK");
     return 0;

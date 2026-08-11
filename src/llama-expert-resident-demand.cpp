@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -270,7 +271,9 @@ struct llm_host_resident_demand_coordinator::impl {
     llm_expert_provider_result release_holds(llm_host_resident_demand_batch & batch) noexcept {
         auto result = llm_expert_provider_result::success();
         for (size_t order = 0; order < batch.unique_count; ++order) {
-            auto & entry = batch.entries[batch.canonical_order[order]];
+            const uint32_t index = batch.semantic_order_frozen ? batch.semantic_order[order] : uint32_t(order);
+            if (index >= batch.unique_count) continue;
+            auto & entry = batch.entries[index];
             if (!entry.request_hold) continue;
             const auto released = config.cache->release(entry.reference, config.base_hold_kind);
             if (result.is_ready() && !released.is_ready()) result = released;
@@ -284,11 +287,15 @@ struct llm_host_resident_demand_coordinator::impl {
 
     llm_expert_provider_result fail_batch(
             llm_host_resident_demand_batch & batch,
-            size_t current,
+            size_t processed_count,
             llm_expert_provider_error error,
             bool cancelled) noexcept {
-        for (size_t index = 0; index <= current && index < batch.unique_count; ++index) {
-            auto & entry = batch.entries[batch.canonical_order[index]];
+        if (batch.finalized) return llm_expert_provider_result::failure(cancelled ?
+            llm_expert_provider_error::cancelled : error);
+        for (size_t order = 0; order < processed_count && order < batch.unique_count; ++order) {
+            const uint32_t index = batch.semantic_order_frozen ? batch.semantic_order[order] : uint32_t(order);
+            if (index >= batch.unique_count) continue;
+            auto & entry = batch.entries[index];
             if (entry.scheduler_owned) (void) terminalize_owned(entry, cancelled);
             if (entry.lookup == llm_cold_demand_lookup::reserved && !config.cache->ready(entry.reference)) {
                 (void) config.cache->fail_reservation(entry.key, entry.reference);
@@ -298,6 +305,7 @@ struct llm_host_resident_demand_coordinator::impl {
         (void) config.cache->cleanup_failed_slots();
         counters.failures++;
         if (cancelled) counters.cancellations++;
+        batch.finalized = true;
         return llm_expert_provider_result::failure(cancelled ?
             llm_expert_provider_error::cancelled : error);
     }
@@ -319,18 +327,27 @@ llm_host_resident_demand_coordinator::llm_host_resident_demand_coordinator(
 
 llm_host_resident_demand_coordinator::~llm_host_resident_demand_coordinator() = default;
 
-llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
+llm_expert_provider_result llm_host_resident_demand_coordinator::plan(
         int32_t layer,
         const int32_t * logical_ids,
         size_t logical_count,
-        llm_host_resident_demand_batch & batch,
-        bool (*abort_callback)(void *),
-        void * abort_data) noexcept {
-    LLM_EXPERT_TRACE_SCOPE("k3.provider", "host_resident_demand", "layer", layer,
+        llm_host_resident_demand_batch & batch) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.provider", "host_resident_demand_plan", "layer", layer,
         "selected_occurrences", logical_count, "serial_control", pimpl->config.serial_control);
     std::lock_guard<std::mutex> guard(pimpl->mutex);
+    auto semantic_trace = std::move(batch.event.semantic_order);
+    auto physical_trace = std::move(batch.event.physical_completion_order);
+    batch.event = {};
+    batch.event.semantic_order = std::move(semantic_trace);
+    batch.event.physical_completion_order = std::move(physical_trace);
+    batch.event.semantic_order.clear();
+    batch.event.physical_completion_order.clear();
     batch.occurrence_count = 0;
     batch.unique_count = 0;
+    batch.resolved_semantic_count = 0;
+    batch.transport_epoch = 0;
+    batch.semantic_order_frozen = false;
+    batch.finalized = false;
     if (logical_ids == nullptr || logical_count == 0 ||
         logical_count > pimpl->config.maximum_occurrences || layer < 0 ||
         size_t(layer) >= pimpl->config.layout_registry->layer_ids.size()) {
@@ -343,7 +360,9 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
     try {
         batch.entries.assign(pimpl->config.maximum_unique_keys, {});
         batch.occurrence_to_unique.assign(logical_count, 0);
-        batch.canonical_order.assign(pimpl->config.maximum_unique_keys, 0);
+        batch.semantic_order.assign(pimpl->config.maximum_unique_keys, UINT32_MAX);
+        batch.event.semantic_order.reserve(pimpl->config.maximum_unique_keys);
+        batch.event.physical_completion_order.reserve(pimpl->config.maximum_unique_keys);
     } catch (...) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
     }
@@ -363,37 +382,74 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
                     llm_expert_provider_error::unsupported_configuration);
             }
             batch.entries[unique].key = key;
-            batch.canonical_order[unique] = uint32_t(unique);
             batch.unique_count++;
         }
         batch.occurrence_to_unique[occurrence] = uint32_t(unique);
         batch.entries[unique].occurrence_count++;
     }
-    std::sort(batch.canonical_order.begin(), batch.canonical_order.begin() + batch.unique_count,
-        [&](uint32_t lhs, uint32_t rhs) {
-            const auto & lhs_key = batch.entries[lhs].key;
-            const auto & rhs_key = batch.entries[rhs].key;
-            return lhs_key.layer != rhs_key.layer ? lhs_key.layer < rhs_key.layer :
-                lhs_key.expert < rhs_key.expert;
-        });
+    batch.entries.resize(batch.unique_count);
+    batch.semantic_order.resize(batch.unique_count);
+    batch.event.sequence = pimpl->counters.batches;
+    batch.event.layer = layer;
+    batch.event.selected_occurrences = uint32_t(logical_count);
+    batch.event.unique_keys = uint32_t(batch.unique_count);
+    batch.event.serial_control = true;
+    batch.transport_epoch = pimpl->config.transport->diagnostics().transport_epoch;
+    return llm_expert_provider_result::success();
+}
 
-    llm_host_resident_demand_event event;
-    event.sequence = pimpl->counters.batches;
-    event.layer = layer;
-    event.selected_occurrences = uint32_t(logical_count);
-    event.unique_keys = uint32_t(batch.unique_count);
-    event.serial_control = true;
-    const uint64_t transport_epoch = pimpl->config.transport->diagnostics().transport_epoch;
+llm_expert_provider_result llm_host_resident_demand_coordinator::freeze_semantic_order(
+        llm_host_resident_demand_batch & batch) noexcept {
+    std::lock_guard<std::mutex> guard(pimpl->mutex);
+    if (batch.finalized || batch.semantic_order_frozen || batch.unique_count == 0 ||
+        batch.entries.size() != batch.unique_count || batch.semantic_order.size() != batch.unique_count) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
     for (size_t order = 0; order < batch.unique_count; ++order) {
-        auto & entry = batch.entries[batch.canonical_order[order]];
+        const uint32_t index = batch.semantic_order[order];
+        if (index >= batch.unique_count) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        for (size_t prior = 0; prior < order; ++prior) {
+            if (batch.semantic_order[prior] == index) {
+                return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+            }
+        }
+        batch.event.semantic_order.push_back(batch.entries[index].key);
+    }
+    batch.semantic_order_frozen = true;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_host_resident_demand_coordinator::resolve_serial_next(
+        llm_host_resident_demand_batch & batch,
+        bool (*abort_callback)(void *),
+        void * abort_data) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.provider", "host_resident_demand_serial_next",
+        "layer", batch.event.layer, "semantic_position", batch.resolved_semantic_count);
+    std::lock_guard<std::mutex> guard(pimpl->mutex);
+    if (batch.finalized || !batch.semantic_order_frozen ||
+        batch.resolved_semantic_count >= batch.unique_count ||
+        batch.event.semantic_order.size() != batch.unique_count) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    const size_t order = batch.resolved_semantic_count;
+    const uint32_t unique_index = batch.semantic_order[order];
+    if (unique_index >= batch.unique_count ||
+        !same_key(batch.entries[unique_index].key, batch.event.semantic_order[order])) {
+        return pimpl->fail_batch(batch, order, llm_expert_provider_error::metadata_mismatch, false);
+    }
+    auto & event = batch.event;
+    auto & entry = batch.entries[unique_index];
+    const size_t processed_count = order + 1;
         auto found = pimpl->config.cache->reserve_or_join_demand(entry.key, entry.reference, entry.lookup);
         if (!found.is_ready()) {
-            return pimpl->fail_batch(batch, order, found.error, false);
+            return pimpl->fail_batch(batch, processed_count, found.error, false);
         }
         if (entry.lookup == llm_cold_demand_lookup::ready) {
             event.ready_hits++;
             found = pimpl->config.cache->acquire(entry.reference, pimpl->config.base_hold_kind);
-            if (!found.is_ready()) return pimpl->fail_batch(batch, order, found.error, false);
+            if (!found.is_ready()) return pimpl->fail_batch(batch, processed_count, found.error, false);
             entry.request_hold = true;
             pimpl->record_hold(event);
         } else if (entry.lookup == llm_cold_demand_lookup::joined_loading) {
@@ -410,16 +466,16 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
                     entry.scheduler_handle = scheduled.handle;
                     entry.scheduler_owned = true;
                 }
-                return pimpl->fail_batch(batch, order, schedule_error(scheduled.disposition), false);
+                return pimpl->fail_batch(batch, processed_count, schedule_error(scheduled.disposition), false);
             }
             entry.scheduler_handle = scheduled.handle;
             entry.scheduler_joined = true;
             event.scheduler_joins++;
             if (event.first_wait_us == 0) event.first_wait_us = ggml_time_us();
             found = pimpl->config.cache->wait_until_ready(entry.reference);
-            if (!found.is_ready()) return pimpl->fail_batch(batch, order, found.error, false);
+            if (!found.is_ready()) return pimpl->fail_batch(batch, processed_count, found.error, false);
             found = pimpl->config.cache->acquire(entry.reference, pimpl->config.base_hold_kind);
-            if (!found.is_ready()) return pimpl->fail_batch(batch, order, found.error, false);
+            if (!found.is_ready()) return pimpl->fail_batch(batch, processed_count, found.error, false);
             entry.request_hold = true;
             pimpl->record_hold(event);
         } else if (entry.lookup == llm_cold_demand_lookup::reserved) {
@@ -427,7 +483,7 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
             if (pimpl->config.preflight != nullptr) {
                 found = pimpl->config.preflight(
                     pimpl->config.preflight_data, pimpl->config.reservation_bytes);
-                if (!found.is_ready()) return pimpl->fail_batch(batch, order, found.error, false);
+                if (!found.is_ready()) return pimpl->fail_batch(batch, processed_count, found.error, false);
             }
             llm_expert_request_metadata metadata;
             metadata.layout_class_id = entry.reference.layout_class_id;
@@ -437,7 +493,7 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
                 entry.key, llm_expert_priority::demand_current_layer,
                 llm_expert_readiness::host_ready, metadata);
             if (scheduled.disposition != llm_expert_schedule_disposition::admitted) {
-                return pimpl->fail_batch(batch, order, schedule_error(scheduled.disposition), false);
+                return pimpl->fail_batch(batch, processed_count, schedule_error(scheduled.disposition), false);
             }
             entry.scheduler_handle = scheduled.handle;
             entry.scheduler_owned = true;
@@ -447,13 +503,13 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
             if (taken.disposition != llm_expert_schedule_disposition::admitted ||
                 selected.handle.slot != entry.scheduler_handle.slot ||
                 selected.handle.generation != entry.scheduler_handle.generation) {
-                return pimpl->fail_batch(batch, order,
+                return pimpl->fail_batch(batch, processed_count,
                     taken.disposition == llm_expert_schedule_disposition::admitted ?
                         llm_expert_provider_error::metadata_mismatch : schedule_error(taken.disposition), false);
             }
             const auto & target = pimpl->config.cache->bundle_for_key(entry.key);
             if (entry.reference.layout_class_id >= pimpl->config.layout_registry->classes.size()) {
-                return pimpl->fail_batch(batch, order, llm_expert_provider_error::invalid_descriptor, false);
+                return pimpl->fail_batch(batch, processed_count, llm_expert_provider_error::invalid_descriptor, false);
             }
             const auto & layout = pimpl->config.layout_registry->classes[
                 entry.reference.layout_class_id].prototype;
@@ -462,27 +518,27 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
             size_t destination_count = 0;
             size_t operation_count = 0;
             if (!build_destinations(target, layout, entry.reference, destinations, destination_count)) {
-                return pimpl->fail_batch(batch, order, llm_expert_provider_error::invalid_descriptor, false);
+                return pimpl->fail_batch(batch, processed_count, llm_expert_provider_error::invalid_descriptor, false);
             }
             const auto planned = pimpl->config.storage->make_read_plan(
                 entry.key, destinations.data(), destination_count,
                 operations.data(), operations.size(), operation_count);
             if (!planned.is_ready() || operation_count == 0) {
                 pimpl->config.storage->poison();
-                return pimpl->fail_batch(batch, order,
+                return pimpl->fail_batch(batch, processed_count,
                     planned.is_ready() ? llm_expert_provider_error::metadata_mismatch : storage_error(planned.error),
                     planned.error == llm_expert_storage_error::cancelled);
             }
             uint64_t read_bytes = 0;
             for (size_t operation = 0; operation < operation_count; ++operation) {
                 if (operations[operation].byte_count > UINT64_MAX - read_bytes) {
-                    return pimpl->fail_batch(batch, order,
+                    return pimpl->fail_batch(batch, processed_count,
                         llm_expert_provider_error::unsupported_configuration, false);
                 }
                 read_bytes += operations[operation].byte_count;
             }
             const llm_expert_async_operation_identity identity = {
-                transport_epoch,
+                batch.transport_epoch,
                 entry.scheduler_handle,
                 0,
                 entry.key,
@@ -502,7 +558,7 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
                     (void) pimpl->config.transport->wait_read(entry.scheduler_handle, discarded);
                     (void) pimpl->config.transport->release_read(entry.scheduler_handle);
                 }
-                return pimpl->fail_batch(batch, order,
+                return pimpl->fail_batch(batch, processed_count,
                     submitted == llm_expert_async_result::ready ?
                         llm_expert_provider_error::metadata_mismatch : async_error(submitted),
                     submitted == llm_expert_async_result::closed);
@@ -534,7 +590,7 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
                     destinations.data(), destination_count, completion);
             if (waited != llm_expert_async_result::ready ||
                 released != llm_expert_async_result::ready || !integrity_matches) {
-                return pimpl->fail_batch(batch, order,
+                return pimpl->fail_batch(batch, processed_count,
                     waited != llm_expert_async_result::ready ? async_error(waited) :
                     released != llm_expert_async_result::ready ? async_error(released) :
                         llm_expert_provider_error::metadata_mismatch,
@@ -544,34 +600,74 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::resolve(
                 pimpl->counters.physical_completion_digest, uint64_t(uint32_t(entry.key.layer)));
             pimpl->counters.physical_completion_digest = digest_value(
                 pimpl->counters.physical_completion_digest, uint64_t(uint32_t(entry.key.expert)));
+            event.physical_completion_order.push_back(entry.key);
             found = pimpl->config.cache->publish_ready_and_acquire(
                 entry.key, entry.reference, pimpl->config.base_hold_kind);
-            if (!found.is_ready()) return pimpl->fail_batch(batch, order, found.error, false);
+            if (!found.is_ready()) return pimpl->fail_batch(batch, processed_count, found.error, false);
             entry.request_hold = true;
             pimpl->record_hold(event);
             const auto transitioned = pimpl->config.scheduler->transition(entry.scheduler_handle,
                 llm_expert_request_state::io_in_flight, llm_expert_request_state::host_ready);
             if (transitioned != llm_expert_schedule_disposition::admitted) {
-                return pimpl->fail_batch(batch, order, schedule_error(transitioned), false);
+                return pimpl->fail_batch(batch, processed_count, schedule_error(transitioned), false);
             }
         } else {
-            return pimpl->fail_batch(batch, order, llm_expert_provider_error::metadata_mismatch, false);
+            return pimpl->fail_batch(batch, processed_count, llm_expert_provider_error::metadata_mismatch, false);
         }
         event.host_ready++;
-        pimpl->counters.canonical_commit_digest = digest_value(
-            pimpl->counters.canonical_commit_digest, uint64_t(uint32_t(entry.key.layer)));
-        pimpl->counters.canonical_commit_digest = digest_value(
-            pimpl->counters.canonical_commit_digest, uint64_t(uint32_t(entry.key.expert)));
-    }
-    event.first_wait_after_all_enqueue_attempts = event.first_wait_us == 0 ||
-        event.scheduler_enqueue_attempts <= 1;
-    event.first_wait_after_all_admissible_submissions = event.first_wait_us == 0 || event.read_plans <= 1;
-    pimpl->counters.batches++;
-    if (pimpl->counters.events.size() == pimpl->config.trace_capacity) {
-        pimpl->counters.events.erase(pimpl->counters.events.begin());
-    }
-    pimpl->counters.events.push_back(event);
+    batch.resolved_semantic_count++;
     return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_host_resident_demand_coordinator::finish_serial_batch(
+        llm_host_resident_demand_batch & batch) noexcept {
+    std::lock_guard<std::mutex> guard(pimpl->mutex);
+    if (batch.finalized || !batch.semantic_order_frozen ||
+        batch.resolved_semantic_count != batch.unique_count ||
+        batch.event.semantic_order.size() != batch.unique_count) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    for (size_t order = 0; order < batch.unique_count; ++order) {
+        const uint32_t index = batch.semantic_order[order];
+        if (index >= batch.unique_count ||
+            !same_key(batch.entries[index].key, batch.event.semantic_order[order])) {
+            return pimpl->fail_batch(batch, batch.resolved_semantic_count,
+                llm_expert_provider_error::metadata_mismatch, false);
+        }
+    }
+    batch.event.first_wait_after_all_enqueue_attempts = batch.event.first_wait_us == 0 ||
+        batch.event.scheduler_enqueue_attempts <= 1;
+    batch.event.first_wait_after_all_admissible_submissions = batch.event.first_wait_us == 0 ||
+        batch.event.read_plans <= 1;
+    try {
+        if (pimpl->counters.events.size() == pimpl->config.trace_capacity) {
+            std::rotate(pimpl->counters.events.begin(), pimpl->counters.events.begin() + 1,
+                pimpl->counters.events.end());
+            pimpl->counters.events.back() = batch.event;
+        } else {
+            pimpl->counters.events.push_back(batch.event);
+        }
+    } catch (...) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+    }
+    for (size_t order = 0; order < batch.unique_count; ++order) {
+        const auto & key = batch.entries[batch.semantic_order[order]].key;
+        pimpl->counters.semantic_commit_digest = digest_value(
+            pimpl->counters.semantic_commit_digest, uint64_t(uint32_t(key.layer)));
+        pimpl->counters.semantic_commit_digest = digest_value(
+            pimpl->counters.semantic_commit_digest, uint64_t(uint32_t(key.expert)));
+    }
+    pimpl->counters.batches++;
+    batch.finalized = true;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_host_resident_demand_coordinator::fail_serial_batch(
+        llm_host_resident_demand_batch & batch,
+        llm_expert_provider_error error,
+        bool cancelled) noexcept {
+    std::lock_guard<std::mutex> guard(pimpl->mutex);
+    return pimpl->fail_batch(batch, batch.resolved_semantic_count, error, cancelled);
 }
 
 llm_expert_provider_result llm_host_resident_demand_coordinator::complete_host_scheduler(
@@ -618,7 +714,9 @@ llm_expert_provider_result llm_host_resident_demand_coordinator::fail_host_sched
     std::lock_guard<std::mutex> guard(pimpl->mutex);
     auto result = llm_expert_provider_result::success();
     for (size_t order = 0; order < batch.unique_count; ++order) {
-        auto & entry = batch.entries[batch.canonical_order[order]];
+        const uint32_t index = batch.semantic_order_frozen ? batch.semantic_order[order] : uint32_t(order);
+        if (index >= batch.unique_count) continue;
+        auto & entry = batch.entries[index];
         if (!entry.scheduler_owned) continue;
         const auto terminal = pimpl->terminalize_owned(entry, cancelled);
         if (result.is_ready() && !terminal.is_ready()) result = terminal;

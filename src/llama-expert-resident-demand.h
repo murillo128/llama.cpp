@@ -19,14 +19,6 @@ struct llm_host_resident_demand_entry {
     bool request_hold = false;
 };
 
-struct llm_host_resident_demand_batch {
-    std::vector<llm_host_resident_demand_entry> entries;
-    std::vector<uint32_t> occurrence_to_unique;
-    std::vector<uint32_t> canonical_order;
-    size_t occurrence_count = 0;
-    size_t unique_count = 0;
-};
-
 struct llm_host_resident_demand_event {
     uint64_t sequence = 0;
     int32_t layer = -1;
@@ -51,6 +43,21 @@ struct llm_host_resident_demand_event {
     bool first_wait_after_all_enqueue_attempts = false;
     bool first_wait_after_all_admissible_submissions = false;
     bool serial_control = true;
+    std::vector<llm_expert_key> semantic_order;
+    std::vector<llm_expert_key> physical_completion_order;
+};
+
+struct llm_host_resident_demand_batch {
+    std::vector<llm_host_resident_demand_entry> entries;
+    std::vector<uint32_t> occurrence_to_unique;
+    std::vector<uint32_t> semantic_order;
+    llm_host_resident_demand_event event;
+    size_t occurrence_count = 0;
+    size_t unique_count = 0;
+    size_t resolved_semantic_count = 0;
+    uint64_t transport_epoch = 0;
+    bool semantic_order_frozen = false;
+    bool finalized = false;
 };
 
 struct llm_host_resident_demand_diagnostics {
@@ -59,7 +66,7 @@ struct llm_host_resident_demand_diagnostics {
     uint64_t cancellations = 0;
     uint64_t stale_completions = 0;
     uint64_t physical_completion_digest = UINT64_C(1469598103934665603);
-    uint64_t canonical_commit_digest = UINT64_C(1469598103934665603);
+    uint64_t semantic_commit_digest = UINT64_C(1469598103934665603);
     uint64_t current_request_holds = 0;
     uint64_t peak_request_holds = 0;
     std::vector<llm_host_resident_demand_event> events;
@@ -90,13 +97,23 @@ public:
     llm_host_resident_demand_coordinator(const llm_host_resident_demand_coordinator &) = delete;
     llm_host_resident_demand_coordinator & operator=(const llm_host_resident_demand_coordinator &) = delete;
 
-    llm_expert_provider_result resolve(
+    llm_expert_provider_result plan(
             int32_t layer,
             const int32_t * logical_ids,
             size_t logical_count,
+            llm_host_resident_demand_batch & batch) noexcept;
+    llm_expert_provider_result freeze_semantic_order(
+            llm_host_resident_demand_batch & batch) noexcept;
+    llm_expert_provider_result resolve_serial_next(
             llm_host_resident_demand_batch & batch,
             bool (*abort_callback)(void *) = nullptr,
             void * abort_data = nullptr) noexcept;
+    llm_expert_provider_result finish_serial_batch(
+            llm_host_resident_demand_batch & batch) noexcept;
+    llm_expert_provider_result fail_serial_batch(
+            llm_host_resident_demand_batch & batch,
+            llm_expert_provider_error error,
+            bool cancelled) noexcept;
     llm_expert_provider_result complete_host_scheduler(
             llm_host_resident_demand_entry & entry) noexcept;
     llm_expert_provider_result fail_host_scheduler(

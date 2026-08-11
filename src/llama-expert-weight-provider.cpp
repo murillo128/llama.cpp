@@ -5425,11 +5425,8 @@ public:
                 return fail(llm_expert_provider_result::failure(
                     llm_expert_provider_error::invalid_binding));
             }
-            provider_lock->unlock();
-            auto loaded = host_resident_demand->resolve(
-                binding.layer, logical_ids, logical_id_count, host_resident_batch,
-                abort_callback, abort_callback_data);
-            provider_lock->lock();
+            auto loaded = host_resident_demand->plan(
+                binding.layer, logical_ids, logical_id_count, host_resident_batch);
             if (!loaded.is_ready()) return fail(loaded);
             if (host_resident_batch.unique_count != unique_count ||
                 host_resident_batch.occurrence_count != logical_id_count) {
@@ -5438,25 +5435,41 @@ public:
                     llm_expert_provider_error::metadata_mismatch));
             }
             for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
-                const uint32_t index = host_resident_batch.canonical_order[order];
+                const uint32_t index = policy_unique_indices[order];
+                if (index >= host_resident_batch.unique_count ||
+                    !expert_key_matches(host_resident_batch.entries[index].key, unique_keys[index])) {
+                    return fail(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                host_resident_batch.semantic_order[order] = index;
+            }
+            loaded = host_resident_demand->freeze_semantic_order(host_resident_batch);
+            if (!loaded.is_ready()) return fail(loaded);
+            for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
+                const uint32_t index = host_resident_batch.semantic_order[order];
                 auto & entry = host_resident_batch.entries[index];
+                provider_lock->unlock();
+                loaded = host_resident_demand->resolve_serial_next(
+                    host_resident_batch, abort_callback, abort_callback_data);
+                provider_lock->lock();
+                if (!loaded.is_ready()) return fail(loaded);
                 loaded = host_resident_demand->complete_host_scheduler(entry);
                 if (!loaded.is_ready()) {
-                    (void) host_resident_demand->fail_host_schedulers(host_resident_batch, false);
-                    (void) host_resident_demand->release_request_holds(host_resident_batch);
+                    (void) host_resident_demand->fail_serial_batch(
+                        host_resident_batch, loaded.error, false);
                     return fail(loaded);
                 }
                 if (cpu_execution_pin_count >= cpu_execution_pins.size()) {
-                    (void) host_resident_demand->fail_host_schedulers(host_resident_batch, false);
-                    (void) host_resident_demand->release_request_holds(host_resident_batch);
+                    (void) host_resident_demand->fail_serial_batch(
+                        host_resident_batch, llm_expert_provider_error::unsupported_configuration, false);
                     (void) release_request_pins_locked();
                     return fail(llm_expert_provider_result::failure(
                         llm_expert_provider_error::unsupported_configuration));
                 }
                 const auto acquired = host_resident_demand->transfer_request_hold_to_cpu_execution(entry);
                 if (!acquired.is_ready()) {
-                    (void) host_resident_demand->fail_host_schedulers(host_resident_batch, false);
-                    (void) host_resident_demand->release_request_holds(host_resident_batch);
+                    (void) host_resident_demand->fail_serial_batch(
+                        host_resident_batch, acquired.error, false);
                     (void) release_request_pins_locked();
                     return fail(acquired);
                 }
@@ -5464,8 +5477,10 @@ public:
                 unique_slots[index] = int32_t(entry.reference.slot);
                 cold_references[index] = entry.reference;
             }
-            loaded = host_resident_demand->release_request_holds(host_resident_batch);
+            loaded = host_resident_demand->finish_serial_batch(host_resident_batch);
             if (!loaded.is_ready()) {
+                (void) host_resident_demand->fail_serial_batch(
+                    host_resident_batch, loaded.error, false);
                 (void) release_request_pins_locked();
                 return fail(loaded);
             }
