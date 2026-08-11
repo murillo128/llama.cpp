@@ -1,5 +1,6 @@
 #include "ggml-cpp.h"
 #include "ggml-cuda.h"
+#include "llama-expert-async-io.h"
 #include "llama-expert-scheduler.h"
 #include "llama-expert-storage.h"
 #include "llama-expert-weight-provider.h"
@@ -104,6 +105,32 @@ struct temporary_source {
     ~temporary_source() { unlink(path); }
 };
 
+struct async_fixture {
+    llm_expert_async_transport transport;
+
+    static llm_expert_async_config config() {
+        llm_expert_async_config result;
+        result.requested_queue_depth = 16;
+        result.effective_hot_capacity = 2;
+        result.request_capacity = 8;
+        result.trace_capacity = 64;
+        result.cold_cache_bytes = 8192;
+        result.maximum_aligned_read_bytes = 4096;
+        result.source_file_capacity = 1;
+        result.force_positional_reads = true;
+        return result;
+    }
+
+    explicit async_fixture(llm_expert_storage & storage) : transport(config()) {
+        intptr_t handle = -1;
+        size_t handle_count = 0;
+        require(storage.copy_source_native_handles(&handle, 1, handle_count).is_ready() &&
+            handle_count == 1, "source handle discovery failed");
+        require(transport.register_files(&handle, 1) == llm_expert_async_result::ready,
+            "source registration failed");
+    }
+};
+
 llm_expert_bundle_descriptor make_bundle(ggml_context * ctx) {
     auto projection = [&](const char * name) {
         auto * weight = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 3, 2);
@@ -129,6 +156,7 @@ void test_provider() {
     require(storage.add_bundle({ 0, 0 }, spans(0)).is_ready(), "expert 0 directory failed");
     require(storage.add_bundle({ 0, 1 }, spans(144)).is_ready(), "expert 1 directory failed");
     require(storage.seal().is_ready(), "storage seal failed");
+    async_fixture async(storage);
     llm_expert_scheduler scheduler({ 1, 2, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
 
     llm_uma_cache_config config;
@@ -140,6 +168,7 @@ void test_provider() {
     config.buffer_type = ggml_backend_cuda_uma_buffer_type(0);
     config.target_device = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0);
     config.storage = &storage;
+    config.async_transport = &async.transport;
     config.scheduler = &scheduler;
     config.is_uma_buffer_type = ggml_backend_buft_is_cuda_uma;
     config.prefetch = ggml_backend_cuda_uma_prefetch;
@@ -253,6 +282,7 @@ void test_readiness_selection_and_failed_generation_retry() {
     require(storage.add_bundle({ 0, 0 }, spans(0)).is_ready(), "expert 0 directory failed");
     require(storage.add_bundle({ 0, 1 }, spans(144)).is_ready(), "expert 1 directory failed");
     require(storage.seal().is_ready(), "storage seal failed");
+    async_fixture async(storage);
     ggml_init_params params = { ggml_tensor_overhead()*32, nullptr, true };
     ggml_context_ptr ctx(ggml_init(params));
     require(bool(ctx), "context failed");
@@ -270,6 +300,7 @@ void test_readiness_selection_and_failed_generation_retry() {
         config.buffer_type = ggml_backend_cuda_uma_buffer_type(0);
         config.target_device = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0);
         config.storage = &storage;
+        config.async_transport = &async.transport;
         config.scheduler = &scheduler;
         config.is_uma_buffer_type = ggml_backend_buft_is_cuda_uma;
         config.prefetch = controlled_prefetch;
@@ -426,6 +457,7 @@ void test_autofit_policy_pressure_trim_and_surrender() {
     require(storage.add_bundle({ 0, 0 }, spans(0)).is_ready(), "pressure expert 0 directory failed");
     require(storage.add_bundle({ 0, 1 }, spans(144)).is_ready(), "pressure expert 1 directory failed");
     require(storage.seal().is_ready(), "pressure storage seal failed");
+    async_fixture async(storage);
     llm_expert_scheduler scheduler({ 1, 2, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
     llm_uma_cache_config config;
     config.pool_bytes = 0;
@@ -436,6 +468,7 @@ void test_autofit_policy_pressure_trim_and_surrender() {
     config.buffer_type = ggml_backend_cuda_uma_buffer_type(0);
     config.target_device = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0);
     config.storage = &storage;
+    config.async_transport = &async.transport;
     config.scheduler = &scheduler;
     config.is_uma_buffer_type = ggml_backend_buft_is_cuda_uma;
     config.prefetch = ggml_backend_cuda_uma_prefetch;

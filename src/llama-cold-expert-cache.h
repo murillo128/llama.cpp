@@ -22,6 +22,7 @@ enum class llm_cold_reference_kind {
     transfer,
     request,
     cpu_execution,
+    batch,
 };
 
 struct llm_cold_reference {
@@ -105,6 +106,8 @@ struct llm_cold_cache_diagnostics {
     uint64_t peak_request_refs = 0;
     uint64_t current_cpu_execution_refs = 0;
     uint64_t peak_cpu_execution_refs = 0;
+    uint64_t current_batch_refs = 0;
+    uint64_t peak_batch_refs = 0;
     bool residency_supported = false;
     std::string residency_unavailable_reason;
     uint64_t ready_logical_bytes = 0;
@@ -127,6 +130,7 @@ struct llm_cold_cache_diagnostics {
         uint32_t transfer_refs = 0;
         uint32_t request_refs = 0;
         uint32_t cpu_execution_refs = 0;
+        uint32_t batch_refs = 0;
         llm_expert_residency_origin origin = llm_expert_residency_origin::demand;
         bool speculative_consumed = false;
         uint64_t speculative_deadline = 0;
@@ -215,10 +219,18 @@ public:
             llm_expert_residency_origin origin,
             bool consumed = false) noexcept;
     llm_expert_provider_result publish_ready(llm_expert_key key, llm_cold_reference reference) noexcept;
+    llm_expert_provider_result publish_ready_and_acquire(
+            llm_expert_key key,
+            llm_cold_reference reference,
+            llm_cold_reference_kind kind) noexcept;
     llm_expert_provider_result fail_reservation(llm_expert_key key, llm_cold_reference reference) noexcept;
     llm_expert_provider_result acquire(
             llm_cold_reference reference,
             llm_cold_reference_kind kind) noexcept;
+    llm_expert_provider_result convert_request_to_cpu_execution(
+            llm_cold_reference reference) noexcept;
+    llm_expert_provider_result convert_batch_to_request(
+            llm_cold_reference reference) noexcept;
     llm_expert_provider_result policy_shadow_hit(
             llm_expert_key key,
             llm_cold_reference reference,

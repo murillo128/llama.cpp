@@ -2,6 +2,7 @@
 
 #include "llama-cold-expert-cache.h"
 #include "llama-expert-cache-policy.h"
+#include "llama-expert-resident-demand.h"
 #include "llama-expert-scheduler.h"
 #include "llama-expert-storage.h"
 #include "llama-perfetto-trace.h"
@@ -60,19 +61,6 @@ int expert_axis(const ggml_tensor * tensor, int32_t n_expert, bool weight) {
     return 1;
 }
 
-struct uma_load_context {
-    llm_expert_storage * storage = nullptr;
-    llm_expert_scheduler * scheduler = nullptr;
-    llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
-    bool (*abort_callback)(void *) = nullptr;
-    void * abort_data = nullptr;
-    llm_expert_provider_result (*preflight)(void *, uint64_t) = nullptr;
-    void * preflight_data = nullptr;
-    uint64_t incoming_bytes = 0;
-    llm_expert_request_handle handle;
-    bool active = false;
-};
-
 bool build_destinations(
         const llm_expert_bundle_descriptor & bundle,
         uint32_t slot,
@@ -103,97 +91,6 @@ bool build_destinations(
     return count != 0;
 }
 
-llm_expert_provider_result fail_scheduler(uma_load_context & context, bool cancelled) {
-    if (!context.active) return llm_expert_provider_result::failure(
-        cancelled ? llm_expert_provider_error::cancelled : llm_expert_provider_error::copy_failed);
-    auto & scheduler = *context.scheduler;
-    llm_expert_request_snapshot snapshot;
-    const auto snapshotted = scheduler.snapshot(context.handle, snapshot);
-    if (snapshotted == llm_expert_schedule_disposition::admitted &&
-        snapshot.state != llm_expert_request_state::draining) {
-        (void) scheduler.begin_demand_cancellation(context.handle, snapshot.state);
-        (void) scheduler.transition(context.handle, llm_expert_request_state::cancelling,
-            llm_expert_request_state::draining);
-    }
-    (void) scheduler.finish(context.handle,
-        cancelled ? llm_expert_request_state::cancelled : llm_expert_request_state::failed);
-    (void) scheduler.release_terminal(context.handle);
-    context.active = false;
-    return llm_expert_provider_result::failure(
-        cancelled ? llm_expert_provider_error::cancelled : llm_expert_provider_error::copy_failed);
-}
-
-llm_expert_provider_result load_uma_bundle(
-        void * user_data,
-        llm_expert_key key,
-        const llm_expert_bundle_descriptor & destination,
-        uint32_t slot) noexcept {
-    auto & context = *static_cast<uma_load_context *>(user_data);
-    if (context.storage == nullptr || context.scheduler == nullptr) {
-        return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
-    }
-    if (context.preflight != nullptr) {
-        const auto preflight = context.preflight(context.preflight_data, context.incoming_bytes);
-        if (!preflight.is_ready()) return preflight;
-    }
-    const auto enqueued = context.scheduler->enqueue(
-        key, llm_expert_priority::demand_current_layer, llm_expert_readiness::device_ready);
-    if (enqueued.disposition != llm_expert_schedule_disposition::admitted) {
-        return llm_expert_provider_result::failure(enqueued.disposition == llm_expert_schedule_disposition::busy ?
-            llm_expert_provider_error::busy : llm_expert_provider_error::metadata_mismatch);
-    }
-    context.handle = enqueued.handle;
-    context.active = true;
-    llm_expert_request_snapshot selected;
-    const auto taken = context.scheduler->take_next(selected);
-    if (taken.disposition != llm_expert_schedule_disposition::admitted ||
-        selected.handle.slot != context.handle.slot || selected.handle.generation != context.handle.generation ||
-        context.scheduler->transition(context.handle, llm_expert_request_state::submitting,
-            llm_expert_request_state::io_in_flight) != llm_expert_schedule_disposition::admitted) {
-        return fail_scheduler(context, false);
-    }
-    std::array<llm_expert_storage_destination, 12> destinations;
-    size_t destination_count = 0;
-    if (!build_destinations(destination, slot, destinations, destination_count)) {
-        return fail_scheduler(context, false);
-    }
-    const auto read = context.storage->read_bundle(key, destinations.data(), destination_count,
-        context.abort_callback, context.abort_data);
-    if (!read.is_ready()) return fail_scheduler(context, read.error == llm_expert_storage_error::cancelled);
-    if (context.integrity_mode == llm_expert_integrity_mode::none) {
-        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_finalize", "integrity_checked", false);
-        if (read.integrity_status != llm_expert_integrity_status::not_checked || read.digest != 0) {
-            context.storage->poison();
-            return fail_scheduler(context, false);
-        }
-        context.storage->record_integrity_status(llm_expert_integrity_status::not_checked);
-        return llm_expert_provider_result::success();
-    }
-    uint64_t destination_digest = UINT64_C(1469598103934665603);
-    uint64_t digest_bytes = 0;
-    {
-        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_digest", "destination_count", destination_count);
-        for (size_t index = 0; index < destination_count; ++index) {
-            const auto * bytes = static_cast<const uint8_t *>(destinations[index].data);
-            digest_bytes += destinations[index].extent;
-            for (uint64_t offset = 0; offset < destinations[index].extent; ++offset) {
-                destination_digest ^= bytes[offset];
-                destination_digest *= UINT64_C(1099511628211);
-            }
-        }
-    }
-    const bool integrity_matches = read.integrity_status == llm_expert_integrity_status::passed &&
-        destination_digest == read.digest;
-    {
-        LLM_EXPERT_TRACE_SCOPE("k3.provider", "integrity_finalize", "integrity_checked", true,
-            "integrity_matches", integrity_matches, "digest_bytes", digest_bytes);
-        context.storage->record_integrity_status(integrity_matches ? llm_expert_integrity_status::passed :
-            llm_expert_integrity_status::failed, digest_bytes);
-    }
-    if (!integrity_matches) return fail_scheduler(context, false);
-    return llm_expert_provider_result::success();
-}
-
 class llm_uma_expert_weight_provider final : public llm_expert_weight_provider {
 public:
     static constexpr uint32_t policy_trace_capacity = 65536;
@@ -207,7 +104,8 @@ public:
             this->config.total_expert_keys % this->config.routed_layer_count != 0 ||
             this->config.buffer_type == nullptr || this->config.is_uma_buffer_type == nullptr ||
             !this->config.is_uma_buffer_type(this->config.buffer_type) ||
-            this->config.target_device == nullptr || this->config.storage == nullptr || this->config.scheduler == nullptr ||
+            this->config.target_device == nullptr || this->config.storage == nullptr ||
+            this->config.async_transport == nullptr || this->config.scheduler == nullptr ||
             this->config.prefetch == nullptr || this->config.checksum == nullptr ||
             (this->config.integrity_mode != llm_expert_integrity_mode::none &&
              this->config.integrity_mode != llm_expert_integrity_mode::fnv64_end_to_end) ||
@@ -309,108 +207,111 @@ public:
             void * abort_data) noexcept override {
         LLM_EXPERT_TRACE_SCOPE("k3.provider", "uma_remap_checkpoint", "layer", binding.layer,
             "selected_key_count", logical_count);
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!active_request || !cache || binding.provider_identity != this || binding.graph_epoch != epoch ||
+        std::lock_guard<std::mutex> ordered_lock(ordered_remap_mutex);
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!active_request || !cache || !host_resident_demand ||
+            binding.provider_identity != this || binding.graph_epoch != epoch ||
             binding.generation_lease.get() != cache->allocation_lease().get() || binding.layer < 0 ||
             logical_ids == nullptr || execution_ids == nullptr || logical_count == 0) {
             return failure(llm_expert_provider_error::invalid_binding);
         }
         const auto prior_pins_released = release_request_pins_locked();
         if (!prior_pins_released.is_ready()) return failure(prior_pins_released.error);
-        std::vector<llm_expert_key> unique;
-        std::vector<size_t> element_index(logical_count);
-        try { unique.reserve(logical_count); } catch (...) { return failure(llm_expert_provider_error::allocation_failed); }
-        for (size_t index = 0; index < logical_count; ++index) {
-            if (logical_ids[index] < 0 || logical_ids[index] >= int32_t(n_expert)) {
-                return failure(llm_expert_provider_error::invalid_key);
-            }
-            const llm_expert_key key = { binding.layer, logical_ids[index] };
-            auto found = std::find_if(unique.begin(), unique.end(), [&](auto value) { return same_key(value, key); });
-            if (found == unique.end()) { element_index[index] = unique.size(); unique.push_back(key); }
-            else element_index[index] = size_t(found - unique.begin());
-        }
-        if (unique.size() > config.hot_capacity) return failure(llm_expert_provider_error::unsupported_configuration);
-        std::vector<llm_cold_reference> references(unique.size());
+        lock.unlock();
+        auto result = host_resident_demand->resolve(
+            binding.layer, logical_ids, logical_count, host_resident_batch,
+            abort_callback, abort_data);
+        lock.lock();
+        if (!result.is_ready()) return failure(result.error);
         const size_t rollback_begin = request_pins.size();
-        for (size_t index = 0; index < unique.size(); ++index) {
-            auto result = policy_result(hot_policy.demand(
-                { unique[index].layer, unique[index].expert }, 1, bundle_payload_bytes, slot_footprint_bytes));
-            if (!result.is_ready()) {
-                rollback(rollback_begin);
-                return failure(result.error);
+        auto fail_batch = [&](llm_expert_provider_result failed,
+                              llm_cold_reference retire = {}) {
+            for (size_t index = 0; index < host_resident_batch.unique_count; ++index) {
+                auto & entry = host_resident_batch.entries[index];
+                if (entry.scheduler_owned) (void) fail_host_scheduler(entry, false);
             }
-            int32_t hot_slot = find_hot_key(unique[index]);
+            (void) host_resident_demand->release_request_holds(host_resident_batch);
+            rollback(rollback_begin);
+            if (retire.generation != 0 && cache->ready(retire)) (void) cache->retire_ready(retire);
+            (void) cache->cleanup_failed_slots();
+            return failure(failed.error);
+        };
+        for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
+            const uint32_t index = host_resident_batch.canonical_order[order];
+            auto & entry = host_resident_batch.entries[index];
+            const auto & key = entry.key;
+            result = policy_result(hot_policy.demand(
+                { key.layer, key.expert }, 1, bundle_payload_bytes, slot_footprint_bytes));
+            if (!result.is_ready()) {
+                return fail_batch(result);
+            }
+            int32_t hot_slot = find_hot_key(key);
             llm_expert_cache_policy_decision decision;
             if (hot_slot < 0) {
-                result = select_hot_slot(unique[index], decision);
+                result = select_hot_slot(key, decision);
                 if (result.is_ready() && !decision.free) result = demote_hot(decision.slot);
-                if (!result.is_ready()) {
-                    rollback(rollback_begin);
-                    return failure(result.error);
-                }
+                if (!result.is_ready()) return fail_batch(result);
             }
-            uma_load_context load = { config.storage, config.scheduler, config.integrity_mode, abort_callback, abort_data,
-                preflight_trampoline, this, slot_footprint_bytes, {}, false };
-            result = cache->find_or_admit_with_loader(unique[index], references[index], load_uma_bundle, &load);
-            if (!result.is_ready()) {
-                (void) cache->cleanup_failed_slots();
-                rollback(rollback_begin);
-                return failure(result.error);
+            ensure_slot_state(entry.reference);
+            auto & slot = slots[entry.reference.slot];
+            if (hot_slot >= 0 && find_hot_entry(key, entry.reference) != hot_slot) {
+                return fail_batch(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::metadata_mismatch));
             }
-            ensure_slot_state(references[index]);
-            auto & slot = slots[references[index].slot];
-            if (hot_slot >= 0 && find_hot_entry(unique[index], references[index]) != hot_slot) {
-                rollback(rollback_begin);
-                return failure(llm_expert_provider_error::metadata_mismatch);
-            }
-            const auto hit = classify_hit(load.active, hot_slot >= 0, references[index]);
+            const auto hit = classify_hit(
+                entry.lookup == llm_cold_demand_lookup::reserved, hot_slot >= 0, entry.reference);
             if (hot_slot < 0) {
                 result = policy_result(hot_policy.load_begin(
-                    decision.slot, references[index].generation,
-                    { unique[index].layer, unique[index].expert }, bundle_payload_bytes, slot_footprint_bytes));
-                if (!result.is_ready() && load.active) (void) fail_scheduler(load, false);
-                if (result.is_ready()) result = complete_readiness(load, references[index]);
+                    decision.slot, entry.reference.generation,
+                    { key.layer, key.expert }, bundle_payload_bytes, slot_footprint_bytes));
+                if (result.is_ready()) {
+                    lock.unlock();
+                    result = complete_readiness(entry, entry.reference);
+                    lock.lock();
+                }
                 bool hot_acquired = false;
                 if (result.is_ready()) {
-                    result = cache->acquire(references[index], llm_cold_reference_kind::hot);
+                    result = cache->acquire(entry.reference, llm_cold_reference_kind::hot);
                     hot_acquired = result.is_ready();
                 }
                 if (result.is_ready()) result = policy_result(
-                    hot_policy.load_complete(decision.slot, references[index].generation));
+                    hot_policy.load_complete(decision.slot, entry.reference.generation));
                 if (!result.is_ready()) {
-                    if (hot_acquired) (void) cache->release(
-                        references[index], llm_cold_reference_kind::hot);
+                    if (hot_acquired) (void) cache->release(entry.reference, llm_cold_reference_kind::hot);
                     if (decision.slot < hot_entries.size() && hot_policy.validate_loading(
-                            decision.slot, references[index].generation,
-                            { unique[index].layer, unique[index].expert })) {
-                        (void) hot_policy.load_failed(decision.slot, references[index].generation);
+                            decision.slot, entry.reference.generation,
+                            { key.layer, key.expert })) {
+                        (void) hot_policy.load_failed(decision.slot, entry.reference.generation);
                     }
-                    if (cache->ready(references[index])) (void) cache->retire_ready(references[index]);
-                    (void) cache->cleanup_failed_slots();
-                    rollback(rollback_begin);
-                    return failure(result.error);
+                    return fail_batch(result, entry.reference);
                 }
-                hot_entries[decision.slot] = { unique[index], references[index], true };
+                hot_entries[decision.slot] = { key, entry.reference, true };
                 hot_slot = int32_t(decision.slot);
                 slot.hot = true;
                 hot_count++;
-            } else if (load.active) {
-                rollback(rollback_begin);
-                return failure(llm_expert_provider_error::metadata_mismatch);
+            } else if (entry.scheduler_owned) {
+                return fail_batch(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::metadata_mismatch));
             } else {
-                result = policy_result(hot_policy.hit(uint32_t(hot_slot), references[index].generation));
-                if (!result.is_ready()) { rollback(rollback_begin); return failure(result.error); }
+                result = policy_result(hot_policy.hit(uint32_t(hot_slot), entry.reference.generation));
+                if (!result.is_ready()) return fail_batch(result);
             }
-            result = cache->acquire(references[index], llm_cold_reference_kind::request);
-            if (result.is_ready()) result = policy_result(
-                hot_policy.pin(uint32_t(hot_slot), references[index].generation));
-            if (!result.is_ready()) { rollback(rollback_begin); return failure(result.error); }
+            result = policy_result(hot_policy.pin(uint32_t(hot_slot), entry.reference.generation));
+            if (result.is_ready()) {
+                const auto transferred = host_resident_demand->transfer_request_hold(entry);
+                if (!transferred.is_ready()) {
+                    (void) hot_policy.unpin(uint32_t(hot_slot), entry.reference.generation);
+                    result = transferred;
+                }
+            }
+            if (!result.is_ready()) return fail_batch(result);
             slot.refs++;
             slot.last_use = ++use_clock;
-            request_pins.push_back({ references[index], uint32_t(hot_slot), hit });
+            request_pins.push_back({ entry.reference, uint32_t(hot_slot), hit });
         }
         for (size_t index = 0; index < logical_count; ++index) {
-            execution_ids[index] = int32_t(references[element_index[index]].slot);
+            execution_ids[index] = int32_t(host_resident_batch.entries[
+                host_resident_batch.occurrence_to_unique[index]].reference.slot);
         }
         return llm_expert_provider_result::success();
     }
@@ -493,6 +394,8 @@ public:
         result.cold_peak_hot_refs = cold.peak_hot_refs;
         result.cold_current_request_refs = cold.current_request_refs;
         result.cold_peak_request_refs = cold.peak_request_refs;
+        result.cold_current_batch_refs = cold.current_batch_refs;
+        result.cold_peak_batch_refs = cold.peak_batch_refs;
         result.cold_residency_supported = cold.residency_supported;
         result.cold_residency_unavailable_reason = cold.residency_unavailable_reason;
         result.cold_ready_logical_bytes = cold.ready_logical_bytes;
@@ -704,7 +607,34 @@ public:
         hot_candidates.assign(config.hot_capacity, {});
         bundle_payload_bytes = diagnostics.bundle_payload_bytes;
         slot_footprint_bytes = diagnostics.aligned_slot_footprint;
+        const int32_t maximum_layer = *std::max_element(
+            config.routed_layers.begin(), config.routed_layers.end());
+        layout_registry.classes = {
+            { 0, 0, diagnostics.bundle_payload_bytes, *prototype },
+        };
+        layout_registry.layer_ids.assign(
+            size_t(maximum_layer) + 1, LLM_EXPERT_LAYOUT_CLASS_INVALID);
+        for (int32_t layer : config.routed_layers) {
+            layout_registry.layer_ids[size_t(layer)] = 0;
+        }
         cache = std::move(candidate);
+        host_resident_demand = std::make_unique<llm_host_resident_demand_coordinator>(
+            llm_host_resident_demand_config{
+                cache.get(),
+                config.storage,
+                config.scheduler,
+                config.async_transport,
+                &layout_registry,
+                config.integrity_mode,
+                config.total_expert_keys,
+                config.hot_capacity,
+                policy_trace_capacity,
+                true,
+                preflight_trampoline,
+                this,
+                slot_footprint_bytes,
+                llm_cold_reference_kind::batch,
+            });
         epoch++;
         stats.allocations++;
         return llm_expert_provider_result::success();
@@ -789,6 +719,7 @@ public:
         }
         auto result = policy_result(hot_policy.surrender());
         if (!result.is_ready()) return result;
+        host_resident_demand.reset();
         result = cache->surrender();
         if (!result.is_ready()) return result;
         cache.reset();
@@ -803,6 +734,7 @@ public:
 
 protected:
     void release_handle(uint64_t) noexcept override {
+        std::lock_guard<std::mutex> ordered_lock(ordered_remap_mutex);
         std::lock_guard<std::mutex> lock(mutex);
         release_pins_locked();
         stats.handles_released++;
@@ -931,7 +863,9 @@ private:
     }
 
     static llm_expert_provider_result preflight_trampoline(void * data, uint64_t incoming_bytes) {
-        return static_cast<llm_uma_expert_weight_provider *>(data)->preflight_pressure(incoming_bytes);
+        auto * provider = static_cast<llm_uma_expert_weight_provider *>(data);
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        return provider->preflight_pressure(incoming_bytes);
     }
 
     llm_expert_provider_result preflight_pressure(uint64_t incoming_bytes) {
@@ -1104,19 +1038,26 @@ private:
 #endif
     }
 
-    llm_expert_provider_result complete_readiness(uma_load_context & load, llm_cold_reference reference) {
-        if (load.active && config.scheduler->transition(load.handle, llm_expert_request_state::io_in_flight,
-                llm_expert_request_state::host_ready) != llm_expert_schedule_disposition::admitted) {
-            return fail_scheduler(load, false);
-        }
-        if (load.active && config.scheduler->transition(load.handle, llm_expert_request_state::host_ready,
+    llm_expert_provider_result fail_host_scheduler(
+            llm_host_resident_demand_entry & entry,
+            bool cancelled) {
+        const auto terminal = host_resident_demand->fail_host_scheduler(entry, cancelled);
+        return terminal.is_ready() ? llm_expert_provider_result::failure(cancelled ?
+            llm_expert_provider_error::cancelled : llm_expert_provider_error::preparation_failed) : terminal;
+    }
+
+    llm_expert_provider_result complete_readiness(
+            llm_host_resident_demand_entry & entry,
+            llm_cold_reference reference) {
+        if (entry.scheduler_owned && config.scheduler->transition(entry.scheduler_handle,
+                llm_expert_request_state::host_ready,
                 llm_expert_request_state::device_preparing) != llm_expert_schedule_disposition::admitted) {
-            return fail_scheduler(load, false);
+            return fail_host_scheduler(entry, false);
         }
         std::array<llm_expert_storage_destination, 12> destinations;
         size_t count = 0;
         if (!build_destinations(cache->bundle(), reference.slot, destinations, count)) {
-            return load.active ? fail_scheduler(load, false) :
+            return entry.scheduler_owned ? fail_host_scheduler(entry, false) :
                 llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
         auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(cache->buffer()));
@@ -1125,18 +1066,17 @@ private:
             int status = resolved_readiness == LLAMA_EXPERT_UMA_READINESS_CUDA_TOUCH ?
                 config.checksum(cache->buffer(), offset, destinations[index].extent, &readiness_checksum) :
                 config.prefetch(cache->buffer(), offset, destinations[index].extent);
-            if (status != 0) return load.active ? fail_scheduler(load, false) :
+            if (status != 0) return entry.scheduler_owned ? fail_host_scheduler(entry, false) :
                 llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
         }
-        if (load.active) {
-            if (config.scheduler->transition(load.handle, llm_expert_request_state::device_preparing,
-                    llm_expert_request_state::device_ready) != llm_expert_schedule_disposition::admitted ||
-                config.scheduler->finish(load.handle, llm_expert_request_state::complete) !=
-                    llm_expert_schedule_disposition::admitted ||
-                config.scheduler->release_terminal(load.handle) != llm_expert_schedule_disposition::admitted) {
-                return fail_scheduler(load, false);
+        if (entry.scheduler_owned) {
+            if (config.scheduler->transition(entry.scheduler_handle,
+                    llm_expert_request_state::device_preparing,
+                    llm_expert_request_state::device_ready) != llm_expert_schedule_disposition::admitted) {
+                return fail_host_scheduler(entry, false);
             }
-            load.active = false;
+            const auto completed = host_resident_demand->complete_host_scheduler(entry);
+            if (!completed.is_ready()) return completed;
         }
         return llm_expert_provider_result::success();
     }
@@ -1180,9 +1120,13 @@ private:
     llm_expert_provider_faults faults;
     uint32_t n_expert = 0;
     mutable std::mutex mutex;
+    std::mutex ordered_remap_mutex;
     std::map<int32_t, llm_expert_bundle_descriptor> registrations;
     std::optional<llm_expert_bundle_descriptor> prototype;
+    llm_expert_layout_registry layout_registry;
     std::unique_ptr<llm_cold_expert_cache> cache;
+    std::unique_ptr<llm_host_resident_demand_coordinator> host_resident_demand;
+    llm_host_resident_demand_batch host_resident_batch;
     std::vector<slot_state> slots;
     std::vector<hot_entry> hot_entries;
     std::vector<llm_expert_cache_policy_candidate> hot_candidates;

@@ -1657,6 +1657,7 @@ void llama_model::init_expert_weight_provider() {
                 uma.buffer_type = buffer_type_fn(target_index);
                 uma.target_device = target;
                 uma.storage = pimpl->expert_storage.get();
+                uma.async_transport = pimpl->expert_async_transport.get();
                 uma.scheduler = pimpl->expert_scheduler.get();
                 uma.integrity_mode = pimpl->expert_integrity_mode;
                 uma.readiness = pimpl->expert_uma_config.value.readiness;

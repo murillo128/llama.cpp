@@ -3,6 +3,7 @@
 #include "llama-cold-expert-cache.h"
 #include "llama-expert-storage.h"
 #include "llama-expert-async-io.h"
+#include "llama-expert-resident-demand.h"
 #include "llama-expert-scheduler.h"
 #include "llama-expert-transfer-ring.h"
 #include "llama-hparams.h"
@@ -2593,7 +2594,7 @@ public:
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
-        if (deterministic_policy_terminals) ordered_lock.lock();
+        if (deterministic_policy_terminals || config.cpu_cold_only) ordered_lock.lock();
         std::unique_lock<std::mutex> lock(mutex);
         return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr, nullptr,
             abort_callback, abort_callback_data, &lock);
@@ -2618,7 +2619,7 @@ public:
         LLM_EXPERT_TRACE_SCOPE("k3.provider", "remap_checkpoint_tensor", "layer", binding.layer,
             "layout_class_id", binding.layout_class_id, "graph_epoch", binding.graph_epoch);
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
-        if (deterministic_policy_terminals) ordered_lock.lock();
+        if (deterministic_policy_terminals || config.cpu_cold_only) ordered_lock.lock();
         std::unique_lock<std::mutex> lock(mutex);
         (void) execution_backend;
         ggml_tensor * checkpoint_ids = binding.checkpoint_ids != nullptr ?
@@ -5419,58 +5420,78 @@ public:
             });
 
         const auto cold_before = cold_cache->counter_diagnostics();
-        storage_load_context storage_context = { config.storage, config.async_transport, config.scheduler,
-            config.integrity_mode, provider_lock, {}, false, abort_callback, abort_callback_data };
-        storage_context.layer_ids = &layout_registry.layer_ids;
-        storage_context.layout_registry = &layout_registry;
-        storage_context.target_device = 0;
-
-        for (size_t policy_index = 0; policy_index < unique_count; ++policy_index) {
-            const uint32_t unique_index = policy_unique_indices[policy_index];
-            auto loaded = config.storage != nullptr ? cold_cache->find_or_admit_with_loader(
-                    unique_keys[unique_index], cold_references[unique_index],
-                    load_storage_bundle, &storage_context) :
-                cold_cache->find_or_admit(
-                    unique_keys[unique_index], registrations.at(binding.layer),
-                    cold_references[unique_index]);
-            if (storage_context.completed_io_pending_publication) {
-                const auto handle = storage_context.completed_io_handle;
-                const auto next = loaded.is_ready() ? llm_expert_request_state::host_ready :
-                    llm_expert_request_state::draining;
-                const auto transitioned = config.scheduler->transition(
-                    handle, llm_expert_request_state::io_in_flight, next);
-                const auto terminal = loaded.is_ready() ? llm_expert_request_state::complete :
-                    llm_expert_request_state::failed;
-                const auto finished = transitioned == llm_expert_schedule_disposition::admitted ?
-                    config.scheduler->finish(handle, terminal) :
-                    llm_expert_schedule_disposition::invalid;
-                const auto terminal_released = finished == llm_expert_schedule_disposition::admitted ?
-                    config.scheduler->release_terminal(handle) :
-                    llm_expert_schedule_disposition::invalid;
-                storage_context.completed_io_pending_publication = false;
-                storage_context.completed_io_handle = {};
-                if ((transitioned != llm_expert_schedule_disposition::admitted ||
-                     finished != llm_expert_schedule_disposition::admitted ||
-                     terminal_released != llm_expert_schedule_disposition::admitted) && loaded.is_ready()) {
-                    loaded = llm_expert_provider_result::failure(
-                        llm_expert_provider_error::metadata_mismatch);
-                }
+        if (config.storage != nullptr) {
+            if (host_resident_demand == nullptr || provider_lock == nullptr) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::invalid_binding));
             }
+            provider_lock->unlock();
+            auto loaded = host_resident_demand->resolve(
+                binding.layer, logical_ids, logical_id_count, host_resident_batch,
+                abort_callback, abort_callback_data);
+            provider_lock->lock();
+            if (!loaded.is_ready()) return fail(loaded);
+            if (host_resident_batch.unique_count != unique_count ||
+                host_resident_batch.occurrence_count != logical_id_count) {
+                (void) host_resident_demand->release_request_holds(host_resident_batch);
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::metadata_mismatch));
+            }
+            for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
+                const uint32_t index = host_resident_batch.canonical_order[order];
+                auto & entry = host_resident_batch.entries[index];
+                loaded = host_resident_demand->complete_host_scheduler(entry);
+                if (!loaded.is_ready()) {
+                    (void) host_resident_demand->fail_host_schedulers(host_resident_batch, false);
+                    (void) host_resident_demand->release_request_holds(host_resident_batch);
+                    return fail(loaded);
+                }
+                if (cpu_execution_pin_count >= cpu_execution_pins.size()) {
+                    (void) host_resident_demand->fail_host_schedulers(host_resident_batch, false);
+                    (void) host_resident_demand->release_request_holds(host_resident_batch);
+                    (void) release_request_pins_locked();
+                    return fail(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::unsupported_configuration));
+                }
+                const auto acquired = host_resident_demand->transfer_request_hold_to_cpu_execution(entry);
+                if (!acquired.is_ready()) {
+                    (void) host_resident_demand->fail_host_schedulers(host_resident_batch, false);
+                    (void) host_resident_demand->release_request_holds(host_resident_batch);
+                    (void) release_request_pins_locked();
+                    return fail(acquired);
+                }
+                cpu_execution_pins[cpu_execution_pin_count++] = entry.reference;
+                unique_slots[index] = int32_t(entry.reference.slot);
+                cold_references[index] = entry.reference;
+            }
+            loaded = host_resident_demand->release_request_holds(host_resident_batch);
             if (!loaded.is_ready()) {
+                (void) release_request_pins_locked();
                 return fail(loaded);
             }
-
-            const auto acquired = cold_cache->acquire(
-                cold_references[unique_index], llm_cold_reference_kind::cpu_execution);
-            if (!acquired.is_ready()) return fail(acquired);
-            if (cpu_execution_pin_count >= cpu_execution_pins.size()) {
-                (void) cold_cache->release(
-                    cold_references[unique_index], llm_cold_reference_kind::cpu_execution);
-                return fail(llm_expert_provider_result::failure(
-                    llm_expert_provider_error::unsupported_configuration));
+            for (size_t occurrence = 0; occurrence < logical_id_count; ++occurrence) {
+                element_unique[occurrence] = int32_t(
+                    host_resident_batch.occurrence_to_unique[occurrence]);
             }
-            cpu_execution_pins[cpu_execution_pin_count++] = cold_references[unique_index];
-            unique_slots[unique_index] = int32_t(cold_references[unique_index].slot);
+        } else {
+            for (size_t policy_index = 0; policy_index < unique_count; ++policy_index) {
+                const uint32_t unique_index = policy_unique_indices[policy_index];
+                auto loaded = cold_cache->find_or_admit(
+                    unique_keys[unique_index], registrations.at(binding.layer),
+                    cold_references[unique_index]);
+                if (!loaded.is_ready()) return fail(loaded);
+                const auto acquired = cold_cache->acquire(
+                    cold_references[unique_index], llm_cold_reference_kind::cpu_execution);
+                if (!acquired.is_ready()) return fail(acquired);
+                if (cpu_execution_pin_count >= cpu_execution_pins.size()) {
+                    (void) cold_cache->release(
+                        cold_references[unique_index], llm_cold_reference_kind::cpu_execution);
+                    return fail(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::unsupported_configuration));
+                }
+                cpu_execution_pins[cpu_execution_pin_count++] = cold_references[unique_index];
+                unique_slots[unique_index] = int32_t(cold_references[unique_index].slot);
+            }
         }
 
         for (size_t index = 0; index < logical_id_count; ++index) {
@@ -5813,6 +5834,21 @@ public:
                 layout_preflight_consumer_count = 0;
                 layout_preflight_passed = true;
                 cold_cache = std::move(cold_candidate);
+                if (config.storage != nullptr) {
+                    host_resident_demand = std::make_unique<llm_host_resident_demand_coordinator>(
+                        llm_host_resident_demand_config{
+                            cold_cache.get(),
+                            config.storage,
+                            config.scheduler,
+                            config.async_transport,
+                            &layout_registry,
+                            config.integrity_mode,
+                            config.total_expert_keys,
+                            config.capacity,
+                            std::max<uint32_t>(config.trace_capacity, 1),
+                            true,
+                        });
+                }
                 pool = std::move(generation_candidate);
                 epoch++;
                 counters.allocations++;
@@ -6813,6 +6849,8 @@ public:
             result.cold_resident_ready_bytes = cold.resident_ready_bytes;
             result.cold_current_cpu_execution_refs = cold.current_cpu_execution_refs;
             result.cold_peak_cpu_execution_refs = cold.peak_cpu_execution_refs;
+            result.cold_current_batch_refs = cold.current_batch_refs;
+            result.cold_peak_batch_refs = cold.peak_batch_refs;
             result.cold_policy = cold.policy;
             result.cold_policy_domains = cold.policy_domains;
             result.cold_policy_events = cold.policy_events;
@@ -7436,7 +7474,7 @@ protected:
     void release_handle(uint64_t lease_id) noexcept override {
         LLM_EXPERT_TRACE_SCOPE("k3.provider", "release", "request_id", lease_id);
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
-        if (deterministic_policy_terminals) ordered_lock.lock();
+        if (deterministic_policy_terminals || config.cpu_cold_only) ordered_lock.lock();
         std::lock_guard<std::mutex> lock(mutex);
         if (!active_request || lease_id != active_request_id || !validate_request_pins_locked()) {
             stale_generation_failures++;
@@ -9773,6 +9811,8 @@ private:
     std::shared_ptr<hot_pool_generation> pool;
     std::vector<std::shared_ptr<hot_pool_generation>> device_pools;
     std::unique_ptr<llm_cold_expert_cache> cold_cache;
+    std::unique_ptr<llm_host_resident_demand_coordinator> host_resident_demand;
+    llm_host_resident_demand_batch host_resident_batch;
     std::vector<std::unique_ptr<llm_expert_transfer_ring>> transfer_rings;
     std::vector<uint32_t> device_transfer_lane_capacities;
     std::vector<uint8_t> device_transfer_event_capabilities;
