@@ -2001,8 +2001,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * cache_aware_candidate_selection_scores = nullptr;
     if (cache_aware_routing_enabled) {
         GGML_ASSERT(arch == LLM_ARCH_KIMI_K3);
-        cache_aware_candidate_experts = ggml_argsort_top_k(
-            ctx0, selection_probs, cache_aware_routing_candidate_count);
+        // Materialize the argsort result before exposing it at a host callback.
+        // The backend's direct multi-token argsort tensor can use transient
+        // workspace whose later ranks are no longer stable at that boundary.
+        cache_aware_candidate_experts = ggml_dup(ctx0, ggml_argsort_top_k(
+            ctx0, selection_probs, cache_aware_routing_candidate_count));
         cache_aware_candidate_selection_scores = ggml_get_rows(
             ctx0,
             ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens),

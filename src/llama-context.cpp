@@ -2187,6 +2187,15 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
             cache_aware_route->candidate_selection_scores->type != GGML_TYPE_F32 ||
             cache_aware_route->final_experts->type != GGML_TYPE_I32 ||
             n_candidates != ctx->cache_aware_routing_config.candidate_count) {
+            LLAMA_LOG_ERROR(
+                "%s: invalid cache-aware route tensor metadata "
+                "(layer=%d candidate_count=%" PRIu64 " final_count=%" PRIu64
+                " n_tokens=%u top_k=%u top_m=%u candidate_type=%d score_type=%d final_type=%d)\n",
+                __func__, cache_aware_route->il, candidate_count64, final_count64,
+                n_tokens, n_expert_used, n_candidates,
+                int(cache_aware_route->candidate_experts->type),
+                int(cache_aware_route->candidate_selection_scores->type),
+                int(cache_aware_route->final_experts->type));
             ctx->cache_aware_routing_stats.failures++;
             ctx->expert_eval_result = llm_expert_provider_result::failure(
                 llm_expert_provider_error::invalid_selection);
@@ -2243,6 +2252,39 @@ bool llama_context::expert_eval_callback(ggml_tensor * tensor, bool ask, void * 
                 ctx->cache_aware_routing_config.max_score_regret,
                 ctx->cache_aware_final_ids.data() + final_offset);
             if (!selected.is_ready()) {
+                int32_t prefix_mismatch = -1;
+                int32_t score_inversion = -1;
+                int32_t duplicate_rank = -1;
+                for (uint32_t rank = 0; rank < n_candidates; ++rank) {
+                    if (rank < n_expert_used &&
+                        ctx->cache_aware_exact_ids[final_offset + rank] !=
+                            ctx->cache_aware_candidate_ids[candidate_offset + rank] &&
+                        prefix_mismatch < 0) {
+                        prefix_mismatch = int32_t(rank);
+                    }
+                    if (rank > 0 &&
+                        ctx->cache_aware_candidate_scores[candidate_offset + rank] >
+                            ctx->cache_aware_candidate_scores[candidate_offset + rank - 1] &&
+                        score_inversion < 0) {
+                        score_inversion = int32_t(rank);
+                    }
+                    for (uint32_t previous = 0; previous < rank; ++previous) {
+                        if (ctx->cache_aware_candidate_ids[candidate_offset + previous] ==
+                            ctx->cache_aware_candidate_ids[candidate_offset + rank] &&
+                            duplicate_rank < 0) {
+                            duplicate_rank = int32_t(rank);
+                        }
+                    }
+                }
+                LLAMA_LOG_ERROR(
+                    "%s: cache-aware selection rejected runtime input "
+                    "(layer=%d token=%u error=%u prefix_mismatch=%d score_inversion=%d "
+                    "duplicate_rank=%d exact0=%d candidate0=%d score0=%g)\n",
+                    __func__, cache_aware_route->il, token, unsigned(selected.error),
+                    prefix_mismatch, score_inversion, duplicate_rank,
+                    ctx->cache_aware_exact_ids[final_offset],
+                    ctx->cache_aware_candidate_ids[candidate_offset],
+                    double(ctx->cache_aware_candidate_scores[candidate_offset]));
                 ctx->cache_aware_routing_stats.failures++;
                 ctx->expert_eval_result = llm_expert_provider_result::failure(
                     llm_expert_provider_error::invalid_selection);
