@@ -2137,6 +2137,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     bool multi_device_execution = false;
     std::vector<llm_expert_graph_binding::device_binding> device_execution_bindings;
     ggml_backend_dev_t default_execution_target_device = nullptr;
+    bool cpu_cold_only_execution = false;
 
     if (expert_weight_provider && res->get_expert_provider_result().is_ready()) {
         const llm_expert_bundle_descriptor bundle = {
@@ -2170,6 +2171,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             execution_down_exps_s = binding.down.scale;
             execution_ids = binding.execution_ids;
             default_execution_target_device = binding.default_target_device;
+            cpu_cold_only_execution = binding.cpu_cold_only;
             hybrid_execution = binding.hybrid;
             remote_single_execution = binding.remote_single;
             if (remote_single_execution) {
@@ -2257,7 +2259,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
         GGML_ASSERT(local_cached_execution_backend != nullptr &&
-            local_cached_execution_backend != backend_cpu);
+            (cpu_cold_only_execution ? local_cached_execution_backend == backend_cpu :
+                                       local_cached_execution_backend != backend_cpu));
         ggml_backend_sched_set_tensor_backend(sched, execution_ids, local_cached_execution_backend);
     }
     std::vector<ggml_backend_t> device_execution_backends;

@@ -304,6 +304,8 @@ struct llm_expert_graph_binding {
     ggml_tensor * cpu_execution_ids = nullptr;
     bool hybrid = false;
 
+    bool cpu_cold_only = false;
+
     struct device_binding {
         struct h2d_dependency {
             uint32_t lane = 0;
@@ -599,6 +601,7 @@ struct llm_hot_cache_diagnostics {
     };
 
     llama_expert_miss_policy configured_miss_policy = LLAMA_EXPERT_MISS_POLICY_PROMOTE_AND_GPU;
+    bool cpu_cold_only = false;
     bool background_promotion_configured = false;
     uint32_t auto_cost_model_version = 0;
     uint64_t auto_cost_model_digest = 0;
@@ -983,6 +986,20 @@ struct llm_hot_cache_diagnostics {
     uint64_t phase10_h2d_events_dropped = 0;
 };
 
+struct llm_expert_cold_scalar_snapshot {
+    bool available = false;
+    uint64_t requested_bytes = 0;
+    uint64_t actual_bytes = 0;
+    uint32_t capacity = 0;
+    uint32_t occupancy = 0;
+    uint64_t requests = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t admissions = 0;
+    uint64_t evictions = 0;
+    uint64_t residency_digest = 0;
+};
+
 enum class llm_expert_execution_backend : uint8_t {
     cpu,
     gpu,
@@ -1275,6 +1292,7 @@ public:
     }
     virtual uint64_t graph_epoch() const noexcept { return 0; }
     virtual llm_hot_cache_diagnostics hot_cache_diagnostics() const { return {}; }
+    virtual llm_expert_cold_scalar_snapshot cold_cache_scalar_snapshot() const noexcept { return {}; }
     virtual bool supports_route_service_tier_snapshot() const noexcept { return false; }
     // Allocation-free, read-only snapshot at the routed-layer materialization
     // boundary. Implementations must fail rather than return stale or partial
@@ -1399,6 +1417,7 @@ struct llm_hot_cache_config {
     bool allow_non_cuda_target_for_testing = false;
     uint64_t initial_slot_generation_for_testing = 0;
     bool cold_mode = false;
+    bool cpu_cold_only = false;
     uint64_t cold_cache_bytes = 0;
     uint64_t transfer_ring_bytes = 0;
     ggml_backend_dev_t target_device = nullptr;

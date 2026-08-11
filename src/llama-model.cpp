@@ -1282,6 +1282,9 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     const bool performance_mode = params.expert_runtime_mode == LLAMA_EXPERT_RUNTIME_MODE_PERFORMANCE;
     const bool cold_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
     const bool uma_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
+    const bool cpu_cold_only = cold_mode && params.n_gpu_layers == 0 &&
+        params.expert_hot_cache_capacity == 0 && params.expert_transfer_ring_bytes == 0 &&
+        params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
     const bool cached_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE || cold_mode || uma_mode;
     if (params.expert_role_config != nullptr) {
         if (params.devices != nullptr || params.tensor_split != nullptr ||
@@ -1433,8 +1436,13 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         pimpl->expert_auto_cost_model_digest = digest;
     }
     if ((!cold_mode && !uma_mode && (params.expert_cold_cache_bytes != 0 || params.expert_transfer_ring_bytes != 0)) ||
-        (cold_mode && (total_hot_slots == 0 || params.expert_cold_cache_bytes == 0 ||
-                       params.expert_transfer_ring_bytes == 0)) ||
+        (cpu_cold_only && (params.expert_cold_cache_bytes == 0 || total_hot_slots != 0 ||
+                          params.expert_transfer_ring_bytes != 0 || params.expert_hot_cache_policy != nullptr ||
+                          params.expert_background_promotion || params.expert_async_cold_fill ||
+                          params.expert_auto_cost_model != nullptr || params.expert_prefetch_config != nullptr ||
+                          params.expert_role_config != nullptr || params.expert_peer_staging_bytes != 0)) ||
+        (cold_mode && !cpu_cold_only && (total_hot_slots == 0 || params.expert_cold_cache_bytes == 0 ||
+                                        params.expert_transfer_ring_bytes == 0)) ||
         (uma_mode && (total_hot_slots == 0 || params.expert_transfer_ring_bytes != 0))) {
         throw std::invalid_argument("invalid cold-cache byte budgets");
     }
@@ -1476,9 +1484,10 @@ void llama_model::init_expert_weight_provider() {
         case LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE:
         case LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE: {
             const bool uma_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
-            const auto & roles = expert_role_plan();
-            const bool independent_cold_target =
-                llm_expert_role_has_independent_cold_target(params.expert_weights_mode, roles);
+            const bool cpu_cold_only = uses_cpu_cold_cache();
+            const llm_expert_role_plan * roles = cpu_cold_only ? nullptr : &expert_role_plan();
+            const bool independent_cold_target = roles != nullptr &&
+                llm_expert_role_has_independent_cold_target(params.expert_weights_mode, *roles);
             ggml_backend_dev_t target = nullptr;
             uint32_t routed_layer_count = 0;
             std::vector<int32_t> routed_layers;
@@ -1568,7 +1577,9 @@ void llama_model::init_expert_weight_provider() {
                 }
                 auto cpu_supports = [&](const ggml_tensor * weight) {
                     if (weight == nullptr) return true;
-                    if (weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_MXFP4) return false;
+                    if (!cpu_cold_only && weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_MXFP4) {
+                        return false;
+                    }
                     ggml_init_params probe_params = {
                         /*.mem_size   =*/ ggml_tensor_overhead()*5,
                         /*.mem_buffer =*/ nullptr,
@@ -1599,11 +1610,11 @@ void llama_model::init_expert_weight_provider() {
             if (directory_entries > UINT32_MAX) {
                 throw std::overflow_error("hot-cache expert directory exceeds uint32_t capacity");
             }
-            const bool distributed_roles = roles.shape != llm_expert_role_shape::local_single;
+            const bool distributed_roles = roles != nullptr && roles->shape != llm_expert_role_shape::local_single;
             ggml_backend_dev_t provider_target = independent_cold_target || distributed_roles ?
-                roles.experts.front().device : target;
+                roles->experts.front().device : target;
             llm_hot_cache_config config;
-            config.capacity = hot_capacity;
+            config.capacity = cpu_cold_only ? uint32_t(hparams.n_expert_used) : hot_capacity;
             config.n_expert_used = uint32_t(hparams.n_expert_used);
             config.routed_layer_count = routed_layer_count;
             config.total_expert_keys = uint32_t(directory_entries);
@@ -1658,6 +1669,7 @@ void llama_model::init_expert_weight_provider() {
             } else if (params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
                 config.routed_layers = std::move(routed_layers);
                 config.cold_mode = true;
+                config.cpu_cold_only = cpu_cold_only;
                 config.cold_cache_bytes = params.expert_cold_cache_bytes;
                 config.transfer_ring_bytes = params.expert_transfer_ring_bytes;
                 config.target_device = provider_target;
@@ -1671,10 +1683,10 @@ void llama_model::init_expert_weight_provider() {
                 config.peer_transport = params.expert_peer_transport;
                 config.peer_staging_bytes = params.expert_peer_staging_bytes;
                 if (distributed_roles) {
-                    config.remote_single = roles.shape == llm_expert_role_shape::remote_single;
-                    config.devices.reserve(roles.experts.size());
-                    for (size_t index = 0; index < roles.experts.size(); ++index) {
-                        const auto & expert = roles.experts[index];
+                    config.remote_single = roles->shape == llm_expert_role_shape::remote_single;
+                    config.devices.reserve(roles->experts.size());
+                    for (size_t index = 0; index < roles->experts.size(); ++index) {
+                        const auto & expert = roles->experts[index];
                         config.devices.push_back({
                             llm_expert_device_id(index), expert.device,
                             ggml_backend_dev_buffer_type(expert.device), expert.hot_slots,
@@ -1823,7 +1835,8 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         throw std::overflow_error("expert async maximum aligned read size overflow");
     }
     const uint32_t hot_capacity = expert_hot_cache_capacity();
-    const uint32_t expert_devices = expert_device_count();
+    const bool cpu_cold_only = uses_cpu_cold_cache();
+    const uint32_t expert_devices = cpu_cold_only ? 1 : expert_device_count();
     const bool positional_reads = params.expert_io_force_positional_reads;
     const uint32_t io_worker_count = llm_expert_resolve_io_worker_count(
         params.expert_io_worker_count, expert_devices, positional_reads);
@@ -1859,27 +1872,33 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         predictive_prefetch ? prefetch.max_speculative_h2d_bytes_per_token : 0,
         predictive_prefetch ? prefetch.max_speculative_cold_slots : 0,
         predictive_prefetch ? prefetch.max_speculative_hot_slots : 0,
-        uint32_t(std::min<int64_t>(hparams.n_expert, hot_capacity)),
+        uint32_t(std::min<int64_t>(hparams.n_expert,
+            cpu_cold_only ? hparams.n_expert_used : hot_capacity)),
         // Scheduling targets expert devices independently of the shared I/O transport.
         expert_devices,
         0,
         0,
     };
-    const auto & roles = expert_role_plan();
-    for (uint32_t device = 0; device < expert_devices; ++device) {
-        const uint64_t capacity = uint64_t(roles.experts[device].hot_slots)*4;
-        if (capacity > UINT32_MAX) {
-            throw std::overflow_error("expert scheduler per-device capacity overflow");
+    if (cpu_cold_only) {
+        scheduler_config.device_request_capacities[0] = request_capacity;
+        scheduler_config.device_inflight_capacities[0] = request_capacity;
+    } else {
+        const auto & roles = expert_role_plan();
+        for (uint32_t device = 0; device < expert_devices; ++device) {
+            const uint64_t capacity = uint64_t(roles.experts[device].hot_slots)*4;
+            if (capacity > UINT32_MAX) {
+                throw std::overflow_error("expert scheduler per-device capacity overflow");
+            }
+            scheduler_config.device_request_capacities[device] = uint32_t(capacity);
+            scheduler_config.device_inflight_capacities[device] = uint32_t(capacity);
         }
-        scheduler_config.device_request_capacities[device] = uint32_t(capacity);
-        scheduler_config.device_inflight_capacities[device] = uint32_t(capacity);
     }
     auto scheduler = std::make_unique<llm_expert_scheduler>(scheduler_config);
     const uint64_t transport_accounting_bytes = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE &&
         params.expert_cold_cache_bytes == 0 ? storage_diagnostics.maximum_bundle_bytes : params.expert_cold_cache_bytes;
     auto transport = std::make_unique<llm_expert_async_transport>(llm_expert_async_config{
         params.expert_io_queue_depth,
-        hot_capacity,
+        cpu_cold_only ? uint32_t(hparams.n_expert_used) : hot_capacity,
         request_capacity,
         uint32_t(trace_capacity_64),
         transport_accounting_bytes,
@@ -2920,6 +2939,13 @@ uint32_t llama_model::expert_transport_device_count() const {
 
 uint32_t llama_model::expert_hot_cache_capacity() const {
     return pimpl->expert_role_plan.total_hot_slots;
+}
+
+bool llama_model::uses_cpu_cold_cache() const noexcept {
+    return params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE &&
+        params.n_gpu_layers == 0 && params.expert_hot_cache_capacity == 0 &&
+        params.expert_transfer_ring_bytes == 0 &&
+        params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
 }
 
 const llm_expert_role_plan & llama_model::expert_role_plan() const {

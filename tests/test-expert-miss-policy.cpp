@@ -122,6 +122,23 @@ void test_model_parameter_validation_and_copy() {
     random_direct.expert_io_random_access = true;
     random_direct.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
     expect_invalid([&] { validation_model model(random_direct); });
+
+    auto cpu_cold = defaults;
+    cpu_cold.n_gpu_layers = 0;
+    cpu_cold.expert_weights_mode = LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE;
+    cpu_cold.expert_hot_cache_capacity = 0;
+    cpu_cold.expert_cold_cache_bytes = 1U << 20;
+    cpu_cold.expert_transfer_ring_bytes = 0;
+    cpu_cold.expert_miss_policy = LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
+    validation_model cpu_cold_model(cpu_cold);
+    GGML_ASSERT(cpu_cold_model.uses_cpu_cold_cache());
+
+    auto invalid_cpu_cold = cpu_cold;
+    invalid_cpu_cold.expert_hot_cache_capacity = 1;
+    expect_invalid([&] { validation_model model(invalid_cpu_cold); });
+    invalid_cpu_cold = cpu_cold;
+    invalid_cpu_cold.expert_transfer_ring_bytes = 1U << 20;
+    expect_invalid([&] { validation_model model(invalid_cpu_cold); });
 }
 
 void mark_inactive_capable(ggml_tensor * tensor) {
@@ -411,6 +428,82 @@ struct provider_fixture {
             llm_expert_projection_descriptor::from(down, nullptr, nullptr) };
     }
 };
+
+void test_cpu_cold_only_binding() {
+    provider_fixture fixture;
+    llm_hot_cache_config config;
+    config.capacity = 2;
+    config.n_expert_used = 2;
+    config.routed_layer_count = 1;
+    config.total_expert_keys = 4;
+    config.target_buffer_type = ggml_backend_cpu_buffer_type();
+    config.target_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    config.allow_non_cuda_target_for_testing = true;
+    config.cold_mode = true;
+    config.cpu_cold_only = true;
+    config.cold_cache_bytes = 1U << 20;
+    config.miss_policy = LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
+    auto provider = llm_create_cold_cache_expert_weight_provider(config);
+
+    ggml_init_params graph_params = { ggml_tensor_overhead()*8, nullptr, true };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    const llm_expert_selection selection = { 0, 4, 2, 1, fixture.ids };
+    llm_expert_graph_binding binding;
+    GGML_ASSERT(provider->bind_graph(graph_ctx.get(), fixture.bundle(), selection, binding).is_ready());
+    GGML_ASSERT(binding.bootstrap && !binding.cpu_cold_only);
+    GGML_ASSERT(provider->initialize_after_reserve().is_ready());
+
+    binding = {};
+    GGML_ASSERT(provider->bind_graph(graph_ctx.get(), fixture.bundle(), selection, binding).is_ready());
+    GGML_ASSERT(!binding.bootstrap && binding.cpu_cold_only && !binding.hybrid);
+    GGML_ASSERT(binding.default_target_device == config.target_device);
+    GGML_ASSERT(binding.execution_ids != selection.logical_ids);
+    GGML_ASSERT(binding.checkpoint_ids != nullptr && binding.checkpoint_ids != binding.execution_ids);
+    GGML_ASSERT(binding.up.weight != nullptr && binding.gate.weight != nullptr && binding.down.weight != nullptr);
+
+    ggml_backend_buffer_ptr graph_buffer(
+        ggml_backend_alloc_ctx_tensors_from_buft(graph_ctx.get(), ggml_backend_cpu_buffer_type()));
+    GGML_ASSERT(graph_buffer);
+    ggml_backend_ptr backend(ggml_backend_dev_init(config.target_device, nullptr));
+    GGML_ASSERT(backend);
+
+    const auto initial = provider->hot_cache_diagnostics();
+    GGML_ASSERT(initial.cpu_cold_only && initial.requested_capacity == 0 &&
+        initial.effective_capacity == 0 && initial.pool_bytes == 0);
+    GGML_ASSERT(initial.cold_effective_slots >= 2 && initial.cold_admissions == 0);
+
+    const int32_t logical_ids[] = { 0, 1 };
+    ggml_backend_tensor_set(binding.checkpoint_ids, logical_ids, 0, sizeof(logical_ids));
+    llm_expert_execution_plan plan;
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint_tensor(binding, backend.get()).is_ready());
+    int32_t physical_ids[2] = { -1, -1 };
+    ggml_backend_tensor_get(binding.checkpoint_ids, physical_ids, 0, sizeof(physical_ids));
+    GGML_ASSERT(physical_ids[0] >= 0 && physical_ids[1] >= 0 && physical_ids[0] != physical_ids[1]);
+    plan.reset();
+
+    llama_route_service_tier tiers[3] = {};
+    const int32_t routed[] = { 0, 1, 2 };
+    GGML_ASSERT(provider->route_service_tier_snapshot(0, routed, 3, tiers).is_ready());
+    GGML_ASSERT(tiers[0] == LLAMA_ROUTE_SERVICE_TIER_COLD &&
+        tiers[1] == LLAMA_ROUTE_SERVICE_TIER_COLD &&
+        tiers[2] == LLAMA_ROUTE_SERVICE_TIER_BACKING);
+    const auto filled = provider->hot_cache_diagnostics();
+    GGML_ASSERT(filled.cold_admissions == 2 && filled.cold_misses == 2 && filled.cold_hits == 0);
+
+    GGML_ASSERT(provider->prepare({ binding }, plan).is_ready());
+    GGML_ASSERT(provider->remap_checkpoint_tensor(binding, backend.get()).is_ready());
+    plan.reset();
+    const auto repeated = provider->hot_cache_diagnostics();
+    GGML_ASSERT(repeated.cold_hits == 2 && repeated.cold_misses == 2 && repeated.cold_admissions == 2);
+    GGML_ASSERT(repeated.h2d_bytes == 0 && repeated.slots.empty());
+
+    binding = {};
+    graph_buffer.reset();
+    graph_ctx.reset();
+    GGML_ASSERT(provider->trim().is_ready());
+    GGML_ASSERT(provider->surrender().is_ready());
+}
 
 void test_hybrid_binding() {
     ggml_backend_load_all();
@@ -888,6 +981,7 @@ int main(int argc, char ** argv) {
         assert_case(gpu, mixed_fusion_shape);
         assert_case(gpu, active_fast_path, false);
     }
+    test_cpu_cold_only_binding();
     test_hybrid_binding();
     if (argc > 1) test_hybrid_model_graph(argv[1]);
     return 0;

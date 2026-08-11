@@ -732,6 +732,7 @@ struct llama_model {
     uint32_t expert_device_count() const;
     uint32_t expert_transport_device_count() const;
     uint32_t expert_hot_cache_capacity() const;
+    bool uses_cpu_cold_cache() const noexcept;
     const llm_expert_role_plan & expert_role_plan() const;
     ggml_backend_dev_t expert_resident_device() const noexcept;
     bool has_explicit_expert_role_config() const;

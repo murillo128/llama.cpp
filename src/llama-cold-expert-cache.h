@@ -136,6 +136,28 @@ struct llm_cold_cache_diagnostics {
     std::vector<slot> slots;
 };
 
+struct llm_cold_cache_scalar_diagnostics {
+    bool available = false;
+    uint64_t requested_bytes = 0;
+    uint64_t actual_bytes = 0;
+    uint32_t effective_slots = 0;
+    uint32_t occupancy = 0;
+    uint64_t requests = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t admissions = 0;
+    uint64_t evictions = 0;
+    uint64_t residency_digest = 0;
+};
+
+struct llm_cold_cache_counter_diagnostics {
+    uint64_t requests = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t admissions = 0;
+    uint64_t evictions = 0;
+};
+
 class llm_cold_expert_cache {
 public:
     explicit llm_cold_expert_cache(llm_cold_cache_config config);
@@ -227,6 +249,8 @@ public:
     const llm_expert_bundle_descriptor & bundle_for_key(llm_expert_key key) const noexcept;
     ggml_backend_buffer_t buffer() const noexcept;
     std::shared_ptr<void> allocation_lease() const noexcept;
+    llm_cold_cache_counter_diagnostics counter_diagnostics() const noexcept;
+    llm_cold_cache_scalar_diagnostics scalar_diagnostics() const noexcept;
     llm_cold_cache_diagnostics diagnostics() const;
 
 private:
