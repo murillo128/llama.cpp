@@ -342,7 +342,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     const bool cached_mode = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_HOT_CACHE ||
         params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE ||
         params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE;
-    if (cached_mode && !explicit_roles) {
+    if (cached_mode && !explicit_roles && !model->uses_cpu_cold_cache()) {
         try {
             model->resolve_legacy_expert_role_plan();
         } catch (const std::exception & error) {
@@ -386,7 +386,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const bool hybrid_expert_policy =
             params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK ||
             params.expert_miss_policy == LLAMA_EXPERT_MISS_POLICY_AUTO;
-        if (hybrid_expert_policy &&
+        if (hybrid_expert_policy && !model_ptr->uses_cpu_cold_cache() &&
             (model_ptr->devices.size() != 1 ||
              (model_ptr->devices.front().is_meta && model_ptr->get_split_state_ud.n_devices > 1))) {
             throw std::invalid_argument("hybrid expert miss policies require exactly one accelerator device");

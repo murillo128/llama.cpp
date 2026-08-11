@@ -1965,6 +1965,46 @@ std::shared_ptr<void> llm_cold_expert_cache::allocation_lease() const noexcept {
     return std::static_pointer_cast<void>(pimpl->arena);
 }
 
+llm_cold_cache_counter_diagnostics llm_cold_expert_cache::counter_diagnostics() const noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    return {
+        pimpl->counters.requests,
+        pimpl->counters.hits,
+        pimpl->counters.misses,
+        pimpl->counters.admissions,
+        pimpl->counters.evictions,
+    };
+}
+
+llm_cold_cache_scalar_diagnostics llm_cold_expert_cache::scalar_diagnostics() const noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    uint64_t residency_digest = UINT64_C(1469598103934665603);
+    for (const auto & slot : pimpl->slots) {
+        if (slot.state != llm_cold_slot_state::ready) continue;
+        for (uint64_t value : { uint64_t(uint32_t(slot.key.layer)),
+                                uint64_t(uint32_t(slot.key.expert)),
+                                uint64_t(slot.layout_class_id) }) {
+            for (size_t byte = 0; byte < sizeof(value); ++byte) {
+                residency_digest ^= (value >> (byte*8)) & 0xffU;
+                residency_digest *= UINT64_C(1099511628211);
+            }
+        }
+    }
+    return {
+        pimpl->arena != nullptr,
+        pimpl->counters.requested_bytes,
+        pimpl->counters.actual_bytes,
+        pimpl->counters.effective_slots,
+        uint32_t(pimpl->occupancy()),
+        pimpl->counters.requests,
+        pimpl->counters.hits,
+        pimpl->counters.misses,
+        pimpl->counters.admissions,
+        pimpl->counters.evictions,
+        residency_digest,
+    };
+}
+
 llm_cold_cache_diagnostics llm_cold_expert_cache::diagnostics() const {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     auto result = pimpl->counters;

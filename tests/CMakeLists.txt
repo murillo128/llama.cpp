@@ -298,6 +298,9 @@ llama_test(phase10-prefetch-replay LABEL "model" ARGS --self-test)
 llama_build(phase13-routing-probe.cpp)
 target_include_directories(phase13-routing-probe PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
 
+llama_build(phase13-mode-p-probe.cpp)
+target_include_directories(phase13-mode-p-probe PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+
 set(LLAMA_TEST_NAME phase10-prefetch-probe)
 llama_build(phase10-prefetch-probe.cpp)
 unset(LLAMA_TEST_NAME)
