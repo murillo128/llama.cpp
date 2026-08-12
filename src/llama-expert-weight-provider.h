@@ -1339,6 +1339,11 @@ public:
         (void) policy;
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
+    virtual llm_expert_provider_result debug_set_host_resident_serial_issue_for_testing(
+            bool serial_control) noexcept {
+        (void) serial_control;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
     virtual llm_expert_provider_result debug_set_auto_cost_model_for_testing(
             const llama_expert_auto_cost_model & cost) noexcept {
         (void) cost;

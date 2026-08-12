@@ -5598,6 +5598,18 @@ public:
         return llm_expert_provider_result::success();
     }
 
+    llm_expert_provider_result debug_set_host_resident_serial_issue_for_testing(
+            bool serial_control) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!config.cpu_cold_only || active_request || pool || cold_cache ||
+            host_resident_demand) {
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::unsupported_configuration);
+        }
+        config.phase10_serial_issue_for_testing = serial_control;
+        return llm_expert_provider_result::success();
+    }
+
     llm_expert_provider_result debug_set_auto_cost_model_for_testing(
             const llama_expert_auto_cost_model & cost) noexcept override {
         std::lock_guard<std::mutex> lock(mutex);

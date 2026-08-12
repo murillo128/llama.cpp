@@ -2,6 +2,7 @@
 #include "llama-cpp.h"
 #include "llama-context.h"
 #include "llama-expert-async-io.h"
+#include "llama-expert-scheduler.h"
 #include "llama-expert-storage.h"
 #include "llama-expert-weight-provider.h"
 #include "llama-model.h"
@@ -35,6 +36,7 @@ struct arguments {
     std::string prompt_corpus;
     std::string output;
     std::string point;
+    std::string issue_mode = "BATCHED";
     uint64_t cold_cache_bytes = 96ULL*1024*1024*1024;
     uint32_t warmup_limit = 128;
     uint32_t decode_forwards = 64;
@@ -68,6 +70,7 @@ bool parse_arguments(int argc, char ** argv, arguments & args) {
         else if (option == "--prompt-corpus") args.prompt_corpus = value;
         else if (option == "--output") args.output = value;
         else if (option == "--point") args.point = value;
+        else if (option == "--issue-mode") args.issue_mode = value;
         else if (option == "--cold-cache-bytes") {
             if (!parse_u64(value, args.cold_cache_bytes)) return false;
         } else if (option == "--warmup-limit") {
@@ -88,12 +91,17 @@ bool parse_arguments(int argc, char ** argv, arguments & args) {
     }
     return !args.model.empty() && (!args.prompt_corpus.empty() || args.prompt_token >= 0) && !args.output.empty() &&
         (args.point == "EXACT" || args.point == "KNEE" || args.point == "AGGRESSIVE") &&
+        (args.issue_mode == "SERIAL" || args.issue_mode == "BATCHED") &&
         args.cold_cache_bytes != 0 && args.warmup_limit != 0 && args.decode_forwards != 0 &&
         args.threads != 0 && args.n_ctx >= args.warmup_limit + args.decode_forwards;
 }
 
 double seconds(steady_clock::duration duration) {
     return std::chrono::duration<double>(duration).count();
+}
+
+double seconds(const timeval & value) {
+    return double(value.tv_sec) + double(value.tv_usec)/1000000.0;
 }
 
 std::string hex_u64(uint64_t value) {
@@ -208,6 +216,81 @@ json storage_delta_json(
     };
 }
 
+json async_delta_json(
+        const llm_expert_async_diagnostics & before,
+        const llm_expert_async_diagnostics & after) {
+    return {
+        {"read_requests_submitted", delta(after.read_requests_submitted,
+                                           before.read_requests_submitted)},
+        {"read_requests_completed", delta(after.read_requests_completed,
+                                           before.read_requests_completed)},
+        {"read_requests_cancelled", delta(after.read_requests_cancelled,
+                                           before.read_requests_cancelled)},
+        {"read_operations_completed", delta(after.read_operations_completed,
+                                             before.read_operations_completed)},
+        {"read_bytes_completed", delta(after.read_bytes_completed,
+                                        before.read_bytes_completed)},
+        {"queue_wait_samples", delta(after.read_queue_wait_samples,
+                                      before.read_queue_wait_samples)},
+        {"queue_wait_us", delta(after.read_queue_wait_us, before.read_queue_wait_us)},
+        {"queue_wait_max_us_lifetime", after.read_queue_wait_max_us},
+        {"ring_submissions", delta(after.ring_submissions, before.ring_submissions)},
+        {"ring_completions", delta(after.ring_completions, before.ring_completions)},
+        {"ring_request_batches", delta(after.ring_request_batches,
+                                        before.ring_request_batches)},
+        {"peak_ring_batch_requests_lifetime", after.peak_ring_batch_requests},
+        {"peak_active_read_requests_lifetime", after.peak_active_read_requests},
+        {"peak_active_operations_lifetime", after.peak_active_operations},
+        {"peak_sq_occupancy_lifetime", after.peak_sq_occupancy},
+        {"peak_cq_occupancy_lifetime", after.peak_cq_occupancy},
+        {"cq_empty_waits", delta(after.cq_empty_waits, before.cq_empty_waits)},
+        {"direct_read_operations", delta(after.direct_read_operations,
+                                          before.direct_read_operations)},
+        {"direct_useful_bytes", delta(after.direct_useful_bytes,
+                                       before.direct_useful_bytes)},
+        {"direct_aligned_bytes", delta(after.direct_aligned_bytes,
+                                        before.direct_aligned_bytes)},
+        {"buffered_fallback_operations", delta(after.buffered_fallback_operations,
+                                                 before.buffered_fallback_operations)},
+        {"synchronous_fallback_operations", delta(after.synchronous_fallback_operations,
+                                                    before.synchronous_fallback_operations)},
+    };
+}
+
+json scheduler_delta_json(
+        const llm_expert_scheduler_diagnostics & before,
+        const llm_expert_scheduler_diagnostics & after) {
+    return {
+        {"flights_created", delta(after.flights_created, before.flights_created)},
+        {"joins", delta(after.joins, before.joins)},
+        {"pending_successors", delta(after.pending_successors,
+                                      before.pending_successors)},
+        {"successor_activations", delta(after.successor_activations,
+                                         before.successor_activations)},
+        {"successor_cancellations", delta(after.successor_cancellations,
+                                           before.successor_cancellations)},
+        {"terminal_complete", delta(after.terminal_complete, before.terminal_complete)},
+        {"terminal_failed", delta(after.terminal_failed, before.terminal_failed)},
+        {"terminal_cancelled", delta(after.terminal_cancelled, before.terminal_cancelled)},
+        {"terminal_releases", delta(after.terminal_releases, before.terminal_releases)},
+        {"stale_completions", delta(after.stale_completions, before.stale_completions)},
+        {"active_requests", after.active_requests},
+        {"queued_requests", after.queued_requests},
+        {"peak_active_requests_lifetime", after.peak_active_requests},
+    };
+}
+
+json terminal_reference_json(const llm_hot_cache_diagnostics & value) {
+    return {
+        {"cold_hot_refs", value.cold_current_hot_refs},
+        {"cold_transfer_refs", value.cold_current_transfer_refs},
+        {"cold_request_refs", value.cold_current_request_refs},
+        {"cold_cpu_execution_refs", value.cold_current_cpu_execution_refs},
+        {"cold_batch_refs", value.cold_current_batch_refs},
+        {"provider_pins", value.current_pins},
+    };
+}
+
 std::vector<llama_token> load_prompt(const std::string & path, const llama_vocab * vocab) {
     std::ifstream input(path);
     if (!input) throw std::runtime_error("unable to open prompt corpus");
@@ -236,7 +319,8 @@ int main(int argc, char ** argv) {
     if (!parse_arguments(argc, argv, args)) {
         std::fprintf(stderr,
             "usage: %s --model GGUF --prompt-corpus JSON --output JSON --point EXACT|KNEE|AGGRESSIVE "
-            "[--cold-cache-bytes N --warmup-limit N --decode-forwards N --threads N --n-ctx N --prompt-token ID]\n",
+            "[--issue-mode SERIAL|BATCHED --cold-cache-bytes N --warmup-limit N "
+            "--decode-forwards N --threads N --n-ctx N --prompt-token ID]\n",
             argv[0]);
         return 2;
     }
@@ -272,6 +356,12 @@ int main(int argc, char ** argv) {
         if (!model) throw std::runtime_error("model load failed");
         const auto model_loaded = steady_clock::now();
         if (!model->uses_cpu_cold_cache()) throw std::runtime_error("CPU cold-only model topology not selected");
+        auto * provider = model->expert_weight_provider();
+        if (provider == nullptr ||
+            !provider->debug_set_host_resident_serial_issue_for_testing(
+                args.issue_mode == "SERIAL").is_ready()) {
+            throw std::runtime_error("unable to configure the internal issue-mode evidence seam");
+        }
         const llama_vocab * vocab = llama_model_get_vocab(model.get());
         const int n_vocab = llama_vocab_n_tokens(vocab);
         const auto prompt = args.prompt_token >= 0 ? std::vector<llama_token>{args.prompt_token} :
@@ -292,12 +382,12 @@ int main(int argc, char ** argv) {
         if (!context) throw std::runtime_error("context initialization failed");
         const auto context_loaded = steady_clock::now();
 
-        auto * provider = model->expert_weight_provider();
         auto * storage = model->expert_storage();
         if (provider == nullptr || storage == nullptr) throw std::runtime_error("CPU provider/storage unavailable");
         const auto initial_cold = provider->cold_cache_scalar_snapshot();
         const auto initial_storage = storage->diagnostics();
         const auto initial_async = model->expert_async_diagnostics();
+        const auto initial_scheduler = model->expert_scheduler_diagnostics();
         const auto initial_full = provider->hot_cache_diagnostics();
         const uint64_t allowed_async_fallback_mask =
             uint64_t(llm_expert_async_fallback_reason::buffer_registration);
@@ -370,6 +460,8 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("real cold cache did not fill within the bounded warmup: occupancy=" +
                 std::to_string(fill_cold.occupancy) + " capacity=" + std::to_string(fill_cold.capacity));
         }
+        const auto fill_async = model->expert_async_diagnostics();
+        const auto fill_scheduler = model->expert_scheduler_diagnostics();
 
         const bool changed_routing = args.point != "EXACT";
         uint32_t max_swaps = 0;
@@ -395,11 +487,16 @@ int main(int argc, char ** argv) {
         const auto before_cold = provider->cold_cache_scalar_snapshot();
         const auto before_storage = storage->diagnostics();
         const auto before_async = model->expert_async_diagnostics();
+        const auto before_scheduler = model->expert_scheduler_diagnostics();
         std::vector<llama_token> generated;
         generated.reserve(args.decode_forwards);
         std::vector<double> forward_latency_s;
         forward_latency_s.reserve(args.decode_forwards);
 
+        struct rusage measured_usage_before {};
+        if (getrusage(RUSAGE_SELF, &measured_usage_before) != 0) {
+            throw std::runtime_error("initial measured getrusage failed");
+        }
         const auto measured_started = steady_clock::now();
         for (uint32_t index = 0; index < args.decode_forwards; ++index) {
             const auto forward_started = steady_clock::now();
@@ -409,11 +506,17 @@ int main(int argc, char ** argv) {
             forward_latency_s.push_back(seconds(forward_completed - forward_started));
         }
         const auto measured_completed = steady_clock::now();
+        struct rusage measured_usage_after {};
+        if (getrusage(RUSAGE_SELF, &measured_usage_after) != 0) {
+            throw std::runtime_error("final measured getrusage failed");
+        }
 
         const auto post_started = steady_clock::now();
         const auto after_cold = provider->cold_cache_scalar_snapshot();
         const auto after_storage = storage->diagnostics();
         const auto after_async = model->expert_async_diagnostics();
+        const auto after_scheduler = model->expert_scheduler_diagnostics();
+        const auto after_full = provider->hot_cache_diagnostics();
         const auto routing_stats = llama_cache_aware_routing_get_stats(context.get());
         struct rusage usage {};
         if (getrusage(RUSAGE_SELF, &usage) != 0) throw std::runtime_error("getrusage failed");
@@ -425,6 +528,13 @@ int main(int argc, char ** argv) {
             after_async.synchronous_fallback_operations != 0 ||
             (after_async.fallback_reason_mask & ~allowed_async_fallback_mask) != 0 ||
             after_async.direct_read_operations <= initial_async.direct_read_operations ||
+            after_scheduler.active_requests != 0 || after_scheduler.queued_requests != 0 ||
+            after_scheduler.terminal_failed != 0 || after_scheduler.terminal_cancelled != 0 ||
+            after_scheduler.stale_completions != 0 ||
+            after_full.cold_current_hot_refs != 0 || after_full.cold_current_transfer_refs != 0 ||
+            after_full.cold_current_request_refs != 0 ||
+            after_full.cold_current_cpu_execution_refs != 0 ||
+            after_full.cold_current_batch_refs != 0 || after_full.current_pins != 0 ||
             swap_kib != 0 || routing_stats.failures != 0 ||
             (!changed_routing && (routing_stats.ubatches != 0 || routing_stats.layers != 0 ||
                                   routing_stats.decisions != 0 || routing_stats.swaps != 0))) {
@@ -432,6 +542,10 @@ int main(int argc, char ** argv) {
         }
 
         const double measured_s = seconds(measured_completed - measured_started);
+        const double measured_user_cpu_s =
+            seconds(measured_usage_after.ru_utime) - seconds(measured_usage_before.ru_utime);
+        const double measured_system_cpu_s =
+            seconds(measured_usage_after.ru_stime) - seconds(measured_usage_before.ru_stime);
         const double init_s = seconds(context_loaded - process_started);
         const double fill_s = seconds(fill_completed - fill_started);
         const double post_s = seconds(post_completed - post_started);
@@ -440,7 +554,7 @@ int main(int argc, char ** argv) {
         for (int index = 0; index < argc; ++index) command.push_back(argv[index]);
 
         const json result = {
-            {"schema_version", "phase13-mode-p-cpu-v1"},
+            {"schema_version", "phase13-6p-cpu-demand-v1"},
             {"status", "pass"},
             {"exit_status", 0},
             {"point", args.point},
@@ -453,6 +567,8 @@ int main(int argc, char ** argv) {
                 {"cuda_dependency", "none"}, {"load_mode", "DIRECT_IO"},
                 {"runtime_mode", "PERFORMANCE"}, {"n_ctx", args.n_ctx},
                 {"n_batch", 1}, {"n_ubatch", 1}, {"threads", args.threads},
+                {"current_layer_issue_mode", args.issue_mode},
+                {"serial_control", args.issue_mode == "SERIAL"},
                 {"native_io_uring", initial_async.io_uring_enabled},
                 {"registered_file_count", initial_async.registered_file_count},
                 {"registered_buffer_count", initial_async.registered_buffer_count},
@@ -482,12 +598,15 @@ int main(int argc, char ** argv) {
                 {"same_cache_residency_visible_to_routing", seam_residency_visible},
                 {"initial_cold", cold_json(initial_cold)},
                 {"initial_storage", storage_json(initial_storage)},
+                {"initial_terminal_references", terminal_reference_json(initial_full)},
             }},
             {"fill", {
                 {"tokens_to_full", tokens_to_full}, {"time_to_full_s", fill_s},
                 {"cold", cold_json(fill_cold)},
                 {"cold_delta", cold_delta_json(initial_cold, fill_cold)},
                 {"storage_delta", storage_delta_json(initial_storage, fill_storage)},
+                {"async_delta", async_delta_json(initial_async, fill_async)},
+                {"scheduler_delta", scheduler_delta_json(initial_scheduler, fill_scheduler)},
             }},
             {"measured", {
                 {"decode_forwards", args.decode_forwards}, {"decode_s", measured_s},
@@ -498,10 +617,16 @@ int main(int argc, char ** argv) {
                 {"cold_before", cold_json(before_cold)}, {"cold_after", cold_json(after_cold)},
                 {"cold_delta", cold_delta_json(before_cold, after_cold)},
                 {"storage_delta", storage_delta_json(before_storage, after_storage)},
-                {"async_direct_read_operations", delta(after_async.direct_read_operations,
-                                                        before_async.direct_read_operations)},
-                {"async_direct_useful_bytes", delta(after_async.direct_useful_bytes,
-                                                     before_async.direct_useful_bytes)},
+                {"async_delta", async_delta_json(before_async, after_async)},
+                {"scheduler_delta", scheduler_delta_json(before_scheduler, after_scheduler)},
+                {"user_cpu_s", measured_user_cpu_s},
+                {"system_cpu_s", measured_system_cpu_s},
+                {"process_cpu_utilization", measured_s == 0 ? 0 :
+                    (measured_user_cpu_s + measured_system_cpu_s)/measured_s},
+                {"minor_faults", delta(measured_usage_after.ru_minflt,
+                                        measured_usage_before.ru_minflt)},
+                {"major_faults", delta(measured_usage_after.ru_majflt,
+                                        measured_usage_before.ru_majflt)},
             }},
             {"output", {
                 {"generated_token_count", generated.size()},
@@ -510,6 +635,9 @@ int main(int argc, char ** argv) {
             }},
             {"resources", {
                 {"peak_rss_kib", usage.ru_maxrss}, {"vm_swap_kib", swap_kib},
+                {"terminal_references", terminal_reference_json(after_full)},
+                {"terminal_scheduler_active_requests", after_scheduler.active_requests},
+                {"terminal_scheduler_queued_requests", after_scheduler.queued_requests},
             }},
             {"wall_fractions", {
                 {"model_load_s", seconds(model_loaded - model_load_started)},
