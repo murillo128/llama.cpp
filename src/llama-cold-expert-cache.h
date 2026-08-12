@@ -203,6 +203,11 @@ public:
             llm_expert_key key,
             llm_cold_reference & reference,
             llm_cold_demand_lookup & lookup) noexcept;
+    llm_expert_provider_result reserve_or_join_demand_batch(
+            const llm_expert_key * keys,
+            size_t key_count,
+            llm_cold_reference * references,
+            llm_cold_demand_lookup * lookups) noexcept;
     llm_expert_provider_result lookup_demand(
             llm_expert_key key,
             llm_cold_reference & reference,
@@ -230,6 +235,8 @@ public:
     llm_expert_provider_result convert_request_to_cpu_execution(
             llm_cold_reference reference) noexcept;
     llm_expert_provider_result convert_batch_to_request(
+            llm_cold_reference reference) noexcept;
+    llm_expert_provider_result convert_batch_to_cpu_execution(
             llm_cold_reference reference) noexcept;
     llm_expert_provider_result policy_shadow_hit(
             llm_expert_key key,
@@ -266,6 +273,10 @@ public:
     llm_cold_cache_diagnostics diagnostics() const;
 
 private:
+    llm_expert_provider_result reserve_or_join_demand_locked(
+            llm_expert_key key,
+            llm_cold_reference & reference,
+            llm_cold_demand_lookup & lookup) noexcept;
     struct impl;
     std::unique_ptr<impl> pimpl;
 };

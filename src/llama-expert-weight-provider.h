@@ -1488,6 +1488,8 @@ struct llm_uma_cache_config {
     uint64_t min_runtime_headroom_bytes = 0;
     llm_expert_cache_policy_config_internal hot_cache_policy_config = {};
     llm_expert_cache_policy_config_internal cold_cache_policy_config = {};
+    // Internal evidence seam. The model-facing path always leaves this false.
+    bool host_resident_serial_issue_for_testing = false;
     std::vector<int32_t> routed_layers;
 };
 

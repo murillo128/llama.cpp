@@ -89,6 +89,7 @@ struct llm_expert_scheduler_config {
 enum class llm_expert_schedule_disposition {
     admitted,
     joined,
+    pending_successor,
     dropped,
     busy,
     closed,
@@ -100,11 +101,27 @@ enum class llm_expert_schedule_disposition {
 struct llm_expert_schedule_result {
     llm_expert_schedule_disposition disposition = llm_expert_schedule_disposition::invalid;
     llm_expert_request_handle handle;
+    llm_expert_request_handle blocking_handle;
+
+    llm_expert_schedule_result() = default;
+    llm_expert_schedule_result(
+            llm_expert_schedule_disposition disposition,
+            llm_expert_request_handle handle,
+            llm_expert_request_handle blocking_handle = {}) :
+        disposition(disposition), handle(handle), blocking_handle(blocking_handle) {}
 
     bool accepted() const {
         return disposition == llm_expert_schedule_disposition::admitted ||
-            disposition == llm_expert_schedule_disposition::joined;
+            disposition == llm_expert_schedule_disposition::joined ||
+            disposition == llm_expert_schedule_disposition::pending_successor;
     }
+};
+
+struct llm_expert_schedule_batch_item {
+    llm_expert_key key = { -1, -1 };
+    llm_expert_priority priority = llm_expert_priority::demand_current_layer;
+    llm_expert_readiness readiness = llm_expert_readiness::host_ready;
+    llm_expert_request_metadata metadata;
 };
 
 struct llm_expert_request_snapshot {
@@ -158,6 +175,9 @@ struct llm_expert_scheduler_diagnostics {
     uint64_t terminal_failed = 0;
     uint64_t terminal_cancelled = 0;
     uint64_t terminal_releases = 0;
+    uint64_t pending_successors = 0;
+    uint64_t successor_activations = 0;
+    uint64_t successor_cancellations = 0;
     uint64_t speculative_budget_rejections = 0;
     uint64_t speculative_cancelled_before_submit = 0;
     uint64_t demand_promotions = 0;
@@ -188,7 +208,14 @@ public:
             llm_expert_priority priority,
             llm_expert_readiness readiness,
             llm_expert_request_metadata metadata = {}) noexcept;
+    llm_expert_schedule_disposition enqueue_batch(
+            const llm_expert_schedule_batch_item * items,
+            size_t item_count,
+            llm_expert_schedule_result * results) noexcept;
     llm_expert_schedule_result take_next(llm_expert_request_snapshot & request) noexcept;
+    llm_expert_schedule_result take(
+            llm_expert_request_handle handle,
+            llm_expert_request_snapshot & request) noexcept;
     llm_expert_schedule_disposition snapshot(
             llm_expert_request_handle handle,
             llm_expert_request_snapshot & request) const noexcept;
@@ -208,6 +235,8 @@ public:
             llm_expert_request_handle handle,
             llm_expert_request_state terminal) noexcept;
     llm_expert_schedule_disposition release_terminal(llm_expert_request_handle handle) noexcept;
+    llm_expert_schedule_disposition cancel_pending_successor(
+            llm_expert_request_handle handle) noexcept;
     llm_expert_schedule_disposition cancel_queued_speculative(
             llm_expert_request_handle handle) noexcept;
     bool shutdown() noexcept;

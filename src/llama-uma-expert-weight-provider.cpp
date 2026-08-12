@@ -235,15 +235,20 @@ public:
             (void) cache->cleanup_failed_slots();
             return failure(failed.error);
         };
+        if (!config.host_resident_serial_issue_for_testing) {
+            lock.unlock();
+            result = host_resident_demand->resolve_batch(
+                host_resident_batch, abort_callback, abort_data);
+            lock.lock();
+            if (!result.is_ready()) return fail_batch(result);
+        }
         for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
             const uint32_t index = host_resident_batch.semantic_order[order];
             auto & entry = host_resident_batch.entries[index];
             const auto & key = entry.key;
             result = policy_result(hot_policy.demand(
                 { key.layer, key.expert }, 1, bundle_payload_bytes, slot_footprint_bytes));
-            if (!result.is_ready()) {
-                return fail_batch(result);
-            }
+            if (!result.is_ready()) return fail_batch(result);
             int32_t hot_slot = find_hot_key(key);
             llm_expert_cache_policy_decision decision;
             if (hot_slot < 0) {
@@ -251,11 +256,13 @@ public:
                 if (result.is_ready() && !decision.free) result = demote_hot(decision.slot);
                 if (!result.is_ready()) return fail_batch(result);
             }
-            lock.unlock();
-            result = host_resident_demand->resolve_serial_next(
-                host_resident_batch, abort_callback, abort_data);
-            lock.lock();
-            if (!result.is_ready()) return fail_batch(result);
+            if (config.host_resident_serial_issue_for_testing) {
+                lock.unlock();
+                result = host_resident_demand->resolve_serial_next(
+                    host_resident_batch, abort_callback, abort_data);
+                lock.lock();
+                if (!result.is_ready()) return fail_batch(result);
+            }
             ensure_slot_state(entry.reference);
             auto & slot = slots[entry.reference.slot];
             if (hot_slot >= 0 && find_hot_entry(key, entry.reference) != hot_slot) {
@@ -263,7 +270,8 @@ public:
                     llm_expert_provider_error::metadata_mismatch));
             }
             const auto hit = classify_hit(
-                entry.lookup == llm_cold_demand_lookup::reserved, hot_slot >= 0, entry.reference);
+                entry.lookup == llm_cold_demand_lookup::reserved,
+                hot_slot >= 0, entry.reference);
             if (hot_slot < 0) {
                 result = policy_result(hot_policy.load_begin(
                     decision.slot, entry.reference.generation,
@@ -634,7 +642,7 @@ public:
                 config.total_expert_keys,
                 config.hot_capacity,
                 policy_trace_capacity,
-                true,
+                config.host_resident_serial_issue_for_testing,
                 preflight_trampoline,
                 this,
                 slot_footprint_bytes,
@@ -753,7 +761,11 @@ private:
         bool sampled = false;
     };
     struct slot_state { uint64_t generation = 0; uint64_t last_use = 0; uint32_t refs = 0; bool hot = false; };
-    struct hot_entry { llm_expert_key key; llm_cold_reference reference; bool occupied = false; };
+    struct hot_entry {
+        llm_expert_key key;
+        llm_cold_reference reference;
+        bool occupied = false;
+    };
     struct request_pin {
         llm_cold_reference reference;
         uint32_t hot_slot = UINT32_MAX;

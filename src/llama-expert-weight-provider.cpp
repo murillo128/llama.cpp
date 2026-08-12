@@ -5445,14 +5445,23 @@ public:
             }
             loaded = host_resident_demand->freeze_semantic_order(host_resident_batch);
             if (!loaded.is_ready()) return fail(loaded);
-            for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
-                const uint32_t index = host_resident_batch.semantic_order[order];
-                auto & entry = host_resident_batch.entries[index];
+            if (!config.phase10_serial_issue_for_testing) {
                 provider_lock->unlock();
-                loaded = host_resident_demand->resolve_serial_next(
+                loaded = host_resident_demand->resolve_batch(
                     host_resident_batch, abort_callback, abort_callback_data);
                 provider_lock->lock();
                 if (!loaded.is_ready()) return fail(loaded);
+            }
+            for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
+                const uint32_t index = host_resident_batch.semantic_order[order];
+                auto & entry = host_resident_batch.entries[index];
+                if (config.phase10_serial_issue_for_testing) {
+                    provider_lock->unlock();
+                    loaded = host_resident_demand->resolve_serial_next(
+                        host_resident_batch, abort_callback, abort_callback_data);
+                    provider_lock->lock();
+                    if (!loaded.is_ready()) return fail(loaded);
+                }
                 loaded = host_resident_demand->complete_host_scheduler(entry);
                 if (!loaded.is_ready()) {
                     (void) host_resident_demand->fail_serial_batch(
@@ -5861,7 +5870,13 @@ public:
                             config.total_expert_keys,
                             config.capacity,
                             std::max<uint32_t>(config.trace_capacity, 1),
-                            true,
+                            config.phase10_serial_issue_for_testing,
+                            nullptr,
+                            nullptr,
+                            0,
+                            config.phase10_serial_issue_for_testing ?
+                                llm_cold_reference_kind::request :
+                                llm_cold_reference_kind::batch,
                         });
                 }
                 pool = std::move(generation_candidate);

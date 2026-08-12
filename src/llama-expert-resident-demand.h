@@ -3,6 +3,7 @@
 #include "llama-cold-expert-cache.h"
 #include "llama-expert-async-io.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -12,11 +13,32 @@ struct llm_host_resident_demand_entry {
     llm_expert_key key = { -1, -1 };
     llm_cold_reference reference;
     llm_expert_request_handle scheduler_handle;
+    llm_expert_request_handle deferred_predecessor_handle;
+    std::array<llm_expert_storage_destination, 12> destinations;
+    std::array<llm_expert_storage_read_operation, 12> operations;
+    llm_expert_async_read_completion completion;
     uint64_t occurrence_count = 0;
+    uint64_t read_bytes = 0;
+    size_t destination_count = 0;
+    size_t operation_count = 0;
     llm_cold_demand_lookup lookup = llm_cold_demand_lookup::missing;
     bool scheduler_owned = false;
     bool scheduler_joined = false;
+    bool scheduler_deferred = false;
     bool request_hold = false;
+    bool scheduler_taken = false;
+    bool read_submitted = false;
+    bool read_completed = false;
+    bool read_released = false;
+    bool storage_recorded = false;
+};
+
+enum class llm_host_resident_wait_reason : uint8_t {
+    none,
+    read_completion,
+    joined_generation,
+    draining_predecessor,
+    failure_drain,
 };
 
 struct llm_host_resident_demand_event {
@@ -30,20 +52,25 @@ struct llm_host_resident_demand_event {
     uint32_t scheduler_enqueue_attempts = 0;
     uint32_t scheduler_admissions = 0;
     uint32_t scheduler_joins = 0;
+    uint32_t scheduler_deferred_successors = 0;
     uint32_t read_plans = 0;
     uint32_t read_operations = 0;
     uint64_t read_bytes = 0;
     uint32_t host_ready = 0;
+    uint32_t adapter_ready = 0;
     uint32_t request_holds = 0;
     uint32_t peak_active_read_requests = 0;
     uint32_t peak_active_read_operations = 0;
     uint64_t last_enqueue_us = 0;
     uint64_t last_read_submit_us = 0;
     uint64_t first_wait_us = 0;
+    llm_host_resident_wait_reason first_wait_reason =
+        llm_host_resident_wait_reason::none;
     bool first_wait_after_all_enqueue_attempts = false;
     bool first_wait_after_all_admissible_submissions = false;
     bool serial_control = true;
     std::vector<llm_expert_key> semantic_order;
+    std::vector<llm_expert_key> issue_order;
     std::vector<llm_expert_key> physical_completion_order;
 };
 
@@ -51,12 +78,22 @@ struct llm_host_resident_demand_batch {
     std::vector<llm_host_resident_demand_entry> entries;
     std::vector<uint32_t> occurrence_to_unique;
     std::vector<uint32_t> semantic_order;
+    std::vector<uint32_t> issue_order;
+    std::vector<llm_expert_schedule_batch_item> schedule_items;
+    std::vector<llm_expert_schedule_result> schedule_results;
+    std::vector<uint32_t> schedule_entry_indices;
+    std::vector<llm_expert_key> cache_keys;
+    std::vector<llm_cold_reference> cache_references;
+    std::vector<llm_cold_demand_lookup> cache_lookups;
+    std::vector<llm_expert_request_handle> pending_handles;
     llm_host_resident_demand_event event;
     size_t occurrence_count = 0;
     size_t unique_count = 0;
     size_t resolved_semantic_count = 0;
     uint64_t transport_epoch = 0;
     bool semantic_order_frozen = false;
+    bool issue_order_frozen = false;
+    bool deferred_reads_open = false;
     bool finalized = false;
 };
 
@@ -87,6 +124,8 @@ struct llm_host_resident_demand_config {
     void * preflight_data = nullptr;
     uint64_t reservation_bytes = 0;
     llm_cold_reference_kind base_hold_kind = llm_cold_reference_kind::request;
+    void (*before_semantic_publication_for_testing)(void *) = nullptr;
+    void * before_semantic_publication_data_for_testing = nullptr;
 };
 
 class llm_host_resident_demand_coordinator {
@@ -105,6 +144,10 @@ public:
     llm_expert_provider_result freeze_semantic_order(
             llm_host_resident_demand_batch & batch) noexcept;
     llm_expert_provider_result resolve_serial_next(
+            llm_host_resident_demand_batch & batch,
+            bool (*abort_callback)(void *) = nullptr,
+            void * abort_data = nullptr) noexcept;
+    llm_expert_provider_result resolve_batch(
             llm_host_resident_demand_batch & batch,
             bool (*abort_callback)(void *) = nullptr,
             void * abort_data = nullptr) noexcept;

@@ -601,6 +601,43 @@ void test_batch_hold_publication_and_transfer() {
     GGML_ASSERT(cache.surrender().is_ready());
 }
 
+void test_transactional_demand_batch_protects_selected_hits() {
+    fixture tensors;
+    llm_cold_expert_cache cache(config(budget_for_slots(tensors, 2), 2));
+    GGML_ASSERT(cache.initialize(tensors.bundle()).is_ready());
+    llm_cold_reference zero;
+    llm_cold_reference one;
+    GGML_ASSERT(cache.find_or_admit({ 0, 0 }, tensors.bundle(), zero).is_ready());
+    GGML_ASSERT(cache.find_or_admit({ 0, 1 }, tensors.bundle(), one).is_ready());
+    GGML_ASSERT(cache.policy_request_end(true, false).is_ready());
+
+    const std::array<llm_expert_key, 2> keys = {{ { 0, 0 }, { 0, 2 } }};
+    std::array<llm_cold_reference, 2> references;
+    std::array<llm_cold_demand_lookup, 2> lookups;
+    GGML_ASSERT(cache.reserve_or_join_demand_batch(
+        keys.data(), keys.size(), references.data(), lookups.data()).is_ready());
+    GGML_ASSERT(lookups[0] == llm_cold_demand_lookup::ready &&
+        lookups[1] == llm_cold_demand_lookup::reserved &&
+        references[0].slot == zero.slot && references[1].slot == one.slot &&
+        cache.contains_ready({ 0, 0 }) && !cache.contains_ready({ 0, 1 }));
+    auto diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.current_batch_refs == 1 &&
+        diagnostics.slots[zero.slot].batch_refs == 1);
+
+    GGML_ASSERT(cache.publish_ready_and_acquire(
+        { 0, 2 }, references[1], llm_cold_reference_kind::batch).is_ready());
+    GGML_ASSERT(cache.convert_batch_to_cpu_execution(references[0]).is_ready());
+    diagnostics = cache.diagnostics();
+    GGML_ASSERT(diagnostics.current_batch_refs == 1 &&
+        diagnostics.current_cpu_execution_refs == 1 && cache.contains_ready({ 0, 0 }) &&
+        cache.contains_ready({ 0, 2 }));
+    GGML_ASSERT(cache.release(
+        references[0], llm_cold_reference_kind::cpu_execution).is_ready());
+    GGML_ASSERT(cache.release(references[1], llm_cold_reference_kind::batch).is_ready());
+    GGML_ASSERT(cache.policy_request_end(true, false).is_ready());
+    GGML_ASSERT(cache.validate_invariants().is_ready());
+}
+
 } // namespace
 
 int main() {
@@ -619,6 +656,7 @@ int main() {
     test_demand_joins_loading_speculative_cold_generation();
     test_lookup_only_demand_does_not_admit_or_evict();
     test_batch_hold_publication_and_transfer();
+    test_transactional_demand_batch_protects_selected_hits();
     std::cout << "cold expert cache tests passed\n";
     return 0;
 }

@@ -4,10 +4,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <future>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -34,13 +38,35 @@ struct temporary_source {
     }
 };
 
-llm_expert_bundle_descriptor make_bundle(ggml_context * ctx) {
+struct wide_temporary_source {
+    char path[64] = "/tmp/expert-resident-batch-XXXXXX";
+
+    explicit wide_temporary_source(uint32_t expert_count) {
+        const int fd = mkstemp(path);
+        require(fd >= 0, "wide mkstemp failed");
+        std::vector<uint8_t> bytes(size_t(expert_count)*144);
+        for (size_t index = 0; index < bytes.size(); ++index) bytes[index] = uint8_t(index*17U + 3U);
+        require(write(fd, bytes.data(), bytes.size()) == ssize_t(bytes.size()),
+            "wide source write failed");
+        close(fd);
+    }
+
+    ~wide_temporary_source() {
+        unlink(path);
+    }
+};
+
+llm_expert_bundle_descriptor make_bundle(ggml_context * ctx, int64_t n_expert) {
     auto projection = [&](const char * name) {
-        auto * weight = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 3, 4);
+        auto * weight = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 3, n_expert);
         ggml_set_name(weight, name);
         return llm_expert_projection_descriptor::from(weight, nullptr, nullptr);
     };
-    return { 0, 4, projection("up"), projection("gate"), {}, projection("down") };
+    return { 0, int32_t(n_expert), projection("up"), projection("gate"), {}, projection("down") };
+}
+
+llm_expert_bundle_descriptor make_bundle(ggml_context * ctx) {
+    return make_bundle(ctx, 4);
 }
 
 std::vector<llm_expert_storage_span> spans(uint64_t base) {
@@ -126,6 +152,15 @@ bool same_policy_event(
         lhs.slot == rhs.slot && lhs.generation == rhs.generation && lhs.domain == rhs.domain &&
         lhs.eligible == rhs.eligible && lhs.decision == rhs.decision && lhs.reason == rhs.reason &&
         lhs.state_digest == rhs.state_digest;
+}
+
+bool same_key_sequence(
+        const std::vector<llm_expert_key> & lhs,
+        const std::vector<llm_expert_key> & rhs) {
+    return lhs.size() == rhs.size() && std::equal(
+        lhs.begin(), lhs.end(), rhs.begin(), [](const auto & left, const auto & right) {
+            return left.layer == right.layer && left.expert == right.expert;
+        });
 }
 
 void validate_slot(
@@ -675,7 +710,695 @@ void test_uma_stable_first_semantic_equivalence() {
         "UMA semantic transport did not drain");
 }
 
-void test_cpu_provider_serial_adapter() {
+enum class batch_reader_mode {
+    ready,
+    short_read,
+    io_error,
+};
+
+struct deterministic_batch_reader : llm_expert_async_read_override {
+    batch_reader_mode mode = batch_reader_mode::ready;
+    bool slow_first_expert = false;
+    bool stagger_by_expert = false;
+
+    int64_t read_at(
+            intptr_t,
+            void * destination,
+            size_t byte_count,
+            uint64_t file_offset,
+            int & native_error) noexcept override {
+        const uint64_t expert = file_offset/144;
+        const uint64_t stagger_us = stagger_by_expert ?
+            (1 + ((expert*5 + 3)%7))*1000 : 1000;
+        usleep(slow_first_expert && file_offset < 144 ? 30000 : stagger_us);
+        if (mode == batch_reader_mode::io_error) {
+            native_error = EIO;
+            return -1;
+        }
+        auto * bytes = static_cast<uint8_t *>(destination);
+        for (size_t index = 0; index < byte_count; ++index) {
+            bytes[index] = uint8_t((file_offset + index)*17U + 3U);
+        }
+        native_error = 0;
+        return mode == batch_reader_mode::short_read && byte_count != 0 ?
+            int64_t(byte_count - 1) : int64_t(byte_count);
+    }
+};
+
+struct batch_case_result {
+    llm_expert_provider_error error = llm_expert_provider_error::none;
+    uint64_t failures = 0;
+    uint64_t cancellations = 0;
+    llm_host_resident_demand_event event;
+    llm_cold_cache_diagnostics cache;
+    llm_expert_storage_diagnostics storage;
+    std::vector<int32_t> execution_ids;
+};
+
+struct batch_case_options {
+    bool reverse_completion = false;
+    bool reverse_issue = false;
+    bool staggered_completion = false;
+    bool cancel_on_first_wait = false;
+    bool cancel_after_completion_before_publication = false;
+    bool cancel_after_host_ready = false;
+    bool close_transport_before_resolve = false;
+    bool integrity_mismatch = false;
+    bool expect_failure = false;
+    bool retry_after_failure = false;
+    batch_reader_mode reader_mode = batch_reader_mode::ready;
+    uint32_t scheduler_capacity = 32;
+    uint32_t transport_request_capacity = 32;
+    uint64_t initial_cache_generation = 0;
+};
+
+batch_case_result run_batch_case(
+        const std::vector<int32_t> & logical_ids,
+        const std::vector<int32_t> & warm_ids = {},
+        batch_case_options options = {}) {
+    constexpr uint32_t expert_count = 16;
+    wide_temporary_source source(expert_count);
+    llama_file file(source.path, "rb");
+    llm_expert_storage storage(
+        { 1, expert_count, expert_count, 4096 }, { { 0, &file, 512, source.path, false } });
+    for (int32_t expert = 0; expert < int32_t(expert_count); ++expert) {
+        require(storage.add_bundle({ 0, expert }, spans(uint64_t(expert)*144)).is_ready(),
+            "batch storage directory failed");
+    }
+    require(storage.seal().is_ready(), "batch storage seal failed");
+
+    ggml_init_params context_params = { ggml_tensor_overhead()*32, nullptr, true };
+    ggml_context_ptr context(ggml_init(context_params));
+    require(bool(context), "batch context failed");
+    const auto prototype = make_bundle(context.get(), expert_count);
+
+    llm_cold_cache_config cache_config;
+    cache_config.byte_budget = 1U << 20;
+    cache_config.minimum_slots = expert_count;
+    cache_config.routed_layer_count = 1;
+    cache_config.total_expert_keys = expert_count;
+    cache_config.initial_slot_generation_for_testing = options.initial_cache_generation;
+    cache_config.routed_layers = { 0 };
+    llm_cold_expert_cache cache(cache_config);
+    require(cache.initialize(prototype).is_ready(), "batch cache initialization failed");
+
+    llm_expert_layout_registry registry;
+    registry.classes = { { 0, 0, cache.diagnostics().bundle_payload_bytes, prototype } };
+    registry.layer_ids = { 0 };
+
+    llm_expert_scheduler_config scheduler_config;
+    scheduler_config.layer_count = 1;
+    scheduler_config.experts_per_layer = expert_count;
+    scheduler_config.request_capacity = options.scheduler_capacity;
+    scheduler_config.waiters_per_request = 16;
+    scheduler_config.max_current_layer_demand_flights = expert_count;
+    scheduler_config.device_count = 1;
+    scheduler_config.per_device_request_capacity = options.scheduler_capacity;
+    scheduler_config.per_device_inflight_capacity = options.scheduler_capacity;
+    llm_expert_scheduler scheduler(scheduler_config);
+
+    deterministic_batch_reader reader;
+    reader.mode = options.reader_mode;
+    reader.stagger_by_expert = options.staggered_completion;
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 64;
+    async_config.effective_hot_capacity = expert_count;
+    async_config.request_capacity = options.transport_request_capacity;
+    async_config.trace_capacity = 128;
+    async_config.cold_cache_bytes = cache.diagnostics().actual_bytes;
+    async_config.maximum_aligned_read_bytes = 4096;
+    async_config.source_file_capacity = 1;
+    async_config.read_override_for_testing = &reader;
+    async_config.reverse_queued_requests_for_testing = options.reverse_completion;
+    async_config.force_positional_reads = true;
+    async_config.worker_count = options.staggered_completion ? 4 : 1;
+    llm_expert_async_transport transport(async_config);
+    intptr_t handle = -1;
+    size_t handle_count = 0;
+    require(storage.copy_source_native_handles(&handle, 1, handle_count).is_ready() &&
+        handle_count == 1 && transport.register_files(&handle, 1) == llm_expert_async_result::ready,
+        "batch source registration failed");
+
+    llm_host_resident_demand_config demand_config;
+    demand_config.cache = &cache;
+    demand_config.storage = &storage;
+    demand_config.scheduler = &scheduler;
+    demand_config.transport = &transport;
+    demand_config.layout_registry = &registry;
+    demand_config.maximum_occurrences = 32;
+    demand_config.maximum_unique_keys = expert_count;
+    demand_config.trace_capacity = 16;
+    demand_config.serial_control = false;
+    demand_config.base_hold_kind = llm_cold_reference_kind::batch;
+    bool publication_cancel_requested = false;
+    if (options.cancel_after_completion_before_publication) {
+        demand_config.before_semantic_publication_for_testing = [](void * data) {
+            *static_cast<bool *>(data) = true;
+        };
+        demand_config.before_semantic_publication_data_for_testing =
+            &publication_cancel_requested;
+    }
+    if (options.integrity_mismatch) {
+        demand_config.integrity_mode = llm_expert_integrity_mode::fnv64_end_to_end;
+    }
+    llm_host_resident_demand_coordinator coordinator(demand_config);
+
+    llm_expert_provider_error last_error = llm_expert_provider_error::none;
+    bool transport_closed = false;
+    auto execute = [&](const std::vector<int32_t> & ids, bool alternate_issue, bool may_fail) {
+        require(!ids.empty(), "batch execution requires logical occurrences");
+        require(cache.policy_request_begin().is_ready(), "batch policy begin failed");
+        llm_host_resident_demand_batch batch;
+        require(coordinator.plan(0, ids.data(), ids.size(), batch).is_ready(),
+            "batch demand plan failed");
+        std::iota(batch.semantic_order.begin(), batch.semantic_order.end(), 0U);
+        std::sort(batch.semantic_order.begin(), batch.semantic_order.end(), [&](uint32_t lhs, uint32_t rhs) {
+            return batch.entries[lhs].key.expert < batch.entries[rhs].key.expert;
+        });
+        if (alternate_issue) {
+            batch.issue_order = batch.semantic_order;
+            std::reverse(batch.issue_order.begin(), batch.issue_order.end());
+        }
+        require(coordinator.freeze_semantic_order(batch).is_ready(),
+            "batch semantic freeze failed");
+        if (options.close_transport_before_resolve && !transport_closed) {
+            require(transport.shutdown(), "batch pre-submit transport shutdown failed");
+            transport_closed = true;
+        }
+        bool cancel_requested = options.cancel_on_first_wait;
+        const auto abort_callback = [](void * data) {
+            return *static_cast<bool *>(data);
+        };
+        bool (*callback)(void *) =
+            (options.cancel_on_first_wait || options.cancel_after_completion_before_publication) ?
+                +abort_callback : nullptr;
+        bool * callback_data = options.cancel_after_completion_before_publication ?
+            &publication_cancel_requested : &cancel_requested;
+        const auto resolved = coordinator.resolve_batch(
+            batch, callback, callback != nullptr ? callback_data : nullptr);
+        if (!resolved.is_ready()) {
+            last_error = resolved.error;
+            require(may_fail, "batched demand resolve failed");
+            require(cache.policy_request_end(false,
+                resolved.error == llm_expert_provider_error::cancelled).is_ready(),
+                "failed batch policy end failed");
+            return std::vector<int32_t>{};
+        }
+        require(!may_fail || options.cancel_after_host_ready,
+            "batched demand unexpectedly succeeded");
+        if (options.cancel_after_host_ready) {
+            const auto cancelled = coordinator.fail_serial_batch(
+                batch, llm_expert_provider_error::cancelled, true);
+            require(cancelled.error == llm_expert_provider_error::cancelled,
+                "HOST_READY cancellation status changed");
+            last_error = cancelled.error;
+            require(cache.policy_request_end(false, true).is_ready(),
+                "HOST_READY cancellation policy end failed");
+            return std::vector<int32_t>{};
+        }
+
+        std::vector<llm_cold_reference> execution_refs;
+        execution_refs.reserve(batch.unique_count);
+        for (size_t order = 0; order < batch.unique_count; ++order) {
+            auto & entry = batch.entries[batch.semantic_order[order]];
+            require(coordinator.complete_host_scheduler(entry).is_ready(),
+                "batch host scheduler completion failed");
+            require(coordinator.transfer_request_hold_to_cpu_execution(entry).is_ready(),
+                "batch CPU execution hold transfer failed");
+            execution_refs.push_back(entry.reference);
+            validate_slot(cache.bundle(), entry.reference.slot, entry.key.expert);
+        }
+        require(coordinator.finish_serial_batch(batch).is_ready(), "batch finish failed");
+        std::vector<int32_t> result(ids.size(), -1);
+        for (size_t occurrence = 0; occurrence < ids.size(); ++occurrence) {
+            result[occurrence] = int32_t(batch.entries[
+                batch.occurrence_to_unique[occurrence]].reference.slot);
+        }
+        require(cache.release_many(execution_refs.data(), execution_refs.size(),
+            llm_cold_reference_kind::cpu_execution).is_ready(),
+            "batch CPU execution release failed");
+        require(cache.policy_request_end(true, false).is_ready(), "batch policy end failed");
+        return result;
+    };
+
+    if (!warm_ids.empty()) (void) execute(warm_ids, false, false);
+    batch_case_result result;
+    result.execution_ids = execute(logical_ids, options.reverse_issue, options.expect_failure);
+    if (options.retry_after_failure) {
+        require(options.expect_failure && last_error != llm_expert_provider_error::none,
+            "batch retry requires a fully drained first failure");
+        reader.mode = batch_reader_mode::ready;
+        result.execution_ids = execute(logical_ids, options.reverse_issue, false);
+    }
+    const auto coordinator_diagnostics = coordinator.diagnostics();
+    result.error = last_error;
+    result.failures = coordinator_diagnostics.failures;
+    result.cancellations = coordinator_diagnostics.cancellations;
+    if (!options.expect_failure || options.retry_after_failure) {
+        require(!coordinator_diagnostics.events.empty(), "batch event missing");
+        result.event = coordinator_diagnostics.events.back();
+    }
+    result.cache = cache.diagnostics();
+    result.storage = storage.diagnostics();
+    require(result.cache.current_request_refs == 0 && result.cache.current_cpu_execution_refs == 0 &&
+        result.cache.current_batch_refs == 0 && scheduler.diagnostics().active_requests == 0 &&
+        transport.diagnostics().active_read_requests == 0 &&
+        transport.diagnostics().active_operations == 0,
+        "batch terminal resources did not drain");
+    require(cache.validate_invariants().is_ready(), "batch cache invariant failed");
+    return result;
+}
+
+void require_same_batch_semantics(
+        const batch_case_result & lhs,
+        const batch_case_result & rhs,
+        const char * message) {
+    require(lhs.execution_ids == rhs.execution_ids &&
+        lhs.cache.policy.state_digest == rhs.cache.policy.state_digest &&
+        lhs.cache.requests == rhs.cache.requests && lhs.cache.hits == rhs.cache.hits &&
+        lhs.cache.misses == rhs.cache.misses && lhs.cache.admissions == rhs.cache.admissions &&
+        lhs.cache.evictions == rhs.cache.evictions &&
+        lhs.cache.generation_changes == rhs.cache.generation_changes &&
+        lhs.cache.policy_events.size() == rhs.cache.policy_events.size() &&
+        lhs.cache.slots.size() == rhs.cache.slots.size() &&
+        lhs.storage.read_requests == rhs.storage.read_requests &&
+        lhs.storage.read_chunks == rhs.storage.read_chunks &&
+        lhs.storage.read_bytes == rhs.storage.read_bytes,
+        message);
+    for (size_t index = 0; index < lhs.cache.policy_events.size(); ++index) {
+        require(same_policy_event(lhs.cache.policy_events[index], rhs.cache.policy_events[index]), message);
+    }
+    for (size_t index = 0; index < lhs.cache.slots.size(); ++index) {
+        const auto & left = lhs.cache.slots[index];
+        const auto & right = rhs.cache.slots[index];
+        require(left.key.layer == right.key.layer && left.key.expert == right.key.expert &&
+            left.layout_class_id == right.layout_class_id && left.generation == right.generation &&
+            left.last_use == right.last_use && left.state == right.state &&
+            left.hot_refs == right.hot_refs && left.request_refs == right.request_refs &&
+            left.transfer_refs == right.transfer_refs &&
+            left.cpu_execution_refs == right.cpu_execution_refs && left.batch_refs == right.batch_refs,
+            message);
+    }
+}
+
+void test_batched_issue_ahead_and_determinism() {
+    for (uint32_t width : { 1U, 2U, 4U, 8U, 16U }) {
+        std::vector<int32_t> ids(width);
+        std::iota(ids.begin(), ids.end(), 0);
+        const auto result = run_batch_case(ids);
+        require(result.event.new_reservations == width && result.event.ready_hits == 0 &&
+            result.event.scheduler_enqueue_attempts == width &&
+            result.event.scheduler_admissions == width && result.event.read_plans == width &&
+            result.event.host_ready == width && result.event.adapter_ready == width &&
+            result.event.first_wait_after_all_enqueue_attempts &&
+            result.event.first_wait_after_all_admissible_submissions &&
+            result.event.first_wait_reason ==
+                llm_host_resident_wait_reason::read_completion &&
+            !result.event.serial_control && result.event.issue_order.size() == width &&
+            result.event.physical_completion_order.size() == width,
+            "batch issue-ahead witness changed");
+        require(result.event.peak_active_read_requests == width &&
+            result.event.peak_active_read_operations >= width,
+            "batch did not expose complete current-layer read concurrency");
+    }
+
+    const std::vector<int32_t> four = { 0, 1, 2, 3 };
+    const auto all_hit = run_batch_case(four, four);
+    require(all_hit.event.ready_hits == 4 && all_hit.event.new_reservations == 0 &&
+        all_hit.event.scheduler_enqueue_attempts == 0 && all_hit.event.read_plans == 0 &&
+        all_hit.event.first_wait_us == 0 &&
+        all_hit.event.first_wait_reason == llm_host_resident_wait_reason::none &&
+        all_hit.event.first_wait_after_all_enqueue_attempts &&
+        all_hit.event.first_wait_after_all_admissible_submissions,
+        "batch all-hit path performed scheduler or storage work");
+
+    const auto mixed = run_batch_case(four, { 0, 1 });
+    require(mixed.event.ready_hits == 2 && mixed.event.new_reservations == 2 &&
+        mixed.event.scheduler_admissions == 2 && mixed.event.read_plans == 2 &&
+        mixed.event.peak_active_read_requests == 2,
+        "batch mixed hit/miss classification changed");
+
+    const std::vector<int32_t> duplicates = { 2, 0, 2, 1 };
+    const auto duplicate = run_batch_case(duplicates);
+    require(duplicate.event.selected_occurrences == 4 && duplicate.event.unique_keys == 3 &&
+        duplicate.event.new_reservations == 3 && duplicate.event.semantic_order.size() == 3 &&
+        duplicate.event.semantic_order[0].expert == 0 &&
+        duplicate.event.semantic_order[1].expert == 1 &&
+        duplicate.event.semantic_order[2].expert == 2 &&
+        duplicate.execution_ids[0] == duplicate.execution_ids[2],
+        "batch duplicate occurrence reconstruction changed");
+
+    const std::vector<int32_t> permuted = { 5, 1, 7, 3 };
+    const auto normal = run_batch_case(permuted);
+    batch_case_options reversed_options;
+    reversed_options.reverse_completion = true;
+    const auto reversed = run_batch_case(permuted, {}, reversed_options);
+    batch_case_options issue_options;
+    issue_options.reverse_issue = true;
+    const auto alternate_issue = run_batch_case(permuted, {}, issue_options);
+    batch_case_options staggered_options;
+    staggered_options.staggered_completion = true;
+    const auto staggered = run_batch_case(permuted, {}, staggered_options);
+    require_same_batch_semantics(normal, reversed,
+        "reversed completion changed batch semantic state");
+    require_same_batch_semantics(normal, alternate_issue,
+        "alternate issue order changed batch semantic state");
+    require_same_batch_semantics(normal, staggered,
+        "staggered completion changed batch semantic state");
+    require(same_key_sequence(normal.event.semantic_order, reversed.event.semantic_order) &&
+        same_key_sequence(normal.event.semantic_order, alternate_issue.event.semantic_order) &&
+        same_key_sequence(normal.event.semantic_order, staggered.event.semantic_order) &&
+        !same_key_sequence(normal.event.issue_order, alternate_issue.event.issue_order) &&
+        !same_key_sequence(normal.event.physical_completion_order,
+            reversed.event.physical_completion_order) &&
+        !same_key_sequence(normal.event.physical_completion_order,
+            staggered.event.physical_completion_order),
+        "batch occurrence, semantic, issue, and completion orders were not separated");
+}
+
+void require_failed_batch_drained(
+        const batch_case_result & result,
+        llm_expert_provider_error expected,
+        bool cancelled = false) {
+    require(result.error == expected && result.failures == 1 &&
+        result.cancellations == uint64_t(cancelled) &&
+        result.cache.current_hot_refs == 0 && result.cache.current_request_refs == 0 &&
+        result.cache.current_transfer_refs == 0 &&
+        result.cache.current_cpu_execution_refs == 0 && result.cache.current_batch_refs == 0 &&
+        std::none_of(result.cache.slots.begin(), result.cache.slots.end(), [](const auto & slot) {
+            return slot.state == llm_cold_slot_state::loading ||
+                slot.state == llm_cold_slot_state::reserved ||
+                slot.state == llm_cold_slot_state::failed;
+        }),
+        "failed batch did not drain exact generation ownership");
+}
+
+void test_batched_failure_cleanup() {
+    const std::vector<int32_t> ids = { 0, 1, 2, 3 };
+
+    batch_case_options short_read;
+    short_read.expect_failure = true;
+    short_read.retry_after_failure = true;
+    short_read.reader_mode = batch_reader_mode::short_read;
+    const auto retried = run_batch_case(ids, {}, short_read);
+    require_failed_batch_drained(retried, llm_expert_provider_error::copy_failed);
+    require(retried.execution_ids.size() == ids.size() && retried.cache.admissions == ids.size(),
+        "batch retry after complete drain did not publish a fresh exact generation");
+
+    batch_case_options io_error;
+    io_error.expect_failure = true;
+    io_error.reader_mode = batch_reader_mode::io_error;
+    require_failed_batch_drained(
+        run_batch_case(ids, {}, io_error), llm_expert_provider_error::copy_failed);
+
+    batch_case_options cancellation;
+    cancellation.expect_failure = true;
+    cancellation.cancel_on_first_wait = true;
+    require_failed_batch_drained(
+        run_batch_case(ids, {}, cancellation), llm_expert_provider_error::cancelled, true);
+
+    batch_case_options pre_submit_cancellation;
+    pre_submit_cancellation.expect_failure = true;
+    pre_submit_cancellation.close_transport_before_resolve = true;
+    const auto cancelled_before_submit = run_batch_case(ids, {}, pre_submit_cancellation);
+    require_failed_batch_drained(
+        cancelled_before_submit, llm_expert_provider_error::cancelled, true);
+    require(cancelled_before_submit.storage.read_requests == 0,
+        "pre-submit cancellation reached backing storage");
+
+    batch_case_options completed_cancellation;
+    completed_cancellation.expect_failure = true;
+    completed_cancellation.cancel_after_completion_before_publication = true;
+    require_failed_batch_drained(
+        run_batch_case(ids, {}, completed_cancellation),
+        llm_expert_provider_error::cancelled, true);
+
+    batch_case_options host_ready_cancellation;
+    host_ready_cancellation.expect_failure = true;
+    host_ready_cancellation.cancel_after_host_ready = true;
+    const auto cancelled_after_host_ready = run_batch_case(ids, {}, host_ready_cancellation);
+    require_failed_batch_drained(
+        cancelled_after_host_ready, llm_expert_provider_error::cancelled, true);
+    require(cancelled_after_host_ready.cache.admissions == ids.size(),
+        "HOST_READY cancellation discarded valid ready content");
+
+    batch_case_options integrity_failure;
+    integrity_failure.expect_failure = true;
+    integrity_failure.integrity_mismatch = true;
+    require_failed_batch_drained(
+        run_batch_case(ids, {}, integrity_failure),
+        llm_expert_provider_error::metadata_mismatch);
+
+    batch_case_options scheduler_saturation;
+    scheduler_saturation.expect_failure = true;
+    scheduler_saturation.scheduler_capacity = 2;
+    const auto scheduler_failure = run_batch_case(ids, {}, scheduler_saturation);
+    require_failed_batch_drained(scheduler_failure, llm_expert_provider_error::busy);
+    require(scheduler_failure.storage.read_requests == 0,
+        "scheduler saturation submitted partial storage work");
+
+    batch_case_options transport_saturation;
+    transport_saturation.expect_failure = true;
+    transport_saturation.transport_request_capacity = 2;
+    require_failed_batch_drained(
+        run_batch_case(ids, {}, transport_saturation), llm_expert_provider_error::copy_failed);
+
+    batch_case_options generation_exhaustion;
+    generation_exhaustion.expect_failure = true;
+    generation_exhaustion.initial_cache_generation = std::numeric_limits<uint64_t>::max();
+    const auto generation_failure = run_batch_case(ids, {}, generation_exhaustion);
+    require_failed_batch_drained(
+        generation_failure, llm_expert_provider_error::generation_exhausted);
+    require(generation_failure.storage.read_requests == 0,
+        "generation exhaustion submitted storage work");
+}
+
+void run_batched_join_case(bool predecessor_queued, bool predecessor_draining = false) {
+    temporary_source source;
+    llama_file file(source.path, "rb");
+    llm_expert_storage storage({ 1, 4, 4, 1024 }, { { 0, &file, 512, source.path, false } });
+    for (int32_t expert = 0; expert < 4; ++expert) {
+        require(storage.add_bundle({ 0, expert }, spans(uint64_t(expert)*144)).is_ready(),
+            "join storage directory failed");
+    }
+    require(storage.seal().is_ready(), "join storage seal failed");
+
+    ggml_init_params context_params = { ggml_tensor_overhead()*16, nullptr, true };
+    ggml_context_ptr context(ggml_init(context_params));
+    require(bool(context), "join context failed");
+    const auto prototype = make_bundle(context.get());
+    llm_cold_cache_config cache_config;
+    cache_config.byte_budget = 1U << 20;
+    cache_config.minimum_slots = 4;
+    cache_config.routed_layer_count = 1;
+    cache_config.total_expert_keys = 4;
+    cache_config.routed_layers = { 0 };
+    llm_cold_expert_cache cache(cache_config);
+    require(cache.initialize(prototype).is_ready(), "join cache initialization failed");
+    require(cache.policy_request_begin().is_ready(), "join policy begin failed");
+
+    llm_expert_layout_registry registry;
+    registry.classes = { { 0, 0, cache.diagnostics().bundle_payload_bytes, prototype } };
+    registry.layer_ids = { 0 };
+    llm_expert_scheduler_config scheduler_config;
+    scheduler_config.layer_count = 1;
+    scheduler_config.experts_per_layer = 4;
+    scheduler_config.request_capacity = 8;
+    scheduler_config.waiters_per_request = 4;
+    scheduler_config.max_current_layer_demand_flights = 4;
+    scheduler_config.device_count = 1;
+    scheduler_config.per_device_request_capacity = 8;
+    scheduler_config.per_device_inflight_capacity = 8;
+    llm_expert_scheduler scheduler(scheduler_config);
+
+    deterministic_batch_reader reader;
+    reader.slow_first_expert = true;
+    llm_expert_async_config async_config;
+    async_config.requested_queue_depth = 16;
+    async_config.effective_hot_capacity = 4;
+    async_config.request_capacity = 8;
+    async_config.trace_capacity = 64;
+    async_config.cold_cache_bytes = cache.diagnostics().actual_bytes;
+    async_config.maximum_aligned_read_bytes = 4096;
+    async_config.source_file_capacity = 1;
+    async_config.read_override_for_testing = &reader;
+    async_config.force_positional_reads = true;
+    async_config.worker_count = 2;
+    llm_expert_async_transport transport(async_config);
+    intptr_t source_handle = -1;
+    size_t handle_count = 0;
+    require(storage.copy_source_native_handles(&source_handle, 1, handle_count).is_ready() &&
+        handle_count == 1 && transport.register_files(&source_handle, 1) == llm_expert_async_result::ready,
+        "join source registration failed");
+
+    llm_cold_reference predecessor_reference;
+    llm_cold_demand_lookup predecessor_lookup = llm_cold_demand_lookup::missing;
+    require(cache.reserve_or_join_demand(
+        { 0, 0 }, predecessor_reference, predecessor_lookup).is_ready() &&
+        predecessor_lookup == llm_cold_demand_lookup::reserved,
+        "join predecessor reservation failed");
+    llm_expert_request_metadata predecessor_metadata;
+    predecessor_metadata.layout_class_id = predecessor_reference.layout_class_id;
+    const auto predecessor = scheduler.enqueue(
+        { 0, 0 }, llm_expert_priority::demand_current_layer,
+        llm_expert_readiness::host_ready, predecessor_metadata);
+    require(predecessor.accepted(), "join predecessor scheduler admission failed");
+
+    std::array<llm_expert_storage_destination, 3> destinations;
+    const auto & target = cache.bundle();
+    const std::array<std::pair<llm_expert_storage_projection, ggml_tensor *>, 3> projections = {{
+        { llm_expert_storage_projection::up, target.up.weight },
+        { llm_expert_storage_projection::gate, target.gate.weight },
+        { llm_expert_storage_projection::down, target.down.weight },
+    }};
+    for (size_t index = 0; index < projections.size(); ++index) {
+        auto * tensor = projections[index].second;
+        destinations[index] = {
+            projections[index].first,
+            llm_expert_storage_sidecar::weight,
+            static_cast<uint8_t *>(tensor->data) +
+                size_t(predecessor_reference.slot)*tensor->nb[2],
+            tensor->nb[1]*uint64_t(tensor->ne[1]),
+            0,
+        };
+    }
+    std::array<llm_expert_storage_read_operation, 3> operations;
+    size_t operation_count = 0;
+    require(storage.make_read_plan(
+        { 0, 0 }, destinations.data(), destinations.size(), operations.data(),
+        operations.size(), operation_count).is_ready() && operation_count != 0,
+        "join predecessor read plan failed");
+
+    std::promise<void> predecessor_submitted;
+    auto predecessor_submitted_future = predecessor_submitted.get_future();
+    auto predecessor_worker = std::async(std::launch::async, [&]() {
+        if (predecessor_queued) usleep(20000);
+        llm_expert_request_snapshot selected;
+        if (!scheduler.take(predecessor.handle, selected).accepted()) {
+            predecessor_submitted.set_value();
+            return false;
+        }
+        if (predecessor_draining) {
+            if (scheduler.transition(predecessor.handle, llm_expert_request_state::submitting,
+                    llm_expert_request_state::draining) !=
+                    llm_expert_schedule_disposition::admitted) {
+                predecessor_submitted.set_value();
+                return false;
+            }
+            if (!cache.fail_reservation({ 0, 0 }, predecessor_reference).is_ready() ||
+                !cache.cleanup_failed_slots().is_ready()) {
+                predecessor_submitted.set_value();
+                return false;
+            }
+            predecessor_submitted.set_value();
+            usleep(30000);
+            return scheduler.finish(predecessor.handle, llm_expert_request_state::failed) ==
+                    llm_expert_schedule_disposition::admitted &&
+                scheduler.release_terminal(predecessor.handle) ==
+                    llm_expert_schedule_disposition::admitted;
+        }
+        const llm_expert_async_operation_identity identity = {
+            transport.diagnostics().transport_epoch,
+            predecessor.handle,
+            0,
+            { 0, 0 },
+            llm_expert_readiness::host_ready,
+            llm_expert_priority::demand_current_layer,
+            predecessor_reference.layout_class_id,
+        };
+        if (transport.submit_read_plan(identity, operations.data(), operation_count) !=
+                llm_expert_async_result::ready ||
+            scheduler.transition(predecessor.handle, llm_expert_request_state::submitting,
+                llm_expert_request_state::io_in_flight) !=
+                llm_expert_schedule_disposition::admitted) {
+            predecessor_submitted.set_value();
+            return false;
+        }
+        predecessor_submitted.set_value();
+        llm_expert_async_read_completion completion;
+        const auto waited = transport.wait_read(predecessor.handle, completion);
+        const auto released = transport.release_read(predecessor.handle);
+        storage.record_async_read(
+            operation_count, completion.bytes_completed,
+            waited == llm_expert_async_result::ready ? llm_expert_storage_error::none :
+                llm_expert_storage_error::io_error,
+            completion.native_error);
+        if (waited != llm_expert_async_result::ready ||
+            released != llm_expert_async_result::ready ||
+            !cache.publish_ready({ 0, 0 }, predecessor_reference).is_ready() ||
+            scheduler.transition(predecessor.handle, llm_expert_request_state::io_in_flight,
+                llm_expert_request_state::host_ready) !=
+                llm_expert_schedule_disposition::admitted ||
+            scheduler.finish(predecessor.handle, llm_expert_request_state::complete) !=
+                llm_expert_schedule_disposition::admitted ||
+            scheduler.release_terminal(predecessor.handle) !=
+                llm_expert_schedule_disposition::admitted) {
+            return false;
+        }
+        return true;
+    });
+    if (!predecessor_queued) predecessor_submitted_future.wait();
+
+    llm_host_resident_demand_config demand_config;
+    demand_config.cache = &cache;
+    demand_config.storage = &storage;
+    demand_config.scheduler = &scheduler;
+    demand_config.transport = &transport;
+    demand_config.layout_registry = &registry;
+    demand_config.maximum_occurrences = 4;
+    demand_config.maximum_unique_keys = 4;
+    demand_config.trace_capacity = 8;
+    demand_config.serial_control = false;
+    demand_config.base_hold_kind = llm_cold_reference_kind::batch;
+    llm_host_resident_demand_coordinator coordinator(demand_config);
+    const int32_t logical_ids[] = { 0, 1, 2 };
+    llm_host_resident_demand_batch batch;
+    require(coordinator.plan(0, logical_ids, 3, batch).is_ready(), "join batch plan failed");
+    std::iota(batch.semantic_order.begin(), batch.semantic_order.end(), 0U);
+    require(coordinator.freeze_semantic_order(batch).is_ready(), "join semantic freeze failed");
+    const auto joined_resolve = coordinator.resolve_batch(batch);
+    require(joined_resolve.is_ready(), "joined batch resolve failed");
+    require(predecessor_worker.get(), "join predecessor worker failed");
+
+    std::array<llm_cold_reference, 3> execution_refs;
+    for (size_t order = 0; order < batch.unique_count; ++order) {
+        auto & entry = batch.entries[batch.semantic_order[order]];
+        require(coordinator.complete_host_scheduler(entry).is_ready(),
+            "join scheduler completion failed");
+        require(coordinator.transfer_request_hold_to_cpu_execution(entry).is_ready(),
+            "join CPU execution transfer failed");
+        execution_refs[order] = entry.reference;
+    }
+    require(coordinator.finish_serial_batch(batch).is_ready(), "join batch finish failed");
+    require(cache.release_many(execution_refs.data(), batch.unique_count,
+        llm_cold_reference_kind::cpu_execution).is_ready(), "join execution release failed");
+    require(cache.policy_request_end(true, false).is_ready(), "join policy end failed");
+    const auto event = coordinator.diagnostics().events.back();
+    const uint32_t expected_new_reservations = predecessor_draining ? 3 : 2;
+    const uint32_t expected_scheduler_joins = predecessor_draining ? 0 : 1;
+    const uint32_t expected_scheduler_admissions = predecessor_draining ? 3 : 2;
+    const uint32_t expected_read_plans = predecessor_draining ? 3 : 2;
+    const uint32_t expected_joined_loads = predecessor_draining ? 0 : 1;
+    require(event.joined_loads == expected_joined_loads &&
+        event.new_reservations == expected_new_reservations &&
+        event.scheduler_joins == expected_scheduler_joins &&
+        event.scheduler_deferred_successors == uint32_t(predecessor_draining) &&
+        event.scheduler_admissions == expected_scheduler_admissions &&
+        event.read_plans == expected_read_plans && event.peak_active_read_requests >= 2 &&
+        event.first_wait_after_all_enqueue_attempts &&
+        event.first_wait_after_all_admissible_submissions &&
+        cache.validate_invariants().is_ready() && scheduler.diagnostics().active_requests == 0 &&
+        transport.diagnostics().active_read_requests == 0,
+        "queued/in-flight join changed issue-ahead or terminal state");
+}
+
+void test_batched_queued_and_inflight_joins() {
+    run_batched_join_case(true);
+    run_batched_join_case(false);
+    run_batched_join_case(false, true);
+}
+
+void test_cpu_provider_adapter(bool serial_control) {
     temporary_source source;
     llama_file file(source.path, "rb");
     llm_expert_storage storage({ 1, 4, 4, 1024 }, { { 0, &file, 512, source.path, false } });
@@ -735,6 +1458,12 @@ void test_cpu_provider_serial_adapter() {
     config.storage = &storage;
     config.scheduler = &scheduler;
     config.async_transport = &transport;
+    config.phase10_serial_issue_for_testing = serial_control;
+    config.prefetch_config.supplied = true;
+    config.prefetch_config.value.version = LLAMA_EXPERT_PREFETCH_VERSION_1;
+    config.prefetch_config.value.struct_size = sizeof(llama_expert_prefetch_config_v1);
+    config.prefetch_config.value.policy = LLAMA_EXPERT_PREFETCH_POLICY_OFF;
+    config.prefetch_config.value.seed_mode = LLAMA_EXPERT_PREFETCH_SEED_MODE_OFF;
     config.trace_capacity = 64;
     auto provider = llm_create_cold_cache_expert_weight_provider(config);
 
@@ -811,7 +1540,11 @@ void test_cpu_provider_serial_adapter() {
 int main() {
     test_serial_host_ready_equivalence();
     test_uma_stable_first_semantic_equivalence();
-    test_cpu_provider_serial_adapter();
-    std::puts("EXPERT_RESIDENT_DEMAND_SERIAL_OK");
+    test_batched_issue_ahead_and_determinism();
+    test_batched_failure_cleanup();
+    test_batched_queued_and_inflight_joins();
+    test_cpu_provider_adapter(true);
+    test_cpu_provider_adapter(false);
+    std::puts("EXPERT_RESIDENT_DEMAND_OK");
     return 0;
 }
