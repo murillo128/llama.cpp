@@ -692,6 +692,16 @@ struct llm_expert_async_transport::impl {
                 uint32_t(batch_slots.size());
             {
                 std::lock_guard<std::mutex> guard(mutex);
+                // A cancellation or operation failure observed after a prior CQ
+                // batch must prevent every still-unsubmitted operation for that
+                // request from entering the next SQ batch.
+                for (size_t handle_index = 0; handle_index < handle_count; ++handle_index) {
+                    auto * request = find_read(group_handles[handle_index]);
+                    if (request == nullptr || request->state != read_state::running ||
+                        (!request->cancel_requested &&
+                         request->completion.result == llm_expert_async_result::ready)) continue;
+                    finalize_group_request_locked(*request, true);
+                }
                 for (; next_operation < operations.size() && batch < batch_capacity; ++next_operation) {
                     auto & operation = operations[next_operation];
                     if (!operation.active || !operation.read_operation) continue;
@@ -813,12 +823,32 @@ struct llm_expert_async_transport::impl {
                     }
                 }
                 if (cancels_prepared != 0) {
-                    const int count = ring.submit(native_error);
-                    if (count > 0) {
-                        cancels_left += uint32_t(count);
-                        std::lock_guard<std::mutex> guard(mutex);
-                        counters.ring_cancel_submissions += uint32_t(count);
+                    uint32_t cancel_submitted = 0;
+                    while (cancel_submitted < cancels_prepared) {
+                        const int count = ring.submit(native_error);
+                        if (count <= 0) {
+                            ring.close_ring();
+                            std::lock_guard<std::mutex> guard(mutex);
+                            counters.io_uring_enabled = false;
+                            counters.io_uring_runtime_error = count == 0 ? EAGAIN : native_error;
+                            record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                                counters.io_uring_runtime_error, "ring-runtime");
+                            for (size_t handle_index = 0; handle_index < handle_count; ++handle_index) {
+                                auto * request = find_read(group_handles[handle_index]);
+                                if (request == nullptr) continue;
+                                if (!request->cancel_requested) {
+                                    request->completion.result = llm_expert_async_result::invalid;
+                                    request->completion.native_error = counters.io_uring_runtime_error;
+                                }
+                                finalize_group_request_locked(*request, true);
+                            }
+                            return false;
+                        }
+                        cancel_submitted += uint32_t(count);
                     }
+                    cancels_left += cancel_submitted;
+                    std::lock_guard<std::mutex> guard(mutex);
+                    counters.ring_cancel_submissions += cancel_submitted;
                 }
                 io_uring_cqe cqe{};
                 {
@@ -1610,7 +1640,8 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
             config.direct_staging_lane_count,
             config.requested_staging_bytes/config.maximum_aligned_read_bytes));
         if (config.direct_staging_lane_count <= 1) {
-            staging_lane_bytes = 0;
+            config.direct_staging_lane_count = 1;
+            staging_lane_bytes = config.requested_staging_bytes;
         } else {
             staging_lane_bytes = config.requested_staging_bytes/config.direct_staging_lane_count;
             if (config.maximum_direct_alignment != 0) {
