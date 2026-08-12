@@ -105,9 +105,11 @@ void test_shared_system_memory_budget() {
 
     injected_sample.memory_available_bytes = 29*GIB;
     injected_sample.cgroup_memory_current_bytes = 91*GIB;
+    require(budget.revalidate().error == llm_expert_system_memory_error::unsafe_capacity,
+        "pressure refresh accepted reserves without hysteresis");
     require(budget.preflight(GIB).error == llm_expert_system_memory_error::unsafe_capacity,
         "pressure guard accepted reserves without hysteresis");
-    require(budget.diagnostics().pressure_rejections == 1,
+    require(budget.diagnostics().pressure_rejections == 2,
         "pressure rejection was not recorded");
 
     injected_sample.cgroup_memory_current_bytes = 24*GIB;

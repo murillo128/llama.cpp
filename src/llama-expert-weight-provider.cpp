@@ -2480,6 +2480,13 @@ public:
             plan.set_result(result);
             return fail(result);
         }
+        if (config.cold_mode) {
+            const auto memory_result = system_memory_result(system_memory_budget.revalidate());
+            if (!memory_result.is_ready()) {
+                plan.set_result(memory_result);
+                return fail(memory_result);
+            }
+        }
 
         size_t max_elements = 0;
         for (const auto & binding : bindings) {

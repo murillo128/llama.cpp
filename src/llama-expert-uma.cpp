@@ -475,16 +475,14 @@ struct llm_expert_system_memory_budget::impl {
         return llm_expert_system_memory_result::failure(llm_expert_system_memory_error::unsafe_capacity);
     }
 
-    llm_expert_system_memory_result check_pressure(uint64_t incoming_bytes) noexcept {
-        state.pressure_samples++;
+    llm_expert_system_memory_result check_sampled_pressure(uint64_t incoming_bytes) noexcept {
         if (state.pressure_circuit_open) return reject("pressure circuit already open", true);
-        const auto sampled = sample_current(false);
-        if (!sampled.is_ready()) return reject(
-            state.current_sample.unavailable_reason.empty() ?
-                "required memory capacity telemetry unavailable" :
-                state.current_sample.unavailable_reason.c_str(), false);
         const auto & current = state.current_sample;
         const auto & baseline = state.baseline_sample;
+        if (current.physical_ram_bytes == 0 || current.cgroup_memory_max_bytes == 0 ||
+            current.memory_available_bytes == 0) {
+            return reject("required memory capacity telemetry unavailable", false);
+        }
         if ((current.process_swap_bytes > baseline.process_swap_bytes) ||
             (current.swap_counters_supported && baseline.swap_counters_supported &&
              (current.cgroup_swap_current_bytes > baseline.cgroup_swap_current_bytes ||
@@ -514,6 +512,17 @@ struct llm_expert_system_memory_budget::impl {
         }
         state.pressure_rejection_reason.clear();
         return llm_expert_system_memory_result::success();
+    }
+
+    llm_expert_system_memory_result refresh_pressure(uint64_t incoming_bytes) noexcept {
+        if (state.pressure_circuit_open) return reject("pressure circuit already open", true);
+        const auto sampled = sample_current(false);
+        if (!sampled.is_ready()) return reject(
+            state.current_sample.unavailable_reason.empty() ?
+                "required memory capacity telemetry unavailable" :
+                state.current_sample.unavailable_reason.c_str(), false);
+        state.pressure_samples++;
+        return check_sampled_pressure(incoming_bytes);
     }
 };
 
@@ -545,6 +554,14 @@ llm_expert_system_memory_result llm_expert_system_memory_budget::resolve(
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     selected_pool_bytes = 0;
     if (pimpl->state.frozen || slot_stride == 0 || topology_bytes == 0 || minimum_slots == 0) {
+        return llm_expert_system_memory_result::failure(
+            llm_expert_system_memory_error::invalid_configuration);
+    }
+    if (minimum_slots > UINT64_MAX/slot_stride) {
+        return llm_expert_system_memory_result::failure(
+            llm_expert_system_memory_error::overflow);
+    }
+    if (requested_pool_bytes != 0 && requested_pool_bytes < minimum_slots*slot_stride) {
         return llm_expert_system_memory_result::failure(
             llm_expert_system_memory_error::invalid_configuration);
     }
@@ -600,7 +617,9 @@ llm_expert_system_memory_result llm_expert_system_memory_budget::resolve(
     selected_pool_bytes = selected_pool_bytes/slot_stride*slot_stride;
     if (selected_pool_bytes/slot_stride < minimum_slots) {
         selected_pool_bytes = 0;
-        return llm_expert_system_memory_result::failure(llm_expert_system_memory_error::unsafe_capacity);
+        return llm_expert_system_memory_result::failure(
+            pimpl->state.headroom.autofit ? llm_expert_system_memory_error::unsafe_capacity :
+                llm_expert_system_memory_error::invalid_configuration);
     }
     pimpl->state.requested_pool_bytes = requested_pool_bytes;
     pimpl->state.selected_pool_bytes = selected_pool_bytes;
@@ -625,13 +644,13 @@ llm_expert_system_memory_result llm_expert_system_memory_budget::record_runtime_
         return llm_expert_system_memory_result::failure(llm_expert_system_memory_error::unsafe_capacity);
     }
     pimpl->state.measured_runtime_obligation_bytes = bytes;
-    return pimpl->check_pressure(0);
+    return pimpl->refresh_pressure(0);
 }
 
 llm_expert_system_memory_result llm_expert_system_memory_budget::revalidate() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (!pimpl->state.frozen) return llm_expert_system_memory_result::success();
-    return pimpl->check_pressure(0);
+    return pimpl->refresh_pressure(0);
 }
 
 llm_expert_system_memory_result llm_expert_system_memory_budget::preflight(
@@ -641,7 +660,7 @@ llm_expert_system_memory_result llm_expert_system_memory_budget::preflight(
         return llm_expert_system_memory_result::failure(
             llm_expert_system_memory_error::invalid_configuration);
     }
-    return pimpl->check_pressure(incoming_bytes);
+    return pimpl->check_sampled_pressure(incoming_bytes);
 }
 
 llm_expert_system_memory_diagnostics

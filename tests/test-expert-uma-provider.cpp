@@ -532,8 +532,7 @@ void test_autofit_policy_pressure_trim_and_surrender() {
     int32_t logical_id = 0, execution = -1;
     {
         llm_expert_execution_plan plan;
-        require(provider->prepare({ binding }, plan).is_ready(), "pressure prepare failed");
-        const auto rejected = provider->remap_checkpoint(binding, &logical_id, 1, &execution);
+        const auto rejected = provider->prepare({ binding }, plan);
         require(rejected.status == llm_expert_provider_status::allocation_failed && storage.diagnostics().read_bytes == 0,
             "headroom pressure was not rejected before storage I/O");
     }
@@ -555,8 +554,7 @@ void test_autofit_policy_pressure_trim_and_surrender() {
     logical_id = 1;
     {
         llm_expert_execution_plan plan;
-        require(provider->prepare({ binding }, plan).is_ready(), "swap prepare failed");
-        const auto rejected = provider->remap_checkpoint(binding, &logical_id, 1, &execution);
+        const auto rejected = provider->prepare({ binding }, plan);
         require(rejected.status == llm_expert_provider_status::allocation_failed,
             "post-activation PSI/compression activity did not open the pressure circuit");
     }
@@ -571,8 +569,7 @@ void test_autofit_policy_pressure_trim_and_surrender() {
     controlled_memory.zswap_write_pages = 0;
     {
         llm_expert_execution_plan plan;
-        require(provider->prepare({ binding }, plan).is_ready(), "open-circuit prepare failed");
-        require(provider->remap_checkpoint(binding, &logical_id, 1, &execution).status ==
+        require(provider->prepare({ binding }, plan).status ==
             llm_expert_provider_status::allocation_failed, "pressure circuit did not remain open");
     }
     diagnostics = provider->hot_cache_diagnostics();

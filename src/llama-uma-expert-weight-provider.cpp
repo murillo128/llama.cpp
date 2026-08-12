@@ -216,6 +216,8 @@ public:
                 return set_plan_failure(plan, llm_expert_provider_error::invalid_binding);
             }
         }
+        const auto memory_result = system_memory_result(system_memory_budget.revalidate());
+        if (!memory_result.is_ready()) return set_plan_failure(plan, memory_result.error);
         auto started = cache->policy_request_begin();
         if (!started.is_ready()) return set_plan_failure(plan, started.error);
         auto hot_started = policy_result(hot_policy.request_begin());
