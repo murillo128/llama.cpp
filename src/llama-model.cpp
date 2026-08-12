@@ -1767,6 +1767,12 @@ bool checked_storage_add(uint64_t lhs, uint64_t rhs, uint64_t & result) {
     return true;
 }
 
+bool checked_storage_multiply(uint64_t lhs, uint64_t rhs, uint64_t & result) {
+    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max()/lhs) return false;
+    result = lhs*rhs;
+    return true;
+}
+
 llm_expert_integrity_mode expert_integrity_mode_from_environment() {
     const char * requested = std::getenv("LLAMA_EXPERT_INTEGRITY_MODE");
     if (requested == nullptr || requested[0] == '\0' || std::strcmp(requested, "NONE") == 0) {
@@ -1942,8 +1948,24 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         }
     }
     auto scheduler = std::make_unique<llm_expert_scheduler>(scheduler_config);
-    const uint64_t transport_accounting_bytes = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE &&
-        params.expert_cold_cache_bytes == 0 ? storage_diagnostics.maximum_bundle_bytes : params.expert_cold_cache_bytes;
+    const uint32_t direct_staging_lanes =
+        !params.expert_io_force_positional_reads && params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO &&
+                (cpu_cold_only || params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) ?
+            uint32_t(hparams.n_expert_used) : 1;
+    uint64_t transport_accounting_bytes = params.expert_cold_cache_bytes;
+    if (transport_accounting_bytes == 0) {
+        // The cache budget is deliberately unresolved until the first context.
+        // Give the already-bounded transport enough accounting room for its
+        // maximum legal current-layer staging burst without guessing a cache size.
+        uint64_t staging_burst_bytes = 0;
+        if (!checked_storage_multiply(maximum_aligned_read_bytes, direct_staging_lanes,
+                staging_burst_bytes) ||
+            !checked_storage_multiply(staging_burst_bytes, 4, transport_accounting_bytes)) {
+            throw std::overflow_error("expert AUTO transport accounting overflow");
+        }
+        transport_accounting_bytes = std::max(
+            transport_accounting_bytes, storage_diagnostics.maximum_bundle_bytes);
+    }
     auto transport = std::make_unique<llm_expert_async_transport>(llm_expert_async_config{
         params.expert_io_queue_depth,
         cpu_cold_only ? uint32_t(hparams.n_expert_used) : hot_capacity,
@@ -1971,9 +1993,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         params.expert_io_force_positional_reads,
         pimpl->expert_integrity_mode,
         io_worker_count,
-        !params.expert_io_force_positional_reads && params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO &&
-                (cpu_cold_only || params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) ?
-            uint32_t(hparams.n_expert_used) : 1,
+        direct_staging_lanes,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;
