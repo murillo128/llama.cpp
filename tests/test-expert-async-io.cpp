@@ -159,6 +159,11 @@ void test_configuration() {
         invalid.integrity_mode = static_cast<llm_expert_integrity_mode>(UINT8_MAX);
         llm_expert_async_transport transport(invalid);
     });
+    expect_invalid([] {
+        auto invalid = config(8);
+        invalid.inject_second_read_cqe_for_testing = true;
+        llm_expert_async_transport transport(invalid);
+    });
 
     llm_expert_async_transport transport(config());
     const auto diagnostics = transport.diagnostics();
@@ -664,7 +669,12 @@ void test_group_failure_stops_unsubmitted_operations() {
     GGML_ASSERT(std::fwrite(source.data(), source.size(), 1, file) == 1);
     GGML_ASSERT(std::fflush(file) == 0);
 
-    llm_expert_async_transport transport(config(8));
+    auto cfg = config(8);
+    cfg.inject_first_read_cqe_for_testing = true;
+    cfg.first_read_cqe_result_for_testing = -EIO;
+    cfg.inject_second_read_cqe_for_testing = true;
+    cfg.second_read_cqe_result_for_testing = -EAGAIN;
+    llm_expert_async_transport transport(cfg);
     if (!transport.diagnostics().io_uring_enabled) {
         GGML_ASSERT(std::fclose(file) == 0);
         return;
@@ -690,9 +700,11 @@ void test_group_failure_stops_unsubmitted_operations() {
     llm_expert_async_read_completion completion;
     GGML_ASSERT(transport.wait_read(identity.request, completion) ==
         llm_expert_async_result::invalid);
+    GGML_ASSERT(completion.native_error == EIO);
     GGML_ASSERT(transport.release_read(identity.request) == llm_expert_async_result::ready);
     const auto diagnostics = transport.diagnostics();
     GGML_ASSERT(diagnostics.ring_submissions == 8 && diagnostics.ring_completions == 8);
+    GGML_ASSERT(diagnostics.would_block_reads_retried == 0);
     GGML_ASSERT(diagnostics.active_read_requests == 0 && diagnostics.active_operations == 0);
     GGML_ASSERT(std::fclose(file) == 0);
 #endif
@@ -712,6 +724,8 @@ void test_group_cancellation_stops_later_sub_batch() {
 
     auto cfg = config(8);
     cfg.delay_cq_drain_ms_for_testing = 50;
+    cfg.inject_first_read_cqe_for_testing = true;
+    cfg.first_read_cqe_result_for_testing = -EAGAIN;
     llm_expert_async_transport transport(cfg);
     if (!transport.diagnostics().io_uring_enabled) {
         GGML_ASSERT(std::fclose(file) == 0);
@@ -744,6 +758,7 @@ void test_group_cancellation_stops_later_sub_batch() {
         [](uint8_t value) { return value == 0; }));
     const auto diagnostics = transport.diagnostics();
     GGML_ASSERT(diagnostics.ring_submissions == 8 && diagnostics.ring_completions == 8);
+    GGML_ASSERT(diagnostics.would_block_reads_retried == 0);
     GGML_ASSERT(diagnostics.read_requests_cancelled == 1 &&
         diagnostics.active_read_requests == 0 && diagnostics.active_operations == 0);
     GGML_ASSERT(std::fclose(file) == 0);
@@ -874,6 +889,8 @@ void test_native_ring_cancel_and_shutdown_drain() {
     auto cancel_cfg = config(8);
     cancel_cfg.pause_after_ring_submit_for_testing = true;
     cancel_cfg.hide_cqes_after_cancel_polls_for_testing = 8;
+    cancel_cfg.inject_first_read_cqe_for_testing = true;
+    cancel_cfg.first_read_cqe_result_for_testing = -EAGAIN;
     llm_expert_async_transport cancel_transport(cancel_cfg);
     if (cancel_transport.diagnostics().io_uring_enabled) {
         std::array<uint8_t, 8> destination{};
@@ -894,6 +911,8 @@ void test_native_ring_cancel_and_shutdown_drain() {
         GGML_ASSERT(diagnostics.ring_cancel_submissions == 1);
         GGML_ASSERT(diagnostics.ring_cancel_completions == 1);
         GGML_ASSERT(diagnostics.ring_completions == 1);
+        GGML_ASSERT(diagnostics.ring_submissions == 1 &&
+            diagnostics.would_block_reads_retried == 0);
         GGML_ASSERT(diagnostics.cq_empty_waits_after_cancel >= 8);
         GGML_ASSERT(cancel_elapsed >= std::chrono::milliseconds(4));
         GGML_ASSERT(diagnostics.active_operations == 0);

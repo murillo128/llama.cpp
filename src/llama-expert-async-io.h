@@ -45,6 +45,10 @@ struct llm_expert_async_config {
     llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
     uint32_t worker_count = 1;
     uint32_t direct_staging_lane_count = 1;
+    // Keep new test-only fields at the tail: production sites use aggregate
+    // initialization for the stable configuration prefix.
+    bool inject_second_read_cqe_for_testing = false;
+    int32_t second_read_cqe_result_for_testing = 0;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {

@@ -360,13 +360,26 @@ struct llm_expert_async_transport::impl {
     uint64_t staging_alignment = 0;
     bool staging_registered = false;
     bool ring_submit_paused_for_testing = false;
-    bool read_cqe_injected_for_testing = false;
+    uint32_t read_cqes_injected_for_testing = 0;
     uint32_t hidden_cqe_polls_for_testing = 0;
 #if defined(__linux__)
     io_uring_owner ring;
 #endif
 
     ~impl() { std::free(staging); }
+
+#if defined(__linux__)
+    void inject_read_cqe_for_testing(io_uring_cqe & cqe) {
+        if (read_cqes_injected_for_testing == 0 && config.inject_first_read_cqe_for_testing) {
+            cqe.res = config.first_read_cqe_result_for_testing;
+            read_cqes_injected_for_testing++;
+        } else if (read_cqes_injected_for_testing == 1 &&
+                config.inject_second_read_cqe_for_testing) {
+            cqe.res = config.second_read_cqe_result_for_testing;
+            read_cqes_injected_for_testing++;
+        }
+    }
+#endif
 
     void record_fallback(llm_expert_async_fallback_reason reason, int native_error, const char * detail) {
         const uint64_t bit = static_cast<uint64_t>(reason);
@@ -893,15 +906,29 @@ struct llm_expert_async_transport::impl {
                     }
                     continue;
                 }
+                inject_read_cqe_for_testing(cqe);
                 if (cqe.res == -EINTR || cqe.res == -EAGAIN) {
-                    io_uring_sqe * retry = ring.acquire_sqe();
-                    int retry_error = 0;
-                    if (retry != nullptr && fill_read_sqe(operation_slot, *retry) && ring.submit(retry_error) == 1) {
-                        counters.ring_submissions++;
-                        counters.ring_completions++;
-                        if (cqe.res == -EINTR) counters.interrupted_reads_retried++;
-                        else counters.would_block_reads_retried++;
-                        continue;
+                    if (!request->cancel_requested &&
+                            request->completion.result == llm_expert_async_result::ready) {
+                        int retry_error = 0;
+                        io_uring_sqe prepared{};
+                        io_uring_sqe * retry = nullptr;
+                        if (fill_read_sqe(operation_slot, prepared)) {
+                            retry = ring.acquire_sqe();
+                            if (retry != nullptr) *retry = prepared;
+                        }
+                        if (retry != nullptr && ring.submit(retry_error) == 1) {
+                            counters.ring_submissions++;
+                            counters.ring_completions++;
+                            if (cqe.res == -EINTR) counters.interrupted_reads_retried++;
+                            else counters.would_block_reads_retried++;
+                            continue;
+                        }
+                        if (retry != nullptr && !ring.discard_unsubmitted(1)) {
+                            retry_error = EINVAL;
+                        }
+                        request->completion.result = llm_expert_async_result::invalid;
+                        request->completion.native_error = retry_error == 0 ? EAGAIN : retry_error;
                     }
                 }
                 operation.ring_completed = true;
@@ -914,7 +941,9 @@ struct llm_expert_async_transport::impl {
                 reads_left--;
                 request->operations_remaining--;
                 if (cqe.res < 0) {
-                    if (cqe.res != -ECANCELED || !request->cancel_requested) {
+                    if (!request->cancel_requested &&
+                            request->completion.result == llm_expert_async_result::ready &&
+                            cqe.res != -ECANCELED) {
                         request->completion.result = llm_expert_async_result::invalid;
                         request->completion.native_error = -cqe.res;
                     }
@@ -1148,6 +1177,9 @@ struct llm_expert_async_transport::impl {
                 const bool cancel_completion = (operation_slot & 0x80000000U) != 0;
                 operation_slot &= 0x7fffffffU;
                 std::lock_guard<std::mutex> guard(mutex);
+                // Re-sample cancellation at the CQE linearization point. The
+                // earlier local snapshot can predate a concurrent cancel_read().
+                cancel_requested = read_requests[handle.slot].cancel_requested;
                 if (!decoded || operation_slot >= operations.size()) {
                     counters.stale_completions++;
                     if (first_error == llm_expert_async_result::ready) first_error = llm_expert_async_result::stale_generation;
@@ -1174,23 +1206,27 @@ struct llm_expert_async_transport::impl {
                     }
                     continue;
                 }
-                if (config.inject_first_read_cqe_for_testing && !read_cqe_injected_for_testing) {
-                    cqe.res = config.first_read_cqe_result_for_testing;
-                    read_cqe_injected_for_testing = true;
-                }
+                inject_read_cqe_for_testing(cqe);
                 if (cqe.res == -EINTR || cqe.res == -EAGAIN) {
-                    io_uring_sqe * retry = ring.acquire_sqe();
-                    int retry_error = 0;
-                    const bool retry_ready = retry != nullptr && fill_read_sqe(operation_slot, *retry) &&
-                        ring.submit(retry_error) == 1;
-                    counters.ring_completions++;
-                    if (cqe.res == -EINTR) counters.interrupted_reads_retried++;
-                    else counters.would_block_reads_retried++;
-                    if (retry_ready) {
-                        counters.ring_submissions++;
-                        continue;
-                    }
-                    if (first_error == llm_expert_async_result::ready) {
+                    if (!cancel_requested && first_error == llm_expert_async_result::ready) {
+                        int retry_error = 0;
+                        io_uring_sqe prepared{};
+                        io_uring_sqe * retry = nullptr;
+                        if (fill_read_sqe(operation_slot, prepared)) {
+                            retry = ring.acquire_sqe();
+                            if (retry != nullptr) *retry = prepared;
+                        }
+                        const bool retry_ready = retry != nullptr && ring.submit(retry_error) == 1;
+                        if (retry_ready) {
+                            counters.ring_completions++;
+                            counters.ring_submissions++;
+                            if (cqe.res == -EINTR) counters.interrupted_reads_retried++;
+                            else counters.would_block_reads_retried++;
+                            continue;
+                        }
+                        if (retry != nullptr && !ring.discard_unsubmitted(1)) {
+                            retry_error = EINVAL;
+                        }
                         first_error = llm_expert_async_result::invalid;
                         first_native_error = retry_error == 0 ? EAGAIN : retry_error;
                     }
@@ -1292,7 +1328,7 @@ struct llm_expert_async_transport::impl {
             if (counters.io_uring_enabled && config.read_override_for_testing == nullptr &&
                 (!config.direct_io_requested || config.direct_staging_lane_count > 1) &&
                 config.submit_error_for_testing == 0 &&
-                !config.pause_after_ring_submit_for_testing && !config.inject_first_read_cqe_for_testing &&
+                !config.pause_after_ring_submit_for_testing &&
                 config.hide_cqes_after_cancel_polls_for_testing == 0) {
                 size_t handle_count = 0;
                 for (auto & queued : read_requests) {
@@ -1592,6 +1628,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
         (config.direct_staging_lane_count > 1 &&
          (!config.direct_io_requested || config.force_positional_reads || config.worker_count != 1 ||
           config.maximum_aligned_read_bytes == 0)) ||
+        (config.inject_second_read_cqe_for_testing && !config.inject_first_read_cqe_for_testing) ||
         config.cold_cache_bytes == 0 || !integrity_mode_valid ||
         (config.requested_queue_depth != 0 &&
          (config.requested_queue_depth < 8 || config.requested_queue_depth > 4096))) {
