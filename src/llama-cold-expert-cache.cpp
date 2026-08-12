@@ -1195,7 +1195,6 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand_batch(
             return llm_expert_provider_result::failure(
                 llm_expert_provider_error::unsupported_configuration);
         }
-        pimpl->demand_batch_protected[uint32_t(forward.slot)] = true;
     }
     for (size_t index = 0; index < key_count; ++index) {
         const auto result = reserve_or_join_demand_locked(
@@ -1203,6 +1202,12 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand_batch(
         if (!result.is_ready()) {
             clear_protection();
             return result;
+        }
+        // Match the serial semantic sequence: an earlier miss may evict a later
+        // key that was ready at preflight. Protect a hit only after its own
+        // lookup has been applied, so it is unavailable to subsequent victims.
+        if (lookups[index] == llm_cold_demand_lookup::ready) {
+            pimpl->demand_batch_protected[references[index].slot] = true;
         }
     }
     for (size_t index = 0; index < key_count; ++index) {

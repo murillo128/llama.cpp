@@ -1001,6 +1001,113 @@ void require_same_batch_semantics(
     }
 }
 
+struct victim_sequence_result {
+    std::array<llm_cold_demand_lookup, 2> lookups{};
+    llm_cold_cache_diagnostics cache;
+};
+
+victim_sequence_result run_victim_sequence(bool batched) {
+    constexpr uint32_t expert_count = 16;
+    ggml_init_params context_params = { ggml_tensor_overhead()*32, nullptr, true };
+    ggml_context_ptr context(ggml_init(context_params));
+    require(bool(context), "victim sequence context failed");
+    const auto prototype = make_bundle(context.get(), expert_count);
+    uint64_t slot_footprint = 0;
+    require(llm_cold_expert_cache::calculate_slot_footprint(
+        prototype, ggml_backend_cpu_buffer_type(), slot_footprint).is_ready(),
+        "victim sequence slot footprint failed");
+
+    llm_cold_cache_config cache_config;
+    cache_config.byte_budget = slot_footprint*2;
+    cache_config.minimum_slots = 2;
+    cache_config.routed_layer_count = 1;
+    cache_config.total_expert_keys = expert_count;
+    cache_config.routed_layers = { 0 };
+    cache_config.buffer_type = ggml_backend_cpu_buffer_type();
+    llm_cold_expert_cache cache(cache_config);
+    require(cache.initialize(prototype).is_ready() && cache.diagnostics().effective_slots == 2,
+        "victim sequence cache initialization failed");
+
+    const auto warm = [&](int32_t expert) {
+        require(cache.policy_request_begin().is_ready(), "victim sequence warm begin failed");
+        llm_cold_reference reference;
+        llm_cold_demand_lookup lookup = llm_cold_demand_lookup::missing;
+        require(cache.reserve_or_join_demand({ 0, expert }, reference, lookup).is_ready() &&
+            lookup == llm_cold_demand_lookup::reserved,
+            "victim sequence warm reservation failed");
+        require(cache.publish_ready_and_acquire(
+            { 0, expert }, reference, llm_cold_reference_kind::batch).is_ready(),
+            "victim sequence warm publication failed");
+        require(cache.release(reference, llm_cold_reference_kind::batch).is_ready(),
+            "victim sequence warm release failed");
+        require(cache.policy_request_end(true, false).is_ready(),
+            "victim sequence warm end failed");
+    };
+    warm(2);
+    warm(0);
+
+    const std::array<llm_expert_key, 2> keys = {{ { 0, 1 }, { 0, 2 } }};
+    std::array<llm_cold_reference, 2> references{};
+    victim_sequence_result result;
+    require(cache.policy_request_begin().is_ready(), "victim sequence demand begin failed");
+    if (batched) {
+        require(cache.reserve_or_join_demand_batch(
+            keys.data(), keys.size(), references.data(), result.lookups.data()).is_ready(),
+            "victim sequence batch reservation failed");
+    } else {
+        for (size_t index = 0; index < keys.size(); ++index) {
+            require(cache.reserve_or_join_demand(
+                keys[index], references[index], result.lookups[index]).is_ready(),
+                "victim sequence serial reservation failed");
+            require(result.lookups[index] == llm_cold_demand_lookup::reserved,
+                "victim sequence serial reference unexpectedly hit");
+            require(cache.publish_ready_and_acquire(
+                keys[index], references[index], llm_cold_reference_kind::batch).is_ready(),
+                "victim sequence serial publication failed");
+        }
+    }
+    if (batched) {
+        for (size_t index = 0; index < keys.size(); ++index) {
+            require(result.lookups[index] == llm_cold_demand_lookup::reserved,
+                "batch protected a future semantic-order hit from the prior victim decision");
+            require(cache.publish_ready_and_acquire(
+                keys[index], references[index], llm_cold_reference_kind::batch).is_ready(),
+                "victim sequence batch publication failed");
+        }
+    }
+    require(cache.release_many(
+        references.data(), references.size(), llm_cold_reference_kind::batch).is_ready(),
+        "victim sequence demand release failed");
+    require(cache.policy_request_end(true, false).is_ready(), "victim sequence demand end failed");
+    result.cache = cache.diagnostics();
+    require(cache.validate_invariants().is_ready(), "victim sequence invariant failed");
+    return result;
+}
+
+void test_batch_reservation_preserves_serial_victim_sequence() {
+    const auto serial = run_victim_sequence(false);
+    const auto batched = run_victim_sequence(true);
+    require(serial.lookups == batched.lookups,
+        "batch reservation changed serial hit/miss dispositions");
+    require(serial.cache.requests == batched.cache.requests &&
+        serial.cache.hits == batched.cache.hits &&
+        serial.cache.misses == batched.cache.misses &&
+        serial.cache.admissions == batched.cache.admissions &&
+        serial.cache.evictions == batched.cache.evictions &&
+        serial.cache.generation_changes == batched.cache.generation_changes &&
+        serial.cache.current_batch_refs == 0 && batched.cache.current_batch_refs == 0,
+        "batch reservation changed serial cache counters or terminal holds");
+    require(serial.cache.slots.size() == batched.cache.slots.size(),
+        "victim sequence slot count changed");
+    for (size_t index = 0; index < serial.cache.slots.size(); ++index) {
+        const auto & lhs = serial.cache.slots[index];
+        const auto & rhs = batched.cache.slots[index];
+        require(lhs.key.layer == rhs.key.layer && lhs.key.expert == rhs.key.expert &&
+            lhs.generation == rhs.generation && lhs.state == rhs.state,
+            "batch reservation changed final victim slots or generations");
+    }
+}
+
 void test_batched_issue_ahead_and_determinism() {
     for (uint32_t width : { 1U, 2U, 4U, 8U, 16U }) {
         std::vector<int32_t> ids(width);
@@ -1540,6 +1647,7 @@ void test_cpu_provider_adapter(bool serial_control) {
 int main() {
     test_serial_host_ready_equivalence();
     test_uma_stable_first_semantic_equivalence();
+    test_batch_reservation_preserves_serial_victim_sequence();
     test_batched_issue_ahead_and_determinism();
     test_batched_failure_cleanup();
     test_batched_queued_and_inflight_joins();
