@@ -49,6 +49,7 @@ struct llm_expert_async_config {
     // initialization for the stable configuration prefix.
     bool inject_second_read_cqe_for_testing = false;
     int32_t second_read_cqe_result_for_testing = 0;
+    bool pause_before_ring_submit_for_testing = false;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {
@@ -273,6 +274,7 @@ public:
             void * abort_callback_data = nullptr) noexcept;
     llm_expert_async_result cancel_read(llm_expert_request_handle request) noexcept;
     llm_expert_async_result release_read(llm_expert_request_handle request) noexcept;
+    bool wait_until_ring_prepared_for_testing() noexcept;
     bool wait_until_ring_submitted_for_testing() noexcept;
     bool wait_until_read_submitted_for_testing(llm_expert_request_handle request) noexcept;
     bool shutdown() noexcept;

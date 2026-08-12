@@ -359,6 +359,8 @@ struct llm_expert_async_transport::impl {
     uint64_t staging_stride_bytes = 0;
     uint64_t staging_alignment = 0;
     bool staging_registered = false;
+    bool ring_submit_prepared_for_testing = false;
+    bool ring_submit_prepare_pause_consumed_for_testing = false;
     bool ring_submit_paused_for_testing = false;
     uint32_t read_cqes_injected_for_testing = 0;
     uint32_t hidden_cqe_polls_for_testing = 0;
@@ -369,6 +371,33 @@ struct llm_expert_async_transport::impl {
     ~impl() { std::free(staging); }
 
 #if defined(__linux__)
+    bool prepared_batch_healthy_locked(uint32_t batch) {
+        for (uint32_t index = 0; index < batch; ++index) {
+            const auto & operation = operations[batch_slots[index]];
+            const auto * request = find_read(operation.identity.request);
+            if (request == nullptr || request->state != read_state::running ||
+                    request->cancel_requested ||
+                    request->completion.result != llm_expert_async_result::ready) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void pause_before_ring_submit_for_testing_locked(
+            std::unique_lock<std::mutex> & lock, uint32_t batch) {
+        if (!config.pause_before_ring_submit_for_testing ||
+                ring_submit_prepare_pause_consumed_for_testing) return;
+        ring_submit_prepare_pause_consumed_for_testing = true;
+        ring_submit_prepared_for_testing = true;
+        condition.notify_all();
+        condition.wait(lock, [&] {
+            return worker_stop || !prepared_batch_healthy_locked(batch);
+        });
+        ring_submit_prepared_for_testing = false;
+        condition.notify_all();
+    }
+
     void inject_read_cqe_for_testing(io_uring_cqe & cqe) {
         if (read_cqes_injected_for_testing == 0 && config.inject_first_read_cqe_for_testing) {
             cqe.res = config.first_read_cqe_result_for_testing;
@@ -756,21 +785,50 @@ struct llm_expert_async_transport::impl {
             if (batch == 0) break;
             int native_error = 0;
             uint32_t submitted = 0;
+            // cancel_read() linearizes under this mutex. Keep it held from the
+            // final health check through io_uring_enter so cancellation either
+            // discards this unsubmitted batch or observes it as already issued.
+            std::unique_lock<std::mutex> submit_guard(mutex);
+            pause_before_ring_submit_for_testing_locked(submit_guard, batch);
+            if (!prepared_batch_healthy_locked(batch)) {
+                const size_t restart_operation = batch_slots[0];
+                const bool discarded = ring.discard_unsubmitted(batch);
+                if (!discarded) {
+                    ring.close_ring();
+                    counters.io_uring_enabled = false;
+                    counters.io_uring_runtime_error = EINVAL;
+                    record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                        EINVAL, "ring-runtime");
+                }
+                for (size_t handle_index = 0; handle_index < handle_count; ++handle_index) {
+                    auto * request = find_read(group_handles[handle_index]);
+                    if (request == nullptr || request->state != read_state::running) continue;
+                    if (!discarded) {
+                        request->completion.result = llm_expert_async_result::invalid;
+                        request->completion.native_error = EINVAL;
+                    }
+                    if (!discarded || request->cancel_requested ||
+                            request->completion.result != llm_expert_async_result::ready) {
+                        finalize_group_request_locked(*request, true);
+                    }
+                }
+                next_operation = restart_operation;
+                submit_guard.unlock();
+                if (!discarded) return false;
+                continue;
+            }
             while (submitted < batch) {
                 const int count = ring.submit(native_error);
                 if (count <= 0) {
                     ring.close_ring();
-                    {
-                        std::lock_guard<std::mutex> guard(mutex);
-                        counters.io_uring_enabled = false;
-                        counters.io_uring_runtime_error = count == 0 ? EAGAIN : native_error;
-                        record_fallback(llm_expert_async_fallback_reason::ring_runtime,
-                            counters.io_uring_runtime_error, "ring-runtime");
-                    }
+                    counters.io_uring_enabled = false;
+                    counters.io_uring_runtime_error = count == 0 ? EAGAIN : native_error;
+                    record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                        counters.io_uring_runtime_error, "ring-runtime");
                     if (!config.direct_io_requested) {
+                        submit_guard.unlock();
                         run_buffered_group_fallback(handle_count);
                     } else {
-                        std::lock_guard<std::mutex> guard(mutex);
                         for (size_t handle_index = 0; handle_index < handle_count; ++handle_index) {
                             auto * request = find_read(group_handles[handle_index]);
                             if (request == nullptr) continue;
@@ -783,32 +841,30 @@ struct llm_expert_async_transport::impl {
                 }
                 submitted += uint32_t(count);
             }
-            {
-                std::lock_guard<std::mutex> guard(mutex);
-                counters.ring_submissions += submitted;
-                counters.peak_sq_occupancy = std::max(counters.peak_sq_occupancy, submitted);
-                const uint64_t submit_us = uint64_t(ggml_time_us());
-                for (uint32_t index = 0; index < batch; ++index) {
-                    auto & operation = operations[batch_slots[index]];
-                    operation.submit_us = submit_us;
-                    operation.complete_us = 0;
-                    operation.completed_bytes = 0;
-                    auto * request = find_read(operation.identity.request);
-                    if (request != nullptr && request->completion.submit_us == 0) {
-                        request->completion.submit_us = submit_us;
-                        request->completion.request = request->handle;
-                    }
-                    [[maybe_unused]] const uint64_t operation_id = llm_perfetto_trace_operation_id(
-                        llm_perfetto_trace_domain::storage, operation.identity.request.slot,
-                        uint32_t(operation.identity.request.generation), operation.identity.request_operation_index);
-                    LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation", operation_id,
-                        "request_slot", operation.identity.request.slot, "request_generation",
-                        operation.identity.request.generation, "operation_index",
-                        operation.identity.request_operation_index, "submitted_bytes", operation.read.byte_count,
-                        "file_offset", operation.read.file_offset, "io_uring", true);
+            counters.ring_submissions += submitted;
+            counters.peak_sq_occupancy = std::max(counters.peak_sq_occupancy, submitted);
+            const uint64_t submit_us = uint64_t(ggml_time_us());
+            for (uint32_t index = 0; index < batch; ++index) {
+                auto & operation = operations[batch_slots[index]];
+                operation.submit_us = submit_us;
+                operation.complete_us = 0;
+                operation.completed_bytes = 0;
+                auto * request = find_read(operation.identity.request);
+                if (request != nullptr && request->completion.submit_us == 0) {
+                    request->completion.submit_us = submit_us;
+                    request->completion.request = request->handle;
                 }
-                condition.notify_all();
+                [[maybe_unused]] const uint64_t operation_id = llm_perfetto_trace_operation_id(
+                    llm_perfetto_trace_domain::storage, operation.identity.request.slot,
+                    uint32_t(operation.identity.request.generation), operation.identity.request_operation_index);
+                LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation", operation_id,
+                    "request_slot", operation.identity.request.slot, "request_generation",
+                    operation.identity.request.generation, "operation_index",
+                    operation.identity.request_operation_index, "submitted_bytes", operation.read.byte_count,
+                    "file_offset", operation.read.file_offset, "io_uring", true);
             }
+            condition.notify_all();
+            submit_guard.unlock();
             if (config.delay_cq_drain_ms_for_testing != 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.delay_cq_drain_ms_for_testing));
             }
@@ -1006,8 +1062,11 @@ struct llm_expert_async_transport::impl {
         }
         while (remaining > 0) {
             uint32_t batch = 0;
+            // The serial path can prepare more than one buffered SQE. Treat
+            // preparation, the final health check, and kernel entry as one
+            // cancellation-linearized operation.
+            std::unique_lock<std::mutex> submit_guard(mutex);
             for (; next < operations.size(); ++next) {
-                std::lock_guard<std::mutex> guard(mutex);
                 auto & operation = operations[next];
                 if (!operation.active || !operation.read_operation ||
                     !same_request(operation.identity.request, handle)) continue;
@@ -1027,16 +1086,27 @@ struct llm_expert_async_transport::impl {
                         return false;
                     }
                 }
-                io_uring_sqe * sqe = ring.acquire_sqe();
-                if (sqe == nullptr) break;
-                batch_slots[batch] = uint32_t(next);
-                operation.ring_completed = false;
-                operation.cancel_submitted = false;
-                if (!fill_read_sqe(uint32_t(next), *sqe)) {
+                io_uring_sqe prepared{};
+                if (!fill_read_sqe(uint32_t(next), prepared)) {
+                    const bool discarded = ring.discard_unsubmitted(batch);
+                    if (!discarded) {
+                        ring.close_ring();
+                        counters.io_uring_enabled = false;
+                        counters.io_uring_runtime_error = EINVAL;
+                        record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                            EINVAL, "ring-runtime");
+                        transport_failed = true;
+                    }
                     completion.result = llm_expert_async_result::invalid;
                     completion.native_error = EINVAL;
                     return false;
                 }
+                io_uring_sqe * sqe = ring.acquire_sqe();
+                if (sqe == nullptr) break;
+                *sqe = prepared;
+                batch_slots[batch] = uint32_t(next);
+                operation.ring_completed = false;
+                operation.cancel_submitted = false;
                 batch++;
                 if (config.direct_io_requested) {
                     ++next;
@@ -1049,6 +1119,24 @@ struct llm_expert_async_transport::impl {
             }
             int native_error = 0;
             uint32_t submitted = 0;
+            pause_before_ring_submit_for_testing_locked(submit_guard, batch);
+            if (!prepared_batch_healthy_locked(batch)) {
+                const bool discarded = ring.discard_unsubmitted(batch);
+                if (!discarded) {
+                    ring.close_ring();
+                    counters.io_uring_enabled = false;
+                    counters.io_uring_runtime_error = EINVAL;
+                    record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                        EINVAL, "ring-runtime");
+                    transport_failed = true;
+                    completion.result = llm_expert_async_result::invalid;
+                    completion.native_error = EINVAL;
+                } else {
+                    completion.result = read_requests[handle.slot].cancel_requested ?
+                        llm_expert_async_result::closed : llm_expert_async_result::invalid;
+                }
+                return false;
+            }
             while (submitted < batch) {
                 const int count = ring.submit(native_error);
                 if (count <= 0) {
@@ -1058,13 +1146,10 @@ struct llm_expert_async_transport::impl {
                     // iovec, and destination reference; the complete unpublished bundle can
                     // then be retried by the positional path without changing its I/O mode.
                     ring.close_ring();
-                    {
-                        std::lock_guard<std::mutex> guard(mutex);
-                        counters.io_uring_enabled = false;
-                        counters.io_uring_runtime_error = count == 0 ? EAGAIN : native_error;
-                        record_fallback(llm_expert_async_fallback_reason::ring_runtime,
-                            counters.io_uring_runtime_error, "ring-runtime");
-                    }
+                    counters.io_uring_enabled = false;
+                    counters.io_uring_runtime_error = count == 0 ? EAGAIN : native_error;
+                    record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                        counters.io_uring_runtime_error, "ring-runtime");
                     transport_failed = true;
                     completion.result = llm_expert_async_result::invalid;
                     completion.native_error = count == 0 ? EAGAIN : native_error;
@@ -1072,26 +1157,24 @@ struct llm_expert_async_transport::impl {
                 }
                 submitted += uint32_t(count);
             }
-            {
-                std::lock_guard<std::mutex> guard(mutex);
-                counters.ring_submissions += submitted;
-                counters.peak_sq_occupancy = std::max(counters.peak_sq_occupancy, submitted);
-                const uint64_t submit_us = uint64_t(ggml_time_us());
-                for (uint32_t index = 0; index < batch; ++index) {
-                    auto & operation = operations[batch_slots[index]];
-                    operation.submit_us = submit_us;
-                    operation.complete_us = 0;
-                    operation.completed_bytes = 0;
-                    LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation",
-                        llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::storage,
-                            operation.identity.request.slot, uint32_t(operation.identity.request.generation),
-                            operation.identity.request_operation_index),
-                        "request_slot", operation.identity.request.slot, "request_generation",
-                        operation.identity.request.generation, "operation_index",
-                        operation.identity.request_operation_index, "submitted_bytes", operation.read.byte_count,
-                        "file_offset", operation.read.file_offset, "io_uring", true);
-                }
+            counters.ring_submissions += submitted;
+            counters.peak_sq_occupancy = std::max(counters.peak_sq_occupancy, submitted);
+            const uint64_t submit_us = uint64_t(ggml_time_us());
+            for (uint32_t index = 0; index < batch; ++index) {
+                auto & operation = operations[batch_slots[index]];
+                operation.submit_us = submit_us;
+                operation.complete_us = 0;
+                operation.completed_bytes = 0;
+                LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.storage", "read_operation",
+                    llm_perfetto_trace_operation_id(llm_perfetto_trace_domain::storage,
+                        operation.identity.request.slot, uint32_t(operation.identity.request.generation),
+                        operation.identity.request_operation_index),
+                    "request_slot", operation.identity.request.slot, "request_generation",
+                    operation.identity.request.generation, "operation_index",
+                    operation.identity.request_operation_index, "submitted_bytes", operation.read.byte_count,
+                    "file_offset", operation.read.file_offset, "io_uring", true);
             }
+            submit_guard.unlock();
             if (config.pause_after_ring_submit_for_testing) {
                 std::unique_lock<std::mutex> guard(mutex);
                 ring_submit_paused_for_testing = true;
@@ -2264,6 +2347,15 @@ llm_expert_async_result llm_expert_async_transport::release_read(llm_expert_requ
     request->started_us = 0;
     pimpl->counters.active_read_requests--;
     return llm_expert_async_result::ready;
+}
+
+bool llm_expert_async_transport::wait_until_ring_prepared_for_testing() noexcept {
+    std::unique_lock<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->config.pause_before_ring_submit_for_testing ||
+            !pimpl->counters.io_uring_enabled) return false;
+    return pimpl->condition.wait_for(lock, std::chrono::seconds(5), [&] {
+        return pimpl->ring_submit_prepared_for_testing || pimpl->counters.admission_closed;
+    }) && pimpl->ring_submit_prepared_for_testing;
 }
 
 bool llm_expert_async_transport::wait_until_ring_submitted_for_testing() noexcept {
