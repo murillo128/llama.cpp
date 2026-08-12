@@ -312,6 +312,7 @@ llm_expert_prefetch_result llm_expert_prefetch_copy_config(
         uint64_t storage_capacity_bytes,
         uint64_t h2d_capacity_bytes,
         llm_expert_prefetch_config_internal & destination) noexcept {
+    (void) cold_capacity_bytes;
     destination = {};
     if (source == nullptr) {
         if (profile_path != nullptr) return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_configuration);
@@ -346,7 +347,7 @@ llm_expert_prefetch_result llm_expert_prefetch_copy_config(
     if (value.readiness == LLAMA_EXPERT_PREFETCH_READINESS_HOST_READY && mode != LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE) {
         return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_configuration);
     }
-    if (seed && (hot_capacity == 0 || (mode == LLAMA_EXPERT_WEIGHTS_MODE_COLD_CACHE && cold_capacity_bytes == 0))) {
+    if (seed && hot_capacity == 0) {
         return llm_expert_prefetch_result::failure(llm_expert_prefetch_error::invalid_configuration);
     }
     if (value.policy == LLAMA_EXPERT_PREFETCH_POLICY_TEMPORAL_FREQUENCY) {

@@ -46,6 +46,7 @@ struct llm_cold_hot_backing {
 };
 
 struct llm_cold_cache_config {
+    using preflight_fn = llm_expert_provider_result (*)(void *, uint64_t);
     uint64_t byte_budget = 0;
     uint32_t minimum_slots = 0;
     uint32_t routed_layer_count = 0;
@@ -57,6 +58,9 @@ struct llm_cold_cache_config {
     uint32_t policy_trace_capacity = 4096;
     ggml_backend_buffer_type_t buffer_type = nullptr;
     bool reclaim_free_pages = false;
+    preflight_fn preflight = nullptr;
+    void * preflight_data = nullptr;
+    uint64_t reservation_bytes = 0;
 };
 
 using llm_cold_cache_loader = llm_expert_provider_result (*)(
@@ -176,6 +180,10 @@ public:
     llm_expert_provider_result initialize(const llm_expert_layout_registry & registry) noexcept;
     static llm_expert_provider_result calculate_slot_footprint(
             const llm_expert_bundle_descriptor & prototype,
+            ggml_backend_buffer_type_t buffer_type,
+            uint64_t & footprint) noexcept;
+    static llm_expert_provider_result calculate_slot_footprint(
+            const llm_expert_layout_registry & registry,
             ggml_backend_buffer_type_t buffer_type,
             uint64_t & footprint) noexcept;
     llm_expert_provider_result find_or_admit(

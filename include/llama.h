@@ -601,6 +601,7 @@ extern "C" {
         enum llama_expert_weights_mode expert_weights_mode; // routed-expert provider mode [EXPERIMENTAL]
         enum llama_expert_runtime_mode expert_runtime_mode; // compliance attestation or production-performance mode [EXPERIMENTAL]
         uint32_t expert_hot_cache_capacity; // global routed-expert slot capacity [EXPERIMENTAL]
+        // System-memory cold-cache budget. Zero selects the shared residency-safe AUTO resolver.
         uint64_t expert_cold_cache_bytes; // pageable routed-expert cache budget [EXPERIMENTAL]
         uint64_t expert_transfer_ring_bytes; // bounded transfer staging budget [EXPERIMENTAL]
         uint32_t expert_device_count; // bounded owner-only expert device set [EXPERIMENTAL]

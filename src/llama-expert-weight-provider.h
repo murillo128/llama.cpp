@@ -854,7 +854,30 @@ struct llm_hot_cache_diagnostics {
     uint64_t uma_psi_full_total_usec = 0;
     uint64_t uma_zram_write_bytes = 0;
     uint64_t uma_zswap_write_pages = 0;
+    uint64_t system_memory_requested_pool_bytes = 0;
+    uint64_t system_memory_selected_pool_bytes = 0;
+    uint64_t system_memory_safe_pool_bytes = 0;
+    uint64_t system_memory_admission_safe_pool_bytes = 0;
+    uint64_t system_memory_effective_limit_bytes = 0;
+    uint64_t system_memory_limit_headroom_bytes = 0;
+    uint64_t system_memory_available_headroom_bytes = 0;
+    uint64_t system_memory_measured_non_pool_committed_bytes = 0;
+    uint64_t system_memory_runtime_obligation_bytes = 0;
+    uint64_t system_memory_system_reserve_bytes = 0;
+    uint64_t system_memory_runtime_reserve_bytes = 0;
+    uint64_t system_memory_hysteresis_bytes = 0;
+    uint64_t system_memory_model_file_virtual_bytes = 0;
+    uint64_t system_memory_model_file_cache_resident_bytes = 0;
+    uint64_t system_memory_model_file_resident_bytes = 0;
+    uint64_t system_memory_model_allocated_virtual_bytes = 0;
+    uint64_t system_memory_model_allocated_resident_bytes = 0;
+    uint64_t system_memory_other_process_resident_bytes = 0;
+    uint64_t system_memory_pressure_samples = 0;
+    uint64_t system_memory_pressure_rejections = 0;
     bool uma_autofit = false;
+    bool system_memory_autofit = false;
+    bool system_memory_budget_frozen = false;
+    bool system_memory_pressure_circuit_open = false;
     bool uma_pressure_circuit_open = false;
     bool uma_swap_counters_supported = false;
     bool uma_psi_full_supported = false;
@@ -868,6 +891,8 @@ struct llm_hot_cache_diagnostics {
     std::string uma_nvidia_hmm_status_reason;
     std::string uma_pressure_rejection_reason;
     std::string uma_telemetry_unavailable_reason;
+    std::string system_memory_pressure_rejection_reason;
+    std::string system_memory_residency_unavailable_reason;
     uint64_t ring_requested_bytes = 0;
     uint64_t ring_actual_bytes = 0;
     uint64_t ring_lane_footprint = 0;
@@ -1286,6 +1311,9 @@ public:
     virtual llm_expert_provider_result initialize_after_reserve() noexcept {
         return llm_expert_provider_result::success();
     }
+    virtual llm_expert_provider_result revalidate_system_memory_budget() noexcept {
+        return llm_expert_provider_result::success();
+    }
     virtual llm_expert_provider_result trim() noexcept {
         return llm_expert_provider_result::success();
     }
@@ -1426,6 +1454,10 @@ struct llm_hot_cache_config {
     bool cold_mode = false;
     bool cpu_cold_only = false;
     uint64_t cold_cache_bytes = 0;
+    llm_expert_system_memory_sample_fn sample_memory = nullptr;
+    uint64_t min_system_headroom_bytes = 0;
+    uint64_t min_runtime_headroom_bytes = 0;
+    std::vector<llm_expert_system_memory_region> system_memory_regions;
     uint64_t transfer_ring_bytes = 0;
     ggml_backend_dev_t target_device = nullptr;
     bool force_pageable_transfer_for_testing = false;
@@ -1491,6 +1523,7 @@ struct llm_uma_cache_config {
     llama_expert_uma_readiness readiness = LLAMA_EXPERT_UMA_READINESS_AUTO;
     uint64_t min_system_headroom_bytes = 0;
     uint64_t min_runtime_headroom_bytes = 0;
+    std::vector<llm_expert_system_memory_region> system_memory_regions;
     llm_expert_cache_policy_config_internal hot_cache_policy_config = {};
     llm_expert_cache_policy_config_internal cold_cache_policy_config = {};
     // Internal evidence seam. The model-facing path always leaves this false.

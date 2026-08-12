@@ -4,6 +4,13 @@
 
 namespace {
 
+llm_expert_system_memory_sample injected_sample;
+
+llm_expert_system_memory_result sample_injected(llm_expert_system_memory_sample & output) {
+    output = injected_sample;
+    return llm_expert_system_memory_result::success();
+}
+
 void require(bool condition, const char * message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -71,11 +78,53 @@ void test_native_memory_sample() {
 #endif
 }
 
+void test_shared_system_memory_budget() {
+    constexpr uint64_t GIB = UINT64_C(1024)*1024*1024;
+    injected_sample = {};
+    injected_sample.physical_ram_bytes = 128*GIB;
+    injected_sample.cgroup_memory_max_bytes = 120*GIB;
+    injected_sample.cgroup_memory_current_bytes = 24*GIB;
+    injected_sample.memory_available_bytes = 100*GIB;
+    injected_sample.process_rss_bytes = 12*GIB;
+
+    llm_expert_system_memory_budget budget;
+    budget.configure(sample_injected, 0, 0);
+    uint64_t selected = 0;
+    require(budget.resolve(0, GIB, 100*GIB, 2, selected).is_ready(),
+        "shared AUTO resolve failed");
+    require(selected == 66*GIB, "shared AUTO selected the wrong pool");
+    const auto & resolved = budget.diagnostics();
+    require(resolved.frozen && resolved.headroom.autofit &&
+            resolved.measured_non_pool_committed_bytes == 24*GIB &&
+            resolved.headroom.safe_pool_bytes == 68*GIB &&
+            resolved.admission_safe_pool_bytes == 66*GIB &&
+            resolved.hysteresis_bytes == 2*GIB,
+        "shared AUTO diagnostics are incomplete");
+    require(budget.record_runtime_obligation(8*GIB).is_ready(),
+        "bounded runtime obligation was rejected");
+
+    injected_sample.memory_available_bytes = 29*GIB;
+    injected_sample.cgroup_memory_current_bytes = 91*GIB;
+    require(budget.preflight(GIB).error == llm_expert_system_memory_error::unsafe_capacity,
+        "pressure guard accepted reserves without hysteresis");
+    require(budget.diagnostics().pressure_rejections == 1,
+        "pressure rejection was not recorded");
+
+    injected_sample.cgroup_memory_current_bytes = 24*GIB;
+    injected_sample.memory_available_bytes = 100*GIB;
+    llm_expert_system_memory_budget explicit_budget;
+    explicit_budget.configure(sample_injected, 0, 0);
+    require(explicit_budget.resolve(67*GIB, GIB, 100*GIB, 2, selected).error ==
+            llm_expert_system_memory_error::unsafe_capacity,
+        "explicit pool above the shared safe cap was accepted");
+}
+
 } // namespace
 
 int main() {
     test_config_copy();
     test_headroom();
     test_native_memory_sample();
+    test_shared_system_memory_budget();
     return 0;
 }

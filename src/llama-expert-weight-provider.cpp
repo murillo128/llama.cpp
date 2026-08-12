@@ -290,6 +290,44 @@ llm_expert_auto_result llm_evaluate_expert_auto(const llm_expert_auto_input & in
 
 namespace {
 
+llm_expert_provider_result system_memory_result(llm_expert_system_memory_result result) {
+    if (result.is_ready()) return llm_expert_provider_result::success();
+    return llm_expert_provider_result::failure(
+        result.error == llm_expert_system_memory_error::unsafe_capacity ?
+            llm_expert_provider_error::allocation_failed :
+            llm_expert_provider_error::unsupported_configuration);
+}
+
+void copy_system_memory_diagnostics(
+        const llm_expert_system_memory_diagnostics & source,
+        llm_hot_cache_diagnostics & target) {
+    target.system_memory_requested_pool_bytes = source.requested_pool_bytes;
+    target.system_memory_selected_pool_bytes = source.selected_pool_bytes;
+    target.system_memory_safe_pool_bytes = source.headroom.safe_pool_bytes;
+    target.system_memory_admission_safe_pool_bytes = source.admission_safe_pool_bytes;
+    target.system_memory_effective_limit_bytes = source.headroom.effective_limit_bytes;
+    target.system_memory_limit_headroom_bytes = source.headroom.limit_headroom_bytes;
+    target.system_memory_available_headroom_bytes = source.headroom.available_headroom_bytes;
+    target.system_memory_measured_non_pool_committed_bytes = source.measured_non_pool_committed_bytes;
+    target.system_memory_runtime_obligation_bytes = source.measured_runtime_obligation_bytes;
+    target.system_memory_system_reserve_bytes = source.headroom.system_reserve_bytes;
+    target.system_memory_runtime_reserve_bytes = source.headroom.runtime_reserve_bytes;
+    target.system_memory_hysteresis_bytes = source.hysteresis_bytes;
+    target.system_memory_model_file_virtual_bytes = source.model_file_virtual_bytes;
+    target.system_memory_model_file_cache_resident_bytes = source.model_file_cache_resident_bytes;
+    target.system_memory_model_file_resident_bytes = source.model_file_resident_bytes;
+    target.system_memory_model_allocated_virtual_bytes = source.model_allocated_virtual_bytes;
+    target.system_memory_model_allocated_resident_bytes = source.model_allocated_resident_bytes;
+    target.system_memory_other_process_resident_bytes = source.other_process_resident_bytes;
+    target.system_memory_pressure_samples = source.pressure_samples;
+    target.system_memory_pressure_rejections = source.pressure_rejections;
+    target.system_memory_autofit = source.headroom.autofit;
+    target.system_memory_budget_frozen = source.frozen;
+    target.system_memory_pressure_circuit_open = source.pressure_circuit_open;
+    target.system_memory_pressure_rejection_reason = source.pressure_rejection_reason;
+    target.system_memory_residency_unavailable_reason = source.residency_unavailable_reason;
+}
+
 uint64_t saturating_add_work(uint64_t lhs, uint64_t rhs) noexcept {
     return rhs > UINT64_MAX - lhs ? UINT64_MAX : lhs + rhs;
 }
@@ -1942,6 +1980,12 @@ public:
             config.hot_cache_policy_config.supplied || config.cold_cache_policy_config.supplied ||
             (config.prefetch_config.supplied &&
              config.prefetch_config.value.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF)) {
+        requested_cold_cache_bytes = this->config.cold_cache_bytes;
+        system_memory_budget.configure(
+            this->config.sample_memory,
+            this->config.min_system_headroom_bytes,
+            this->config.min_runtime_headroom_bytes,
+            this->config.system_memory_regions);
         if (faults.initialization != llm_expert_provider_error::none) {
             throw std::runtime_error("hot-cache expert-weight provider initialization failed");
         }
@@ -2037,7 +2081,7 @@ public:
             !buffer_type_is_cuda(config.target_buffer_type)) {
             throw std::invalid_argument("hot-cache target must be one CUDA device");
         }
-        if (config.cpu_cold_only && (!config.cold_mode || config.cold_cache_bytes == 0 ||
+        if (config.cpu_cold_only && (!config.cold_mode ||
             config.transfer_ring_bytes != 0 || config.target_device == nullptr ||
             ggml_backend_dev_type(config.target_device) != GGML_BACKEND_DEVICE_TYPE_CPU ||
             buffer_type_is_cuda(config.target_buffer_type) || config.capacity != config.n_expert_used ||
@@ -2049,7 +2093,7 @@ public:
             throw std::invalid_argument("invalid CPU cold-only expert topology");
         }
         if (config.cold_mode && !config.cpu_cold_only &&
-            (config.cold_cache_bytes == 0 || config.transfer_ring_bytes == 0 ||
+            (config.transfer_ring_bytes == 0 ||
             config.target_device == nullptr || (!config.allow_non_cuda_target_for_testing &&
                 config.storage == nullptr && config.phase8_test_control == nullptr) ||
             (config.descriptor_only_source_for_testing && !config.allow_non_cuda_target_for_testing))) {
@@ -5762,12 +5806,43 @@ public:
                 return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
             }
         }
+        uint64_t runtime_obligation = config.peer_staging_bytes;
+        for (uint64_t bytes : backend_bytes_after_final_reserve) {
+            if (bytes > UINT64_MAX - runtime_obligation) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::unsupported_configuration));
+            }
+            runtime_obligation += bytes;
+        }
+        for (const auto & ring : transfer_rings) {
+            const uint64_t bytes = ring ? ring->diagnostics().actual_bytes : 0;
+            if (bytes > UINT64_MAX - runtime_obligation) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::unsupported_configuration));
+            }
+            runtime_obligation += bytes;
+        }
+        const auto memory_validated = system_memory_result(
+            system_memory_budget.record_runtime_obligation(runtime_obligation));
+        if (!memory_validated.is_ready()) return fail(memory_validated);
         scheduler_backend_bytes_after_hierarchy = backend_bytes_after_hierarchy;
         scheduler_backend_bytes_after_final_reserve = backend_bytes_after_final_reserve;
         final_bootstrap_source_bindings = final_source_bindings;
         complete_deferred_payload_bytes = deferred_payload_bytes;
         complete_deferred_payload_in_compute_workspace = false;
         return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result revalidate_system_memory_budget() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return config.cold_mode ? system_memory_result(system_memory_budget.revalidate()) :
+            llm_expert_provider_result::success();
+    }
+
+    static llm_expert_provider_result system_memory_preflight_trampoline(
+            void * data, uint64_t incoming_bytes) {
+        auto * provider = static_cast<llm_hot_cache_expert_weight_provider *>(data);
+        return system_memory_result(provider->system_memory_budget.preflight(incoming_bytes));
     }
 
     llm_expert_provider_result finish_initialization(bool success) noexcept override {
@@ -5802,6 +5877,27 @@ public:
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
         }
 
+        if (config.cold_mode) {
+            uint64_t slot_footprint = 0;
+            auto calculated = llm_cold_expert_cache::calculate_slot_footprint(
+                layout_registry, config.cpu_cold_only ? config.target_buffer_type : nullptr,
+                slot_footprint);
+            if (!calculated.is_ready() || slot_footprint > UINT64_MAX/config.total_expert_keys) {
+                return fail_initialization("system-memory slot sizing",
+                    calculated.is_ready() ? llm_expert_provider_result::failure(
+                        llm_expert_provider_error::unsupported_configuration) : calculated);
+            }
+            const uint64_t topology_bytes = slot_footprint*config.total_expert_keys;
+            uint64_t selected_pool_bytes = 0;
+            const auto resolved = system_memory_result(system_memory_budget.resolve(
+                requested_cold_cache_bytes, slot_footprint, topology_bytes,
+                config.n_expert_used, selected_pool_bytes));
+            if (!resolved.is_ready()) {
+                return fail_initialization("system-memory cold-cache budget", resolved);
+            }
+            config.cold_cache_bytes = selected_pool_bytes;
+        }
+
         try {
             if (config.cpu_cold_only) {
                 std::vector<int32_t> policy_layers = config.routed_layers;
@@ -5824,6 +5920,12 @@ public:
                 cold_config.routed_layers = policy_layers;
                 cold_config.policy_trace_capacity = std::max<uint32_t>(65536, config.trace_capacity);
                 cold_config.buffer_type = config.target_buffer_type;
+                cold_config.reclaim_free_pages = true;
+                cold_config.preflight = system_memory_preflight_trampoline;
+                cold_config.preflight_data = this;
+                const auto memory_diagnostics = system_memory_budget.diagnostics();
+                cold_config.reservation_bytes = memory_diagnostics.headroom.slot_count == 0 ?
+                    0 : config.cold_cache_bytes/memory_diagnostics.headroom.slot_count;
                 auto cold_candidate = std::make_unique<llm_cold_expert_cache>(std::move(cold_config));
                 auto initialized = cold_candidate->initialize(layout_registry);
                 if (!initialized.is_ready()) {
@@ -5999,6 +6101,12 @@ public:
                 cold_config.cache_policy_config = config.cold_cache_policy_config;
                 cold_config.routed_layers = policy_layers;
                 cold_config.policy_trace_capacity = policy_trace_capacity;
+                cold_config.reclaim_free_pages = true;
+                cold_config.preflight = system_memory_preflight_trampoline;
+                cold_config.preflight_data = this;
+                const auto memory_diagnostics = system_memory_budget.diagnostics();
+                cold_config.reservation_bytes = memory_diagnostics.headroom.slot_count == 0 ?
+                    0 : config.cold_cache_bytes/memory_diagnostics.headroom.slot_count;
                 cold_candidate = std::make_unique<llm_cold_expert_cache>(std::move(cold_config));
                 auto initialized = cold_candidate->initialize(layout_registry);
                 if (!initialized.is_ready()) {
@@ -6621,6 +6729,9 @@ public:
     llm_hot_cache_diagnostics hot_cache_diagnostics() const override {
         std::lock_guard<std::mutex> lock(mutex);
         llm_hot_cache_diagnostics result;
+        if (config.cold_mode) {
+            copy_system_memory_diagnostics(system_memory_budget.diagnostics(), result);
+        }
         result.configured_miss_policy = config.miss_policy;
         result.cpu_cold_only = config.cpu_cold_only;
         result.background_promotion_configured = config.background_promotion;
@@ -9837,6 +9948,8 @@ private:
 
     llm_hot_cache_config config;
     llm_expert_provider_faults faults;
+    llm_expert_system_memory_budget system_memory_budget;
+    uint64_t requested_cold_cache_bytes = 0;
     const bool deterministic_policy_terminals = false;
     llm_expert_cache_policy hot_policy;
     uint32_t n_expert = 0;

@@ -92,7 +92,7 @@ bool parse_arguments(int argc, char ** argv, arguments & args) {
     return !args.model.empty() && (!args.prompt_corpus.empty() || args.prompt_token >= 0) && !args.output.empty() &&
         (args.point == "EXACT" || args.point == "KNEE" || args.point == "AGGRESSIVE") &&
         (args.issue_mode == "SERIAL" || args.issue_mode == "BATCHED") &&
-        args.cold_cache_bytes != 0 && args.warmup_limit != 0 && args.decode_forwards != 0 &&
+        args.warmup_limit != 0 && args.decode_forwards != 0 &&
         args.threads != 0 && args.n_ctx >= args.warmup_limit + args.decode_forwards;
 }
 
@@ -168,6 +168,36 @@ json cold_json(const llm_expert_cold_scalar_snapshot & value) {
         {"admissions", value.admissions},
         {"evictions", value.evictions},
         {"residency_digest", hex_u64(value.residency_digest)},
+    };
+}
+
+json system_memory_json(const llm_hot_cache_diagnostics & value) {
+    return {
+        {"requested_pool_bytes", value.system_memory_requested_pool_bytes},
+        {"selected_pool_bytes", value.system_memory_selected_pool_bytes},
+        {"safe_pool_bytes", value.system_memory_safe_pool_bytes},
+        {"admission_safe_pool_bytes", value.system_memory_admission_safe_pool_bytes},
+        {"effective_limit_bytes", value.system_memory_effective_limit_bytes},
+        {"limit_headroom_bytes", value.system_memory_limit_headroom_bytes},
+        {"available_headroom_bytes", value.system_memory_available_headroom_bytes},
+        {"measured_non_pool_committed_bytes", value.system_memory_measured_non_pool_committed_bytes},
+        {"runtime_obligation_bytes", value.system_memory_runtime_obligation_bytes},
+        {"system_reserve_bytes", value.system_memory_system_reserve_bytes},
+        {"runtime_reserve_bytes", value.system_memory_runtime_reserve_bytes},
+        {"hysteresis_bytes", value.system_memory_hysteresis_bytes},
+        {"model_file_virtual_bytes", value.system_memory_model_file_virtual_bytes},
+        {"model_file_cache_resident_bytes", value.system_memory_model_file_cache_resident_bytes},
+        {"model_file_resident_bytes", value.system_memory_model_file_resident_bytes},
+        {"model_allocated_virtual_bytes", value.system_memory_model_allocated_virtual_bytes},
+        {"model_allocated_resident_bytes", value.system_memory_model_allocated_resident_bytes},
+        {"other_process_resident_bytes", value.system_memory_other_process_resident_bytes},
+        {"pressure_samples", value.system_memory_pressure_samples},
+        {"pressure_rejections", value.system_memory_pressure_rejections},
+        {"autofit", value.system_memory_autofit},
+        {"budget_frozen", value.system_memory_budget_frozen},
+        {"pressure_circuit_open", value.system_memory_pressure_circuit_open},
+        {"pressure_rejection_reason", value.system_memory_pressure_rejection_reason},
+        {"residency_unavailable_reason", value.system_memory_residency_unavailable_reason},
     };
 }
 
@@ -392,7 +422,10 @@ int main(int argc, char ** argv) {
         const uint64_t allowed_async_fallback_mask =
             uint64_t(llm_expert_async_fallback_reason::buffer_registration);
         if (!initial_cold.available || initial_cold.occupancy != 0 || initial_cold.capacity == 0 ||
-            initial_cold.requested_bytes != args.cold_cache_bytes || !initial_full.cpu_cold_only ||
+            initial_full.system_memory_requested_pool_bytes != args.cold_cache_bytes ||
+            initial_full.system_memory_selected_pool_bytes != initial_cold.requested_bytes ||
+            !initial_full.system_memory_budget_frozen ||
+            initial_full.system_memory_autofit != (args.cold_cache_bytes == 0) || !initial_full.cpu_cold_only ||
             initial_full.requested_capacity != 0 || initial_full.effective_capacity != 0 ||
             initial_full.pool_bytes != 0 || !initial_full.slots.empty() ||
             initial_storage.direct_source_count != initial_storage.source_file_count ||
@@ -601,6 +634,7 @@ int main(int argc, char ** argv) {
                 {"initial_cold", cold_json(initial_cold)},
                 {"initial_storage", storage_json(initial_storage)},
                 {"initial_terminal_references", terminal_reference_json(initial_full)},
+                {"system_memory", system_memory_json(initial_full)},
             }},
             {"fill", {
                 {"tokens_to_full", tokens_to_full}, {"time_to_full_s", fill_s},
@@ -638,6 +672,7 @@ int main(int argc, char ** argv) {
             {"resources", {
                 {"peak_rss_kib", usage.ru_maxrss}, {"vm_swap_kib", swap_kib},
                 {"terminal_references", terminal_reference_json(after_full)},
+                {"system_memory", system_memory_json(after_full)},
                 {"terminal_scheduler_active_requests", after_scheduler.active_requests},
                 {"terminal_scheduler_queued_requests", after_scheduler.queued_requests},
             }},

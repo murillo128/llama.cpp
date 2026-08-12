@@ -24,6 +24,44 @@
 
 namespace {
 
+llm_expert_provider_result system_memory_result(llm_expert_system_memory_result result) {
+    if (result.is_ready()) return llm_expert_provider_result::success();
+    return llm_expert_provider_result::failure(
+        result.error == llm_expert_system_memory_error::unsafe_capacity ?
+            llm_expert_provider_error::allocation_failed :
+            llm_expert_provider_error::unsupported_configuration);
+}
+
+void copy_system_memory_diagnostics(
+        const llm_expert_system_memory_diagnostics & source,
+        llm_hot_cache_diagnostics & target) {
+    target.system_memory_requested_pool_bytes = source.requested_pool_bytes;
+    target.system_memory_selected_pool_bytes = source.selected_pool_bytes;
+    target.system_memory_safe_pool_bytes = source.headroom.safe_pool_bytes;
+    target.system_memory_admission_safe_pool_bytes = source.admission_safe_pool_bytes;
+    target.system_memory_effective_limit_bytes = source.headroom.effective_limit_bytes;
+    target.system_memory_limit_headroom_bytes = source.headroom.limit_headroom_bytes;
+    target.system_memory_available_headroom_bytes = source.headroom.available_headroom_bytes;
+    target.system_memory_measured_non_pool_committed_bytes = source.measured_non_pool_committed_bytes;
+    target.system_memory_runtime_obligation_bytes = source.measured_runtime_obligation_bytes;
+    target.system_memory_system_reserve_bytes = source.headroom.system_reserve_bytes;
+    target.system_memory_runtime_reserve_bytes = source.headroom.runtime_reserve_bytes;
+    target.system_memory_hysteresis_bytes = source.hysteresis_bytes;
+    target.system_memory_model_file_virtual_bytes = source.model_file_virtual_bytes;
+    target.system_memory_model_file_cache_resident_bytes = source.model_file_cache_resident_bytes;
+    target.system_memory_model_file_resident_bytes = source.model_file_resident_bytes;
+    target.system_memory_model_allocated_virtual_bytes = source.model_allocated_virtual_bytes;
+    target.system_memory_model_allocated_resident_bytes = source.model_allocated_resident_bytes;
+    target.system_memory_other_process_resident_bytes = source.other_process_resident_bytes;
+    target.system_memory_pressure_samples = source.pressure_samples;
+    target.system_memory_pressure_rejections = source.pressure_rejections;
+    target.system_memory_autofit = source.headroom.autofit;
+    target.system_memory_budget_frozen = source.frozen;
+    target.system_memory_pressure_circuit_open = source.pressure_circuit_open;
+    target.system_memory_pressure_rejection_reason = source.pressure_rejection_reason;
+    target.system_memory_residency_unavailable_reason = source.residency_unavailable_reason;
+}
+
 bool same_key(llm_expert_key lhs, llm_expert_key rhs) {
     return lhs.layer == rhs.layer && lhs.expert == rhs.expert;
 }
@@ -98,6 +136,11 @@ public:
     llm_uma_expert_weight_provider(llm_uma_cache_config config, llm_expert_provider_faults faults) :
         config(std::move(config)), faults(faults) {
         if (this->config.sample_memory == nullptr) this->config.sample_memory = llm_expert_uma_sample_memory;
+        system_memory_budget.configure(
+            this->config.sample_memory,
+            this->config.min_system_headroom_bytes,
+            this->config.min_runtime_headroom_bytes,
+            this->config.system_memory_regions);
         if (faults.initialization != llm_expert_provider_error::none ||
             this->config.hot_capacity < this->config.n_expert_used || this->config.n_expert_used == 0 ||
             this->config.routed_layer_count == 0 || this->config.total_expert_keys == 0 ||
@@ -369,6 +412,7 @@ public:
     llm_hot_cache_diagnostics hot_cache_diagnostics() const override {
         std::lock_guard<std::mutex> lock(mutex);
         llm_hot_cache_diagnostics result;
+        copy_system_memory_diagnostics(system_memory_budget.diagnostics(), result);
         result.requested_capacity = config.hot_capacity;
         result.effective_capacity = config.hot_capacity;
         result.graph_epoch = epoch;
@@ -539,31 +583,18 @@ public:
         auto result = llm_cold_expert_cache::calculate_slot_footprint(
             *prototype, config.buffer_type, calculated_slot_footprint);
         if (!result.is_ready()) return failure(result.error);
-        llm_expert_uma_memory_sample sampled;
-        if (!config.sample_memory(sampled).is_ready() || !sampled.swap_counters_supported ||
-            !sampled.psi_full_supported || (sampled.zram_present && !sampled.zram_counters_supported) ||
-            (sampled.zswap_enabled && !sampled.zswap_counters_supported)) {
-            memory_sample = sampled;
-            return failure(llm_expert_provider_error::unsupported_configuration);
-        }
-        llm_expert_uma_headroom_input headroom_input = {
-            sampled.physical_ram_bytes, sampled.cgroup_memory_max_bytes,
-            sampled.cgroup_memory_current_bytes, sampled.memory_available_bytes,
-            sampled.cgroup_memory_current_bytes, 0, config.pool_bytes, calculated_slot_footprint,
-            config.min_system_headroom_bytes, config.min_runtime_headroom_bytes,
-        };
-        auto headroom_result = llm_expert_uma_calculate_headroom(headroom_input, headroom);
-        if (!headroom_result.is_ready()) {
-            memory_sample = sampled;
-            return failure(headroom_result.error == llm_expert_uma_error::unsafe_capacity ?
-                llm_expert_provider_error::allocation_failed :
-                llm_expert_provider_error::unsupported_configuration);
-        }
         if (calculated_slot_footprint > UINT64_MAX/config.total_expert_keys) {
             return failure(llm_expert_provider_error::unsupported_configuration);
         }
         const uint64_t topology_bytes = calculated_slot_footprint*config.total_expert_keys;
-        const uint64_t selected_pool_bytes = std::min(headroom.effective_pool_bytes, topology_bytes);
+        uint64_t selected_pool_bytes = 0;
+        const auto headroom_result = system_memory_result(system_memory_budget.resolve(
+            config.pool_bytes, calculated_slot_footprint, topology_bytes,
+            std::max<uint64_t>(config.n_expert_used, config.hot_capacity), selected_pool_bytes));
+        if (!headroom_result.is_ready()) return failure(headroom_result.error);
+        headroom = system_memory_budget.diagnostics().headroom;
+        memory_sample = system_memory_budget.diagnostics().current_sample;
+        baseline_memory_sample = system_memory_budget.diagnostics().baseline_sample;
         model_capacity_bytes = topology_bytes;
         model_cap_unused_safe_bytes = headroom.safe_pool_bytes - selected_pool_bytes;
         alignment_remainder_bytes = headroom.remainder_bytes;
@@ -573,8 +604,6 @@ public:
         }
         headroom.effective_pool_bytes = selected_pool_bytes;
         headroom.slot_count = selected_pool_bytes/calculated_slot_footprint;
-        memory_sample = sampled;
-        baseline_memory_sample = sampled;
         llm_cold_cache_config cold;
         cold.byte_budget = selected_pool_bytes;
         cold.minimum_slots = config.n_expert_used;
@@ -586,6 +615,9 @@ public:
         cold.policy_trace_capacity = policy_trace_capacity;
         cold.buffer_type = config.buffer_type;
         cold.reclaim_free_pages = true;
+        cold.preflight = preflight_trampoline;
+        cold.preflight_data = this;
+        cold.reservation_bytes = calculated_slot_footprint;
         auto candidate = std::make_unique<llm_cold_expert_cache>(std::move(cold));
         result = candidate->initialize(*prototype);
         if (!result.is_ready()) return failure(result.error);
@@ -643,9 +675,9 @@ public:
                 config.hot_capacity,
                 policy_trace_capacity,
                 config.host_resident_serial_issue_for_testing,
-                preflight_trampoline,
-                this,
-                slot_footprint_bytes,
+                nullptr,
+                nullptr,
+                0,
                 llm_cold_reference_kind::batch,
             });
         epoch++;
@@ -681,12 +713,16 @@ public:
             delta += growth;
         }
         if (delta > UINT64_MAX/5) return failure(llm_expert_provider_error::unsupported_configuration);
-        const uint64_t required = (delta*5 + 3)/4;
-        if (required > headroom.runtime_reserve_bytes) {
-            return failure(llm_expert_provider_error::allocation_failed);
-        }
+        const auto validated = system_memory_result(
+            system_memory_budget.record_runtime_obligation(delta));
+        if (!validated.is_ready()) return failure(validated.error);
         runtime_delta_bytes = delta;
         return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result revalidate_system_memory_budget() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return system_memory_result(system_memory_budget.revalidate());
     }
 
     llm_expert_provider_result validate_slot_generation(uint32_t slot, uint64_t generation) noexcept override {
@@ -881,77 +917,18 @@ private:
 
     static llm_expert_provider_result preflight_trampoline(void * data, uint64_t incoming_bytes) {
         auto * provider = static_cast<llm_uma_expert_weight_provider *>(data);
-        std::lock_guard<std::mutex> lock(provider->mutex);
         return provider->preflight_pressure(incoming_bytes);
     }
 
     llm_expert_provider_result preflight_pressure(uint64_t incoming_bytes) {
-        pressure_samples++;
-        if (pressure_circuit_open) {
-            pressure_rejections++;
-            if (pressure_rejection_reason.empty()) pressure_rejection_reason = "pressure circuit already open";
-            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
-        }
-        llm_expert_uma_memory_sample current;
-        if (!config.sample_memory(current).is_ready()) {
-            memory_sample = current;
-            pressure_rejections++;
-            pressure_rejection_reason = !current.unavailable_reason.empty() ?
-                current.unavailable_reason : "pressure telemetry unavailable";
-            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
-        }
-        if (!current.swap_counters_supported || !current.psi_full_supported ||
-            (current.zram_present && !current.zram_counters_supported) ||
-            (current.zswap_enabled && !current.zswap_counters_supported) ||
-            current.process_swap_bytes > baseline_memory_sample.process_swap_bytes ||
-            current.cgroup_swap_current_bytes > baseline_memory_sample.cgroup_swap_current_bytes ||
-            current.pswpin_pages > baseline_memory_sample.pswpin_pages ||
-            current.pswpout_pages > baseline_memory_sample.pswpout_pages ||
-            current.psi_full_total_usec > baseline_memory_sample.psi_full_total_usec ||
-            current.zram_write_bytes > baseline_memory_sample.zram_write_bytes ||
-            current.zswap_write_pages > baseline_memory_sample.zswap_write_pages) {
-            pressure_circuit_open = true;
-            pressure_rejections++;
-            memory_sample = current;
-            if (current.process_swap_bytes > baseline_memory_sample.process_swap_bytes) pressure_rejection_reason = "process swap grew";
-            else if (current.cgroup_swap_current_bytes > baseline_memory_sample.cgroup_swap_current_bytes) pressure_rejection_reason = "cgroup swap grew";
-            else if (current.pswpin_pages > baseline_memory_sample.pswpin_pages) pressure_rejection_reason = "system swap-in grew";
-            else if (current.pswpout_pages > baseline_memory_sample.pswpout_pages) pressure_rejection_reason = "system swap-out grew";
-            else if (current.psi_full_total_usec > baseline_memory_sample.psi_full_total_usec) pressure_rejection_reason = "cgroup PSI-full grew";
-            else if (current.zram_write_bytes > baseline_memory_sample.zram_write_bytes) pressure_rejection_reason = "zram writes grew";
-            else if (current.zswap_write_pages > baseline_memory_sample.zswap_write_pages) pressure_rejection_reason = "zswap writes grew";
-            else pressure_rejection_reason = "required pressure counter became unavailable";
-            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
-        }
-        const uint64_t cgroup_available = current.cgroup_memory_current_bytes <= current.cgroup_memory_max_bytes ?
-            current.cgroup_memory_max_bytes - current.cgroup_memory_current_bytes : 0;
-        const uint64_t available = std::min(current.memory_available_bytes, cgroup_available);
-        const uint64_t hysteresis = std::max<uint64_t>(
-            slot_footprint_bytes <= UINT64_MAX/2 ? 2*slot_footprint_bytes : UINT64_MAX,
-            UINT64_C(1024)*1024*1024);
-        uint64_t required = headroom.system_reserve_bytes;
-        if (headroom.runtime_reserve_bytes > UINT64_MAX - required) {
-            pressure_rejections++;
-            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
-        }
-        required += headroom.runtime_reserve_bytes;
-        if (hysteresis > UINT64_MAX - required) {
-            pressure_rejections++;
-            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
-        }
-        required += hysteresis;
-        if (incoming_bytes > UINT64_MAX - required) {
-            pressure_rejections++;
-            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
-        }
-        required += incoming_bytes;
-        memory_sample = current;
-        if (available < required) {
-            pressure_rejections++;
-            pressure_rejection_reason = "available memory fell below reserves plus hysteresis";
-            return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
-        }
-        return llm_expert_provider_result::success();
+        const auto result = system_memory_result(system_memory_budget.preflight(incoming_bytes));
+        const auto & memory = system_memory_budget.diagnostics();
+        pressure_samples = memory.pressure_samples;
+        pressure_rejections = memory.pressure_rejections;
+        pressure_circuit_open = memory.pressure_circuit_open;
+        pressure_rejection_reason = memory.pressure_rejection_reason;
+        memory_sample = memory.current_sample;
+        return result;
     }
 
     hit_observation classify_hit(bool storage_miss, bool hot_hit, llm_cold_reference reference) {
@@ -1135,6 +1112,7 @@ private:
 
     llm_uma_cache_config config;
     llm_expert_provider_faults faults;
+    llm_expert_system_memory_budget system_memory_budget;
     uint32_t n_expert = 0;
     mutable std::mutex mutex;
     std::mutex ordered_remap_mutex;

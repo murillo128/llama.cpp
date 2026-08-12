@@ -529,7 +529,8 @@ struct llm_cold_expert_cache::impl {
             }
         }
         if (this->config.routed_layers.size() != config.routed_layer_count ||
-            this->config.policy_trace_capacity == 0) {
+            this->config.policy_trace_capacity == 0 ||
+            (this->config.preflight != nullptr && this->config.reservation_bytes == 0)) {
             throw std::invalid_argument("invalid cold-cache policy topology");
         }
     }
@@ -693,6 +694,10 @@ struct llm_cold_expert_cache::impl {
             counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
+        if (decision.free && config.preflight != nullptr) {
+            result = config.preflight(config.preflight_data, config.reservation_bytes);
+            if (!result.is_ready()) return result;
+        }
         selected = int32_t(decision.slot);
         return llm_expert_provider_result::success();
     }
@@ -716,6 +721,30 @@ llm_expert_provider_result llm_cold_expert_cache::calculate_slot_footprint(
     try {
         const size_t size = allocation_size(prototype, 1, buffer_type);
         if (size == 0) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
+        footprint = size;
+        return llm_expert_provider_result::success();
+    } catch (const std::bad_alloc &) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+    } catch (...) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
+    }
+}
+
+llm_expert_provider_result llm_cold_expert_cache::calculate_slot_footprint(
+        const llm_expert_layout_registry & registry,
+        ggml_backend_buffer_type_t buffer_type,
+        uint64_t & footprint) noexcept {
+    footprint = 0;
+    if (!registry.sealed() || registry.classes.empty()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
+    try {
+        const size_t size = registry.classes.size() == 1 ?
+            allocation_size(registry.classes.front().prototype, 1, buffer_type) :
+            universal_slot_stride(registry, buffer_type);
+        if (size == 0 || size == SIZE_MAX) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
         }
         footprint = size;
@@ -2057,10 +2086,25 @@ llm_expert_provider_result llm_cold_expert_cache::trim() noexcept {
                 pimpl->occupancy());
             if (pimpl->config.reclaim_free_pages) {
 #ifdef __linux__
-                const uint64_t reclaimed = pimpl->counters.aligned_slot_footprint;
+                const uint64_t slot_bytes = pimpl->counters.aligned_slot_footprint;
                 auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(pimpl->arena->buffer.get()));
-                if (reclaimed == 0 || reclaimed > SIZE_MAX || index > SIZE_MAX/size_t(reclaimed) ||
-                    madvise(base + size_t(index)*size_t(reclaimed), size_t(reclaimed), MADV_DONTNEED) != 0 ||
+                const long page_value = sysconf(_SC_PAGESIZE);
+                if (slot_bytes == 0 || slot_bytes > SIZE_MAX || index > SIZE_MAX/size_t(slot_bytes) ||
+                    page_value <= 0) {
+                    pimpl->counters.reclaim_failures++;
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
+                }
+                const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(base) + size_t(index)*size_t(slot_bytes);
+                if (slot_bytes > UINTPTR_MAX - raw_begin) {
+                    pimpl->counters.reclaim_failures++;
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
+                }
+                const uintptr_t page = uintptr_t(page_value);
+                const uintptr_t begin = (raw_begin + page - 1)/page*page;
+                const uintptr_t end = (raw_begin + slot_bytes)/page*page;
+                const uint64_t reclaimed = end > begin ? end - begin : 0;
+                if ((reclaimed != 0 && madvise(reinterpret_cast<void *>(begin),
+                        size_t(reclaimed), MADV_DONTNEED) != 0) ||
                     reclaimed > UINT64_MAX - pimpl->counters.reclaimed_bytes) {
                     pimpl->counters.reclaim_failures++;
                     return llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);

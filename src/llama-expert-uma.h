@@ -3,7 +3,9 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 enum class llm_expert_uma_error : uint8_t {
     none,
@@ -85,8 +87,87 @@ struct llm_expert_uma_memory_sample {
     std::string unavailable_reason;
 };
 
+// System-memory cold tiers share this sizing and pressure authority.  The UMA
+// names above are retained for source compatibility with the Phase 11 probes.
+using llm_expert_system_memory_result = llm_expert_uma_result;
+using llm_expert_system_memory_error = llm_expert_uma_error;
+using llm_expert_system_memory_headroom_input = llm_expert_uma_headroom_input;
+using llm_expert_system_memory_headroom = llm_expert_uma_headroom;
+using llm_expert_system_memory_sample = llm_expert_uma_memory_sample;
+using llm_expert_system_memory_sample_fn =
+    llm_expert_system_memory_result (*)(llm_expert_system_memory_sample &);
+
+struct llm_expert_system_memory_region {
+    const void * address = nullptr;
+    uint64_t bytes = 0;
+    bool file_backed = false;
+};
+
+struct llm_expert_system_memory_diagnostics {
+    llm_expert_system_memory_headroom headroom;
+    llm_expert_system_memory_sample baseline_sample;
+    llm_expert_system_memory_sample current_sample;
+    uint64_t requested_pool_bytes = 0;
+    uint64_t selected_pool_bytes = 0;
+    uint64_t topology_bytes = 0;
+    uint64_t measured_non_pool_committed_bytes = 0;
+    uint64_t measured_runtime_obligation_bytes = 0;
+    uint64_t admission_safe_pool_bytes = 0;
+    uint64_t model_file_virtual_bytes = 0;
+    uint64_t model_file_cache_resident_bytes = 0;
+    uint64_t model_file_resident_bytes = 0;
+    uint64_t model_allocated_virtual_bytes = 0;
+    uint64_t model_allocated_resident_bytes = 0;
+    uint64_t other_process_resident_bytes = 0;
+    uint64_t hysteresis_bytes = 0;
+    uint64_t pressure_samples = 0;
+    uint64_t pressure_rejections = 0;
+    bool frozen = false;
+    bool pressure_circuit_open = false;
+    std::string pressure_rejection_reason;
+    std::string residency_unavailable_reason;
+};
+
+class llm_expert_system_memory_budget {
+public:
+    llm_expert_system_memory_budget();
+    ~llm_expert_system_memory_budget();
+    llm_expert_system_memory_budget(llm_expert_system_memory_budget &&) noexcept;
+    llm_expert_system_memory_budget & operator=(llm_expert_system_memory_budget &&) noexcept;
+
+    llm_expert_system_memory_budget(const llm_expert_system_memory_budget &) = delete;
+    llm_expert_system_memory_budget & operator=(const llm_expert_system_memory_budget &) = delete;
+
+    void configure(
+            llm_expert_system_memory_sample_fn sample_memory,
+            uint64_t min_system_headroom_bytes,
+            uint64_t min_runtime_headroom_bytes,
+            std::vector<llm_expert_system_memory_region> regions = {});
+    llm_expert_system_memory_result resolve(
+            uint64_t requested_pool_bytes,
+            uint64_t slot_stride,
+            uint64_t topology_bytes,
+            uint64_t minimum_slots,
+            uint64_t & selected_pool_bytes) noexcept;
+    llm_expert_system_memory_result record_runtime_obligation(uint64_t bytes) noexcept;
+    llm_expert_system_memory_result revalidate() noexcept;
+    llm_expert_system_memory_result preflight(uint64_t incoming_bytes) noexcept;
+    llm_expert_system_memory_diagnostics diagnostics() const noexcept;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
 llm_expert_uma_result llm_expert_uma_sample_memory(llm_expert_uma_memory_sample & output) noexcept;
+
+llm_expert_system_memory_result llm_expert_system_memory_sample_memory(
+        llm_expert_system_memory_sample & output) noexcept;
 
 llm_expert_uma_result llm_expert_uma_calculate_headroom(
         const llm_expert_uma_headroom_input & input,
         llm_expert_uma_headroom & output) noexcept;
+
+llm_expert_system_memory_result llm_expert_system_memory_calculate_headroom(
+        const llm_expert_system_memory_headroom_input & input,
+        llm_expert_system_memory_headroom & output) noexcept;
