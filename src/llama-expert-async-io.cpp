@@ -202,6 +202,14 @@ public:
         return submitted;
     }
 
+    bool discard_unsubmitted(uint32_t count) {
+        if (count > pending) return false;
+        const uint32_t tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
+        __atomic_store_n(sq_tail, tail - count, __ATOMIC_RELEASE);
+        pending -= count;
+        return true;
+    }
+
     bool try_cqe(io_uring_cqe & result) {
         const uint32_t head = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
         const uint32_t tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
@@ -304,6 +312,7 @@ struct llm_expert_async_transport::impl {
         bool read_operation = false;
         bool ring_completed = false;
         bool cancel_submitted = false;
+        uint32_t direct_staging_lane = UINT32_MAX;
         uint64_t submit_us = 0;
         uint64_t complete_us = 0;
         uint64_t completed_bytes = 0;
@@ -409,6 +418,16 @@ struct llm_expert_async_transport::impl {
         return aligned_bytes != 0 && aligned_bytes <= direct_staging_bytes && aligned_bytes <= UINT32_MAX;
     }
 
+    void * direct_staging_for(const operation_record & operation) const {
+        if (staging == nullptr || operation.direct_staging_lane == UINT32_MAX) return staging;
+        return static_cast<uint8_t *>(staging) +
+            uint64_t(operation.direct_staging_lane)*staging_stride_bytes;
+    }
+
+    uint64_t direct_staging_lane_bytes() const {
+        return staging_stride_bytes != 0 ? staging_stride_bytes : staging_bytes;
+    }
+
     bool direct_completion_ready(
             const operation_record & operation, uint64_t aligned_offset,
             uint64_t aligned_bytes, uint64_t completed_bytes) const {
@@ -465,11 +484,12 @@ struct llm_expert_async_transport::impl {
         auto & operation = operations[operation_slot];
         uint64_t direct_offset = 0;
         uint64_t direct_bytes = 0;
+        void * direct_staging = direct_staging_for(operation);
         const bool direct = prepare_direct(
-            operation, staging, staging_bytes, direct_offset, direct_bytes);
+            operation, direct_staging, direct_staging_lane_bytes(), direct_offset, direct_bytes);
         if (direct) {
             sqe.opcode = staging_registered ? IORING_OP_READ_FIXED : IORING_OP_READ;
-            sqe.addr = uint64_t(staging);
+            sqe.addr = uint64_t(direct_staging);
             sqe.len = uint32_t(direct_bytes);
             sqe.off = direct_offset;
             sqe.fd = int(operation.read.direct_native_handle);
@@ -594,6 +614,7 @@ struct llm_expert_async_transport::impl {
                 operation.read_operation = false;
                 operation.ring_completed = false;
                 operation.cancel_submitted = false;
+                operation.direct_staging_lane = UINT32_MAX;
                 operation.submit_us = 0;
                 operation.complete_us = 0;
                 operation.completed_bytes = 0;
@@ -661,24 +682,53 @@ struct llm_expert_async_transport::impl {
         }
     }
 
-    bool run_buffered_group(size_t handle_count) {
+    bool run_ring_group(size_t handle_count) {
         size_t next_operation = 0;
         while (next_operation < operations.size()) {
             uint32_t batch = 0;
+            bool preparation_failed = false;
+            const uint32_t batch_capacity = config.direct_io_requested ?
+                std::min<uint32_t>(uint32_t(batch_slots.size()), config.direct_staging_lane_count) :
+                uint32_t(batch_slots.size());
             {
                 std::lock_guard<std::mutex> guard(mutex);
-                for (; next_operation < operations.size() && batch < batch_slots.size(); ++next_operation) {
+                for (; next_operation < operations.size() && batch < batch_capacity; ++next_operation) {
                     auto & operation = operations[next_operation];
                     if (!operation.active || !operation.read_operation) continue;
                     auto * request = find_read(operation.identity.request);
                     if (request == nullptr || request->state != read_state::running) continue;
+                    operation.direct_staging_lane = config.direct_io_requested ? batch : UINT32_MAX;
+                    io_uring_sqe prepared{};
+                    if (!fill_read_sqe(uint32_t(next_operation), prepared)) {
+                        preparation_failed = true;
+                        break;
+                    }
                     io_uring_sqe * sqe = ring.acquire_sqe();
                     if (sqe == nullptr) break;
+                    *sqe = prepared;
                     operation.ring_completed = false;
                     operation.cancel_submitted = false;
                     batch_slots[batch++] = uint32_t(next_operation);
-                    (void) fill_read_sqe(uint32_t(next_operation), *sqe);
                 }
+            }
+            if (preparation_failed) {
+                const bool discarded = ring.discard_unsubmitted(batch);
+                if (!discarded) ring.close_ring();
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!discarded) {
+                    counters.io_uring_enabled = false;
+                    counters.io_uring_runtime_error = EINVAL;
+                    record_fallback(llm_expert_async_fallback_reason::ring_runtime,
+                        EINVAL, "ring-runtime");
+                }
+                for (size_t handle_index = 0; handle_index < handle_count; ++handle_index) {
+                    auto * request = find_read(group_handles[handle_index]);
+                    if (request == nullptr) continue;
+                    request->completion.result = llm_expert_async_result::invalid;
+                    request->completion.native_error = EINVAL;
+                    finalize_group_request_locked(*request, true);
+                }
+                return false;
             }
             if (batch == 0) break;
             int native_error = 0;
@@ -694,7 +744,18 @@ struct llm_expert_async_transport::impl {
                         record_fallback(llm_expert_async_fallback_reason::ring_runtime,
                             counters.io_uring_runtime_error, "ring-runtime");
                     }
-                    run_buffered_group_fallback(handle_count);
+                    if (!config.direct_io_requested) {
+                        run_buffered_group_fallback(handle_count);
+                    } else {
+                        std::lock_guard<std::mutex> guard(mutex);
+                        for (size_t handle_index = 0; handle_index < handle_count; ++handle_index) {
+                            auto * request = find_read(group_handles[handle_index]);
+                            if (request == nullptr) continue;
+                            request->completion.result = llm_expert_async_result::invalid;
+                            request->completion.native_error = count == 0 ? EAGAIN : native_error;
+                            finalize_group_request_locked(*request, true);
+                        }
+                    }
                     return false;
                 }
                 submitted += uint32_t(count);
@@ -760,6 +821,11 @@ struct llm_expert_async_transport::impl {
                     }
                 }
                 io_uring_cqe cqe{};
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    counters.peak_cq_occupancy = std::max(
+                        counters.peak_cq_occupancy, ring.completion_occupancy());
+                }
                 if (!ring.try_cqe(cqe)) {
                     std::unique_lock<std::mutex> guard(mutex);
                     counters.cq_empty_waits++;
@@ -822,11 +888,43 @@ struct llm_expert_async_transport::impl {
                         request->completion.result = llm_expert_async_result::invalid;
                         request->completion.native_error = -cqe.res;
                     }
-                } else if (uint64_t(cqe.res) != operation.read.byte_count) {
-                    request->completion.result = llm_expert_async_result::invalid;
                 } else {
-                    operation.completed_bytes = uint64_t(cqe.res);
-                    request->completion.bytes_completed += uint64_t(cqe.res);
+                    uint64_t direct_offset = 0;
+                    uint64_t direct_bytes = 0;
+                    void * direct_staging = direct_staging_for(operation);
+                    const bool direct = prepare_direct(operation, direct_staging,
+                        direct_staging_lane_bytes(), direct_offset, direct_bytes);
+                    if (direct) {
+                        if (!direct_completion_ready(
+                                operation, direct_offset, direct_bytes, uint64_t(cqe.res))) {
+                            request->completion.result = llm_expert_async_result::invalid;
+                        } else {
+                            for (uint8_t segment_index = 0;
+                                    segment_index < operation.read.segment_count; ++segment_index) {
+                                const auto & segment = operation.read.segments[segment_index];
+                                std::memcpy(segment.data,
+                                    static_cast<const uint8_t *>(direct_staging) +
+                                        (segment.file_offset - direct_offset),
+                                    size_t(segment.byte_count));
+                            }
+                            operation.completed_bytes = operation.read.byte_count;
+                            request->completion.bytes_completed += operation.read.byte_count;
+                            counters.direct_read_operations++;
+                            counters.direct_useful_bytes += operation.read.byte_count;
+                            counters.direct_aligned_bytes += uint64_t(cqe.res);
+                            counters.direct_scatter_bytes += operation.read.byte_count;
+                            if (uint64_t(cqe.res) != direct_bytes) {
+                                counters.direct_eof_short_reads++;
+                                counters.direct_eof_shortfall_bytes += direct_bytes - uint64_t(cqe.res);
+                            }
+                        }
+                    } else if (config.direct_io_requested ||
+                            uint64_t(cqe.res) != operation.read.byte_count) {
+                        request->completion.result = llm_expert_async_result::invalid;
+                    } else {
+                        operation.completed_bytes = uint64_t(cqe.res);
+                        request->completion.bytes_completed += uint64_t(cqe.res);
+                    }
                 }
                 counters.ring_completions++;
                 if (request->operations_remaining == 0) finalize_group_request_locked(*request, true);
@@ -858,10 +956,12 @@ struct llm_expert_async_transport::impl {
                     completion.result = llm_expert_async_result::closed;
                     return false;
                 }
+                operation.direct_staging_lane = config.direct_io_requested ? 0 : UINT32_MAX;
                 if (config.direct_io_requested) {
                     uint64_t direct_offset = 0;
                     uint64_t direct_bytes = 0;
-                    if (!prepare_direct(operation, staging, staging_bytes,
+                    if (!prepare_direct(operation, direct_staging_for(operation),
+                            direct_staging_lane_bytes(),
                             direct_offset, direct_bytes)) {
                         completion.result = llm_expert_async_result::invalid;
                         completion.native_error = EINVAL;
@@ -1085,8 +1185,9 @@ struct llm_expert_async_transport::impl {
                 }
                 uint64_t direct_offset = 0;
                 uint64_t direct_bytes = 0;
+                void * direct_staging = direct_staging_for(operation);
                 const bool direct = prepare_direct(
-                    operation, staging, staging_bytes, direct_offset, direct_bytes);
+                    operation, direct_staging, direct_staging_lane_bytes(), direct_offset, direct_bytes);
                 const uint64_t expected_bytes = direct ? direct_bytes : operation.read.byte_count;
                 if ((direct && !direct_completion_ready(
                             operation, direct_offset, direct_bytes, uint64_t(cqe.res))) ||
@@ -1099,7 +1200,8 @@ struct llm_expert_async_transport::impl {
                     for (uint8_t segment_index = 0; segment_index < operation.read.segment_count; ++segment_index) {
                         const auto & segment = operation.read.segments[segment_index];
                         std::memcpy(segment.data,
-                            static_cast<const uint8_t *>(staging) + (segment.file_offset - direct_offset),
+                            static_cast<const uint8_t *>(direct_staging) +
+                                (segment.file_offset - direct_offset),
                             size_t(segment.byte_count));
                     }
                     completion.bytes_completed += operation.read.byte_count;
@@ -1158,7 +1260,8 @@ struct llm_expert_async_transport::impl {
             });
 #if defined(__linux__)
             if (counters.io_uring_enabled && config.read_override_for_testing == nullptr &&
-                !config.direct_io_requested && config.submit_error_for_testing == 0 &&
+                (!config.direct_io_requested || config.direct_staging_lane_count > 1) &&
+                config.submit_error_for_testing == 0 &&
                 !config.pause_after_ring_submit_for_testing && !config.inject_first_read_cqe_for_testing &&
                 config.hide_cqes_after_cancel_polls_for_testing == 0) {
                 size_t handle_count = 0;
@@ -1172,7 +1275,7 @@ struct llm_expert_async_transport::impl {
                     counters.peak_ring_batch_requests = std::max(
                         counters.peak_ring_batch_requests, uint32_t(handle_count));
                     lock.unlock();
-                    (void) run_buffered_group(handle_count);
+                    (void) run_ring_group(handle_count);
                     lock.lock();
                     continue;
                 }
@@ -1434,6 +1537,7 @@ struct llm_expert_async_transport::impl {
                         operation.read_operation = false;
                         operation.ring_completed = false;
                         operation.cancel_submitted = false;
+                        operation.direct_staging_lane = UINT32_MAX;
                         operation.submit_us = 0;
                         operation.complete_us = 0;
                         operation.completed_bytes = 0;
@@ -1454,6 +1558,10 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
         config.integrity_mode == llm_expert_integrity_mode::fnv64_end_to_end;
     if (config.effective_hot_capacity == 0 || config.request_capacity == 0 || config.worker_count == 0 ||
         config.worker_count > 8 || (config.worker_count > 1 && !config.force_positional_reads) ||
+        config.direct_staging_lane_count == 0 ||
+        (config.direct_staging_lane_count > 1 &&
+         (!config.direct_io_requested || config.force_positional_reads || config.worker_count != 1 ||
+          config.maximum_aligned_read_bytes == 0)) ||
         config.cold_cache_bytes == 0 || !integrity_mode_valid ||
         (config.requested_queue_depth != 0 &&
          (config.requested_queue_depth < 8 || config.requested_queue_depth > 4096))) {
@@ -1465,21 +1573,58 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
         throw std::invalid_argument("expert async completion queue overflow");
     }
     const uint32_t cq_entries = sq_entries*2;
-    uint64_t staging_ceiling = config.requested_staging_bytes;
-    if (staging_ceiling == 0 && config.staging_required && config.maximum_aligned_read_bytes != 0) {
+    if (config.direct_staging_lane_count > config.request_capacity ||
+        config.direct_staging_lane_count > sq_entries) {
+        throw std::invalid_argument("invalid direct-I/O staging lane count");
+    }
+    uint64_t staging_lane_bytes = config.requested_staging_bytes;
+    uint64_t staging_allocation_bytes = config.requested_staging_bytes;
+    if (staging_lane_bytes == 0 && config.staging_required && config.maximum_aligned_read_bytes != 0) {
         uint64_t minimum = 0;
         if (checked_multiply(config.maximum_aligned_read_bytes, 2, minimum)) {
             const uint64_t maximum = std::min<uint64_t>(512ULL*1024*1024, config.cold_cache_bytes/4);
             if (minimum <= maximum) {
-                staging_ceiling = minimum;
+                if (config.direct_io_requested && !config.force_positional_reads &&
+                        config.direct_staging_lane_count > 1) {
+                    const uint64_t available_lanes = maximum/config.maximum_aligned_read_bytes;
+                    config.direct_staging_lane_count = uint32_t(std::min<uint64_t>(
+                        config.direct_staging_lane_count, available_lanes));
+                    if (config.direct_staging_lane_count > 1) {
+                        staging_lane_bytes = config.maximum_aligned_read_bytes;
+                        if (!checked_multiply(staging_lane_bytes, config.direct_staging_lane_count,
+                                staging_allocation_bytes)) {
+                            staging_lane_bytes = staging_allocation_bytes = 0;
+                        }
+                    } else {
+                        staging_lane_bytes = staging_allocation_bytes = 0;
+                    }
+                } else {
+                    staging_lane_bytes = staging_allocation_bytes = minimum;
+                }
             }
         }
     }
-    uint64_t staging_allocation_bytes = staging_ceiling;
+    if (config.requested_staging_bytes != 0 && config.direct_io_requested &&
+            !config.force_positional_reads && config.direct_staging_lane_count > 1) {
+        config.direct_staging_lane_count = uint32_t(std::min<uint64_t>(
+            config.direct_staging_lane_count,
+            config.requested_staging_bytes/config.maximum_aligned_read_bytes));
+        if (config.direct_staging_lane_count <= 1) {
+            staging_lane_bytes = 0;
+        } else {
+            staging_lane_bytes = config.requested_staging_bytes/config.direct_staging_lane_count;
+            if (config.maximum_direct_alignment != 0) {
+                staging_lane_bytes -= staging_lane_bytes % config.maximum_direct_alignment;
+            }
+            if (staging_lane_bytes < config.maximum_aligned_read_bytes) {
+                staging_lane_bytes = 0;
+            }
+        }
+    }
     if (config.direct_io_requested && config.force_positional_reads &&
-        config.worker_count > 1 && staging_ceiling != 0) {
+        config.worker_count > 1 && staging_lane_bytes != 0) {
         const uint64_t maximum = std::min<uint64_t>(512ULL*1024*1024, config.cold_cache_bytes/4);
-        if (!checked_multiply(staging_ceiling, config.worker_count, staging_allocation_bytes) ||
+        if (!checked_multiply(staging_lane_bytes, config.worker_count, staging_allocation_bytes) ||
             staging_allocation_bytes > maximum) {
             throw std::invalid_argument("bounded direct-I/O worker staging exceeds capacity");
         }
@@ -1501,10 +1646,11 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
     pimpl->counters.operation_capacity = cq_entries;
     pimpl->counters.trace_capacity = config.trace_capacity;
     pimpl->counters.staging_ceiling_bytes = staging_allocation_bytes;
+    pimpl->counters.direct_staging_lane_count = config.direct_staging_lane_count;
     pimpl->counters.positional_reads_forced = config.force_positional_reads;
     pimpl->counters.integrity_mode = config.integrity_mode;
     if (config.direct_io_requested && config.maximum_direct_alignment != 0 &&
-        staging_allocation_bytes == 0) {
+        (staging_allocation_bytes == 0 || staging_lane_bytes == 0)) {
         pimpl->counters.direct_staging_error = ENOBUFS;
     }
     pimpl->counters.administration_bytes = sizeof(*pimpl) +
@@ -1516,7 +1662,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
         pimpl->workers.capacity()*sizeof(std::thread) +
         pimpl->registered_files.capacity()*sizeof(int);
 #if defined(__linux__)
-    if (config.direct_io_requested && staging_allocation_bytes != 0 &&
+    if (config.direct_io_requested && staging_allocation_bytes != 0 && staging_lane_bytes != 0 &&
         config.maximum_direct_alignment != 0) {
         const uint64_t allocation_alignment = std::max<uint64_t>(config.maximum_direct_alignment, sizeof(void *));
         if (!is_power_of_two(config.maximum_direct_alignment) || !is_power_of_two(allocation_alignment) ||
@@ -1530,7 +1676,7 @@ llm_expert_async_transport::llm_expert_async_transport(llm_expert_async_config c
             if (allocation_error == 0) {
                 pimpl->staging = staging;
                 pimpl->staging_bytes = staging_allocation_bytes;
-                pimpl->staging_stride_bytes = staging_ceiling;
+                pimpl->staging_stride_bytes = staging_lane_bytes;
                 pimpl->staging_alignment = allocation_alignment;
             } else {
                 pimpl->counters.direct_staging_error = allocation_error;
@@ -1753,6 +1899,7 @@ llm_expert_async_operation llm_expert_async_transport::reserve_operation(
         operation.generation++;
         operation.identity = identity;
         operation.active = true;
+        operation.direct_staging_lane = UINT32_MAX;
         pimpl->counters.operations_reserved++;
         pimpl->counters.active_operations++;
         pimpl->counters.peak_active_operations = std::max(
@@ -1779,6 +1926,7 @@ llm_expert_async_result llm_expert_async_transport::consume_completion_for_testi
     }
     identity = operation.identity;
     operation.active = false;
+    operation.direct_staging_lane = UINT32_MAX;
     pimpl->counters.active_operations--;
     pimpl->counters.completions_consumed++;
     return llm_expert_async_result::ready;
@@ -1865,6 +2013,7 @@ llm_expert_async_result llm_expert_async_transport::submit_read_plan(
         operation.read_operation = true;
         operation.ring_completed = false;
         operation.cancel_submitted = false;
+        operation.direct_staging_lane = UINT32_MAX;
         operation.submit_us = 0;
         operation.complete_us = 0;
         operation.completed_bytes = 0;

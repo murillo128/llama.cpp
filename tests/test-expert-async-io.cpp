@@ -1253,6 +1253,89 @@ void test_direct_positional_eof_tail() {
 #endif
 }
 
+void test_deferred_direct_multi_request_ring_batch() {
+#if defined(__linux__)
+    char path[] = "/tmp/llama-expert-direct-batch-XXXXXX";
+    const int native_handle = mkstemp(path);
+    GGML_ASSERT(native_handle >= 0);
+    std::array<uint8_t, 3*4096> source{};
+    for (size_t index = 0; index < source.size(); ++index) {
+        source[index] = uint8_t(index);
+    }
+    GGML_ASSERT(write(native_handle, source.data(), source.size()) == int64_t(source.size()));
+    GGML_ASSERT(fsync(native_handle) == 0);
+    const int direct_native_handle = open(path, O_RDONLY | O_DIRECT);
+    const int direct_open_error = direct_native_handle < 0 ? errno : 0;
+    GGML_ASSERT(unlink(path) == 0);
+    if (direct_native_handle < 0 &&
+            (direct_open_error == EINVAL || direct_open_error == ENOTSUP ||
+                direct_open_error == EOPNOTSUPP)) {
+        GGML_ASSERT(close(native_handle) == 0);
+        return;
+    }
+    GGML_ASSERT(direct_native_handle >= 0);
+
+    auto cfg = config(8);
+    cfg.direct_io_requested = true;
+    cfg.maximum_direct_alignment = 4096;
+    cfg.maximum_aligned_read_bytes = 4096;
+    cfg.requested_staging_bytes = 3*4096;
+    cfg.direct_staging_lane_count = 3;
+    llm_expert_async_transport transport(cfg);
+    if (!transport.diagnostics().io_uring_enabled) {
+        GGML_ASSERT(transport.shutdown());
+        GGML_ASSERT(close(direct_native_handle) == 0);
+        GGML_ASSERT(close(native_handle) == 0);
+        return;
+    }
+    const intptr_t registered_handle = direct_native_handle;
+    GGML_ASSERT(transport.register_files(&registered_handle, 1) == llm_expert_async_result::ready);
+
+    std::array<std::array<uint8_t, 8>, 3> destinations{};
+    std::array<llm_expert_storage_read_operation, 3> reads{};
+    std::array<llm_expert_async_operation_identity, 3> identities{};
+    for (uint32_t index = 0; index < destinations.size(); ++index) {
+        reads[index].native_handle = native_handle;
+        reads[index].direct_native_handle = direct_native_handle;
+        reads[index].direct_alignment = 4096;
+        reads[index].source_size = source.size();
+        reads[index].file_offset = index*4096 + 3;
+        reads[index].byte_count = destinations[index].size();
+        reads[index].segment_count = 1;
+        reads[index].segments[0] = { destinations[index].data(), destinations[index].size(),
+            reads[index].file_offset, llm_expert_storage_projection::up,
+            llm_expert_storage_sidecar::weight };
+        identities[index] = { 1, { index, uint64_t(index) + 1 }, 0, { 0, int32_t(index) },
+            llm_expert_readiness::host_ready, llm_expert_priority::demand_current_layer };
+        GGML_ASSERT(transport.submit_read_plan(identities[index], &reads[index], 1, true) ==
+            llm_expert_async_result::ready);
+    }
+    transport.start_deferred_reads();
+    for (uint32_t index = 0; index < destinations.size(); ++index) {
+        llm_expert_async_read_completion completion;
+        GGML_ASSERT(transport.wait_read(identities[index].request, completion) ==
+            llm_expert_async_result::ready);
+        GGML_ASSERT(completion.bytes_completed == destinations[index].size());
+        GGML_ASSERT(std::equal(destinations[index].begin(), destinations[index].end(),
+            source.begin() + reads[index].file_offset));
+        GGML_ASSERT(transport.release_read(identities[index].request) ==
+            llm_expert_async_result::ready);
+    }
+    const auto diagnostics = transport.diagnostics();
+    GGML_ASSERT(diagnostics.direct_staging_lane_count == 3);
+    GGML_ASSERT(diagnostics.ring_request_batches == 1 &&
+        diagnostics.peak_ring_batch_requests == 3 && diagnostics.peak_sq_occupancy >= 3);
+    GGML_ASSERT(diagnostics.direct_read_operations == 3 &&
+        diagnostics.direct_useful_bytes == 3*destinations[0].size());
+    GGML_ASSERT(diagnostics.buffered_fallback_operations == 0 &&
+        diagnostics.synchronous_fallback_operations == 0 &&
+        diagnostics.active_read_requests == 0 && diagnostics.active_operations == 0);
+    GGML_ASSERT(transport.shutdown());
+    GGML_ASSERT(close(direct_native_handle) == 0);
+    GGML_ASSERT(close(native_handle) == 0);
+#endif
+}
+
 void test_concurrent_bounded_access() {
     llm_expert_async_transport transport(config(8));
     std::vector<std::thread> threads;
@@ -1329,6 +1412,7 @@ int main() {
     test_direct_requirements_fail_closed();
     test_direct_positional_workers_use_independent_staging();
     test_direct_positional_eof_tail();
+    test_deferred_direct_multi_request_ring_batch();
     test_concurrent_bounded_access();
     test_reversed_fake_cq_and_saturation();
     return 0;

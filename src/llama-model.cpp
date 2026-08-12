@@ -1924,6 +1924,9 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         params.expert_io_force_positional_reads,
         pimpl->expert_integrity_mode,
         io_worker_count,
+        !params.expert_io_force_positional_reads && params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO &&
+                (cpu_cold_only || params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) ?
+            uint32_t(hparams.n_expert_used) : 1,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;

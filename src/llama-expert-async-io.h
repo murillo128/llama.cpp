@@ -44,6 +44,7 @@ struct llm_expert_async_config {
     bool force_positional_reads = false;
     llm_expert_integrity_mode integrity_mode = llm_expert_integrity_mode::none;
     uint32_t worker_count = 1;
+    uint32_t direct_staging_lane_count = 1;
 };
 
 enum class llm_expert_async_fallback_reason : uint64_t {
@@ -123,6 +124,7 @@ struct llm_expert_async_diagnostics {
     uint32_t active_operations = 0;
     uint32_t peak_active_operations = 0;
     uint64_t staging_ceiling_bytes = 0;
+    uint32_t direct_staging_lane_count = 0;
     uint64_t administration_bytes = 0;
     uint64_t transport_epoch = 1;
     uint64_t fallback_reason_mask = 0;

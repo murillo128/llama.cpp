@@ -570,6 +570,8 @@ int main(int argc, char ** argv) {
                 {"current_layer_issue_mode", args.issue_mode},
                 {"serial_control", args.issue_mode == "SERIAL"},
                 {"native_io_uring", initial_async.io_uring_enabled},
+                {"direct_staging_bytes", initial_async.staging_ceiling_bytes},
+                {"direct_staging_lanes", initial_async.direct_staging_lane_count},
                 {"registered_file_count", initial_async.registered_file_count},
                 {"registered_buffer_count", initial_async.registered_buffer_count},
                 {"buffer_registration_error", initial_async.buffer_registration_error},
