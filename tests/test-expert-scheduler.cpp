@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 
+#include <array>
 #include <chrono>
 #include <future>
 #include <iostream>
@@ -143,6 +144,217 @@ void test_saturation_and_preemption() {
     GGML_ASSERT(diagnostics.peak_active_requests == 2);
     GGML_ASSERT(diagnostics.drops == 2);
     GGML_ASSERT(diagnostics.queued_preemptions == 1);
+}
+
+void test_transactional_batch_admission() {
+    {
+        llm_expert_scheduler scheduler(config(2));
+        const std::array<llm_expert_schedule_batch_item, 3> items = {{
+            { { 0, 0 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+            { { 0, 1 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+            { { 0, 2 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+        }};
+        std::array<llm_expert_schedule_result, 3> results;
+        GGML_ASSERT(scheduler.enqueue_batch(items.data(), items.size(), results.data()) ==
+            llm_expert_schedule_disposition::busy);
+        auto diagnostics = scheduler.diagnostics();
+        GGML_ASSERT(diagnostics.active_requests == 0 && diagnostics.flights_created == 0 &&
+            diagnostics.joins == 0);
+        const auto first = scheduler.enqueue(
+            { 0, 7 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready);
+        GGML_ASSERT(first.accepted() && first.handle.slot == 0 && first.handle.generation == 1);
+    }
+
+    {
+        llm_expert_scheduler scheduler(config(3));
+        const auto existing = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready);
+        GGML_ASSERT(existing.accepted());
+        const std::array<llm_expert_schedule_batch_item, 2> items = {{
+            { { 0, 0 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+            { { 0, 1 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+        }};
+        std::array<llm_expert_schedule_result, 2> results;
+        GGML_ASSERT(scheduler.enqueue_batch(items.data(), items.size(), results.data()) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(results[0].disposition == llm_expert_schedule_disposition::joined &&
+            results[0].handle.slot == existing.handle.slot &&
+            results[0].handle.generation == existing.handle.generation &&
+            results[1].disposition == llm_expert_schedule_disposition::admitted);
+        const auto diagnostics = scheduler.diagnostics();
+        GGML_ASSERT(diagnostics.active_requests == 2 && diagnostics.flights_created == 2 &&
+            diagnostics.joins == 1);
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(scheduler.take(results[1].handle, selected).accepted() &&
+            selected.key.expert == 1);
+        GGML_ASSERT(scheduler.take_next(selected).accepted() && selected.key.expert == 0);
+    }
+
+    {
+        llm_expert_scheduler scheduler(config(2));
+        llm_expert_request_metadata class_one;
+        class_one.layout_class_id = 1;
+        const auto existing = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready, class_one);
+        GGML_ASSERT(existing.accepted());
+        const std::array<llm_expert_schedule_batch_item, 2> items = {{
+            { { 0, 1 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+            { { 0, 0 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+        }};
+        std::array<llm_expert_schedule_result, 2> results;
+        GGML_ASSERT(scheduler.enqueue_batch(items.data(), items.size(), results.data()) ==
+            llm_expert_schedule_disposition::invalid);
+        const auto diagnostics = scheduler.diagnostics();
+        GGML_ASSERT(diagnostics.active_requests == 1 && diagnostics.flights_created == 1 &&
+            diagnostics.joins == 0);
+        const auto next = scheduler.enqueue(
+            { 0, 1 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready);
+        GGML_ASSERT(next.accepted() && next.handle.slot != existing.handle.slot);
+    }
+
+    {
+        llm_expert_scheduler scheduler(config(3));
+        const auto predecessor = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready);
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(predecessor.accepted() &&
+            scheduler.take(predecessor.handle, selected).accepted() &&
+            scheduler.transition(predecessor.handle, llm_expert_request_state::submitting,
+                llm_expert_request_state::io_in_flight) ==
+                llm_expert_schedule_disposition::admitted &&
+            scheduler.transition(predecessor.handle, llm_expert_request_state::io_in_flight,
+                llm_expert_request_state::draining) ==
+                llm_expert_schedule_disposition::admitted);
+        const std::array<llm_expert_schedule_batch_item, 2> items = {{
+            { { 0, 0 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+            { { 0, 1 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+        }};
+        std::array<llm_expert_schedule_result, 2> results;
+        GGML_ASSERT(scheduler.enqueue_batch(items.data(), items.size(), results.data()) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(results[0].disposition == llm_expert_schedule_disposition::pending_successor &&
+            results[0].handle.slot == predecessor.handle.slot &&
+            results[0].handle.generation == predecessor.handle.generation + 1 &&
+            results[0].blocking_handle.slot == predecessor.handle.slot &&
+            results[0].blocking_handle.generation == predecessor.handle.generation &&
+            results[1].disposition == llm_expert_schedule_disposition::admitted &&
+            scheduler.take(results[1].handle, selected).accepted() && selected.key.expert == 1);
+        GGML_ASSERT(scheduler.finish(predecessor.handle, llm_expert_request_state::failed) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.release_terminal(predecessor.handle) ==
+            llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.take(results[0].handle, selected).accepted() &&
+            selected.key.expert == 0 && selected.handle.generation != predecessor.handle.generation);
+        const auto diagnostics = scheduler.diagnostics();
+        GGML_ASSERT(diagnostics.pending_successors == 1 &&
+            diagnostics.successor_activations == 1 &&
+            diagnostics.successor_cancellations == 0);
+    }
+
+    {
+        llm_expert_scheduler scheduler(config(2));
+        const auto predecessor = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready);
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(predecessor.accepted() &&
+            scheduler.take(predecessor.handle, selected).accepted() &&
+            scheduler.transition(predecessor.handle, llm_expert_request_state::submitting,
+                llm_expert_request_state::draining) ==
+                llm_expert_schedule_disposition::admitted);
+        const llm_expert_schedule_batch_item item = {
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready, {}
+        };
+        llm_expert_schedule_result result;
+        GGML_ASSERT(scheduler.enqueue_batch(&item, 1, &result) ==
+            llm_expert_schedule_disposition::admitted &&
+            result.disposition == llm_expert_schedule_disposition::pending_successor &&
+            scheduler.cancel_pending_successor(result.handle) ==
+                llm_expert_schedule_disposition::admitted);
+        GGML_ASSERT(scheduler.finish(predecessor.handle, llm_expert_request_state::failed) ==
+            llm_expert_schedule_disposition::admitted &&
+            scheduler.release_terminal(predecessor.handle) ==
+                llm_expert_schedule_disposition::admitted);
+        const auto diagnostics = scheduler.diagnostics();
+        GGML_ASSERT(diagnostics.active_requests == 0 &&
+            diagnostics.pending_successors == 1 &&
+            diagnostics.successor_activations == 0 &&
+            diagnostics.successor_cancellations == 1);
+    }
+
+    {
+        llm_expert_scheduler scheduler(config(1));
+        const auto predecessor = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready);
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(predecessor.accepted() &&
+            scheduler.take(predecessor.handle, selected).accepted() &&
+            scheduler.transition(predecessor.handle, llm_expert_request_state::submitting,
+                llm_expert_request_state::draining) ==
+                llm_expert_schedule_disposition::admitted &&
+            scheduler.finish(predecessor.handle, llm_expert_request_state::failed) ==
+                llm_expert_schedule_disposition::admitted);
+        const llm_expert_schedule_batch_item item = {
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready, {}
+        };
+        llm_expert_schedule_result result;
+        GGML_ASSERT(scheduler.enqueue_batch(&item, 1, &result) ==
+            llm_expert_schedule_disposition::admitted &&
+            result.disposition == llm_expert_schedule_disposition::pending_successor &&
+            result.blocking_handle.generation == predecessor.handle.generation &&
+            scheduler.release_terminal(predecessor.handle) ==
+                llm_expert_schedule_disposition::admitted &&
+            scheduler.take(result.handle, selected).accepted() &&
+            selected.handle.generation == predecessor.handle.generation + 1);
+    }
+
+    {
+        llm_expert_scheduler scheduler(config(
+            2, std::numeric_limits<uint64_t>::max() - 1));
+        const auto predecessor = scheduler.enqueue(
+            { 0, 0 }, llm_expert_priority::demand_current_layer,
+            llm_expert_readiness::host_ready);
+        llm_expert_request_snapshot selected;
+        GGML_ASSERT(predecessor.accepted() &&
+            predecessor.handle.generation == std::numeric_limits<uint64_t>::max() &&
+            scheduler.take(predecessor.handle, selected).accepted() &&
+            scheduler.transition(predecessor.handle, llm_expert_request_state::submitting,
+                llm_expert_request_state::draining) ==
+                llm_expert_schedule_disposition::admitted);
+        const std::array<llm_expert_schedule_batch_item, 2> items = {{
+            { { 0, 0 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+            { { 0, 1 }, llm_expert_priority::demand_current_layer,
+                llm_expert_readiness::host_ready, {} },
+        }};
+        std::array<llm_expert_schedule_result, 2> results;
+        GGML_ASSERT(scheduler.enqueue_batch(items.data(), items.size(), results.data()) ==
+            llm_expert_schedule_disposition::generation_exhausted);
+        const auto diagnostics = scheduler.diagnostics();
+        GGML_ASSERT(diagnostics.active_requests == 1 &&
+            diagnostics.flights_created == 1 && diagnostics.pending_successors == 0);
+        GGML_ASSERT(scheduler.finish(predecessor.handle, llm_expert_request_state::failed) ==
+            llm_expert_schedule_disposition::admitted &&
+            scheduler.release_terminal(predecessor.handle) ==
+                llm_expert_schedule_disposition::admitted);
+    }
 }
 
 void test_stale_completion_and_generation_exhaustion() {
@@ -704,6 +916,7 @@ int main() {
     test_configuration();
     test_priority_fifo_and_promotion();
     test_saturation_and_preemption();
+    test_transactional_batch_admission();
     test_stale_completion_and_generation_exhaustion();
     test_layout_class_identity_is_part_of_join_state();
     test_device_qualified_single_flight_and_backpressure();

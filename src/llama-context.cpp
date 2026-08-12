@@ -669,6 +669,11 @@ void llama_context::sched_reserve() {
             throw std::invalid_argument(
                 "expert hot-cache capacity is insufficient for the requested context microbatch extent");
         }
+        const auto memory_result = expert_weight_provider->revalidate_system_memory_budget();
+        if (!memory_result.is_ready()) {
+            throw std::runtime_error(
+                "system-memory expert cache is unsafe for the requested context");
+        }
     }
 
     auto initialization_stage = llm_expert_provider_initialization_stage::none;

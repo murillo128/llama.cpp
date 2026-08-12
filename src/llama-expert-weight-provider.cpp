@@ -3,6 +3,7 @@
 #include "llama-cold-expert-cache.h"
 #include "llama-expert-storage.h"
 #include "llama-expert-async-io.h"
+#include "llama-expert-resident-demand.h"
 #include "llama-expert-scheduler.h"
 #include "llama-expert-transfer-ring.h"
 #include "llama-hparams.h"
@@ -288,6 +289,44 @@ llm_expert_auto_result llm_evaluate_expert_auto(const llm_expert_auto_input & in
 }
 
 namespace {
+
+llm_expert_provider_result system_memory_result(llm_expert_system_memory_result result) {
+    if (result.is_ready()) return llm_expert_provider_result::success();
+    return llm_expert_provider_result::failure(
+        result.error == llm_expert_system_memory_error::unsafe_capacity ?
+            llm_expert_provider_error::allocation_failed :
+            llm_expert_provider_error::unsupported_configuration);
+}
+
+void copy_system_memory_diagnostics(
+        const llm_expert_system_memory_diagnostics & source,
+        llm_hot_cache_diagnostics & target) {
+    target.system_memory_requested_pool_bytes = source.requested_pool_bytes;
+    target.system_memory_selected_pool_bytes = source.selected_pool_bytes;
+    target.system_memory_safe_pool_bytes = source.headroom.safe_pool_bytes;
+    target.system_memory_admission_safe_pool_bytes = source.admission_safe_pool_bytes;
+    target.system_memory_effective_limit_bytes = source.headroom.effective_limit_bytes;
+    target.system_memory_limit_headroom_bytes = source.headroom.limit_headroom_bytes;
+    target.system_memory_available_headroom_bytes = source.headroom.available_headroom_bytes;
+    target.system_memory_measured_non_pool_committed_bytes = source.measured_non_pool_committed_bytes;
+    target.system_memory_runtime_obligation_bytes = source.measured_runtime_obligation_bytes;
+    target.system_memory_system_reserve_bytes = source.headroom.system_reserve_bytes;
+    target.system_memory_runtime_reserve_bytes = source.headroom.runtime_reserve_bytes;
+    target.system_memory_hysteresis_bytes = source.hysteresis_bytes;
+    target.system_memory_model_file_virtual_bytes = source.model_file_virtual_bytes;
+    target.system_memory_model_file_cache_resident_bytes = source.model_file_cache_resident_bytes;
+    target.system_memory_model_file_resident_bytes = source.model_file_resident_bytes;
+    target.system_memory_model_allocated_virtual_bytes = source.model_allocated_virtual_bytes;
+    target.system_memory_model_allocated_resident_bytes = source.model_allocated_resident_bytes;
+    target.system_memory_other_process_resident_bytes = source.other_process_resident_bytes;
+    target.system_memory_pressure_samples = source.pressure_samples;
+    target.system_memory_pressure_rejections = source.pressure_rejections;
+    target.system_memory_autofit = source.headroom.autofit;
+    target.system_memory_budget_frozen = source.frozen;
+    target.system_memory_pressure_circuit_open = source.pressure_circuit_open;
+    target.system_memory_pressure_rejection_reason = source.pressure_rejection_reason;
+    target.system_memory_residency_unavailable_reason = source.residency_unavailable_reason;
+}
 
 uint64_t saturating_add_work(uint64_t lhs, uint64_t rhs) noexcept {
     return rhs > UINT64_MAX - lhs ? UINT64_MAX : lhs + rhs;
@@ -1941,6 +1980,12 @@ public:
             config.hot_cache_policy_config.supplied || config.cold_cache_policy_config.supplied ||
             (config.prefetch_config.supplied &&
              config.prefetch_config.value.policy != LLAMA_EXPERT_PREFETCH_POLICY_OFF)) {
+        requested_cold_cache_bytes = this->config.cold_cache_bytes;
+        system_memory_budget.configure(
+            this->config.sample_memory,
+            this->config.min_system_headroom_bytes,
+            this->config.min_runtime_headroom_bytes,
+            this->config.system_memory_regions);
         if (faults.initialization != llm_expert_provider_error::none) {
             throw std::runtime_error("hot-cache expert-weight provider initialization failed");
         }
@@ -2036,7 +2081,7 @@ public:
             !buffer_type_is_cuda(config.target_buffer_type)) {
             throw std::invalid_argument("hot-cache target must be one CUDA device");
         }
-        if (config.cpu_cold_only && (!config.cold_mode || config.cold_cache_bytes == 0 ||
+        if (config.cpu_cold_only && (!config.cold_mode ||
             config.transfer_ring_bytes != 0 || config.target_device == nullptr ||
             ggml_backend_dev_type(config.target_device) != GGML_BACKEND_DEVICE_TYPE_CPU ||
             buffer_type_is_cuda(config.target_buffer_type) || config.capacity != config.n_expert_used ||
@@ -2048,7 +2093,7 @@ public:
             throw std::invalid_argument("invalid CPU cold-only expert topology");
         }
         if (config.cold_mode && !config.cpu_cold_only &&
-            (config.cold_cache_bytes == 0 || config.transfer_ring_bytes == 0 ||
+            (config.transfer_ring_bytes == 0 ||
             config.target_device == nullptr || (!config.allow_non_cuda_target_for_testing &&
                 config.storage == nullptr && config.phase8_test_control == nullptr) ||
             (config.descriptor_only_source_for_testing && !config.allow_non_cuda_target_for_testing))) {
@@ -2435,6 +2480,13 @@ public:
             plan.set_result(result);
             return fail(result);
         }
+        if (config.cold_mode) {
+            const auto memory_result = system_memory_result(system_memory_budget.revalidate());
+            if (!memory_result.is_ready()) {
+                plan.set_result(memory_result);
+                return fail(memory_result);
+            }
+        }
 
         size_t max_elements = 0;
         for (const auto & binding : bindings) {
@@ -2593,7 +2645,7 @@ public:
             bool (*abort_callback)(void *),
             void * abort_callback_data) noexcept override {
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
-        if (deterministic_policy_terminals) ordered_lock.lock();
+        if (deterministic_policy_terminals || config.cpu_cold_only) ordered_lock.lock();
         std::unique_lock<std::mutex> lock(mutex);
         return remap_checkpoint_locked(binding, logical_ids, logical_id_count, execution_ids, nullptr, nullptr,
             abort_callback, abort_callback_data, &lock);
@@ -2618,7 +2670,7 @@ public:
         LLM_EXPERT_TRACE_SCOPE("k3.provider", "remap_checkpoint_tensor", "layer", binding.layer,
             "layout_class_id", binding.layout_class_id, "graph_epoch", binding.graph_epoch);
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
-        if (deterministic_policy_terminals) ordered_lock.lock();
+        if (deterministic_policy_terminals || config.cpu_cold_only) ordered_lock.lock();
         std::unique_lock<std::mutex> lock(mutex);
         (void) execution_backend;
         ggml_tensor * checkpoint_ids = binding.checkpoint_ids != nullptr ?
@@ -5419,58 +5471,102 @@ public:
             });
 
         const auto cold_before = cold_cache->counter_diagnostics();
-        storage_load_context storage_context = { config.storage, config.async_transport, config.scheduler,
-            config.integrity_mode, provider_lock, {}, false, abort_callback, abort_callback_data };
-        storage_context.layer_ids = &layout_registry.layer_ids;
-        storage_context.layout_registry = &layout_registry;
-        storage_context.target_device = 0;
-
-        for (size_t policy_index = 0; policy_index < unique_count; ++policy_index) {
-            const uint32_t unique_index = policy_unique_indices[policy_index];
-            auto loaded = config.storage != nullptr ? cold_cache->find_or_admit_with_loader(
-                    unique_keys[unique_index], cold_references[unique_index],
-                    load_storage_bundle, &storage_context) :
-                cold_cache->find_or_admit(
-                    unique_keys[unique_index], registrations.at(binding.layer),
-                    cold_references[unique_index]);
-            if (storage_context.completed_io_pending_publication) {
-                const auto handle = storage_context.completed_io_handle;
-                const auto next = loaded.is_ready() ? llm_expert_request_state::host_ready :
-                    llm_expert_request_state::draining;
-                const auto transitioned = config.scheduler->transition(
-                    handle, llm_expert_request_state::io_in_flight, next);
-                const auto terminal = loaded.is_ready() ? llm_expert_request_state::complete :
-                    llm_expert_request_state::failed;
-                const auto finished = transitioned == llm_expert_schedule_disposition::admitted ?
-                    config.scheduler->finish(handle, terminal) :
-                    llm_expert_schedule_disposition::invalid;
-                const auto terminal_released = finished == llm_expert_schedule_disposition::admitted ?
-                    config.scheduler->release_terminal(handle) :
-                    llm_expert_schedule_disposition::invalid;
-                storage_context.completed_io_pending_publication = false;
-                storage_context.completed_io_handle = {};
-                if ((transitioned != llm_expert_schedule_disposition::admitted ||
-                     finished != llm_expert_schedule_disposition::admitted ||
-                     terminal_released != llm_expert_schedule_disposition::admitted) && loaded.is_ready()) {
-                    loaded = llm_expert_provider_result::failure(
-                        llm_expert_provider_error::metadata_mismatch);
-                }
+        if (config.storage != nullptr) {
+            if (host_resident_demand == nullptr || provider_lock == nullptr) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::invalid_binding));
             }
+            auto loaded = host_resident_demand->plan(
+                binding.layer, logical_ids, logical_id_count, host_resident_batch);
+            if (!loaded.is_ready()) return fail(loaded);
+            if (host_resident_batch.unique_count != unique_count ||
+                host_resident_batch.occurrence_count != logical_id_count) {
+                (void) host_resident_demand->release_request_holds(host_resident_batch);
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::metadata_mismatch));
+            }
+            for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
+                const uint32_t index = policy_unique_indices[order];
+                if (index >= host_resident_batch.unique_count ||
+                    !expert_key_matches(host_resident_batch.entries[index].key, unique_keys[index])) {
+                    return fail(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::metadata_mismatch));
+                }
+                host_resident_batch.semantic_order[order] = index;
+            }
+            loaded = host_resident_demand->freeze_semantic_order(host_resident_batch);
+            if (!loaded.is_ready()) return fail(loaded);
+            if (!config.phase10_serial_issue_for_testing) {
+                provider_lock->unlock();
+                loaded = host_resident_demand->resolve_batch(
+                    host_resident_batch, abort_callback, abort_callback_data);
+                provider_lock->lock();
+                if (!loaded.is_ready()) return fail(loaded);
+            }
+            for (size_t order = 0; order < host_resident_batch.unique_count; ++order) {
+                const uint32_t index = host_resident_batch.semantic_order[order];
+                auto & entry = host_resident_batch.entries[index];
+                if (config.phase10_serial_issue_for_testing) {
+                    provider_lock->unlock();
+                    loaded = host_resident_demand->resolve_serial_next(
+                        host_resident_batch, abort_callback, abort_callback_data);
+                    provider_lock->lock();
+                    if (!loaded.is_ready()) return fail(loaded);
+                }
+                loaded = host_resident_demand->complete_host_scheduler(entry);
+                if (!loaded.is_ready()) {
+                    (void) host_resident_demand->fail_serial_batch(
+                        host_resident_batch, loaded.error, false);
+                    return fail(loaded);
+                }
+                if (cpu_execution_pin_count >= cpu_execution_pins.size()) {
+                    (void) host_resident_demand->fail_serial_batch(
+                        host_resident_batch, llm_expert_provider_error::unsupported_configuration, false);
+                    (void) release_request_pins_locked();
+                    return fail(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::unsupported_configuration));
+                }
+                const auto acquired = host_resident_demand->transfer_request_hold_to_cpu_execution(entry);
+                if (!acquired.is_ready()) {
+                    (void) host_resident_demand->fail_serial_batch(
+                        host_resident_batch, acquired.error, false);
+                    (void) release_request_pins_locked();
+                    return fail(acquired);
+                }
+                cpu_execution_pins[cpu_execution_pin_count++] = entry.reference;
+                unique_slots[index] = int32_t(entry.reference.slot);
+                cold_references[index] = entry.reference;
+            }
+            loaded = host_resident_demand->finish_serial_batch(host_resident_batch);
             if (!loaded.is_ready()) {
+                (void) host_resident_demand->fail_serial_batch(
+                    host_resident_batch, loaded.error, false);
+                (void) release_request_pins_locked();
                 return fail(loaded);
             }
-
-            const auto acquired = cold_cache->acquire(
-                cold_references[unique_index], llm_cold_reference_kind::cpu_execution);
-            if (!acquired.is_ready()) return fail(acquired);
-            if (cpu_execution_pin_count >= cpu_execution_pins.size()) {
-                (void) cold_cache->release(
-                    cold_references[unique_index], llm_cold_reference_kind::cpu_execution);
-                return fail(llm_expert_provider_result::failure(
-                    llm_expert_provider_error::unsupported_configuration));
+            for (size_t occurrence = 0; occurrence < logical_id_count; ++occurrence) {
+                element_unique[occurrence] = int32_t(
+                    host_resident_batch.occurrence_to_unique[occurrence]);
             }
-            cpu_execution_pins[cpu_execution_pin_count++] = cold_references[unique_index];
-            unique_slots[unique_index] = int32_t(cold_references[unique_index].slot);
+        } else {
+            for (size_t policy_index = 0; policy_index < unique_count; ++policy_index) {
+                const uint32_t unique_index = policy_unique_indices[policy_index];
+                auto loaded = cold_cache->find_or_admit(
+                    unique_keys[unique_index], registrations.at(binding.layer),
+                    cold_references[unique_index]);
+                if (!loaded.is_ready()) return fail(loaded);
+                const auto acquired = cold_cache->acquire(
+                    cold_references[unique_index], llm_cold_reference_kind::cpu_execution);
+                if (!acquired.is_ready()) return fail(acquired);
+                if (cpu_execution_pin_count >= cpu_execution_pins.size()) {
+                    (void) cold_cache->release(
+                        cold_references[unique_index], llm_cold_reference_kind::cpu_execution);
+                    return fail(llm_expert_provider_result::failure(
+                        llm_expert_provider_error::unsupported_configuration));
+                }
+                cpu_execution_pins[cpu_execution_pin_count++] = cold_references[unique_index];
+                unique_slots[unique_index] = int32_t(cold_references[unique_index].slot);
+            }
         }
 
         for (size_t index = 0; index < logical_id_count; ++index) {
@@ -5550,6 +5646,18 @@ public:
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
         }
         config.miss_policy = policy;
+        return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result debug_set_host_resident_serial_issue_for_testing(
+            bool serial_control) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!config.cpu_cold_only || active_request || pool || cold_cache ||
+            host_resident_demand) {
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::unsupported_configuration);
+        }
+        config.phase10_serial_issue_for_testing = serial_control;
         return llm_expert_provider_result::success();
     }
 
@@ -5705,12 +5813,43 @@ public:
                 return fail(llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed));
             }
         }
+        uint64_t runtime_obligation = config.peer_staging_bytes;
+        for (uint64_t bytes : backend_bytes_after_final_reserve) {
+            if (bytes > UINT64_MAX - runtime_obligation) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::unsupported_configuration));
+            }
+            runtime_obligation += bytes;
+        }
+        for (const auto & ring : transfer_rings) {
+            const uint64_t bytes = ring ? ring->diagnostics().actual_bytes : 0;
+            if (bytes > UINT64_MAX - runtime_obligation) {
+                return fail(llm_expert_provider_result::failure(
+                    llm_expert_provider_error::unsupported_configuration));
+            }
+            runtime_obligation += bytes;
+        }
+        const auto memory_validated = system_memory_result(
+            system_memory_budget.record_runtime_obligation(runtime_obligation));
+        if (!memory_validated.is_ready()) return fail(memory_validated);
         scheduler_backend_bytes_after_hierarchy = backend_bytes_after_hierarchy;
         scheduler_backend_bytes_after_final_reserve = backend_bytes_after_final_reserve;
         final_bootstrap_source_bindings = final_source_bindings;
         complete_deferred_payload_bytes = deferred_payload_bytes;
         complete_deferred_payload_in_compute_workspace = false;
         return llm_expert_provider_result::success();
+    }
+
+    llm_expert_provider_result revalidate_system_memory_budget() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return config.cold_mode ? system_memory_result(system_memory_budget.revalidate()) :
+            llm_expert_provider_result::success();
+    }
+
+    static llm_expert_provider_result system_memory_preflight_trampoline(
+            void * data, uint64_t incoming_bytes) {
+        auto * provider = static_cast<llm_hot_cache_expert_weight_provider *>(data);
+        return system_memory_result(provider->system_memory_budget.preflight(incoming_bytes));
     }
 
     llm_expert_provider_result finish_initialization(bool success) noexcept override {
@@ -5745,6 +5884,27 @@ public:
             return fail(llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed));
         }
 
+        if (config.cold_mode) {
+            uint64_t slot_footprint = 0;
+            auto calculated = llm_cold_expert_cache::calculate_slot_footprint(
+                layout_registry, config.cpu_cold_only ? config.target_buffer_type : nullptr,
+                slot_footprint);
+            if (!calculated.is_ready() || slot_footprint > UINT64_MAX/config.total_expert_keys) {
+                return fail_initialization("system-memory slot sizing",
+                    calculated.is_ready() ? llm_expert_provider_result::failure(
+                        llm_expert_provider_error::unsupported_configuration) : calculated);
+            }
+            const uint64_t topology_bytes = slot_footprint*config.total_expert_keys;
+            uint64_t selected_pool_bytes = 0;
+            const auto resolved = system_memory_result(system_memory_budget.resolve(
+                requested_cold_cache_bytes, slot_footprint, topology_bytes,
+                config.n_expert_used, selected_pool_bytes));
+            if (!resolved.is_ready()) {
+                return fail_initialization("system-memory cold-cache budget", resolved);
+            }
+            config.cold_cache_bytes = selected_pool_bytes;
+        }
+
         try {
             if (config.cpu_cold_only) {
                 std::vector<int32_t> policy_layers = config.routed_layers;
@@ -5767,6 +5927,12 @@ public:
                 cold_config.routed_layers = policy_layers;
                 cold_config.policy_trace_capacity = std::max<uint32_t>(65536, config.trace_capacity);
                 cold_config.buffer_type = config.target_buffer_type;
+                cold_config.reclaim_free_pages = true;
+                cold_config.preflight = system_memory_preflight_trampoline;
+                cold_config.preflight_data = this;
+                const auto memory_diagnostics = system_memory_budget.diagnostics();
+                cold_config.reservation_bytes = memory_diagnostics.headroom.slot_count == 0 ?
+                    0 : config.cold_cache_bytes/memory_diagnostics.headroom.slot_count;
                 auto cold_candidate = std::make_unique<llm_cold_expert_cache>(std::move(cold_config));
                 auto initialized = cold_candidate->initialize(layout_registry);
                 if (!initialized.is_ready()) {
@@ -5813,6 +5979,27 @@ public:
                 layout_preflight_consumer_count = 0;
                 layout_preflight_passed = true;
                 cold_cache = std::move(cold_candidate);
+                if (config.storage != nullptr) {
+                    host_resident_demand = std::make_unique<llm_host_resident_demand_coordinator>(
+                        llm_host_resident_demand_config{
+                            cold_cache.get(),
+                            config.storage,
+                            config.scheduler,
+                            config.async_transport,
+                            &layout_registry,
+                            config.integrity_mode,
+                            config.total_expert_keys,
+                            config.capacity,
+                            std::max<uint32_t>(config.trace_capacity, 1),
+                            config.phase10_serial_issue_for_testing,
+                            nullptr,
+                            nullptr,
+                            0,
+                            config.phase10_serial_issue_for_testing ?
+                                llm_cold_reference_kind::request :
+                                llm_cold_reference_kind::batch,
+                        });
+                }
                 pool = std::move(generation_candidate);
                 epoch++;
                 counters.allocations++;
@@ -5921,6 +6108,12 @@ public:
                 cold_config.cache_policy_config = config.cold_cache_policy_config;
                 cold_config.routed_layers = policy_layers;
                 cold_config.policy_trace_capacity = policy_trace_capacity;
+                cold_config.reclaim_free_pages = true;
+                cold_config.preflight = system_memory_preflight_trampoline;
+                cold_config.preflight_data = this;
+                const auto memory_diagnostics = system_memory_budget.diagnostics();
+                cold_config.reservation_bytes = memory_diagnostics.headroom.slot_count == 0 ?
+                    0 : config.cold_cache_bytes/memory_diagnostics.headroom.slot_count;
                 cold_candidate = std::make_unique<llm_cold_expert_cache>(std::move(cold_config));
                 auto initialized = cold_candidate->initialize(layout_registry);
                 if (!initialized.is_ready()) {
@@ -6543,6 +6736,9 @@ public:
     llm_hot_cache_diagnostics hot_cache_diagnostics() const override {
         std::lock_guard<std::mutex> lock(mutex);
         llm_hot_cache_diagnostics result;
+        if (config.cold_mode) {
+            copy_system_memory_diagnostics(system_memory_budget.diagnostics(), result);
+        }
         result.configured_miss_policy = config.miss_policy;
         result.cpu_cold_only = config.cpu_cold_only;
         result.background_promotion_configured = config.background_promotion;
@@ -6813,6 +7009,8 @@ public:
             result.cold_resident_ready_bytes = cold.resident_ready_bytes;
             result.cold_current_cpu_execution_refs = cold.current_cpu_execution_refs;
             result.cold_peak_cpu_execution_refs = cold.peak_cpu_execution_refs;
+            result.cold_current_batch_refs = cold.current_batch_refs;
+            result.cold_peak_batch_refs = cold.peak_batch_refs;
             result.cold_policy = cold.policy;
             result.cold_policy_domains = cold.policy_domains;
             result.cold_policy_events = cold.policy_events;
@@ -7436,7 +7634,7 @@ protected:
     void release_handle(uint64_t lease_id) noexcept override {
         LLM_EXPERT_TRACE_SCOPE("k3.provider", "release", "request_id", lease_id);
         std::unique_lock<std::mutex> ordered_lock(ordered_remap_mutex, std::defer_lock);
-        if (deterministic_policy_terminals) ordered_lock.lock();
+        if (deterministic_policy_terminals || config.cpu_cold_only) ordered_lock.lock();
         std::lock_guard<std::mutex> lock(mutex);
         if (!active_request || lease_id != active_request_id || !validate_request_pins_locked()) {
             stale_generation_failures++;
@@ -9757,6 +9955,8 @@ private:
 
     llm_hot_cache_config config;
     llm_expert_provider_faults faults;
+    llm_expert_system_memory_budget system_memory_budget;
+    uint64_t requested_cold_cache_bytes = 0;
     const bool deterministic_policy_terminals = false;
     llm_expert_cache_policy hot_policy;
     uint32_t n_expert = 0;
@@ -9773,6 +9973,8 @@ private:
     std::shared_ptr<hot_pool_generation> pool;
     std::vector<std::shared_ptr<hot_pool_generation>> device_pools;
     std::unique_ptr<llm_cold_expert_cache> cold_cache;
+    std::unique_ptr<llm_host_resident_demand_coordinator> host_resident_demand;
+    llm_host_resident_demand_batch host_resident_batch;
     std::vector<std::unique_ptr<llm_expert_transfer_ring>> transfer_rings;
     std::vector<uint32_t> device_transfer_lane_capacities;
     std::vector<uint8_t> device_transfer_event_capabilities;

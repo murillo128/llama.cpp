@@ -291,6 +291,9 @@ if (TARGET ggml-cuda)
     target_link_libraries(test-expert-uma-provider PRIVATE ggml-cuda)
 endif()
 
+llama_build_and_test(test-expert-resident-demand.cpp LABEL "model")
+target_include_directories(test-expert-resident-demand PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build(phase10-prefetch-replay.cpp)
 target_include_directories(phase10-prefetch-replay PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
 llama_test(phase10-prefetch-replay LABEL "model" ARGS --self-test)

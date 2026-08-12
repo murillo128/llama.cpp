@@ -1436,12 +1436,12 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         pimpl->expert_auto_cost_model_digest = digest;
     }
     if ((!cold_mode && !uma_mode && (params.expert_cold_cache_bytes != 0 || params.expert_transfer_ring_bytes != 0)) ||
-        (cpu_cold_only && (params.expert_cold_cache_bytes == 0 || total_hot_slots != 0 ||
+        (cpu_cold_only && (total_hot_slots != 0 ||
                           params.expert_transfer_ring_bytes != 0 || params.expert_hot_cache_policy != nullptr ||
                           params.expert_background_promotion || params.expert_async_cold_fill ||
                           params.expert_auto_cost_model != nullptr || params.expert_prefetch_config != nullptr ||
                           params.expert_role_config != nullptr || params.expert_peer_staging_bytes != 0)) ||
-        (cold_mode && !cpu_cold_only && (total_hot_slots == 0 || params.expert_cold_cache_bytes == 0 ||
+        (cold_mode && !cpu_cold_only && (total_hot_slots == 0 ||
                                         params.expert_transfer_ring_bytes == 0)) ||
         (uma_mode && (total_hot_slots == 0 || params.expert_transfer_ring_bytes != 0))) {
         throw std::invalid_argument("invalid cold-cache byte budgets");
@@ -1465,6 +1465,50 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 void llama_model::init_expert_weight_provider() {
     LLM_EXPERT_TRACE_SCOPE("k3.provider", "provider_initialize", "expert_weights_mode", uint32_t(params.expert_weights_mode));
     const uint32_t hot_capacity = expert_hot_cache_capacity();
+    auto system_memory_regions = [&] {
+        std::vector<llm_expert_system_memory_region> result;
+        for (const auto & [_, buffers] : pimpl->ctxs_bufs) {
+            for (const auto & buffer : buffers) {
+                if (!buffer || !ggml_backend_buffer_is_host(buffer.get())) continue;
+                const auto * base = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(buffer.get()));
+                const uint64_t bytes = ggml_backend_buffer_get_size(buffer.get());
+                if (base == nullptr || bytes == 0 || bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(base)) continue;
+                const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+                const uintptr_t end = begin + bytes;
+                bool file_backed = false;
+                for (const auto & mapping : pimpl->mappings) {
+                    if (!mapping || mapping->addr() == nullptr || mapping->size() == 0 ||
+                        mapping->size() > UINTPTR_MAX - reinterpret_cast<uintptr_t>(mapping->addr())) continue;
+                    const uintptr_t mapping_begin = reinterpret_cast<uintptr_t>(mapping->addr());
+                    const uintptr_t mapping_end = mapping_begin + mapping->size();
+                    if (begin >= mapping_begin && end <= mapping_end) {
+                        file_backed = true;
+                        break;
+                    }
+                }
+                result.push_back({ base, bytes, file_backed });
+            }
+        }
+        std::sort(result.begin(), result.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.file_backed != rhs.file_backed) return lhs.file_backed < rhs.file_backed;
+            return reinterpret_cast<uintptr_t>(lhs.address) < reinterpret_cast<uintptr_t>(rhs.address);
+        });
+        std::vector<llm_expert_system_memory_region> merged;
+        for (const auto & region : result) {
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(region.address);
+            const uintptr_t end = begin + region.bytes;
+            if (!merged.empty() && merged.back().file_backed == region.file_backed) {
+                const uintptr_t prior_begin = reinterpret_cast<uintptr_t>(merged.back().address);
+                const uintptr_t prior_end = prior_begin + merged.back().bytes;
+                if (begin <= prior_end) {
+                    merged.back().bytes = std::max(prior_end, end) - prior_begin;
+                    continue;
+                }
+            }
+            merged.push_back(region);
+        }
+        return merged;
+    }();
     if (params.expert_prefetch_config != nullptr) {
         const uint64_t scheduler_capacity_64 = std::max<uint64_t>(16, uint64_t(hot_capacity)*4);
         const auto validated = llm_expert_prefetch_copy_config(
@@ -1657,11 +1701,13 @@ void llama_model::init_expert_weight_provider() {
                 uma.buffer_type = buffer_type_fn(target_index);
                 uma.target_device = target;
                 uma.storage = pimpl->expert_storage.get();
+                uma.async_transport = pimpl->expert_async_transport.get();
                 uma.scheduler = pimpl->expert_scheduler.get();
                 uma.integrity_mode = pimpl->expert_integrity_mode;
                 uma.readiness = pimpl->expert_uma_config.value.readiness;
                 uma.min_system_headroom_bytes = pimpl->expert_uma_config.value.min_system_headroom_bytes;
                 uma.min_runtime_headroom_bytes = pimpl->expert_uma_config.value.min_runtime_headroom_bytes;
+                uma.system_memory_regions = system_memory_regions;
                 uma.hot_cache_policy_config = pimpl->expert_hot_cache_policy_config;
                 uma.cold_cache_policy_config = pimpl->expert_cold_cache_policy_config;
                 uma.routed_layers = std::move(routed_layers);
@@ -1671,6 +1717,8 @@ void llama_model::init_expert_weight_provider() {
                 config.cold_mode = true;
                 config.cpu_cold_only = cpu_cold_only;
                 config.cold_cache_bytes = params.expert_cold_cache_bytes;
+                config.sample_memory = llm_expert_system_memory_sample_memory;
+                config.system_memory_regions = system_memory_regions;
                 config.transfer_ring_bytes = params.expert_transfer_ring_bytes;
                 config.target_device = provider_target;
                 config.storage = pimpl->expert_storage.get();
@@ -1716,6 +1764,12 @@ namespace {
 bool checked_storage_add(uint64_t lhs, uint64_t rhs, uint64_t & result) {
     if (lhs > std::numeric_limits<uint64_t>::max() - rhs) return false;
     result = lhs + rhs;
+    return true;
+}
+
+bool checked_storage_multiply(uint64_t lhs, uint64_t rhs, uint64_t & result) {
+    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max()/lhs) return false;
+    result = lhs*rhs;
     return true;
 }
 
@@ -1894,8 +1948,24 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         }
     }
     auto scheduler = std::make_unique<llm_expert_scheduler>(scheduler_config);
-    const uint64_t transport_accounting_bytes = params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE &&
-        params.expert_cold_cache_bytes == 0 ? storage_diagnostics.maximum_bundle_bytes : params.expert_cold_cache_bytes;
+    const uint32_t direct_staging_lanes =
+        !params.expert_io_force_positional_reads && params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO &&
+                (cpu_cold_only || params.expert_weights_mode == LLAMA_EXPERT_WEIGHTS_MODE_UMA_CACHE) ?
+            uint32_t(hparams.n_expert_used) : 1;
+    uint64_t transport_accounting_bytes = params.expert_cold_cache_bytes;
+    if (transport_accounting_bytes == 0) {
+        // The cache budget is deliberately unresolved until the first context.
+        // Give the already-bounded transport enough accounting room for its
+        // maximum legal current-layer staging burst without guessing a cache size.
+        uint64_t staging_burst_bytes = 0;
+        if (!checked_storage_multiply(maximum_aligned_read_bytes, direct_staging_lanes,
+                staging_burst_bytes) ||
+            !checked_storage_multiply(staging_burst_bytes, 4, transport_accounting_bytes)) {
+            throw std::overflow_error("expert AUTO transport accounting overflow");
+        }
+        transport_accounting_bytes = std::max(
+            transport_accounting_bytes, storage_diagnostics.maximum_bundle_bytes);
+    }
     auto transport = std::make_unique<llm_expert_async_transport>(llm_expert_async_config{
         params.expert_io_queue_depth,
         cpu_cold_only ? uint32_t(hparams.n_expert_used) : hot_capacity,
@@ -1923,6 +1993,7 @@ void llama_model::init_expert_storage(llama_model_loader & ml) {
         params.expert_io_force_positional_reads,
         pimpl->expert_integrity_mode,
         io_worker_count,
+        direct_staging_lanes,
     });
     std::vector<intptr_t> source_handles(size_t(storage_diagnostics.source_file_count));
     size_t source_handle_count = 0;

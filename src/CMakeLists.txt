@@ -22,6 +22,7 @@ add_library(llama
             llama-expert-cache-policy.cpp
             llama-expert-prefetch.cpp
             llama-expert-async-io.cpp
+            llama-expert-resident-demand.cpp
             llama-expert-scheduler.cpp
             llama-expert-transfer-ring.cpp
     llama-expert-uma.cpp

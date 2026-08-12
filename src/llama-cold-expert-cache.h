@@ -22,6 +22,7 @@ enum class llm_cold_reference_kind {
     transfer,
     request,
     cpu_execution,
+    batch,
 };
 
 struct llm_cold_reference {
@@ -45,6 +46,7 @@ struct llm_cold_hot_backing {
 };
 
 struct llm_cold_cache_config {
+    using preflight_fn = llm_expert_provider_result (*)(void *, uint64_t);
     uint64_t byte_budget = 0;
     uint32_t minimum_slots = 0;
     uint32_t routed_layer_count = 0;
@@ -56,6 +58,9 @@ struct llm_cold_cache_config {
     uint32_t policy_trace_capacity = 4096;
     ggml_backend_buffer_type_t buffer_type = nullptr;
     bool reclaim_free_pages = false;
+    preflight_fn preflight = nullptr;
+    void * preflight_data = nullptr;
+    uint64_t reservation_bytes = 0;
 };
 
 using llm_cold_cache_loader = llm_expert_provider_result (*)(
@@ -105,6 +110,8 @@ struct llm_cold_cache_diagnostics {
     uint64_t peak_request_refs = 0;
     uint64_t current_cpu_execution_refs = 0;
     uint64_t peak_cpu_execution_refs = 0;
+    uint64_t current_batch_refs = 0;
+    uint64_t peak_batch_refs = 0;
     bool residency_supported = false;
     std::string residency_unavailable_reason;
     uint64_t ready_logical_bytes = 0;
@@ -127,6 +134,7 @@ struct llm_cold_cache_diagnostics {
         uint32_t transfer_refs = 0;
         uint32_t request_refs = 0;
         uint32_t cpu_execution_refs = 0;
+        uint32_t batch_refs = 0;
         llm_expert_residency_origin origin = llm_expert_residency_origin::demand;
         bool speculative_consumed = false;
         uint64_t speculative_deadline = 0;
@@ -174,6 +182,10 @@ public:
             const llm_expert_bundle_descriptor & prototype,
             ggml_backend_buffer_type_t buffer_type,
             uint64_t & footprint) noexcept;
+    static llm_expert_provider_result calculate_slot_footprint(
+            const llm_expert_layout_registry & registry,
+            ggml_backend_buffer_type_t buffer_type,
+            uint64_t & footprint) noexcept;
     llm_expert_provider_result find_or_admit(
             llm_expert_key key,
             const llm_expert_bundle_descriptor & source,
@@ -199,6 +211,11 @@ public:
             llm_expert_key key,
             llm_cold_reference & reference,
             llm_cold_demand_lookup & lookup) noexcept;
+    llm_expert_provider_result reserve_or_join_demand_batch(
+            const llm_expert_key * keys,
+            size_t key_count,
+            llm_cold_reference * references,
+            llm_cold_demand_lookup * lookups) noexcept;
     llm_expert_provider_result lookup_demand(
             llm_expert_key key,
             llm_cold_reference & reference,
@@ -215,10 +232,20 @@ public:
             llm_expert_residency_origin origin,
             bool consumed = false) noexcept;
     llm_expert_provider_result publish_ready(llm_expert_key key, llm_cold_reference reference) noexcept;
+    llm_expert_provider_result publish_ready_and_acquire(
+            llm_expert_key key,
+            llm_cold_reference reference,
+            llm_cold_reference_kind kind) noexcept;
     llm_expert_provider_result fail_reservation(llm_expert_key key, llm_cold_reference reference) noexcept;
     llm_expert_provider_result acquire(
             llm_cold_reference reference,
             llm_cold_reference_kind kind) noexcept;
+    llm_expert_provider_result convert_request_to_cpu_execution(
+            llm_cold_reference reference) noexcept;
+    llm_expert_provider_result convert_batch_to_request(
+            llm_cold_reference reference) noexcept;
+    llm_expert_provider_result convert_batch_to_cpu_execution(
+            llm_cold_reference reference) noexcept;
     llm_expert_provider_result policy_shadow_hit(
             llm_expert_key key,
             llm_cold_reference reference,
@@ -254,6 +281,10 @@ public:
     llm_cold_cache_diagnostics diagnostics() const;
 
 private:
+    llm_expert_provider_result reserve_or_join_demand_locked(
+            llm_expert_key key,
+            llm_cold_reference & reference,
+            llm_cold_demand_lookup & lookup) noexcept;
     struct impl;
     std::unique_ptr<impl> pimpl;
 };

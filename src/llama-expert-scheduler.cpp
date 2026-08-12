@@ -64,6 +64,16 @@ bool checked_add(uint64_t lhs, uint64_t rhs, uint64_t & result) {
 } // namespace
 
 struct llm_expert_scheduler::impl {
+    struct pending_successor_record {
+        bool active = false;
+        uint64_t generation = 0;
+        uint64_t enqueue_ordinal = 0;
+        llm_expert_priority priority = llm_expert_priority::demand_current_layer;
+        llm_expert_readiness readiness = llm_expert_readiness::host_ready;
+        uint32_t waiters = 0;
+        llm_expert_request_metadata metadata;
+    };
+
     struct request_record {
         llm_expert_key key = { -1, -1 };
         uint64_t generation = 0;
@@ -76,10 +86,12 @@ struct llm_expert_scheduler::impl {
         bool speculative_charge_active = false;
         bool promoted_from_speculative = false;
         bool cancellation_demand_owned = false;
+        pending_successor_record pending;
     };
 
     llm_expert_scheduler_config config;
     std::vector<request_record> requests;
+    std::unique_ptr<impl> batch_shadow;
     mutable std::mutex mutex;
     std::condition_variable state_cv;
     llm_expert_scheduler_diagnostics counters;
@@ -226,7 +238,8 @@ struct llm_expert_scheduler::impl {
     }
 
     bool reset_for_reuse(request_record & request) {
-        if (request.generation == std::numeric_limits<uint64_t>::max()) {
+        if (request.generation == std::numeric_limits<uint64_t>::max() ||
+            next_ordinal == std::numeric_limits<uint64_t>::max()) {
             counters.generation_exhaustions++;
             return false;
         }
@@ -241,7 +254,189 @@ struct llm_expert_scheduler::impl {
         request.metadata = {};
         request.promoted_from_speculative = false;
         request.cancellation_demand_owned = false;
+        request.pending = {};
         return true;
+    }
+
+    llm_expert_schedule_result enqueue_locked(
+            llm_expert_key key,
+            llm_expert_priority priority,
+            llm_expert_readiness readiness,
+            llm_expert_request_metadata metadata,
+            bool allow_pending_successor = false) noexcept {
+        if (counters.admission_closed) {
+            return { llm_expert_schedule_disposition::closed, {} };
+        }
+        if (!key.is_valid(config.layer_count, config.experts_per_layer) ||
+            metadata.target_device >= config.device_count ||
+            metadata.layout_class_id >= LLM_EXPERT_LAYOUT_CLASS_MAX) {
+            return { llm_expert_schedule_disposition::invalid, {} };
+        }
+        const bool speculative = priority >= llm_expert_priority::prefetch_next;
+        if (speculative && !speculative_budgets_enabled() &&
+            metadata.origin == llm_expert_request_origin::demand) {
+            metadata.origin = llm_expert_request_origin::speculative;
+        }
+        if ((speculative && metadata.origin != llm_expert_request_origin::speculative) ||
+            (!speculative && metadata.origin == llm_expert_request_origin::speculative) ||
+            (speculative_budgets_enabled() && speculative && metadata.target_layer != key.layer)) {
+            return { llm_expert_schedule_disposition::invalid, {} };
+        }
+        for (uint32_t slot = 0; slot < requests.size(); ++slot) {
+            request_record & request = requests[slot];
+            if (request.state != llm_expert_request_state::free &&
+                (!is_terminal(request.state) || request.pending.active || allow_pending_successor) &&
+                same_key(request.key, key) && request.metadata.target_device == metadata.target_device) {
+                if (request.metadata.layout_class_id != metadata.layout_class_id) {
+                    return { llm_expert_schedule_disposition::invalid, {} };
+                }
+                if (!speculative && (request.state == llm_expert_request_state::cancelling ||
+                        request.state == llm_expert_request_state::draining ||
+                        (allow_pending_successor && is_terminal(request.state)))) {
+                    if (allow_pending_successor) {
+                        if (request.pending.active) {
+                            if (request.pending.metadata.layout_class_id != metadata.layout_class_id ||
+                                request.pending.metadata.target_device != metadata.target_device) {
+                                return { llm_expert_schedule_disposition::invalid, {} };
+                            }
+                            if (request.pending.waiters == config.waiters_per_request) {
+                                return { llm_expert_schedule_disposition::busy, {} };
+                            }
+                            request.pending.waiters++;
+                            counters.joins++;
+                            return { llm_expert_schedule_disposition::pending_successor,
+                                { slot, request.pending.generation,
+                                    request.pending.metadata.target_device },
+                                { slot, request.generation, request.metadata.target_device } };
+                        }
+                        if (request.generation == std::numeric_limits<uint64_t>::max() ||
+                            next_ordinal == std::numeric_limits<uint64_t>::max()) {
+                            counters.generation_exhaustions++;
+                            return { llm_expert_schedule_disposition::generation_exhausted, {} };
+                        }
+                        request.pending = {
+                            true,
+                            request.generation + 1,
+                            next_ordinal++,
+                            priority,
+                            readiness,
+                            1,
+                            metadata,
+                        };
+                        counters.pending_successors++;
+                        update_occupancy();
+                        return { llm_expert_schedule_disposition::pending_successor,
+                            { slot, request.pending.generation,
+                                request.pending.metadata.target_device },
+                            { slot, request.generation, request.metadata.target_device } };
+                    }
+                    return { llm_expert_schedule_disposition::busy,
+                        { slot, request.generation, request.metadata.target_device } };
+                }
+                if (request.waiters == config.waiters_per_request) {
+                    return { llm_expert_schedule_disposition::busy, {} };
+                }
+                request.waiters++;
+                counters.joins++;
+                if (!speculative && request.metadata.origin == llm_expert_request_origin::speculative) {
+                    release_charge(request);
+                    request.metadata = metadata;
+                    request.metadata.origin = llm_expert_request_origin::demand;
+                    request.promoted_from_speculative = true;
+                    counters.demand_promotions++;
+                }
+                if (priority < request.priority) {
+                    request.priority = priority;
+                    counters.promotions++;
+                }
+                if (readiness > request.readiness) {
+                    request.readiness = readiness;
+                    counters.promotions++;
+                }
+                return { llm_expert_schedule_disposition::joined,
+                    { slot, request.generation, request.metadata.target_device } };
+            }
+        }
+
+        const bool device_at_capacity = active_on_device(metadata.target_device) >=
+            (config.device_request_capacities[metadata.target_device] != 0 ?
+                config.device_request_capacities[metadata.target_device] :
+                config.per_device_request_capacity);
+        if (device_at_capacity && priority >= llm_expert_priority::prefetch_next) {
+            counters.drops++;
+            return { llm_expert_schedule_disposition::dropped, {} };
+        }
+
+        uint32_t slot = UINT32_MAX;
+        if (!device_at_capacity) {
+            for (uint32_t index = 0; index < requests.size(); ++index) {
+                if (requests[index].state == llm_expert_request_state::free) {
+                    slot = index;
+                    break;
+                }
+            }
+        }
+        if (slot == UINT32_MAX && priority < llm_expert_priority::prefetch_next) {
+            uint64_t oldest = std::numeric_limits<uint64_t>::max();
+            for (uint32_t index = 0; index < requests.size(); ++index) {
+                const request_record & request = requests[index];
+                if (request.state == llm_expert_request_state::queued &&
+                    request.metadata.target_device == metadata.target_device &&
+                    request.priority > priority && request.enqueue_ordinal < oldest) {
+                    slot = index;
+                    oldest = request.enqueue_ordinal;
+                }
+            }
+            if (slot != UINT32_MAX) {
+                request_record & request = requests[slot];
+                if (!reset_for_reuse(request)) {
+                    update_occupancy();
+                    return { llm_expert_schedule_disposition::generation_exhausted, {} };
+                }
+                counters.queued_preemptions++;
+                counters.drops++;
+            }
+        }
+        if (slot == UINT32_MAX) {
+            if (priority >= llm_expert_priority::prefetch_next) {
+                counters.drops++;
+                return { llm_expert_schedule_disposition::dropped, {} };
+            }
+            return { llm_expert_schedule_disposition::busy, {} };
+        }
+
+        request_record & request = requests[slot];
+        if (request.generation == std::numeric_limits<uint64_t>::max() ||
+            next_ordinal == std::numeric_limits<uint64_t>::max()) {
+            counters.generation_exhaustions++;
+            return { llm_expert_schedule_disposition::generation_exhausted, {} };
+        }
+        request.key = key;
+        request.generation++;
+        request.enqueue_ordinal = next_ordinal++;
+        request.priority = priority;
+        request.readiness = readiness;
+        request.metadata = metadata;
+        request.promoted_from_speculative = false;
+        request.cancellation_demand_owned = false;
+        request.pending = {};
+        request.state = llm_expert_request_state::queued;
+        request.waiters = 1;
+        if (speculative && !can_charge(metadata)) {
+            request.key = { -1, -1 };
+            request.enqueue_ordinal = 0;
+            request.metadata = {};
+            request.state = llm_expert_request_state::free;
+            request.waiters = 0;
+            counters.speculative_budget_rejections++;
+            counters.drops++;
+            return { llm_expert_schedule_disposition::dropped, {} };
+        }
+        if (speculative) charge(request);
+        counters.flights_created++;
+        update_occupancy();
+        return { llm_expert_schedule_disposition::admitted,
+            { slot, request.generation, request.metadata.target_device } };
     }
 };
 
@@ -324,7 +519,15 @@ llm_expert_scheduler::llm_expert_scheduler(llm_expert_scheduler_config config) :
         pimpl->counters.devices[device].inflight_capacity = exact_device_capacities ?
             config.device_inflight_capacities[device] : config.per_device_inflight_capacity;
     }
-    pimpl->counters.administration_bytes = sizeof(*pimpl) + pimpl->requests.capacity()*sizeof(impl::request_record);
+    pimpl->batch_shadow = std::make_unique<impl>();
+    pimpl->batch_shadow->config = config;
+    pimpl->batch_shadow->requests.resize(config.request_capacity);
+    pimpl->batch_shadow->counters.devices.resize(config.device_count);
+    pimpl->counters.administration_bytes = 2*sizeof(*pimpl) +
+        2*pimpl->requests.capacity()*sizeof(impl::request_record) +
+        pimpl->counters.devices.capacity()*sizeof(llm_expert_scheduler_device_diagnostics) +
+        pimpl->batch_shadow->counters.devices.capacity()*
+            sizeof(llm_expert_scheduler_device_diagnostics);
 }
 
 llm_expert_scheduler::~llm_expert_scheduler() = default;
@@ -451,7 +654,8 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     }
 
     impl::request_record & request = pimpl->requests[slot];
-    if (request.generation == std::numeric_limits<uint64_t>::max()) {
+    if (request.generation == std::numeric_limits<uint64_t>::max() ||
+        pimpl->next_ordinal == std::numeric_limits<uint64_t>::max()) {
         pimpl->counters.generation_exhaustions++;
         return { llm_expert_schedule_disposition::generation_exhausted, {} };
     }
@@ -463,6 +667,7 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     request.metadata = metadata;
     request.promoted_from_speculative = false;
     request.cancellation_demand_owned = false;
+    request.pending = {};
     request.state = llm_expert_request_state::queued;
     request.waiters = 1;
     if (speculative && !pimpl->can_charge(metadata)) {
@@ -488,6 +693,71 @@ llm_expert_schedule_result llm_expert_scheduler::enqueue(
     pimpl->state_cv.notify_all();
     return { llm_expert_schedule_disposition::admitted,
         { slot, request.generation, request.metadata.target_device } };
+}
+
+llm_expert_schedule_disposition llm_expert_scheduler::enqueue_batch(
+        const llm_expert_schedule_batch_item * items,
+        size_t item_count,
+        llm_expert_schedule_result * results) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.scheduler", "enqueue_batch", "item_count", item_count);
+    if (items == nullptr || results == nullptr || item_count == 0) {
+        return llm_expert_schedule_disposition::invalid;
+    }
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    const size_t current_layer_capacity = pimpl->config.max_current_layer_demand_flights != 0 ?
+        pimpl->config.max_current_layer_demand_flights : pimpl->config.request_capacity;
+    if (item_count > current_layer_capacity) {
+        return llm_expert_schedule_disposition::busy;
+    }
+    auto & shadow = *pimpl->batch_shadow;
+    std::copy(pimpl->requests.begin(), pimpl->requests.end(), shadow.requests.begin());
+    shadow.counters = pimpl->counters;
+    shadow.next_ordinal = pimpl->next_ordinal;
+    bool accepted = true;
+    auto failure = llm_expert_schedule_disposition::admitted;
+    for (size_t index = 0; index < item_count; ++index) {
+        results[index] = shadow.enqueue_locked(
+            items[index].key, items[index].priority, items[index].readiness,
+            items[index].metadata, true);
+        if (!results[index].accepted()) {
+            if (accepted) failure = results[index].disposition;
+            accepted = false;
+        }
+    }
+    if (!accepted) return failure;
+
+    pimpl->requests.swap(shadow.requests);
+    std::swap(pimpl->counters, shadow.counters);
+    pimpl->next_ordinal = shadow.next_ordinal;
+    for (size_t index = 0; index < item_count; ++index) {
+        const auto & result = results[index];
+        if (result.disposition == llm_expert_schedule_disposition::pending_successor) {
+            continue;
+        }
+        if (result.disposition == llm_expert_schedule_disposition::joined) {
+            [[maybe_unused]] const auto & request = pimpl->requests[result.handle.slot];
+            LLM_EXPERT_TRACE_INSTANT("k3.scheduler", "single_flight_join", "flight_id",
+                llm_perfetto_trace_pair_id(llm_perfetto_trace_domain::flight,
+                    result.handle.slot, uint32_t(result.handle.generation)),
+                "layer", request.key.layer, "original_expert_id", request.key.expert,
+                "waiters", request.waiters);
+            continue;
+        }
+        [[maybe_unused]] const auto & request = pimpl->requests[result.handle.slot];
+        [[maybe_unused]] const uint64_t flight_id = llm_perfetto_trace_pair_id(
+            llm_perfetto_trace_domain::flight, result.handle.slot, uint32_t(result.handle.generation));
+        LLM_EXPERT_TRACE_ASYNC_BEGIN("k3.scheduler", "flight", flight_id,
+            "flight_id", flight_id, "layer", request.key.layer,
+            "original_expert_id", request.key.expert,
+            "layout_class_id", request.metadata.layout_class_id,
+            "priority", uint32_t(request.priority), "queue_depth", pimpl->counters.queued_requests);
+    }
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "scheduler_active_requests", 1,
+        pimpl->counters.active_requests);
+    LLM_EXPERT_TRACE_COUNTER("k3.resource", "scheduler_queue_depth", 2,
+        pimpl->counters.queued_requests);
+    pimpl->state_cv.notify_all();
+    return llm_expert_schedule_disposition::admitted;
 }
 
 llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_snapshot & result) noexcept {
@@ -537,6 +807,50 @@ llm_expert_schedule_result llm_expert_scheduler::take_next(llm_expert_request_sn
         "queue_depth", pimpl->counters.queued_requests);
     LLM_EXPERT_TRACE_FLOW_BEGIN("k3.scheduler", "flight_dispatch", flight_id, "flight_id", flight_id);
     return { llm_expert_schedule_disposition::admitted, result.handle };
+}
+
+llm_expert_schedule_result llm_expert_scheduler::take(
+        llm_expert_request_handle handle,
+        llm_expert_request_snapshot & result) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    impl::request_record * request = pimpl->find(handle);
+    if (request == nullptr) {
+        pimpl->counters.stale_completions++;
+        if (handle.target_device < pimpl->counters.devices.size()) {
+            pimpl->counters.devices[handle.target_device].stale_completions++;
+        }
+        return { llm_expert_schedule_disposition::stale_generation, {} };
+    }
+    const uint32_t inflight_capacity =
+        pimpl->config.device_inflight_capacities[request->metadata.target_device] != 0 ?
+            pimpl->config.device_inflight_capacities[request->metadata.target_device] :
+            pimpl->config.per_device_inflight_capacity;
+    if (request->state != llm_expert_request_state::queued ||
+        pimpl->inflight_on_device(request->metadata.target_device) >= inflight_capacity) {
+        return { llm_expert_schedule_disposition::busy, handle };
+    }
+    request->state = llm_expert_request_state::submitting;
+    result = {
+        request->key,
+        handle,
+        request->priority,
+        request->readiness,
+        request->state,
+        request->waiters,
+        request->enqueue_ordinal,
+        request->metadata,
+        request->promoted_from_speculative,
+    };
+    pimpl->update_occupancy();
+    [[maybe_unused]] const uint64_t flight_id = llm_perfetto_trace_pair_id(
+        llm_perfetto_trace_domain::flight, handle.slot, uint32_t(handle.generation));
+    LLM_EXPERT_TRACE_INSTANT("k3.scheduler", "dispatch", "flight_id", flight_id,
+        "layer", request->key.layer, "original_expert_id", request->key.expert,
+        "target_device", request->metadata.target_device,
+        "queue_depth", pimpl->counters.queued_requests);
+    LLM_EXPERT_TRACE_FLOW_BEGIN("k3.scheduler", "flight_dispatch", flight_id,
+        "flight_id", flight_id);
+    return { llm_expert_schedule_disposition::admitted, handle };
 }
 
 llm_expert_schedule_disposition llm_expert_scheduler::transition(
@@ -668,6 +982,25 @@ llm_expert_schedule_disposition llm_expert_scheduler::release_terminal(llm_exper
     }
     pimpl->counters.devices[request->metadata.target_device].terminal_releases++;
     pimpl->release_charge(*request);
+    if (request->pending.active) {
+        const auto successor = request->pending;
+        request->generation = successor.generation;
+        request->enqueue_ordinal = successor.enqueue_ordinal;
+        request->priority = successor.priority;
+        request->readiness = successor.readiness;
+        request->state = llm_expert_request_state::queued;
+        request->waiters = successor.waiters;
+        request->metadata = successor.metadata;
+        request->promoted_from_speculative = false;
+        request->cancellation_demand_owned = false;
+        request->pending = {};
+        pimpl->counters.terminal_releases++;
+        pimpl->counters.flights_created++;
+        pimpl->counters.successor_activations++;
+        pimpl->update_occupancy();
+        pimpl->state_cv.notify_all();
+        return llm_expert_schedule_disposition::admitted;
+    }
     request->key = { -1, -1 };
     request->enqueue_ordinal = 0;
     request->state = llm_expert_request_state::free;
@@ -675,7 +1008,30 @@ llm_expert_schedule_disposition llm_expert_scheduler::release_terminal(llm_exper
     request->metadata = {};
     request->promoted_from_speculative = false;
     request->cancellation_demand_owned = false;
+    request->pending = {};
     pimpl->counters.terminal_releases++;
+    pimpl->update_occupancy();
+    pimpl->state_cv.notify_all();
+    return llm_expert_schedule_disposition::admitted;
+}
+
+llm_expert_schedule_disposition llm_expert_scheduler::cancel_pending_successor(
+        llm_expert_request_handle handle) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!handle.valid() || handle.slot >= pimpl->requests.size()) {
+        return llm_expert_schedule_disposition::invalid;
+    }
+    auto & request = pimpl->requests[handle.slot];
+    if (!request.pending.active || request.pending.generation != handle.generation ||
+        request.pending.metadata.target_device != handle.target_device) {
+        pimpl->counters.stale_completions++;
+        if (handle.target_device < pimpl->counters.devices.size()) {
+            pimpl->counters.devices[handle.target_device].stale_completions++;
+        }
+        return llm_expert_schedule_disposition::stale_generation;
+    }
+    request.pending = {};
+    pimpl->counters.successor_cancellations++;
     pimpl->update_occupancy();
     pimpl->state_cv.notify_all();
     return llm_expert_schedule_disposition::admitted;
@@ -755,7 +1111,7 @@ bool llm_expert_scheduler::shutdown() noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     pimpl->counters.admission_closed = true;
     for (const impl::request_record & request : pimpl->requests) {
-        if (is_submitted(request.state)) {
+        if (is_submitted(request.state) || request.pending.active) {
             return false;
         }
     }
@@ -768,6 +1124,7 @@ bool llm_expert_scheduler::shutdown() noexcept {
         request.metadata = {};
         request.promoted_from_speculative = false;
         request.cancellation_demand_owned = false;
+        request.pending = {};
     }
     pimpl->update_occupancy();
     pimpl->state_cv.notify_all();

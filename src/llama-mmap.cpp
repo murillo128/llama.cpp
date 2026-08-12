@@ -691,6 +691,11 @@ struct llama_mmap::impl {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
                         strerror(errno));
             }
+        } else if (prefetch == 0) {
+            if (posix_madvise(addr, file->size(), POSIX_MADV_SEQUENTIAL)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_SEQUENTIAL) failed: %s\n",
+                        strerror(errno));
+            }
         }
 
         mapped_fragments.emplace_back(0, file->size());

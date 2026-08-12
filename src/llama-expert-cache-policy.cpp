@@ -183,6 +183,7 @@ llm_expert_cache_policy_result llm_expert_cache_policy::initialize(
         }
         keys.assign(size_t(key_count), {});
         slots.assign(slot_count, {});
+        candidate_seen.assign(slot_count, 0);
         const uint32_t domain_count = config.scope == LLAMA_EXPERT_CACHE_POLICY_SCOPE_GLOBAL ? 1 : routed_layer_count;
         if (domain_budget_bytes != nullptr && domain_budget_count != domain_count) {
             return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::invalid_configuration);
@@ -263,12 +264,14 @@ llm_expert_cache_policy_result llm_expert_cache_policy::initialize(
         if (!add_admin(layers.size(), sizeof(int32_t), requested_admin) ||
             !add_admin(keys.size(), sizeof(key_state), requested_admin) ||
             !add_admin(slots.size(), sizeof(slot_state), requested_admin) ||
+            !add_admin(candidate_seen.size(), sizeof(uint8_t), requested_admin) ||
             !add_admin(domains.size(), sizeof(llm_expert_cache_policy_domain_diagnostics), requested_admin) ||
             !add_admin(frequency_window.size(), sizeof(uint64_t), requested_admin) ||
             !add_admin(events.size(), sizeof(llm_expert_cache_policy_event), requested_admin) ||
             !add_admin(layers.capacity(), sizeof(int32_t), actual_admin) ||
             !add_admin(keys.capacity(), sizeof(key_state), actual_admin) ||
             !add_admin(slots.capacity(), sizeof(slot_state), actual_admin) ||
+            !add_admin(candidate_seen.capacity(), sizeof(uint8_t), actual_admin) ||
             !add_admin(domains.capacity(), sizeof(llm_expert_cache_policy_domain_diagnostics), actual_admin) ||
             !add_admin(frequency_window.capacity(), sizeof(uint64_t), actual_admin) ||
             !add_admin(events.capacity(), sizeof(llm_expert_cache_policy_event), actual_admin)) {
@@ -573,20 +576,16 @@ llm_expert_cache_policy_result llm_expert_cache_policy::select(
     if (!request_active || requested_key < 0 || candidates == nullptr || candidate_count == 0) {
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::invalid_key);
     }
+    std::fill(candidate_seen.begin(), candidate_seen.end(), 0);
     for (size_t index = 0; index < candidate_count; ++index) {
         const auto & candidate = candidates[index];
         if (candidate.slot >= slots.size() || candidate.logical_bundle_bytes == 0 ||
             candidate.physical_slot_footprint_bytes != slot_footprint ||
-            (candidate.free && candidate.eligible)) {
+            (candidate.free && candidate.eligible) || candidate_seen[candidate.slot] != 0) {
             counters.metadata_mismatches++;
             return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::metadata_mismatch);
         }
-        for (size_t prior = 0; prior < index; ++prior) {
-            if (candidates[prior].slot == candidate.slot) {
-                counters.metadata_mismatches++;
-                return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::metadata_mismatch);
-            }
-        }
+        candidate_seen[candidate.slot] = 1;
     }
     const uint32_t domain = key_domain(key);
     const auto capacity = preflight_events();
@@ -655,6 +654,7 @@ llm_expert_cache_policy_result llm_expert_cache_policy::plan_evictions(
     if (physical_slot_footprint_bytes > domain_state.quota_bytes) {
         return llm_expert_cache_policy_result::failure(llm_expert_cache_policy_error::no_victim);
     }
+    std::fill(candidate_seen.begin(), candidate_seen.end(), 0);
     for (size_t index = 0; index < candidate_count; ++index) {
         const auto & candidate = candidates[index];
         if (candidate.slot >= slots.size() || candidate.free || !candidate.eligible ||
@@ -663,18 +663,13 @@ llm_expert_cache_policy_result llm_expert_cache_policy::plan_evictions(
             slots[candidate.slot].generation != candidate.generation ||
             !key_matches(slots[candidate.slot].key, candidate.key) ||
             candidate.physical_slot_footprint_bytes !=
-                slots[candidate.slot].physical_slot_footprint_bytes) {
+                slots[candidate.slot].physical_slot_footprint_bytes ||
+            candidate_seen[candidate.slot] != 0) {
             counters.metadata_mismatches++;
             return llm_expert_cache_policy_result::failure(
                 llm_expert_cache_policy_error::metadata_mismatch);
         }
-        for (size_t prior = 0; prior < index; ++prior) {
-            if (candidates[prior].slot == candidate.slot) {
-                counters.metadata_mismatches++;
-                return llm_expert_cache_policy_result::failure(
-                    llm_expert_cache_policy_error::metadata_mismatch);
-            }
-        }
+        candidate_seen[candidate.slot] = 1;
     }
     const uint64_t available = domain_state.quota_bytes - domain_state.occupancy_bytes;
     if (physical_slot_footprint_bytes <= available) return llm_expert_cache_policy_result::success();
@@ -785,22 +780,17 @@ llm_expert_cache_policy_result llm_expert_cache_policy::optional_admission(
     if (!capacity.is_ready()) return capacity;
     const uint32_t domain = key_domain(key);
     int32_t incumbent = -1;
+    std::fill(candidate_seen.begin(), candidate_seen.end(), 0);
     for (size_t index = 0; index < candidate_count; ++index) {
         const auto & candidate = candidates[index];
         if (candidate.slot >= slots.size() || candidate.logical_bundle_bytes == 0 ||
             candidate.physical_slot_footprint_bytes != slot_footprint ||
-            (candidate.free && candidate.eligible)) {
+            (candidate.free && candidate.eligible) || candidate_seen[candidate.slot] != 0) {
             counters.metadata_mismatches++;
             return llm_expert_cache_policy_result::failure(
                 llm_expert_cache_policy_error::metadata_mismatch);
         }
-        for (size_t prior = 0; prior < index; ++prior) {
-            if (candidates[prior].slot == candidate.slot) {
-                counters.metadata_mismatches++;
-                return llm_expert_cache_policy_result::failure(
-                    llm_expert_cache_policy_error::metadata_mismatch);
-            }
-        }
+        candidate_seen[candidate.slot] = 1;
         if (slots[candidate.slot].domain != domain) continue;
         if (candidate.free) {
             decision = { candidate.slot, candidate.generation, true, true };

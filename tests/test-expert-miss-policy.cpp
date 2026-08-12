@@ -441,7 +441,7 @@ void test_cpu_cold_only_binding() {
     config.allow_non_cuda_target_for_testing = true;
     config.cold_mode = true;
     config.cpu_cold_only = true;
-    config.cold_cache_bytes = 1U << 20;
+    config.cold_cache_bytes = 0;
     config.miss_policy = LLAMA_EXPERT_MISS_POLICY_CPU_FALLBACK;
     auto provider = llm_create_cold_cache_expert_weight_provider(config);
 
@@ -469,7 +469,10 @@ void test_cpu_cold_only_binding() {
 
     const auto initial = provider->hot_cache_diagnostics();
     GGML_ASSERT(initial.cpu_cold_only && initial.requested_capacity == 0 &&
-        initial.effective_capacity == 0 && initial.pool_bytes == 0);
+        initial.effective_capacity == 0 && initial.pool_bytes == 0 &&
+        initial.system_memory_autofit && initial.system_memory_budget_frozen &&
+        initial.system_memory_requested_pool_bytes == 0 &&
+        initial.system_memory_selected_pool_bytes == initial.cold_requested_bytes);
     GGML_ASSERT(initial.cold_effective_slots >= 2 && initial.cold_admissions == 0);
 
     const int32_t logical_ids[] = { 0, 1 };

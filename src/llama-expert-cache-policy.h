@@ -309,6 +309,7 @@ private:
     std::vector<int32_t> layers;
     std::vector<key_state> keys;
     std::vector<slot_state> slots;
+    std::vector<uint8_t> candidate_seen;
     std::vector<llm_expert_cache_policy_domain_diagnostics> domains;
     std::vector<uint64_t> frequency_window;
     size_t frequency_window_write = 0;

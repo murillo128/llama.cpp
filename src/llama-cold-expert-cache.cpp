@@ -529,7 +529,8 @@ struct llm_cold_expert_cache::impl {
             }
         }
         if (this->config.routed_layers.size() != config.routed_layer_count ||
-            this->config.policy_trace_capacity == 0) {
+            this->config.policy_trace_capacity == 0 ||
+            (this->config.preflight != nullptr && this->config.reservation_bytes == 0)) {
             throw std::invalid_argument("invalid cold-cache policy topology");
         }
     }
@@ -567,7 +568,7 @@ struct llm_cold_expert_cache::impl {
 
     bool no_refs(const llm_cold_cache_diagnostics::slot & slot) const {
         return slot.hot_refs == 0 && slot.transfer_refs == 0 && slot.request_refs == 0 &&
-            slot.cpu_execution_refs == 0;
+            slot.cpu_execution_refs == 0 && slot.batch_refs == 0;
     }
 
     uint64_t occupancy() const noexcept {
@@ -598,6 +599,7 @@ struct llm_cold_expert_cache::impl {
     uint64_t use_clock = 0;
     llm_expert_cache_policy policy;
     std::vector<llm_expert_cache_policy_candidate> policy_candidates;
+    std::vector<bool> demand_batch_protected;
     bool policy_request_active = false;
     llm_expert_cache_policy_phase policy_phase = llm_expert_cache_policy_phase::prefill;
 
@@ -669,7 +671,8 @@ struct llm_cold_expert_cache::impl {
                 slot.state == llm_cold_slot_state::free ? payload_for_key(key) : payload_for_key(slot.key),
                 counters.aligned_slot_footprint,
                 slot.state == llm_cold_slot_state::free,
-                slot.state == llm_cold_slot_state::ready && no_refs(slot) };
+                slot.state == llm_cold_slot_state::ready && no_refs(slot) &&
+                    (index >= demand_batch_protected.size() || !demand_batch_protected[index]) };
         }
         llm_expert_cache_policy_decision decision;
         auto result = policy_result(policy.select(policy_key(key),
@@ -682,12 +685,18 @@ struct llm_cold_expert_cache::impl {
         const bool valid = decision.free ?
             slot.state == llm_cold_slot_state::free && slot.generation == decision.generation :
             slot.state == llm_cold_slot_state::ready && no_refs(slot) &&
+                (decision.slot >= demand_batch_protected.size() ||
+                    !demand_batch_protected[decision.slot]) &&
                 slot.generation == decision.generation &&
                 policy.validate_resident(decision.slot, decision.generation,
                     policy_key(slot.key));
         if (!valid) {
             counters.invariant_failures++;
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+        }
+        if (decision.free && config.preflight != nullptr) {
+            result = config.preflight(config.preflight_data, config.reservation_bytes);
+            if (!result.is_ready()) return result;
         }
         selected = int32_t(decision.slot);
         return llm_expert_provider_result::success();
@@ -712,6 +721,30 @@ llm_expert_provider_result llm_cold_expert_cache::calculate_slot_footprint(
     try {
         const size_t size = allocation_size(prototype, 1, buffer_type);
         if (size == 0) {
+            return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+        }
+        footprint = size;
+        return llm_expert_provider_result::success();
+    } catch (const std::bad_alloc &) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
+    } catch (...) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
+    }
+}
+
+llm_expert_provider_result llm_cold_expert_cache::calculate_slot_footprint(
+        const llm_expert_layout_registry & registry,
+        ggml_backend_buffer_type_t buffer_type,
+        uint64_t & footprint) noexcept {
+    footprint = 0;
+    if (!registry.sealed() || registry.classes.empty()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_descriptor);
+    }
+    try {
+        const size_t size = registry.classes.size() == 1 ?
+            allocation_size(registry.classes.front().prototype, 1, buffer_type) :
+            universal_slot_stride(registry, buffer_type);
+        if (size == 0 || size == SIZE_MAX) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
         }
         footprint = size;
@@ -834,6 +867,7 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
         pimpl->counters.effective_slots = low;
         pimpl->counters.pageable = ggml_backend_buffer_is_host(candidate->buffer.get());
         pimpl->policy_candidates.assign(low, {});
+        pimpl->demand_batch_protected.assign(low, false);
         const auto policy_initialized = pimpl->policy.initialize(
             pimpl->config.cache_policy_config,
             llm_expert_cache_policy_tier::cold,
@@ -853,11 +887,13 @@ llm_expert_provider_result llm_cold_expert_cache::initialize(
         pimpl->arena.reset();
         pimpl->directory.clear();
         pimpl->slots.clear();
+        pimpl->demand_batch_protected.clear();
         return llm_expert_provider_result::failure(llm_expert_provider_error::allocation_failed);
     } catch (...) {
         pimpl->arena.reset();
         pimpl->directory.clear();
         pimpl->slots.clear();
+        pimpl->demand_batch_protected.clear();
         return llm_expert_provider_result::failure(llm_expert_provider_error::initialization_failed);
     }
 }
@@ -997,7 +1033,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find(
     }
     slot.generation++;
     slot.last_use = 0;
-    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
+    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = slot.batch_refs = 0;
     slot.origin = llm_expert_residency_origin::demand;
     slot.speculative_consumed = false;
     slot.speculative_deadline = 0;
@@ -1024,6 +1060,13 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
     LLM_EXPERT_TRACE_SCOPE("k3.cache.cold", "demand_lookup", "layer", key.layer,
         "original_expert_id", key.expert);
     std::lock_guard<std::mutex> lock(pimpl->mutex);
+    return reserve_or_join_demand_locked(key, reference, lookup);
+}
+
+llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand_locked(
+        llm_expert_key key,
+        llm_cold_reference & reference,
+        llm_cold_demand_lookup & lookup) noexcept {
     pimpl->counters.requests++;
     lookup = llm_cold_demand_lookup::reserved;
     if (!pimpl->arena || !key.is_valid(LLAMA_MAX_LAYERS, pimpl->n_expert)) {
@@ -1107,7 +1150,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
     }
     slot.generation++;
     slot.last_use = 0;
-    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
+    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = slot.batch_refs = 0;
     slot.origin = llm_expert_residency_origin::demand;
     slot.speculative_consumed = false;
     slot.speculative_deadline = 0;
@@ -1124,6 +1167,94 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand(
     LLM_EXPERT_TRACE_INSTANT("k3.cache.cold", "reserve", "layer", key.layer,
         "original_expert_id", key.expert, "slot_id", reference.slot, "generation", reference.generation,
         "layout_class_id", reference.layout_class_id);
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_cold_expert_cache::reserve_or_join_demand_batch(
+        const llm_expert_key * keys,
+        size_t key_count,
+        llm_cold_reference * references,
+        llm_cold_demand_lookup * lookups) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.cache.cold", "demand_lookup_batch", "key_count", key_count);
+    if (keys == nullptr || references == nullptr || lookups == nullptr || key_count == 0) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+    }
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->arena || pimpl->demand_batch_protected.size() != pimpl->slots.size()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+    }
+    std::fill(pimpl->demand_batch_protected.begin(), pimpl->demand_batch_protected.end(), false);
+    const auto clear_protection = [&]() {
+        std::fill(pimpl->demand_batch_protected.begin(), pimpl->demand_batch_protected.end(), false);
+    };
+    for (size_t index = 0; index < key_count; ++index) {
+        references[index] = {};
+        lookups[index] = llm_cold_demand_lookup::missing;
+    }
+    for (size_t index = 0; index < key_count; ++index) {
+        if (!keys[index].is_valid(LLAMA_MAX_LAYERS, pimpl->n_expert)) {
+            clear_protection();
+            return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
+        }
+        for (size_t prior = 0; prior < index; ++prior) {
+            if (key_matches(keys[index], keys[prior])) {
+                clear_protection();
+                return llm_expert_provider_result::failure(
+                    llm_expert_provider_error::metadata_mismatch);
+            }
+        }
+        const auto & forward = pimpl->directory[pimpl->forward_index(keys[index])];
+        if (forward.slot < 0) continue;
+        if (uint32_t(forward.slot) >= pimpl->slots.size()) {
+            pimpl->counters.invariant_failures++;
+            clear_protection();
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::metadata_mismatch);
+        }
+        const auto & slot = pimpl->slots[uint32_t(forward.slot)];
+        if (!key_matches(slot.key, keys[index]) || slot.generation != forward.generation ||
+            slot.state != llm_cold_slot_state::ready) {
+            pimpl->counters.invariant_failures++;
+            clear_protection();
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::metadata_mismatch);
+        }
+        if (slot.batch_refs == std::numeric_limits<uint32_t>::max()) {
+            clear_protection();
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::unsupported_configuration);
+        }
+    }
+    for (size_t index = 0; index < key_count; ++index) {
+        const auto result = reserve_or_join_demand_locked(
+            keys[index], references[index], lookups[index]);
+        if (!result.is_ready()) {
+            clear_protection();
+            return result;
+        }
+        // Match the serial semantic sequence: an earlier miss may evict a later
+        // key that was ready at preflight. Protect a hit only after its own
+        // lookup has been applied, so it is unavailable to subsequent victims.
+        if (lookups[index] == llm_cold_demand_lookup::ready) {
+            pimpl->demand_batch_protected[references[index].slot] = true;
+        }
+    }
+    for (size_t index = 0; index < key_count; ++index) {
+        if (lookups[index] != llm_cold_demand_lookup::ready) continue;
+        if (!pimpl->valid_reference(references[index])) {
+            pimpl->counters.invariant_failures++;
+            clear_protection();
+            return llm_expert_provider_result::failure(
+                llm_expert_provider_error::stale_generation);
+        }
+        auto & slot = pimpl->slots[references[index].slot];
+        slot.batch_refs++;
+        pimpl->counters.current_batch_refs++;
+        pimpl->counters.peak_batch_refs = std::max(
+            pimpl->counters.peak_batch_refs, pimpl->counters.current_batch_refs);
+        slot.last_use = ++pimpl->use_clock;
+    }
+    clear_protection();
     return llm_expert_provider_result::success();
 }
 
@@ -1327,7 +1458,7 @@ llm_expert_provider_result llm_cold_expert_cache::reserve_or_find_speculative(
     }
     slot.generation++;
     slot.last_use = 0;
-    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
+    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = slot.batch_refs = 0;
     slot.origin = llm_expert_residency_origin::speculative;
     slot.speculative_consumed = false;
     slot.speculative_deadline = deadline;
@@ -1384,6 +1515,77 @@ llm_expert_provider_result llm_cold_expert_cache::publish_ready(
     const auto result = pimpl->commit_ready_policy_slots();
     pimpl->ready_cv.notify_all();
     return result;
+}
+
+llm_expert_provider_result llm_cold_expert_cache::publish_ready_and_acquire(
+        llm_expert_key key,
+        llm_cold_reference reference,
+        llm_cold_reference_kind kind) noexcept {
+    LLM_EXPERT_TRACE_SCOPE("k3.cache.cold", "publish_and_pin", "layer", key.layer,
+        "original_expert_id", key.expert, "slot_id", reference.slot, "generation", reference.generation,
+        "reference_kind", uint32_t(kind));
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (reference.slot >= pimpl->slots.size()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & slot = pimpl->slots[reference.slot];
+    if (slot.generation != reference.generation || slot.layout_class_id != reference.layout_class_id ||
+        slot.state != llm_cold_slot_state::loading || !key_matches(slot.key, key)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & forward = pimpl->directory[pimpl->forward_index(key)];
+    if (forward.slot >= 0) {
+        pimpl->counters.invariant_failures++;
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    uint32_t * counter = nullptr;
+    uint64_t * current = nullptr;
+    uint64_t * peak = nullptr;
+    if (kind == llm_cold_reference_kind::hot) {
+        counter = &slot.hot_refs; current = &pimpl->counters.current_hot_refs; peak = &pimpl->counters.peak_hot_refs;
+    } else if (kind == llm_cold_reference_kind::transfer) {
+        counter = &slot.transfer_refs; current = &pimpl->counters.current_transfer_refs; peak = &pimpl->counters.peak_transfer_refs;
+    } else if (kind == llm_cold_reference_kind::request) {
+        counter = &slot.request_refs; current = &pimpl->counters.current_request_refs; peak = &pimpl->counters.peak_request_refs;
+    } else if (kind == llm_cold_reference_kind::cpu_execution) {
+        counter = &slot.cpu_execution_refs;
+        current = &pimpl->counters.current_cpu_execution_refs;
+        peak = &pimpl->counters.peak_cpu_execution_refs;
+    } else {
+        counter = &slot.batch_refs;
+        current = &pimpl->counters.current_batch_refs;
+        peak = &pimpl->counters.peak_batch_refs;
+    }
+    if (*counter == std::numeric_limits<uint32_t>::max()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    auto result = policy_result(pimpl->policy.validate_event_capacity(
+        kind == llm_cold_reference_kind::batch ? 1 : 2));
+    if (result.is_ready()) result = policy_result(
+        pimpl->policy.load_complete(reference.slot, reference.generation));
+    if (result.is_ready()) result = pimpl->commit_ready_policy_slots();
+    if (!result.is_ready()) {
+        pimpl->ready_cv.notify_all();
+        return result;
+    }
+    if (!pimpl->valid_reference(reference)) {
+        pimpl->counters.invariant_failures++;
+        pimpl->ready_cv.notify_all();
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    if (kind != llm_cold_reference_kind::batch) {
+        const auto pinned = policy_result(pimpl->policy.pin(reference.slot, reference.generation));
+        if (!pinned.is_ready()) {
+            pimpl->ready_cv.notify_all();
+            return pinned;
+        }
+    }
+    (*counter)++;
+    (*current)++;
+    *peak = std::max(*peak, *current);
+    slot.last_use = ++pimpl->use_clock;
+    pimpl->ready_cv.notify_all();
+    return llm_expert_provider_result::success();
 }
 
 llm_expert_provider_result llm_cold_expert_cache::fail_reservation(
@@ -1479,7 +1681,7 @@ llm_expert_provider_result llm_cold_expert_cache::find_or_admit(
     }
     slot.generation++;
     slot.last_use = 0;
-    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = 0;
+    slot.hot_refs = slot.transfer_refs = slot.request_refs = slot.cpu_execution_refs = slot.batch_refs = 0;
     slot.origin = llm_expert_residency_origin::demand;
     slot.speculative_consumed = false;
     slot.speculative_deadline = 0;
@@ -1557,17 +1759,96 @@ llm_expert_provider_result llm_cold_expert_cache::acquire(
         counter = &slot.transfer_refs; current = &pimpl->counters.current_transfer_refs; peak = &pimpl->counters.peak_transfer_refs;
     } else if (kind == llm_cold_reference_kind::request) {
         counter = &slot.request_refs; current = &pimpl->counters.current_request_refs; peak = &pimpl->counters.peak_request_refs;
-    } else {
+    } else if (kind == llm_cold_reference_kind::cpu_execution) {
         counter = &slot.cpu_execution_refs;
         current = &pimpl->counters.current_cpu_execution_refs;
         peak = &pimpl->counters.peak_cpu_execution_refs;
+    } else {
+        counter = &slot.batch_refs;
+        current = &pimpl->counters.current_batch_refs;
+        peak = &pimpl->counters.peak_batch_refs;
     }
     if (*counter == std::numeric_limits<uint32_t>::max()) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
     }
+    if (kind != llm_cold_reference_kind::batch) {
+        const auto pinned = policy_result(pimpl->policy.pin(reference.slot, reference.generation));
+        if (!pinned.is_ready()) return pinned;
+    }
+    (*counter)++; (*current)++; *peak = std::max(*peak, *current);
+    slot.last_use = ++pimpl->use_clock;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_cold_expert_cache::convert_request_to_cpu_execution(
+        llm_cold_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->valid_reference(reference)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & slot = pimpl->slots[reference.slot];
+    if (slot.request_refs == 0 || pimpl->counters.current_request_refs == 0) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    if (slot.cpu_execution_refs == std::numeric_limits<uint32_t>::max()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    slot.request_refs--;
+    pimpl->counters.current_request_refs--;
+    slot.cpu_execution_refs++;
+    pimpl->counters.current_cpu_execution_refs++;
+    pimpl->counters.peak_cpu_execution_refs = std::max(
+        pimpl->counters.peak_cpu_execution_refs, pimpl->counters.current_cpu_execution_refs);
+    slot.last_use = ++pimpl->use_clock;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_cold_expert_cache::convert_batch_to_request(
+        llm_cold_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->valid_reference(reference)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & slot = pimpl->slots[reference.slot];
+    if (slot.batch_refs == 0 || pimpl->counters.current_batch_refs == 0) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    if (slot.request_refs == std::numeric_limits<uint32_t>::max()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
     const auto pinned = policy_result(pimpl->policy.pin(reference.slot, reference.generation));
     if (!pinned.is_ready()) return pinned;
-    (*counter)++; (*current)++; *peak = std::max(*peak, *current);
+    slot.batch_refs--;
+    pimpl->counters.current_batch_refs--;
+    slot.request_refs++;
+    pimpl->counters.current_request_refs++;
+    pimpl->counters.peak_request_refs = std::max(
+        pimpl->counters.peak_request_refs, pimpl->counters.current_request_refs);
+    slot.last_use = ++pimpl->use_clock;
+    return llm_expert_provider_result::success();
+}
+
+llm_expert_provider_result llm_cold_expert_cache::convert_batch_to_cpu_execution(
+        llm_cold_reference reference) noexcept {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    if (!pimpl->valid_reference(reference)) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::stale_generation);
+    }
+    auto & slot = pimpl->slots[reference.slot];
+    if (slot.batch_refs == 0 || pimpl->counters.current_batch_refs == 0) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
+    }
+    if (slot.cpu_execution_refs == std::numeric_limits<uint32_t>::max()) {
+        return llm_expert_provider_result::failure(llm_expert_provider_error::unsupported_configuration);
+    }
+    const auto pinned = policy_result(pimpl->policy.pin(reference.slot, reference.generation));
+    if (!pinned.is_ready()) return pinned;
+    slot.batch_refs--;
+    pimpl->counters.current_batch_refs--;
+    slot.cpu_execution_refs++;
+    pimpl->counters.current_cpu_execution_refs++;
+    pimpl->counters.peak_cpu_execution_refs = std::max(
+        pimpl->counters.peak_cpu_execution_refs, pimpl->counters.current_cpu_execution_refs);
     slot.last_use = ++pimpl->use_clock;
     return llm_expert_provider_result::success();
 }
@@ -1615,14 +1896,18 @@ llm_expert_provider_result llm_cold_expert_cache::release(
         counter = &slot.transfer_refs; current = &pimpl->counters.current_transfer_refs;
     } else if (kind == llm_cold_reference_kind::request) {
         counter = &slot.request_refs; current = &pimpl->counters.current_request_refs;
-    } else {
+    } else if (kind == llm_cold_reference_kind::cpu_execution) {
         counter = &slot.cpu_execution_refs; current = &pimpl->counters.current_cpu_execution_refs;
+    } else {
+        counter = &slot.batch_refs; current = &pimpl->counters.current_batch_refs;
     }
     if (*counter == 0 || *current == 0) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
-    const auto unpinned = policy_result(pimpl->policy.unpin(reference.slot, reference.generation));
-    if (!unpinned.is_ready()) return unpinned;
+    if (kind != llm_cold_reference_kind::batch) {
+        const auto unpinned = policy_result(pimpl->policy.unpin(reference.slot, reference.generation));
+        if (!unpinned.is_ready()) return unpinned;
+    }
     (*counter)--; (*current)--;
     return llm_expert_provider_result::success();
 }
@@ -1635,12 +1920,15 @@ llm_expert_provider_result llm_cold_expert_cache::release_many(
     if (reference_count != 0 && references == nullptr) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::invalid_key);
     }
-    auto capacity = policy_result(pimpl->policy.validate_event_capacity(reference_count));
-    if (!capacity.is_ready()) return capacity;
+    if (kind != llm_cold_reference_kind::batch) {
+        auto capacity = policy_result(pimpl->policy.validate_event_capacity(reference_count));
+        if (!capacity.is_ready()) return capacity;
+    }
     const uint64_t current_references = kind == llm_cold_reference_kind::hot ?
         pimpl->counters.current_hot_refs : kind == llm_cold_reference_kind::transfer ?
         pimpl->counters.current_transfer_refs : kind == llm_cold_reference_kind::request ?
-        pimpl->counters.current_request_refs : pimpl->counters.current_cpu_execution_refs;
+        pimpl->counters.current_request_refs : kind == llm_cold_reference_kind::cpu_execution ?
+        pimpl->counters.current_cpu_execution_refs : pimpl->counters.current_batch_refs;
     if (reference_count > current_references) {
         return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
     }
@@ -1651,7 +1939,8 @@ llm_expert_provider_result llm_cold_expert_cache::release_many(
         const auto & slot = pimpl->slots[references[index].slot];
         const uint32_t counter = kind == llm_cold_reference_kind::hot ? slot.hot_refs :
             kind == llm_cold_reference_kind::transfer ? slot.transfer_refs :
-            kind == llm_cold_reference_kind::request ? slot.request_refs : slot.cpu_execution_refs;
+            kind == llm_cold_reference_kind::request ? slot.request_refs :
+            kind == llm_cold_reference_kind::cpu_execution ? slot.cpu_execution_refs : slot.batch_refs;
         size_t occurrences = 0;
         for (size_t prior = 0; prior <= index; ++prior) {
             occurrences += references[prior].slot == references[index].slot &&
@@ -1671,15 +1960,19 @@ llm_expert_provider_result llm_cold_expert_cache::release_many(
             counter = &slot.transfer_refs; current = &pimpl->counters.current_transfer_refs;
         } else if (kind == llm_cold_reference_kind::request) {
             counter = &slot.request_refs; current = &pimpl->counters.current_request_refs;
-        } else {
+        } else if (kind == llm_cold_reference_kind::cpu_execution) {
             counter = &slot.cpu_execution_refs; current = &pimpl->counters.current_cpu_execution_refs;
+        } else {
+            counter = &slot.batch_refs; current = &pimpl->counters.current_batch_refs;
         }
         if (*counter == 0 || *current == 0) {
             return llm_expert_provider_result::failure(llm_expert_provider_error::metadata_mismatch);
         }
-        const auto unpinned = policy_result(
-            pimpl->policy.unpin(references[index].slot, references[index].generation));
-        if (!unpinned.is_ready()) return unpinned;
+        if (kind != llm_cold_reference_kind::batch) {
+            const auto unpinned = policy_result(
+                pimpl->policy.unpin(references[index].slot, references[index].generation));
+            if (!unpinned.is_ready()) return unpinned;
+        }
         (*counter)--;
         (*current)--;
     }
@@ -1793,10 +2086,25 @@ llm_expert_provider_result llm_cold_expert_cache::trim() noexcept {
                 pimpl->occupancy());
             if (pimpl->config.reclaim_free_pages) {
 #ifdef __linux__
-                const uint64_t reclaimed = pimpl->counters.aligned_slot_footprint;
+                const uint64_t slot_bytes = pimpl->counters.aligned_slot_footprint;
                 auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(pimpl->arena->buffer.get()));
-                if (reclaimed == 0 || reclaimed > SIZE_MAX || index > SIZE_MAX/size_t(reclaimed) ||
-                    madvise(base + size_t(index)*size_t(reclaimed), size_t(reclaimed), MADV_DONTNEED) != 0 ||
+                const long page_value = sysconf(_SC_PAGESIZE);
+                if (slot_bytes == 0 || slot_bytes > SIZE_MAX || index > SIZE_MAX/size_t(slot_bytes) ||
+                    page_value <= 0) {
+                    pimpl->counters.reclaim_failures++;
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
+                }
+                const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(base) + size_t(index)*size_t(slot_bytes);
+                if (slot_bytes > UINTPTR_MAX - raw_begin) {
+                    pimpl->counters.reclaim_failures++;
+                    return llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
+                }
+                const uintptr_t page = uintptr_t(page_value);
+                const uintptr_t begin = (raw_begin + page - 1)/page*page;
+                const uintptr_t end = (raw_begin + slot_bytes)/page*page;
+                const uint64_t reclaimed = end > begin ? end - begin : 0;
+                if ((reclaimed != 0 && madvise(reinterpret_cast<void *>(begin),
+                        size_t(reclaimed), MADV_DONTNEED) != 0) ||
                     reclaimed > UINT64_MAX - pimpl->counters.reclaimed_bytes) {
                     pimpl->counters.reclaim_failures++;
                     return llm_expert_provider_result::failure(llm_expert_provider_error::preparation_failed);
@@ -1853,6 +2161,7 @@ llm_expert_provider_result llm_cold_expert_cache::surrender() noexcept {
     pimpl->counters.pageable = false;
     pimpl->policy = {};
     pimpl->policy_candidates.clear();
+    pimpl->demand_batch_protected.clear();
     pimpl->ready_cv.notify_all();
     return llm_expert_provider_result::success();
 }
