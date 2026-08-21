@@ -44,6 +44,10 @@ void copy_system_memory_diagnostics(
     target.system_memory_available_headroom_bytes = source.headroom.available_headroom_bytes;
     target.system_memory_measured_non_pool_committed_bytes = source.measured_non_pool_committed_bytes;
     target.system_memory_runtime_obligation_bytes = source.measured_runtime_obligation_bytes;
+    target.system_memory_reported_runtime_obligation_bytes = source.reported_runtime_obligation_bytes;
+    target.system_memory_observed_runtime_obligation_bytes = source.observed_runtime_obligation_bytes;
+    target.system_memory_credited_runtime_obligation_bytes = source.credited_runtime_obligation_bytes;
+    target.system_memory_remaining_runtime_reserve_bytes = source.remaining_runtime_reserve_bytes;
     target.system_memory_system_reserve_bytes = source.headroom.system_reserve_bytes;
     target.system_memory_runtime_reserve_bytes = source.headroom.runtime_reserve_bytes;
     target.system_memory_hysteresis_bytes = source.hysteresis_bytes;
@@ -53,11 +57,26 @@ void copy_system_memory_diagnostics(
     target.system_memory_model_allocated_virtual_bytes = source.model_allocated_virtual_bytes;
     target.system_memory_model_allocated_resident_bytes = source.model_allocated_resident_bytes;
     target.system_memory_other_process_resident_bytes = source.other_process_resident_bytes;
+    target.system_memory_current_bytes = source.current_sample.cgroup_memory_current_bytes;
+    target.system_memory_available_bytes = source.current_sample.memory_available_bytes;
+    target.system_memory_calculated_available_bytes = source.calculated_available_bytes;
+    target.system_memory_incoming_bytes = source.incoming_bytes;
+    target.system_memory_required_free_bytes = source.required_free_bytes;
+    target.system_memory_selected_pool_slots = source.headroom.slot_count;
+    target.system_memory_resolve_current_bytes = source.resolve_memory_current_bytes;
+    target.system_memory_resolve_available_bytes = source.resolve_memory_available_bytes;
+    target.system_memory_resolve_calculated_available_bytes = source.resolve_calculated_available_bytes;
+    target.system_memory_resolve_required_free_bytes = source.resolve_required_free_bytes;
+    target.system_memory_obligation_current_bytes = source.obligation_memory_current_bytes;
+    target.system_memory_obligation_available_bytes = source.obligation_memory_available_bytes;
+    target.system_memory_obligation_calculated_available_bytes = source.obligation_calculated_available_bytes;
+    target.system_memory_obligation_required_free_bytes = source.obligation_required_free_bytes;
     target.system_memory_pressure_samples = source.pressure_samples;
     target.system_memory_pressure_rejections = source.pressure_rejections;
     target.system_memory_autofit = source.headroom.autofit;
     target.system_memory_budget_frozen = source.frozen;
     target.system_memory_pressure_circuit_open = source.pressure_circuit_open;
+    target.system_memory_stage = source.stage;
     target.system_memory_pressure_rejection_reason = source.pressure_rejection_reason;
     target.system_memory_residency_unavailable_reason = source.residency_unavailable_reason;
 }
@@ -216,7 +235,8 @@ public:
                 return set_plan_failure(plan, llm_expert_provider_error::invalid_binding);
             }
         }
-        const auto memory_result = system_memory_result(system_memory_budget.revalidate());
+        const auto memory_result = system_memory_result(
+            system_memory_budget.revalidate("uma_provider_prepare"));
         if (!memory_result.is_ready()) return set_plan_failure(plan, memory_result.error);
         auto started = cache->policy_request_begin();
         if (!started.is_ready()) return set_plan_failure(plan, started.error);
@@ -724,7 +744,7 @@ public:
 
     llm_expert_provider_result revalidate_system_memory_budget() noexcept override {
         std::lock_guard<std::mutex> lock(mutex);
-        return system_memory_result(system_memory_budget.revalidate());
+        return system_memory_result(system_memory_budget.revalidate("uma_context_sched_reserve"));
     }
 
     llm_expert_provider_result validate_slot_generation(uint32_t slot, uint64_t generation) noexcept override {

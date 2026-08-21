@@ -98,27 +98,116 @@ void test_shared_system_memory_budget() {
             resolved.measured_non_pool_committed_bytes == 24*GIB &&
             resolved.headroom.safe_pool_bytes == 68*GIB &&
             resolved.admission_safe_pool_bytes == 66*GIB &&
-            resolved.hysteresis_bytes == 2*GIB,
+            resolved.hysteresis_bytes == 2*GIB &&
+            resolved.remaining_runtime_reserve_bytes == 16*GIB &&
+            resolved.calculated_available_bytes == 96*GIB &&
+            resolved.required_free_bytes == 30*GIB &&
+            resolved.resolve_memory_current_bytes == 24*GIB &&
+            resolved.resolve_memory_available_bytes == 100*GIB &&
+            resolved.resolve_calculated_available_bytes == 96*GIB &&
+            resolved.resolve_required_free_bytes == 30*GIB &&
+            resolved.stage == "resolve",
         "shared AUTO diagnostics are incomplete");
-    require(budget.record_runtime_obligation(8*GIB).is_ready(),
-        "bounded runtime obligation was rejected");
 
-    injected_sample.memory_available_bytes = 29*GIB;
-    injected_sample.cgroup_memory_current_bytes = 91*GIB;
-    require(budget.revalidate().error == llm_expert_system_memory_error::unsafe_capacity,
-        "pressure refresh accepted reserves without hysteresis");
-    require(budget.preflight(GIB).error == llm_expert_system_memory_error::unsafe_capacity,
-        "pressure guard accepted reserves without hysteresis");
-    require(budget.diagnostics().pressure_rejections == 2,
-        "pressure rejection was not recorded");
+    injected_sample.cgroup_memory_current_bytes = 98*GIB;
+    injected_sample.memory_available_bytes = 26*GIB;
+    injected_sample.process_rss_bytes = 20*GIB;
+    require(budget.record_runtime_obligation(4*GIB).is_ready(),
+        "bounded runtime obligation was rejected");
+    const auto & recorded = budget.diagnostics();
+    require(recorded.reported_runtime_obligation_bytes == 4*GIB &&
+            recorded.observed_runtime_obligation_bytes == 8*GIB &&
+            recorded.measured_runtime_obligation_bytes == 8*GIB &&
+            recorded.credited_runtime_obligation_bytes == 10*GIB &&
+            recorded.remaining_runtime_reserve_bytes == 6*GIB &&
+            recorded.calculated_available_bytes == 22*GIB &&
+            recorded.required_free_bytes == 20*GIB &&
+            recorded.obligation_memory_current_bytes == 98*GIB &&
+            recorded.obligation_memory_available_bytes == 26*GIB &&
+            recorded.obligation_calculated_available_bytes == 22*GIB &&
+            recorded.obligation_required_free_bytes == 20*GIB &&
+            recorded.stage == "record_runtime_obligation",
+        "bounded runtime-obligation diagnostics are incomplete");
+    require(budget.revalidate("provider_prepare").is_ready(),
+        "legitimate runtime commitment was double charged");
+    require(budget.preflight(GIB).is_ready(),
+        "bounded incoming request was rejected");
+    const auto & preflight = budget.diagnostics();
+    require(preflight.stage == "cold_cache_preflight" &&
+            preflight.incoming_bytes == GIB && preflight.required_free_bytes == 21*GIB,
+        "preflight diagnostics are incomplete");
+
+    injected_sample.memory_available_bytes = 23*GIB;
+    injected_sample.cgroup_memory_current_bytes = 101*GIB;
+    require(budget.revalidate("provider_prepare").error ==
+            llm_expert_system_memory_error::unsafe_capacity,
+        "external memory commitment borrowed the runtime credit");
+    const auto & rejected = budget.diagnostics();
+    require(rejected.stage == "provider_prepare" &&
+            rejected.calculated_available_bytes == 19*GIB &&
+            rejected.required_free_bytes == 20*GIB &&
+            rejected.pressure_rejections == 1 &&
+            rejected.pressure_rejection_reason ==
+                "available memory fell below remaining reserves plus hysteresis" &&
+            rejected.headroom.effective_pool_bytes == 66*GIB,
+        "external-pressure rejection diagnostics are incomplete");
 
     injected_sample.cgroup_memory_current_bytes = 24*GIB;
     injected_sample.memory_available_bytes = 100*GIB;
+    injected_sample.process_rss_bytes = 12*GIB;
     llm_expert_system_memory_budget explicit_budget;
     explicit_budget.configure(sample_injected, 0, 0);
-    require(explicit_budget.resolve(67*GIB, GIB, 100*GIB, 2, selected).error ==
+    require(explicit_budget.resolve(60*GIB, GIB, 100*GIB, 2, selected).is_ready() &&
+            selected == 60*GIB && !explicit_budget.diagnostics().headroom.autofit,
+        "safe explicit capacity behavior changed");
+
+    llm_expert_system_memory_budget unsafe_explicit_budget;
+    unsafe_explicit_budget.configure(sample_injected, 0, 0);
+    require(unsafe_explicit_budget.resolve(67*GIB, GIB, 100*GIB, 2, selected).error ==
             llm_expert_system_memory_error::unsafe_capacity,
         "explicit pool above the shared safe cap was accepted");
+
+    llm_expert_system_memory_budget over_budget;
+    over_budget.configure(sample_injected, 0, 0);
+    require(over_budget.resolve(0, GIB, 100*GIB, 2, selected).is_ready(),
+        "over-budget fixture AUTO resolve failed");
+    require(over_budget.record_runtime_obligation(13*GIB).error ==
+            llm_expert_system_memory_error::unsafe_capacity,
+        "over-budget runtime obligation was accepted");
+    const auto & over_budget_diagnostics = over_budget.diagnostics();
+    require(over_budget_diagnostics.stage == "record_runtime_obligation" &&
+            over_budget_diagnostics.credited_runtime_obligation_bytes == 17*GIB - 3*GIB/4 &&
+            over_budget_diagnostics.pressure_rejection_reason ==
+                "runtime obligation exceeds reserved allowance",
+        "over-budget runtime diagnostics are incomplete");
+
+    injected_sample.swap_counters_supported = true;
+    injected_sample.psi_full_supported = true;
+    injected_sample.psi_full_total_usec = 7;
+    llm_expert_system_memory_budget pressure_budget;
+    pressure_budget.configure(sample_injected, 0, 0);
+    require(pressure_budget.resolve(0, GIB, 100*GIB, 2, selected).is_ready(),
+        "pressure fixture AUTO resolve failed");
+    injected_sample.psi_full_total_usec++;
+    require(pressure_budget.revalidate("provider_prepare").error ==
+            llm_expert_system_memory_error::unsafe_capacity,
+        "full-memory pressure growth was accepted");
+    const auto & pressure = pressure_budget.diagnostics();
+    require(pressure.pressure_circuit_open &&
+            pressure.pressure_rejection_reason == "swap or full-memory-pressure activity grew",
+        "full-memory pressure did not open the circuit");
+
+    injected_sample.psi_full_total_usec = 7;
+    injected_sample.process_swap_bytes = 0;
+    llm_expert_system_memory_budget swap_budget;
+    swap_budget.configure(sample_injected, 0, 0);
+    require(swap_budget.resolve(0, GIB, 100*GIB, 2, selected).is_ready(),
+        "swap fixture AUTO resolve failed");
+    injected_sample.process_swap_bytes = GIB;
+    require(swap_budget.revalidate("provider_prepare").error ==
+            llm_expert_system_memory_error::unsafe_capacity &&
+            swap_budget.diagnostics().pressure_circuit_open,
+        "process swap growth did not open the circuit");
 }
 
 } // namespace

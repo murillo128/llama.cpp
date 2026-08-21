@@ -475,7 +475,44 @@ struct llm_expert_system_memory_budget::impl {
         return llm_expert_system_memory_result::failure(llm_expert_system_memory_error::unsafe_capacity);
     }
 
-    llm_expert_system_memory_result check_sampled_pressure(uint64_t incoming_bytes) noexcept {
+    bool update_sampled_arithmetic(const char * stage, uint64_t incoming_bytes) noexcept {
+        state.stage = stage ? stage : "unknown";
+        state.incoming_bytes = incoming_bytes;
+        state.calculated_available_bytes = 0;
+        state.required_free_bytes = 0;
+        state.remaining_runtime_reserve_bytes =
+            state.credited_runtime_obligation_bytes <= state.headroom.runtime_reserve_bytes ?
+                state.headroom.runtime_reserve_bytes - state.credited_runtime_obligation_bytes : 0;
+        const auto & current = state.current_sample;
+        const uint64_t cgroup_available = current.cgroup_memory_current_bytes <=
+                current.cgroup_memory_max_bytes ?
+            current.cgroup_memory_max_bytes - current.cgroup_memory_current_bytes : 0;
+        state.calculated_available_bytes =
+            std::min(current.memory_available_bytes, cgroup_available);
+        uint64_t required = 0;
+        if (!checked_add(state.headroom.system_reserve_bytes,
+                         state.remaining_runtime_reserve_bytes, required) ||
+            !checked_add(required, state.hysteresis_bytes, required) ||
+            !checked_add(required, incoming_bytes, required)) {
+            return false;
+        }
+        state.required_free_bytes = required;
+        return true;
+    }
+
+    void snapshot_obligation_arithmetic() noexcept {
+        state.obligation_memory_current_bytes = state.current_sample.cgroup_memory_current_bytes;
+        state.obligation_memory_available_bytes = state.current_sample.memory_available_bytes;
+        state.obligation_calculated_available_bytes = state.calculated_available_bytes;
+        state.obligation_required_free_bytes = state.required_free_bytes;
+    }
+
+    llm_expert_system_memory_result check_sampled_pressure(
+            const char * stage,
+            uint64_t incoming_bytes) noexcept {
+        if (!update_sampled_arithmetic(stage, incoming_bytes)) {
+            return reject("pressure reservation arithmetic overflow", false);
+        }
         if (state.pressure_circuit_open) return reject("pressure circuit already open", true);
         const auto & current = state.current_sample;
         const auto & baseline = state.baseline_sample;
@@ -496,25 +533,18 @@ struct llm_expert_system_memory_budget::impl {
              current.zswap_write_pages > baseline.zswap_write_pages)) {
             return reject("swap or full-memory-pressure activity grew", true);
         }
-        const uint64_t cgroup_available = current.cgroup_memory_current_bytes <=
-                current.cgroup_memory_max_bytes ?
-            current.cgroup_memory_max_bytes - current.cgroup_memory_current_bytes : 0;
-        const uint64_t available = std::min(current.memory_available_bytes, cgroup_available);
-        uint64_t required = 0;
-        if (!checked_add(state.headroom.system_reserve_bytes,
-                         state.headroom.runtime_reserve_bytes, required) ||
-            !checked_add(required, state.hysteresis_bytes, required) ||
-            !checked_add(required, incoming_bytes, required)) {
-            return reject("pressure reservation arithmetic overflow", false);
-        }
-        if (available < required) {
-            return reject("available memory fell below reserves plus hysteresis", false);
+        if (state.calculated_available_bytes < state.required_free_bytes) {
+            return reject("available memory fell below remaining reserves plus hysteresis", false);
         }
         state.pressure_rejection_reason.clear();
         return llm_expert_system_memory_result::success();
     }
 
-    llm_expert_system_memory_result refresh_pressure(uint64_t incoming_bytes) noexcept {
+    llm_expert_system_memory_result refresh_pressure(
+            const char * stage,
+            uint64_t incoming_bytes) noexcept {
+        state.stage = stage ? stage : "unknown";
+        state.incoming_bytes = incoming_bytes;
         if (state.pressure_circuit_open) return reject("pressure circuit already open", true);
         const auto sampled = sample_current(false);
         if (!sampled.is_ready()) return reject(
@@ -522,7 +552,7 @@ struct llm_expert_system_memory_budget::impl {
                 "required memory capacity telemetry unavailable" :
                 state.current_sample.unavailable_reason.c_str(), false);
         state.pressure_samples++;
-        return check_sampled_pressure(incoming_bytes);
+        return check_sampled_pressure(stage, incoming_bytes);
     }
 };
 
@@ -628,6 +658,30 @@ llm_expert_system_memory_result llm_expert_system_memory_budget::resolve(
     pimpl->state.headroom.effective_pool_bytes = selected_pool_bytes;
     pimpl->state.headroom.slot_count = selected_pool_bytes/slot_stride;
     pimpl->state.baseline_sample = current;
+    pimpl->state.stage = "resolve";
+    pimpl->state.reported_runtime_obligation_bytes = 0;
+    pimpl->state.observed_runtime_obligation_bytes = 0;
+    pimpl->state.measured_runtime_obligation_bytes = 0;
+    pimpl->state.credited_runtime_obligation_bytes = 0;
+    pimpl->state.remaining_runtime_reserve_bytes = pimpl->state.headroom.runtime_reserve_bytes;
+    pimpl->state.incoming_bytes = 0;
+    const uint64_t cgroup_available = current.cgroup_memory_current_bytes <=
+            current.cgroup_memory_max_bytes ?
+        current.cgroup_memory_max_bytes - current.cgroup_memory_current_bytes : 0;
+    pimpl->state.calculated_available_bytes =
+        std::min(current.memory_available_bytes, cgroup_available);
+    uint64_t required_free = 0;
+    if (!checked_add(pimpl->state.headroom.system_reserve_bytes,
+                     pimpl->state.headroom.runtime_reserve_bytes, required_free) ||
+        !checked_add(required_free, pimpl->state.hysteresis_bytes, required_free)) {
+        return llm_expert_system_memory_result::failure(llm_expert_system_memory_error::overflow);
+    }
+    pimpl->state.required_free_bytes = required_free;
+    pimpl->state.resolve_memory_current_bytes = current.cgroup_memory_current_bytes;
+    pimpl->state.resolve_memory_available_bytes = current.memory_available_bytes;
+    pimpl->state.resolve_calculated_available_bytes = pimpl->state.calculated_available_bytes;
+    pimpl->state.resolve_required_free_bytes = pimpl->state.required_free_bytes;
+    pimpl->state.pressure_rejection_reason.clear();
     pimpl->state.frozen = true;
     return llm_expert_system_memory_result::success();
 }
@@ -635,22 +689,54 @@ llm_expert_system_memory_result llm_expert_system_memory_budget::resolve(
 llm_expert_system_memory_result llm_expert_system_memory_budget::record_runtime_obligation(
         uint64_t bytes) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
-    if (!pimpl->state.frozen || bytes > UINT64_MAX/5) {
+    pimpl->state.stage = "record_runtime_obligation";
+    pimpl->state.reported_runtime_obligation_bytes = bytes;
+    if (!pimpl->state.frozen) {
         return llm_expert_system_memory_result::failure(
             llm_expert_system_memory_error::invalid_configuration);
     }
-    const uint64_t required = (bytes*5 + 3)/4;
-    if (required > pimpl->state.headroom.runtime_reserve_bytes) {
-        return llm_expert_system_memory_result::failure(llm_expert_system_memory_error::unsafe_capacity);
+    const auto sampled = pimpl->sample_current(false);
+    if (!sampled.is_ready()) {
+        return pimpl->reject(
+            pimpl->state.current_sample.unavailable_reason.empty() ?
+                "required memory capacity telemetry unavailable" :
+                pimpl->state.current_sample.unavailable_reason.c_str(), false);
     }
-    pimpl->state.measured_runtime_obligation_bytes = bytes;
-    return pimpl->refresh_pressure(0);
+    pimpl->state.pressure_samples++;
+    const uint64_t baseline_rss = pimpl->state.baseline_sample.process_rss_bytes;
+    const uint64_t current_rss = pimpl->state.current_sample.process_rss_bytes;
+    pimpl->state.observed_runtime_obligation_bytes =
+        current_rss > baseline_rss ? current_rss - baseline_rss : 0;
+    pimpl->state.measured_runtime_obligation_bytes = std::max(
+        bytes, pimpl->state.observed_runtime_obligation_bytes);
+    uint64_t credited_runtime_obligation = 0;
+    if (!checked_ceil_ratio(
+            pimpl->state.measured_runtime_obligation_bytes, 5, 4,
+            credited_runtime_obligation)) {
+        pimpl->state.credited_runtime_obligation_bytes = 0;
+        if (!pimpl->update_sampled_arithmetic("record_runtime_obligation", 0)) {
+            return pimpl->reject("pressure reservation arithmetic overflow", false);
+        }
+        pimpl->snapshot_obligation_arithmetic();
+        return pimpl->reject("runtime obligation arithmetic overflow", false);
+    }
+    pimpl->state.credited_runtime_obligation_bytes = credited_runtime_obligation;
+    if (!pimpl->update_sampled_arithmetic("record_runtime_obligation", 0)) {
+        return pimpl->reject("pressure reservation arithmetic overflow", false);
+    }
+    pimpl->snapshot_obligation_arithmetic();
+    if (pimpl->state.credited_runtime_obligation_bytes >
+            pimpl->state.headroom.runtime_reserve_bytes) {
+        return pimpl->reject("runtime obligation exceeds reserved allowance", false);
+    }
+    return pimpl->check_sampled_pressure("record_runtime_obligation", 0);
 }
 
-llm_expert_system_memory_result llm_expert_system_memory_budget::revalidate() noexcept {
+llm_expert_system_memory_result llm_expert_system_memory_budget::revalidate(
+        const char * stage) noexcept {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     if (!pimpl->state.frozen) return llm_expert_system_memory_result::success();
-    return pimpl->refresh_pressure(0);
+    return pimpl->refresh_pressure(stage, 0);
 }
 
 llm_expert_system_memory_result llm_expert_system_memory_budget::preflight(
@@ -660,7 +746,7 @@ llm_expert_system_memory_result llm_expert_system_memory_budget::preflight(
         return llm_expert_system_memory_result::failure(
             llm_expert_system_memory_error::invalid_configuration);
     }
-    return pimpl->check_sampled_pressure(incoming_bytes);
+    return pimpl->check_sampled_pressure("cold_cache_preflight", incoming_bytes);
 }
 
 llm_expert_system_memory_diagnostics

@@ -112,6 +112,10 @@ struct llm_expert_system_memory_diagnostics {
     uint64_t topology_bytes = 0;
     uint64_t measured_non_pool_committed_bytes = 0;
     uint64_t measured_runtime_obligation_bytes = 0;
+    uint64_t reported_runtime_obligation_bytes = 0;
+    uint64_t observed_runtime_obligation_bytes = 0;
+    uint64_t credited_runtime_obligation_bytes = 0;
+    uint64_t remaining_runtime_reserve_bytes = 0;
     uint64_t admission_safe_pool_bytes = 0;
     uint64_t model_file_virtual_bytes = 0;
     uint64_t model_file_cache_resident_bytes = 0;
@@ -120,10 +124,22 @@ struct llm_expert_system_memory_diagnostics {
     uint64_t model_allocated_resident_bytes = 0;
     uint64_t other_process_resident_bytes = 0;
     uint64_t hysteresis_bytes = 0;
+    uint64_t calculated_available_bytes = 0;
+    uint64_t incoming_bytes = 0;
+    uint64_t required_free_bytes = 0;
+    uint64_t resolve_memory_current_bytes = 0;
+    uint64_t resolve_memory_available_bytes = 0;
+    uint64_t resolve_calculated_available_bytes = 0;
+    uint64_t resolve_required_free_bytes = 0;
+    uint64_t obligation_memory_current_bytes = 0;
+    uint64_t obligation_memory_available_bytes = 0;
+    uint64_t obligation_calculated_available_bytes = 0;
+    uint64_t obligation_required_free_bytes = 0;
     uint64_t pressure_samples = 0;
     uint64_t pressure_rejections = 0;
     bool frozen = false;
     bool pressure_circuit_open = false;
+    std::string stage;
     std::string pressure_rejection_reason;
     std::string residency_unavailable_reason;
 };
@@ -150,7 +166,7 @@ public:
             uint64_t minimum_slots,
             uint64_t & selected_pool_bytes) noexcept;
     llm_expert_system_memory_result record_runtime_obligation(uint64_t bytes) noexcept;
-    llm_expert_system_memory_result revalidate() noexcept;
+    llm_expert_system_memory_result revalidate(const char * stage = "revalidate") noexcept;
     llm_expert_system_memory_result preflight(uint64_t incoming_bytes) noexcept;
     llm_expert_system_memory_diagnostics diagnostics() const noexcept;
 
